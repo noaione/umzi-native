@@ -710,3 +710,63 @@ Replay tuning selected plans for 13 shapes on a miss at each batch size
 and precision. Warmed batch-16 VRAM stayed within 210–212 MiB for
 mixed precision and 204–206 MiB for full FP16. The highest sampled
 native startup increases at batch 16 were 274 MiB and 268 MiB, respectively.
+
+## Fusion at variable tile sizes
+
+Both options now use the session's padded height and width for eligible
+full-resolution 32-channel features. Gate/pool keeps the specialized 128×128
+kernel and uses a kernel that takes height and width at other sizes. Its
+pooling chunks stay within each image. The FP16 projection normalizes
+partials by the actual number of pixels. Conv/SiLU builds its cuDNN plan for
+the prepared tile size and uses the split path when no plan is available.
+
+On the RTX 3050 Laptop GPU, both models used four fused gate/pool sites in
+mixed and FP16, and 12 fused Conv/SiLU sites in mixed. Smoke tests covered
+128×128, 128×160, 65×79 at batch 16, and 1×7 at batch 2. The odd
+65×79 input padded to 80×80 for the original model and 72×80 for IDC.
+cuDNN did not offer an FP16 Conv/SiLU plan in these runs. A separate CUDA
+kernel check used three 9×17 images with 25-pixel final chunks and matched
+the split gate output and checked the partial sums for both precisions.
+The installed Windows wheel produced identical results across graph replay,
+direct dispatch, and device-buffer calls at 65×79 and 128×128, with both
+switches enabled. The CUDA driver also JIT-loaded the new kernel symbols
+from the generated PTX.
+
+With separate cache entries for each fusion switch, two batch-1 comparisons
+showed large latency swings. Per-operation CUDA Graph profiling traced most
+of the time difference to convolutions, including when the four fused
+gate/pool sites themselves took less time. The cache key now shares the
+standalone convolution and projection choices across the two fusion
+switches. The cuDNN fusion plan and gate/pool dispatch are still prepared
+for each session shape. [Independent-cache profile](../output/gaterv3-dynamic-fusions/paired-profiles.json)
+
+The native A/B test used 4×4 tile crops from `page-001.jpg` and
+`page-005.jpg`, with the corresponding Torch CUDA FP32 model as the
+reference. The report stores raw-float PSNR before PNG encoding, separate
+SSIMULACRA2 scores against rendered FP32 crops, and the configuration and
+timing samples for each crop. Batch-1 latency is the mean of independently
+timed, synchronized calls. Batch-16 uses the median of seven synchronized
+calls per crop. Throughput divides total original tile pixels by the sum of
+those medians. The session used CUDA Graph replay and the timed paths
+excluded shape preparation. Both fusion configurations reused the split
+configuration's cached library algorithms. [Raw data and per-tile timings](../output/gaterv3-dynamic-fusions/paired-comparison.json)
+
+Each cell lists split, gate/pool fusion, and Conv/SiLU in that order.
+FP16 Conv/SiLU timings show the split fallback.
+
+| Model | Input tile | Precision | Batch-1 mean (ms/tile) | Batch-16 time (ms/batch) | Batch-16 throughput (MPx/s) |
+| --- | --- | --- | ---: | ---: | ---: |
+| Original | 65×79 | Mixed | 3.39 / 3.44 / 3.59 | 28.69 / 30.77 / 30.63 | 2.86 / 2.67 / 2.68 |
+| Original | 65×79 | FP16 | 2.90 / 2.87 / 2.93 | 23.98 / 24.18 / 24.20 | 3.43 / 3.40 / 3.39 |
+| Original | 128×160 | Mixed | 7.22 / 7.10 / 7.09 | 88.39 / 88.55 / 85.66 | 3.71 / 3.70 / 3.83 |
+| Original | 128×160 | FP16 | 7.56 / 7.81 / 7.62 | 85.97 / 86.86 / 88.54 | 3.81 / 3.77 / 3.70 |
+| IDC | 65×79 | Mixed | 1.89 / 1.94 / 1.77 | 20.07 / 19.10 / 19.22 | 4.09 / 4.30 / 4.27 |
+| IDC | 65×79 | FP16 | 1.75 / 1.63 / 1.63 | 19.74 / 18.18 / 18.45 | 4.16 / 4.52 / 4.45 |
+| IDC | 128×160 | Mixed | 5.47 / 5.22 / 5.46 | 68.65 / 68.26 / 64.19 | 4.77 / 4.80 / 5.10 |
+| IDC | 128×160 | FP16 | 4.76 / 4.91 / 5.05 | 57.42 / 57.02 / 58.75 | 5.71 / 5.75 / 5.58 |
+
+The original model's mixed 65×79 batches ran faster with the split path.
+On IDC, gate/pool improved FP16 throughput at 65×79 from 4.16 to
+4.52 MPx/s. Its mean raw PSNR changed from 65.65 to 65.61 dB and mean
+SSIMULACRA2 from 98.50 to 96.40. At 128×160, IDC's mixed Conv/SiLU throughput
+rose from 4.77 to 5.10 MPx/s and its mean SSIMULACRA2 from 96.39 to 96.42.

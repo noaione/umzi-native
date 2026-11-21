@@ -24,7 +24,7 @@ public:
     void finalize() { CHECK(cudnnBackendFinalize(handle)); }
 };
 
-// Prototype for the bias-free 128x128 C32 convolutions that feed SiLU.
+// Fuses bias-free C32 convolutions that feed SiLU at the prepared tile size.
 class SiluPlan {
     std::vector<std::unique_ptr<BackendDescriptor>> descriptors;
     std::unique_ptr<BackendDescriptor> plan;
@@ -51,11 +51,11 @@ class SiluPlan {
 public:
     size_t workspace = 0;
 
-    void initialize(cudnnHandle_t handle, int batch, bool fp16, size_t limit) {
-        auto& x = tensor(1, batch, 128, 128, false);
+    void initialize(cudnnHandle_t handle, int batch, int height, int width, bool fp16, size_t limit) {
+        auto& x = tensor(1, batch, height, width, false);
         auto& weights = tensor(2, 32, 3, 3, false);
-        auto& tmp = tensor(3, batch, 128, 128, true);
-        auto& output = tensor(4, batch, 128, 128, false);
+        auto& tmp = tensor(3, batch, height, width, true);
+        auto& output = tensor(4, batch, height, width, false);
 
         auto type = fp16 ? CUDNN_DATA_HALF : CUDNN_DATA_FLOAT;
         auto& conv_desc = descriptor(CUDNN_BACKEND_CONVOLUTION_DESCRIPTOR);

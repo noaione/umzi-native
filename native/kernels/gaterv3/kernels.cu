@@ -531,18 +531,27 @@ extern "C" __global__ void attention16_dynamic(half* y, const half* x, int token
 
 // Each half warp owns one pixel and all 32 gated channels. The gate is
 // materialized in FP16 because the later channel scaling also reads it.
-template<bool Full>
+template<bool Full, int Square>
 __device__ void gate_pool(half2* out, void* partial, const half2* in,
-                           const half2* weights, const half2* bias) {
+                           const half2* weights, const half2* bias,
+                           int h = Square, int w = Square, int chunks = 0) {
     constexpr int groups = 16, pixels_per_step = 16, chunk = 64;
     int g = threadIdx.x % groups, lane_pixel = threadIdx.x / groups;
     int base = blockIdx.x * chunk;
+    int count = chunk;
+    if constexpr (Square == 0) {
+        // Lay out partials by image, including a final short chunk if needed.
+        const int pixels = h * w;
+        const int start = (blockIdx.x % chunks) * chunk;
+        base = (blockIdx.x / chunks) * pixels + start;
+        count = min(chunk, pixels - start);
+    }
     if constexpr (Full) {
         __shared__ half2 sums[pixels_per_step][groups];
         half2 acc = splat16(0);
-        for (int p = lane_pixel; p < chunk; p += pixels_per_step) {
+        for (int p = lane_pixel; p < count; p += pixels_per_step) {
             int pixel = base + p;
-            half2 value = local16_value<32, 128>(in, weights, bias, pixel, g);
+            half2 value = local16_value<32, Square>(in, weights, bias, pixel, g, h, w);
             out[pixel * groups + g] = value;
             acc = __hadd2(acc, value);
         }
@@ -556,9 +565,9 @@ __device__ void gate_pool(half2* out, void* partial, const half2* in,
     } else {
         __shared__ float2 sums[pixels_per_step][groups];
         float2 acc{0.f, 0.f};
-        for (int p = lane_pixel; p < chunk; p += pixels_per_step) {
+        for (int p = lane_pixel; p < count; p += pixels_per_step) {
             int pixel = base + p;
-            half2 value = local_gate_value<32, 128>(in, weights, bias, pixel, g);
+            half2 value = local_gate_value<32, Square>(in, weights, bias, pixel, g, h, w);
             out[pixel * groups + g] = value;
             float2 rounded = __half22float2(value);
             acc.x += rounded.x;
@@ -578,11 +587,19 @@ __device__ void gate_pool(half2* out, void* partial, const half2* in,
 
 extern "C" __global__ void gate_pool32(half2* y, float2* p, const half2* x,
                                         const half2* k, const half2* b) {
-    gate_pool<false>(y, p, x, k, b);
+    gate_pool<false, 128>(y, p, x, k, b);
 }
 extern "C" __global__ void gate_pool16_32(half2* y, half2* p, const half2* x,
                                           const half2* k, const half2* b) {
-    gate_pool<true>(y, p, x, k, b);
+    gate_pool<true, 128>(y, p, x, k, b);
+}
+extern "C" __global__ void gate_pool32_dynamic(half2* y, float2* p, const half2* x,
+                                                const half2* k, const half2* b, int h, int w, int chunks) {
+    gate_pool<false, 0>(y, p, x, k, b, h, w, chunks);
+}
+extern "C" __global__ void gate_pool16_32_dynamic(half2* y, half2* p, const half2* x,
+                                                  const half2* k, const half2* b, int h, int w, int chunks) {
+    gate_pool<true, 0>(y, p, x, k, b, h, w, chunks);
 }
 
 template<int C, bool Local, bool Full>

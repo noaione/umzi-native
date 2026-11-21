@@ -72,6 +72,8 @@ The session keeps one prepared padded shape and batch active at a time. If
 either changes, the session prepares the new shape and can reuse matching
 disk-cached algorithms. `cache_status` reports `disabled`, `miss`, `hit`,
 `rebuilt`, or `unavailable`. Check `cache_message` for cache errors.
+Changing `fuse_silu` or `fuse_gate_pool` can reuse the same cached
+convolution and projection algorithms.
 
 ### GateRV3 kernel options
 
@@ -80,13 +82,15 @@ unknown names and values outside `0` and `1`.
 
 | Key | Effect | Check in `get_session_info()` |
 | --- | --- | --- |
-| `fuse_silu` | Tries one cuDNN graph for compatible 3×3 convolutions followed by SiLU on 128×128, 32-channel feature maps. If there are no eligible sites or cuDNN cannot run or capture the fused plan, the runtime uses separate operations. | `diagnostics["fused_silu_count"]` and `kernel_message` |
+| `fuse_silu` | Tries a cuDNN graph for compatible bias-free 3×3 convolutions followed by SiLU on 32-channel feature maps at the padded tile size. If cuDNN cannot run or capture the fused plan for that shape and precision, the runtime uses separate operations. | `diagnostics["fused_silu_count"]` and `kernel_message` |
 | `tune_projections` | Tries more cuBLASLt candidates for eligible 1×1 projections, timing candidates with CUDA Graph replay during tuning. This can increase first-shape setup time. The switch is independent of CUDA Graph replay for inference. | `diagnostics["replay_tuned_shapes"]` |
-| `fuse_gate_pool` | Combines the grouped spatial gate and the partial pooling reduction at eligible 128×128, 32-channel feature maps. Supports mixed and FP16. | `diagnostics["fused_gate_pool_sites"]` |
+| `fuse_gate_pool` | Combines the grouped spatial gate and partial pooling on eligible 32-channel feature maps at the padded tile size. Supports mixed and FP16, including rectangular tiles. | `diagnostics["fused_gate_pool_sites"]` |
 | `fp16_qkv` | In mixed precision, uses FP16 accumulation for the original GateRV3 model's folded QKV projections. The IDC model has no attention projections, and the full FP16 path already uses FP16 accumulation there. | `diagnostics["fp16_qkv_projections"]` |
 
 For example, pass `SessionOptions(kernel_options={"tune_projections": 1,
 "fuse_gate_pool": 1})` to enable replay-based tuning and gate/pool fusion.
+The runtime uses a specialized gate/pool kernel when the padded tile is
+128×128 and a shape-aware kernel for other sizes.
 
 After preparing or running a shape, `get_session_info()` returns the
 padded shape, cache status, setup times, runner buffer sizes and

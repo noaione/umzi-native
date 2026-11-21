@@ -518,8 +518,9 @@ private:
         add_u32(sizeof(void*));
         add_u32(sizeof(cublasLtMatmulAlgo_t));
         add_u32(static_cast<uint32_t>(scratch_bytes));
-        add_u32(static_cast<uint32_t>(fp16) | (tune_projections << 1) | (fp16_qkv << 2)
-            | (fuse_silu << 3) | (fuse_gate_pool << 4));
+        // The disk cache stores standalone convolutions and projections.
+        // Gate/pool dispatch and the cuDNN SiLU graph are prepared separately.
+        add_u32(static_cast<uint32_t>(fp16) | (tune_projections << 1) | (fp16_qkv << 2));
         CUuuid uuid{};
         CHECK(cuDeviceGetUuid(&uuid, device));
         hash.add(uuid);
@@ -876,7 +877,10 @@ private:
         add_bias = lookup(fp16 ? "bias16" : "bias");
         mean_project = lookup(fp16 ? "mean_project16" : "mean_project");
         if (fp16 && variable_pool()) dynamic_mean_project = lookup("mean_project16_dynamic");
-        if (fuse_gate_pool) gate_pool_kernel = lookup(fp16 ? "gate_pool16_32" : "gate_pool32");
+        if (fuse_gate_pool) {
+            const char* name = fp16 ? "gate_pool16_32" : "gate_pool32";
+            gate_pool_kernel = lookup(variable_pool() ? std::string(name) + "_dynamic" : name);
+        }
         constexpr const char* names[] = {
             "pack", nullptr, nullptr, nullptr, "mean_partial", "local_skip",
             nullptr, "global_skip", "shuffle", "concat", "silu", "span_gate",
@@ -889,7 +893,7 @@ private:
                 const auto& gated = tensors[op.input[0]];
                 const auto pixels = gated.pixels();
                 pool_fused[i] = fuse_gate_pool && i && ops[i - 1].kind == Local
-                    && ops[i - 1].out == op.input[0] && gated.h == tile && gated.w == tile
+                    && ops[i - 1].out == op.input[0] && gated.h == height && gated.w == width
                     && gated.c == 32 && out.c == 32;
                 int chunk = pool_fused[i] ? gate_pool_chunk : 256;
                 size_t partial_bytes = size_t((pixels + chunk - 1) / chunk) * batch * out.c
@@ -954,7 +958,7 @@ private:
                 || silu.input[0] != conv.out || uses[conv.out] != 1) continue;
             const auto& x = tensors[conv.input[0]];
             const auto& y = tensors[silu.out];
-            if (x.h != tile || x.w != tile || x.c != 32 || y.h != tile || y.w != tile || y.c != 32)
+            if (x.h != height || x.w != width || x.c != 32 || y.h != height || y.w != width || y.c != 32)
                 continue;
             const auto x_end = x.offset + x.elements() * 2;
             const auto y_end = y.offset + y.elements() * 2;
@@ -967,7 +971,7 @@ private:
         }
         try {
             auto candidate = std::make_unique<gt::SiluPlan>();
-            candidate->initialize(cudnn, batch, fp16, scratch_bytes);
+            candidate->initialize(cudnn, batch, height, width, fp16, scratch_bytes);
             workspace_bytes = std::max(workspace_bytes, candidate->workspace);
             silu_plan = std::move(candidate);
         } catch (const std::exception& error) {
@@ -1049,8 +1053,14 @@ private:
             }
             case Local:
                 if (i + 1 < ops.size() && pool_fused[i + 1]) {
-                    launch(gate_pool_kernel, target, pixels * batch / gate_pool_chunk, 1,
-                           threads, y, scratch, a, w0, w1);
+                    if (variable_pool()) {
+                        int chunks = (pixels + gate_pool_chunk - 1) / gate_pool_chunk;
+                        launch(gate_pool_kernel, target, batch * chunks, 1,
+                               threads, y, scratch, a, w0, w1, o.h, o.w, chunks);
+                    } else {
+                        launch(gate_pool_kernel, target, pixels * batch / gate_pool_chunk, 1,
+                               threads, y, scratch, a, w0, w1);
+                    }
                 } else if (variable_spatial(o.c, o)) {
                     pairs(y, a, w0, w1, o.h, o.w);
                 } else {
@@ -1065,8 +1075,13 @@ private:
                     launch(kernel, target, (o.c / 32) * (variable_pool() ? sites : 1),
                            variable_pool() ? 1 : sites, threads, scratch, a, in.pixels(), o.c, chunks);
                 }
-                auto project = dynamic_mean_project && !pool_fused[i] ? dynamic_mean_project : mean_project;
-                launch(project, target, batch, 1, threads, y, scratch, w0, w1, in.pixels(), o.c, chunks);
+                if (dynamic_mean_project) {
+                    launch(dynamic_mean_project, target, batch, 1, threads, y, scratch, w0, w1,
+                           in.pixels(), o.c, chunks, chunk);
+                } else {
+                    launch(mean_project, target, batch, 1, threads, y, scratch, w0, w1,
+                           in.pixels(), o.c, chunks);
+                }
                 break;
             }
             case LocalSkip: pairs(y, a, b, c, w0, pixels, o.c / 2); break;

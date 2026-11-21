@@ -215,7 +215,7 @@ extern "C" __global__ void mean_partial16_dynamic(half* y, const half* x, int pi
 
 template<bool Dynamic>
 __device__ void mean_project16_spatial(half* out, const half* partial, const half* weight,
-                                          const half* bias, int pixels, int channels, int chunks) {
+                                          const half* bias, int pixels, int channels, int chunks, int chunk) {
     __shared__ half average[256];
     int c = threadIdx.x, lane = c % 32, warp = c / 32, n = blockIdx.x;
     if (c < channels) {
@@ -223,7 +223,7 @@ __device__ void mean_project16_spatial(half* out, const half* partial, const hal
         if constexpr (Dynamic) {
             // Partials all use the same divisor, even the final short chunk.
             // Scale before adding to keep the FP16 running sum in range.
-            half scale = __float2half(256.0f / pixels);
+            half scale = __float2half(float(chunk) / pixels);
             for (int j = 0; j < chunks; ++j)
                 sum = __hfma(partial[(n * chunks + j) * channels + c], scale, sum);
             average[c] = sum;
@@ -244,11 +244,11 @@ __device__ void mean_project16_spatial(half* out, const half* partial, const hal
 }
 extern "C" __global__ void mean_project16(half* y, const half* p, const half* k, const half* b,
                                           int pixels, int channels, int chunks) {
-    mean_project16_spatial<false>(y, p, k, b, pixels, channels, chunks);
+    mean_project16_spatial<false>(y, p, k, b, pixels, channels, chunks, 256);
 }
 extern "C" __global__ void mean_project16_dynamic(half* y, const half* p, const half* k, const half* b,
-                                                  int pixels, int channels, int chunks) {
-    mean_project16_spatial<true>(y, p, k, b, pixels, channels, chunks);
+                                                  int pixels, int channels, int chunks, int chunk) {
+    mean_project16_spatial<true>(y, p, k, b, pixels, channels, chunks, chunk);
 }
 
 extern "C" __global__ void local_skip16(half2* out, const half2* gated, const half2* scale,
