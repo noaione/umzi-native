@@ -20,13 +20,14 @@ import numpy as np
 import torch
 from benchmark import IMAGE_EXTS, ROOT, image_tensor, load_model, patches, tensor_image
 from build_native import load_build_module
-from exporters.gaterv3 import MODEL_METADATA, SCHEMA_VERSION, Op
-from exporters.package import GATERV3, read_sections
 from PIL import Image
 from rtx_session import create_rtx_session
 
+from umzi_native import GateRV3Model, peek_model
 from umzi_native._abi import CACHE_STATUSES, ShapeABI, check_status, open_session, read_session_info, session_setup
 from umzi_native._loader import LIBRARY_NAME, load_session_library
+from umzi_native._model import OPERATION, TENSOR_SPEC
+from umzi_native._model import GateRV3Op as Op
 
 KERNEL_OPTIONS = {"tune-projections": 8, "fuse-gate-pool": 16, "fp16-qkv": 32}
 OPTIMIZATION_STATS = (
@@ -43,20 +44,16 @@ METRIC = Path(r"C:\Tools\imaging\ssimulacra2.exe")
 
 
 def packed_schedule(path):
-    length = path.stat().st_size
+    info = peek_model(path)
+    payload = info.payload
+    if not info.supported or not isinstance(payload, GateRV3Model) or payload.checkpoint is None:
+        raise ValueError(f"Invalid packed GateRV3 model or missing checkpoint digest: {path}")
+    section = next(section for section in info.sections if section.id == 2)
     with path.open("rb") as file:
-        sections = read_sections(file, length, GATERV3, SCHEMA_VERSION)
-        if not {1, 2, 3, 4}.issubset(sections) or sections[1][1] != MODEL_METADATA.size or sections[4][1] != 32:
-            raise ValueError("Invalid packed GateRV3 section sizes")
-        file.seek(sections[1][0])
-        *_, tensors, operations = MODEL_METADATA.unpack(file.read(MODEL_METADATA.size))
-        if not 2 <= operations <= 2000 or tensors != operations + 1 or sections[2][1] != tensors * 8 + operations * 44:
-            raise ValueError("Invalid packed GateRV3 schedule length")
-        file.seek(sections[2][0])
-        specs = np.frombuffer(file.read(tensors * 8), dtype="<i4").reshape(-1, 2)
-        ops = np.frombuffer(file.read(operations * 44), dtype="<i4").reshape(-1, 11)
-        file.seek(sections[4][0])
-        return specs, ops, file.read(32).hex()
+        file.seek(section.offset)
+        specs = np.frombuffer(file.read(payload.tensors * TENSOR_SPEC.size), dtype="<i4").reshape(-1, 2)
+        ops = np.frombuffer(file.read(payload.operations * OPERATION.size), dtype="<i4").reshape(-1, 11)
+    return specs, ops, payload.checkpoint
 
 
 def enabled_optimizations(args):

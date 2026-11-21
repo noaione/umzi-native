@@ -1,11 +1,4 @@
-"""Checkpoint inspection and model construction for GateRV3.
-
-The checkpoints shipped in ``models/`` are raw ``state_dict`` objects, so the
-architecture has to be rebuilt before the weights can be loaded. Instead of
-hardcoding hyper-parameters, ``ModelConfig.from_state_dict`` derives them from
-the tensor shapes / key names, which keeps the loader working across model
-variants (1x / 2x / 4x, with or without attention in the latent stage).
-"""
+"""Resselt-backed GateRV3 reference for the benchmark scripts."""
 
 from __future__ import annotations
 
@@ -13,11 +6,14 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MethodType
 
 import torch
+from resselt.archs.gaterv3.arch import Attention, GateRV3, SampleMods
 from torch import Tensor, nn
+from torch.nn.functional import scaled_dot_product_attention
 
-from .gaterv3 import GateRV3, SampleMods
+from umzi_native.exporter._loader import load_checkpoint
 
 
 def _child_count(state_dict: Mapping[str, Tensor], prefix: str) -> int:
@@ -41,8 +37,6 @@ class ModelConfig:
     attention: bool = False
     flash: bool = True
     upsample: str = "pixelshuffle"
-    upsample_mid_dim: int = 48
-    groups: int = 4
 
     @classmethod
     def from_state_dict(cls, state_dict: Mapping[str, Tensor]) -> ModelConfig:
@@ -70,8 +64,6 @@ class ModelConfig:
 
         scale = 1
         upsample = "pixelshuffle"
-        upsample_mid_dim = 48
-        groups = 4
         if "dim_to_in.weight" not in state_dict:
             # Non-1x models use `UniUpsample`, which stores its own metadata.
             meta = state_dict.get("dim_to_in.MetaUpsample")
@@ -84,8 +76,6 @@ class ModelConfig:
             values = [int(v) for v in meta.flatten().tolist()]
             upsample = SampleMods.__args__[values[1]]  # type: ignore[attr-defined]
             scale = values[2]
-            upsample_mid_dim = values[5]
-            groups = values[6]
 
         if enc_levels == 0 or dec_levels == 0 or num_latent == 0:
             msg = "Malformed GateRV3 checkpoint: encoder/decoder/latent stage is empty."
@@ -102,24 +92,6 @@ class ModelConfig:
             attention=attention,
             flash=flash,
             upsample=upsample,
-            upsample_mid_dim=upsample_mid_dim,
-            groups=groups,
-        )
-
-    def build(self) -> GateRV3:
-        """Instantiate a freshly initialised model with this configuration."""
-        return GateRV3(
-            in_ch=self.in_ch,
-            dim=self.dim,
-            enc_blocks=self.enc_blocks,
-            dec_blocks=self.dec_blocks,
-            num_latent=self.num_latent,
-            scale=self.scale,
-            upsample=self.upsample,  # type: ignore[arg-type]
-            upsample_mid_dim=self.upsample_mid_dim,
-            attention=self.attention,
-            sisr_blocks=self.sisr_blocks,
-            flash=self.flash,
         )
 
     def describe(self) -> str:
@@ -133,30 +105,15 @@ class ModelConfig:
         )
 
 
-def read_state_dict(path: str | Path) -> dict[str, Tensor]:
-    """Load a checkpoint file and normalise common wrapper formats."""
-    path = Path(path)
-    if path.suffix.lower() == ".safetensors":
-        from safetensors.torch import load_file
-
-        checkpoint = load_file(path, device="cpu")
-    else:
-        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
-    if not isinstance(checkpoint, dict):
-        msg = f"Unexpected checkpoint type: {type(checkpoint).__name__}"
-        raise TypeError(msg)
-
-    for key in ("state_dict", "model", "params", "net"):
-        inner = checkpoint.get(key)
-        if isinstance(inner, dict):
-            checkpoint = inner
-            break
-
-    state_dict = {key.removeprefix("module."): value for key, value in checkpoint.items() if isinstance(value, Tensor)}
-    if not state_dict:
-        msg = f"No tensors found in checkpoint {path}"
-        raise ValueError(msg)
-    return state_dict
+def _spatial_attention(layer: Attention, x: Tensor) -> Tensor:
+    batch, channels, height, width = x.shape
+    qkv = layer.qkv_dwconv(layer.qkv(x))
+    q, k, v = (
+        part.view(batch, layer.num_heads, layer.head_dim, height * width).transpose(2, 3)
+        for part in qkv.chunk(3, dim=1)
+    )
+    result = scaled_dot_product_attention(q, k, v, is_causal=False)
+    return layer.project_out(result.transpose(2, 3).contiguous().view(batch, channels, height, width))
 
 
 def load_model(
@@ -164,47 +121,20 @@ def load_model(
     *,
     device: str | torch.device = "auto",
     dtype: torch.dtype | None = None,
-    strict: bool = True,
 ) -> tuple[GateRV3, ModelConfig]:
-    """Rebuild ``GateRV3`` from ``path`` and load its weights.
+    """Load the benchmark reference and preserve the original spatial attention."""
+    model, state = load_checkpoint(Path(path))
+    if not isinstance(model, GateRV3):
+        raise ValueError(f"The GateRV3 benchmark requires a GateRV3 checkpoint: {path}")
+    config = ModelConfig.from_state_dict(state)
+    if config.attention and config.flash:
+        for layer in model.modules():
+            if isinstance(layer, Attention):
+                layer.forward = MethodType(_spatial_attention, layer)
 
-    ``model.eval()`` is called on CPU *before* moving the module, because the
-    fused ``Conv3XC.eval_conv`` weights are computed lazily on the first call
-    to ``train(False)``.
-
-    ``dtype`` casts the (already fused) weights, e.g. ``torch.float16`` for the
-    fast path on MPS/CUDA.
-    """
-    state_dict = read_state_dict(path)
-    config = ModelConfig.from_state_dict(state_dict)
-
-    model = config.build()
-    incompatible = model.load_state_dict(state_dict, strict=False)
-
-    # Some exports drop the non-trainable `flash` flag; it only selects the
-    # attention kernel and defaults to the reference value.
-    ignored = [key for key in incompatible.missing_keys if key.endswith(".flash")]
-    missing = [key for key in incompatible.missing_keys if key not in ignored]
-    if strict and (missing or incompatible.unexpected_keys):
-        msg = (
-            f"Checkpoint does not match the inferred architecture {config.describe()}\n"
-            f"  missing: {missing[:8]}{' ...' if len(missing) > 8 else ''}\n"
-            f"  unexpected: {incompatible.unexpected_keys[:8]}"
-        )
-        raise RuntimeError(msg)
-
-    # Fuses the re-parameterised Conv3XC layers; must happen before `.to(device)`.
-    model.eval()
-    for param in model.parameters():
-        param.requires_grad_(False)
-
-    resolved = resolve_device(device)
-    if dtype is None:
-        model.to(resolved)
-    else:
-        # Cast after fusion so the re-parameterisation stays in float32.
-        model.to(device=resolved, dtype=dtype)
-    return model, config
+    # Conv3XC folds in CPU FP32 before moving to the requested device or dtype.
+    model.eval().requires_grad_(False)
+    return model.to(device=resolve_device(device), dtype=dtype), config
 
 
 def resolve_device(device: str | torch.device = "auto") -> torch.device:

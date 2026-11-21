@@ -1,5 +1,8 @@
 # Built-in model exporter plan
 
+Implemented for the two existing GateRV3 configurations. See the
+[export and inference guide](gaterv3-python.md) for usage and session options.
+
 Ship a checkpoint exporter in the `umzi-native` wheel. It will use Resselt to
 recognize and construct models from SafeTensors and PyTorch checkpoints, then
 pack the weights and schedule for a supported native kernel into one `.ummodel`
@@ -108,6 +111,7 @@ src/umzi_native/
   _model.py             Package reader and shared format definitions
   exporter/
     __init__.py         Public export_model entry point
+    _export.py          Family dispatch and atomic export
     _loader.py          Lazy dependency imports and checkpoint loading
     _package.py         Shared package writer
     _gaterv3.py         GateRV3 validation, schedule, and weight packing
@@ -147,3 +151,26 @@ scripts/
   and 16, the 128×128 baseline, and an odd 65×79 input that exercises padding
   for both checkpoint configurations. Verify the reference adapter separately
   before removing the local architecture.
+
+## Implementation verification
+
+- Built the Windows wheel with CUDA 13 and MSVC. In a scratch installation
+  containing only the wheel and NumPy, package inspection, both subcommand
+  help screens, the legacy reader syntax, and the missing-extra error passed.
+- With Resselt 1.4.1 and the system Torch build with CUDA devices hidden,
+  the wheel's CLI and Python API both produced byte-identical packages to the
+  previous exporter. Tested wrapped PyTorch weights, omitted attention flags,
+  and rejection of incompatible attention flags, unsupported architectures,
+  corrupt SafeTensors files, and kernel mismatches. Failed exports preserved
+  the existing destination file. The legacy split schedule and weights also
+  matched the earlier bundle.
+- The Resselt-backed benchmark reference reproduced the frozen Torch CUDA
+  FP32 output bit for bit for both checkpoints, batches 1 and 16, and shapes
+  128×128 and 65×79. The spatial-attention adapter also passed Torch export
+  and `torch.compile` full-graph tracing with the eager backend.
+- The installed Windows runtime produced bit-identical output from old and
+  new packages in all 16 combinations of checkpoint, precision, batch, and
+  tile shape. The minimum raw-float PSNR against the frozen reference was
+  70.43 dB in mixed precision and 65.37 dB in FP16. The inference tutorial
+  wrote a PNG, and all four GateRV3 options enabled their respective
+  diagnostics on the original 128×128 model input.

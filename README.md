@@ -15,7 +15,8 @@ the repository's `pypi` GitHub Actions environment before the first
 release. The uploaded version comes from `project.version` in
 `pyproject.toml`.
 
-- [Python inference sessions](docs/gaterv3-python.md)
+- [Export a model and run Python inference](docs/gaterv3-python.md)
+- [Session and GateRV3 kernel options](docs/gaterv3-python.md#session-options)
 - [Native CUDA build, verification, and results](docs/gaterv3-native.md)
 - [Kernel tuning, full-FP16 experiment, and VRAM measurements](docs/gaterv3-native-optimization.md)
 - [Planned optimizations](docs/gaterv3-native-optimization.md#planned-improvements)

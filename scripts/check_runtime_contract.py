@@ -11,11 +11,12 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from exporters.package import GATERV3, HEADER_SIZE, write_package
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from umzi_native import InferenceSession, SessionOptions
+from umzi_native._model import GATERV3_FAMILY, HEADER_SIZE
+from umzi_native.exporter._package import write_package
 
 TEST_KERNEL = 0xFFFF0001
 
@@ -71,7 +72,7 @@ def main() -> None:
         invalid[32:64] = hashlib.sha256(invalid[:32] + invalid[64:]).digest()
         package.write_bytes(invalid)
         rejected(package, test_build, "section table")
-        write_package(package, GATERV3, 2, {1: b"test"})
+        write_package(package, GATERV3_FAMILY, 2, {1: b"test"})
         rejected(package, production, "payload version")
     print("Kernel dispatch, independent output shape, and malformed package checks passed.")
 

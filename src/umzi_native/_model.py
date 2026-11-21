@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import struct
 from dataclasses import dataclass
+from enum import IntEnum
 from pathlib import Path
 from typing import BinaryIO
 
@@ -27,30 +28,34 @@ OPERATION = struct.Struct("<11i")
 
 # Keep the tables below in step with native/runtime/registry.cpp and the
 # family parsers under native/kernels/.
-FAMILIES = {1: "gaterv3"}
+GATERV3_FAMILY = 1
+FAMILIES = {GATERV3_FAMILY: "gaterv3"}
 SCHEMAS = {"gaterv3": 1}
 SECTION_NAMES = {1: "architecture", 2: "schedule", 3: "weights", 4: "checkpoint"}
-OP_KINDS = (
-    "Pack",
-    "Conv",
-    "Rms",
-    "Local",
-    "MeanProject",
-    "LocalSkip",
-    "Inception",
-    "GlobalSkip",
-    "Shuffle",
-    "Concat",
-    "Silu",
-    "Span",
-    "Depthwise",
-    "Attention",
-    "Gate",
-    "Add",
-    "Rgb",
-    "ShuffleConcat",
-)
-PACK, RGB = OP_KINDS.index("Pack"), OP_KINDS.index("Rgb")
+
+
+class GateRV3Op(IntEnum):
+    PACK = 0
+    CONV = 1
+    RMS = 2
+    LOCAL = 3
+    MEAN_PROJECT = 4
+    LOCAL_SKIP = 5
+    INCEPTION = 6
+    GLOBAL_SKIP = 7
+    SHUFFLE = 8
+    CONCAT = 9
+    SILU = 10
+    SPAN = 11
+    DEPTHWISE = 12
+    ATTENTION = 13
+    GATE = 14
+    ADD = 15
+    RGB = 16
+    SHUFFLE_CONCAT = 17
+
+
+OP_KINDS = {op.value: op.name.title().replace("_", "") for op in GateRV3Op}
 
 
 @dataclass(frozen=True)
@@ -250,8 +255,8 @@ def _read_gaterv3(
             kind, out = op[0], op[1]
             inputs, weights = op[2:6], op[6:9]
             ended = False
-            invalid = out != index + 1 or not 0 <= kind < len(OP_KINDS) or inputs[0] < 0
-            invalid |= (kind == PACK) != (index == 0) or (kind == RGB) != (index == len(ops) - 1)
+            invalid = out != index + 1 or kind not in OP_KINDS or inputs[0] < 0
+            invalid |= (kind == GateRV3Op.PACK) != (index == 0) or (kind == GateRV3Op.RGB) != (index == len(ops) - 1)
             for item in inputs:
                 invalid |= item < -1 or item > index or (ended and item != -1)
                 ended |= item < 0
@@ -261,7 +266,7 @@ def _read_gaterv3(
                 problems.append(f"Invalid native model operation {index}")
                 break
         for op in ops:
-            name = OP_KINDS[op[0]] if 0 <= op[0] < len(OP_KINDS) else f"kind {op[0]}"
+            name = OP_KINDS.get(op[0], f"kind {op[0]}")
             op_kinds[name] = op_kinds.get(name, 0) + 1
     return GateRV3Model(
         input_channels=input_channels,

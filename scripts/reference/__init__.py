@@ -1,1 +1,1 @@
-"""Torch reference model used by the exporter and benchmarks."""
+"""Resselt-backed Torch reference for the GateRV3 benchmarks."""

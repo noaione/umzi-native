@@ -2,8 +2,9 @@
 
 The runtime source lives in `src/umzi_native/`. Each native kernel
 family has its own directory under `native/`, starting with
-`native/kernels/gaterv3/`. The Torch reference and checkpoint loader live under
-`scripts/reference/` for export and validation.
+`native/kernels/gaterv3/`. The optional exporter lives in
+`src/umzi_native/exporter/`. Benchmark scripts use a Resselt-backed Torch
+reference with GateRV3 spatial attention.
 
 `umzi_native` runs packed `.ummodel` files with NumPy through the native
 Umzi runtime: `umzi_native.dll` on Windows or `libumzi_native.so` on Linux. It
@@ -27,13 +28,25 @@ Both export as `gaterv3` model packages. IDC uses three encoder levels and
 Inception depthwise convolutions in its latent blocks. The package records
 its required padding alignment.
 
-With PyTorch and `safetensors` installed, export IDC from the repository root.
+Use the `exporter` extra to turn a checkpoint into a `.ummodel`. It installs
+Resselt and its dependencies, including Torch. Export runs on the CPU and
+accepts `.safetensors`, `.pth`, `.pt`, and `.ckpt` tensor state dictionaries.
+From the checkout, install `.[exporter]` for the source build. For a published
+wheel, install `umzi-native[exporter]` from your configured index.
 
 ```powershell
 $py = 'C:\Python314\python.exe'
-& $py scripts/export_native.py --model models/1x_umzi_idc_gaterv3.safetensors `
-    --output output/native/1x_umzi_idc_gaterv3.ummodel
+& $py -m pip install ".[exporter]"
+& $py -m umzi_native export --help
+& $py -m umzi_native export models/1x_umzi_idc_gaterv3.safetensors -o output/native/idc.ummodel
+& $py -m umzi_native export models/1x_umzi_digital_decompress_gaterv3_1.pth -o output/native/gaterv3.ummodel
 ```
+
+The Python equivalent is `umzi_native.exporter.export_model(checkpoint, output)`.
+It returns the package's `ModelInfo`. Export detects the kernel family by
+default. Pass `--kernel gaterv3` or `kernel="gaterv3"` to require that match.
+The base install can read and run either package. Resselt is imported only
+when you export.
 
 Pass the resulting `.ummodel` path to `InferenceSession`. Use a runtime
 built with 8-pixel alignment support for this package. The original
@@ -57,7 +70,7 @@ precisions.
 [Same-input comparison](../output/gaterv3-idc-support/same-input-probe.json) ·
 [Installed wheel check](../output/gaterv3-idc-support/wheel-check.json)
 
-Installing the package compiles the native library. `pip install .` from
+Building from source compiles the native library. `pip install .` from
 the checkout, from an sdist, or from a Git URL builds a wheel with
 [Hatchling](https://hatch.pypa.io/latest/config/build/), and Hatchling runs
 the build hook in `hatch_build.py` at the repository root. The hook:
@@ -92,7 +105,6 @@ The build machine needs:
 $py = 'C:\Python314\python.exe'
 & $py -m pip install .                 # builds the DLL, then installs
 & $py -m pip wheel . --no-deps -w dist  # or keep the platform wheel
-& $py scripts/export_native.py --output output/native/gaterv3.ummodel
 ```
 
 On this machine, an isolated `pip wheel .` took about 30 seconds on Windows
@@ -205,32 +217,48 @@ any package is unsupported or unreadable.
 
 ```powershell
 $py = 'C:\Python314\python.exe'
-& $py -m umzi_native models/*.ummodel
-& $py -m umzi_native --json models/1x_umzi_idc_gaterv3.ummodel
+& $py -m umzi_native read --help
+& $py -m umzi_native read output/native/gaterv3.ummodel output/native/idc.ummodel
+& $py -m umzi_native read --json output/native/idc.ummodel
 ```
+
+The older `python -m umzi_native MODEL` syntax also opens the package reader.
 
 Peeking checks the operation table's structure but not every operation
 against shapes. The native runtime performs the full validation when a
 session opens the model.
 
-## Open a session and run a batch
+## Run your first inference
+
+Put the `.ummodel` at `output/native/gaterv3.ummodel` or use the path to your
+package. Install Pillow for reading and saving the image in this example.
+Import CUDA PyTorch before opening the session, or call the explicit CUDA
+library loader shown above. The example processes a single 128×128 crop of a
+repository sample so you can try it without running a whole manga page.
 
 ```python
 from pathlib import Path
 
 import numpy as np
-import torch
+import torch  # Loads the CUDA libraries used by the session.
+from PIL import Image
 
 import umzi_native as umzi
 
-options = umzi.SessionOptions(cache_dir=Path("output/cache/gaterv3"))
-tiles = np.zeros((3, 3, 192, 160), dtype=np.float32)
+with Image.open("samples/input/page-001.jpg") as page:
+    rgb = page.convert("RGB").crop((0, 0, 128, 128))
+pixels = np.asarray(rgb, dtype=np.float32) / np.float32(255)
+tiles = pixels.transpose(2, 0, 1)[None, ...]  # RGB HWC to NCHW.
 
+options = umzi.SessionOptions(cache_dir=Path("output/cache/gaterv3"))
 with umzi.InferenceSession("output/native/gaterv3.ummodel", sess_options=options) as session:
     input_name = session.get_inputs()[0].name
     (restored,) = session.run(None, {input_name: tiles})
-    print(restored.shape, restored.dtype)
-    print(session.get_session_info()["cache_status"])
+    print(restored.shape, restored.dtype, session.get_session_info()["cache_status"])
+
+rgb_out = restored[0].transpose(1, 2, 0)
+png = np.rint(np.clip(rgb_out, 0, 1) * 255).astype(np.uint8)
+Image.fromarray(png).save("output/restored-tile.png")
 ```
 
 The input is one NumPy array named `input` in RGB NCHW layout. Supply
@@ -241,23 +269,47 @@ Each call returns its own array. Strided inputs are copied into
 contiguous storage when needed.
 
 The default mixed session uses FP32 RGB arrays. For full FP16, set
-`precision="fp16"` and pass a `np.float16` array. Both precisions use
-the same packed model. Batch size, height and width can change between
-calls. `session.prepare((batch, 3, height, width))` can prepare a shape
-ahead of its first inference. The context manager closes the session
-and releases its device resources.
+`precision="fp16"` and pass `tiles.astype(np.float16)`. Both precisions use
+the same packed model. To batch several equal-size tiles, normalize each tile
+and stack the CHW arrays with `np.stack(chw_tiles)`. `restored[i]` is the output
+for tile `i`. The runtime pads each tile to the model's alignment and crops
+the result back to the original size. Batch size, height, and width can
+change between calls. `session.prepare(tiles.shape)` can allocate and tune
+the shape ahead of the first `run()`. The context manager closes the session
+and releases its device resources. For full-page tiling and stitching, see
+the [manga tiling benchmark](gaterv3-manga-tiling.md).
 
 ## Session options
 
-| Option | Effect |
-| --- | --- |
-| `precision` | `"mixed"` or `"fp16"`. |
-| `device_id` | CUDA device index. Defaults to 0. |
-| `cache_dir` | Tuned plans use `gaterv3_<hex-key>.umplan` in this directory. Defaults to `None`, which disables disk caching. |
-| `enable_cuda_graph` | Enables replay for the prepared shape. Defaults to `True`. |
-| `kernel_options` | Pass family-specific settings as named integer values. GateRV3 accepts `fuse_silu`, `tune_projections`, `fuse_gate_pool` and `fp16_qkv` as 0 or 1. |
-| `dll_path` | Load this Umzi runtime instead of the package or model-directory copy. |
-| `dll_dirs` | Directories passed to `load_cuda_libraries()` before the session library loads. |
+| `SessionOptions` field | Default | Effect |
+| --- | --- | --- |
+| `precision` | `"mixed"` | Mixed precision uses FP32 NumPy input and output and FP32 accumulation in the default convolution and projection paths. `"fp16"` uses FP16 arrays and enables the native FP16 compute path. |
+| `device_id` | `0` | CUDA ordinal for the session. Use the ordinal visible to the process when CUDA devices are masked. |
+| `cache_dir` | `None` | Set a writable directory to reuse tuned algorithms from `gaterv3_<hex-key>.umplan` on compatible opens. The key includes the model, padded shape and batch, precision, relevant options, and CUDA environment. With `None`, every fresh prepare tunes in memory. The CUDA Graph is captured in the process. |
+| `enable_cuda_graph` | `True` | Capture and replay a CUDA Graph to reduce launch overhead for the prepared shape. `False` submits the operations directly. It still uses cuBLASLt and cuDNN plans. |
+| `kernel_options` | `{}` | Pass the kernel-specific switches below as a mapping of names to integer values. |
+| `dll_path` | `None` | Override the path to the Umzi DLL or shared library. By default the loader checks the installed package directory and then the model directory. |
+| `dll_dirs` | `()` | Search these directories in order to explicitly load CUDA dependencies into the process before loading the Umzi library. An empty sequence uses libraries already available to the process. |
+
+The session keeps one prepared padded shape and batch active at a time. If
+either changes, the session prepares the new shape and can reuse matching
+disk-cached algorithms. `cache_status` reports `disabled`, `miss`, `hit`,
+`rebuilt`, or `unavailable`. Check `cache_message` for cache errors.
+
+### GateRV3 kernel options
+
+Every switch defaults to `0`. Set it to `1` to enable it. The kernel rejects
+unknown names and values outside `0` and `1`.
+
+| Key | Effect | Check in `get_session_info()` |
+| --- | --- | --- |
+| `fuse_silu` | Tries one cuDNN graph for compatible 3×3 convolutions followed by SiLU on 128×128, 32-channel feature maps. If there are no eligible sites or cuDNN cannot run or capture the fused plan, the runtime uses separate operations. | `diagnostics["fused_silu_count"]` and `kernel_message` |
+| `tune_projections` | Tries more cuBLASLt candidates for eligible 1×1 projections, timing candidates with CUDA Graph replay during tuning. This can increase first-shape setup time. The switch is independent of CUDA Graph replay for inference. | `diagnostics["replay_tuned_shapes"]` |
+| `fuse_gate_pool` | Combines the grouped spatial gate and the partial pooling reduction at eligible 128×128, 32-channel feature maps. Supports mixed and FP16. | `diagnostics["fused_gate_pool_sites"]` |
+| `fp16_qkv` | In mixed precision, uses FP16 accumulation for the original GateRV3 model's folded QKV projections. The IDC model has no attention projections, and the full FP16 path already uses FP16 accumulation there. | `diagnostics["fp16_qkv_projections"]` |
+
+For example, pass `SessionOptions(kernel_options={"tune_projections": 1,
+"fuse_gate_pool": 1})` to enable replay-based tuning and gate/pool fusion.
 
 After preparing or running a shape, `get_session_info()` returns the
 padded shape, cache status, setup times, runner buffer sizes and

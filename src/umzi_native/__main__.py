@@ -1,4 +1,4 @@
-"""Command line entry point for peeking at Umzi model packages."""
+"""Read and export Umzi model packages from the command line."""
 
 from __future__ import annotations
 
@@ -57,15 +57,7 @@ def _summary(info: ModelInfo) -> str:
     return "\n".join(lines)
 
 
-def main(argv: list[str] | None = None) -> int:
-    """Print the model information and return a non-zero status for unsupported packages."""
-    parser = argparse.ArgumentParser(
-        prog="python -m umzi_native",
-        description="Read .ummodel packages and report whether this build supports them.",
-    )
-    parser.add_argument("models", metavar="MODEL", nargs="+", type=Path, help="packaged .ummodel file")
-    parser.add_argument("--json", action="store_true", help="print a JSON array instead of a summary")
-    args = parser.parse_args(argv)
+def _read(args: argparse.Namespace) -> int:
     reports: list[dict[str, object]] = []
     status = 0
     for model in args.models:
@@ -86,6 +78,43 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         print(json.dumps(reports, indent=2))
     return status
+
+
+def _export(args: argparse.Namespace) -> int:
+    from .exporter import export_model
+
+    try:
+        info = export_model(args.checkpoint, args.output, kernel=args.kernel)
+    except (OSError, ValueError, ImportError, RuntimeError) as error:
+        print(f"{args.checkpoint}: {error}", file=sys.stderr)
+        return 1
+    print(_summary(info))
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the requested model command and return its exit status."""
+    parser = argparse.ArgumentParser(prog="python -m umzi_native", description="Read and export .ummodel packages.")
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    read = commands.add_parser("read", help="inspect one or more .ummodel packages")
+    read.add_argument("models", metavar="MODEL", nargs="+", type=Path, help="packaged .ummodel file")
+    read.add_argument("--json", action="store_true", help="print a JSON array instead of a summary")
+    read.set_defaults(handler=_read)
+
+    export = commands.add_parser(
+        "export", help="pack a SafeTensors or PyTorch checkpoint (requires the exporter extra)"
+    )
+    export.add_argument("checkpoint", type=Path, help=".safetensors, .pth, .pt, or .ckpt state dictionary")
+    export.add_argument("-o", "--output", type=Path, required=True, help="destination .ummodel file")
+    export.add_argument("--kernel", help="assert the detected native kernel family, such as gaterv3")
+    export.set_defaults(handler=_export)
+
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] not in ("read", "export", "-h", "--help"):
+        arguments.insert(0, "read")  # Preserve the original positional package reader.
+    args = parser.parse_args(arguments)
+    return args.handler(args)
 
 
 if __name__ == "__main__":

@@ -16,13 +16,14 @@ from typing import Any
 import numpy as np
 import torch
 from PIL import Image
-from reference.model import load_model
 from rtx_session import create_rtx_session
 from torch.nn import functional
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from reference.model import load_model
+
+ROOT = Path(__file__).resolve().parents[1]
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
 
 

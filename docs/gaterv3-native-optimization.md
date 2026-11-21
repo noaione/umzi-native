@@ -657,7 +657,6 @@ tuning plus gate–pool fusion. Each comparison has its own control.
 | Full FP16, SiLU requested | 4.458 | 4.404 | 4.454 | 4.515 | 4.204 |
 | Full FP16, replay tuning | 4.496 | 4.486 | 4.486 | 4.516 | 4.306 |
 | Full FP16, replay tuning + fused gate–pool | **4.467** | 4.463 | 4.463 | 4.475 | 4.274 |
-4.463 | 4.475 | 4.274 |
 
 | Runner | Total (s) | MPx/s | ms/tile | page-001 s / MPx/s | page-005 s / MPx/s | page-009 s / MPx/s | Repeated device median (ms) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
