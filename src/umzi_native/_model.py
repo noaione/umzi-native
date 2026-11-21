@@ -1,0 +1,277 @@
+"""Read Umzi model packages and report whether this build supports them."""
+
+from __future__ import annotations
+
+import hashlib
+import struct
+from dataclasses import dataclass
+from pathlib import Path
+from typing import BinaryIO
+
+from ._loader import PathArg
+
+__all__ = ["GateRV3Model", "ModelInfo", "ModelSection", "peek_model"]
+
+MAGIC = b"UMZINPKG"
+VERSION = 1
+MAX_SIZE = 1 << 30
+MAX_WEIGHT_BYTES = 256 << 20
+MAX_SECTIONS = 32
+DIGEST_SIZE = 32
+PREFIX = struct.Struct("<8sIIIIQ")
+HEADER_SIZE = PREFIX.size + DIGEST_SIZE
+SECTION = struct.Struct("<IIQQ")
+ARCHITECTURE = struct.Struct("<8I")
+TENSOR_SPEC = struct.Struct("<2i")
+OPERATION = struct.Struct("<11i")
+
+# Keep the tables below in step with native/runtime/registry.cpp and the
+# family parsers under native/kernels/.
+FAMILIES = {1: "gaterv3"}
+SCHEMAS = {"gaterv3": 1}
+SECTION_NAMES = {1: "architecture", 2: "schedule", 3: "weights", 4: "checkpoint"}
+OP_KINDS = (
+    "Pack",
+    "Conv",
+    "Rms",
+    "Local",
+    "MeanProject",
+    "LocalSkip",
+    "Inception",
+    "GlobalSkip",
+    "Shuffle",
+    "Concat",
+    "Silu",
+    "Span",
+    "Depthwise",
+    "Attention",
+    "Gate",
+    "Add",
+    "Rgb",
+    "ShuffleConcat",
+)
+PACK, RGB = OP_KINDS.index("Pack"), OP_KINDS.index("Rgb")
+
+
+@dataclass(frozen=True)
+class ModelSection:
+    """One entry of the package section table."""
+
+    id: int
+    name: str
+    offset: int
+    length: int
+
+
+@dataclass(frozen=True)
+class GateRV3Model:
+    """Architecture declared by a GateRV3 payload (schema 1)."""
+
+    input_channels: int
+    output_channels: int
+    base_channels: int
+    scale: int
+    alignment: int
+    tensors: int
+    operations: int
+    weight_bytes: int
+    checkpoint: str | None
+    op_kinds: dict[str, int]
+
+
+@dataclass(frozen=True)
+class ModelInfo:
+    """What a model package declares, and whether this runtime accepts it.
+
+    ``payload`` holds the family-specific metadata; GateRV3 packages return a
+    :class:`GateRV3Model`. A package from an unsupported family keeps
+    ``payload = None`` because its payload layout is unknown.
+    """
+
+    path: Path
+    size: int
+    version: int
+    family: int
+    family_name: str | None
+    schema: int
+    digest: str
+    sections: tuple[ModelSection, ...]
+    payload: GateRV3Model | None = None
+    problems: tuple[str, ...] = ()
+
+    @property
+    def supported(self) -> bool:
+        """Whether the bundled runtime can open this package."""
+        return not self.problems
+
+
+def _read_section(file: BinaryIO, offset: int, length: int) -> bytes:
+    file.seek(offset)
+    return file.read(length)
+
+
+def peek_model(path: PathArg) -> ModelInfo:
+    """Read a ``.ummodel`` package and report the model information it declares.
+
+    The container, section table, checksum, kernel family, payload schema and
+    declared architecture are checked against the rules of the bundled runtime,
+    so ``ModelInfo.supported`` says whether a session can open the package.
+    Shape-dependent operation validation still runs when a session opens it.
+
+    A file that is not a well-formed package raises ``ValueError``. A package
+    from an unknown family, with an unsupported payload schema, or with an
+    unsupported architecture is returned with the reasons in ``problems``.
+    """
+    model = Path(path).resolve()
+    if not model.is_file():
+        raise FileNotFoundError(f"Umzi model package not found: {model}")
+    with model.open("rb") as file:
+        size = file.seek(0, 2)
+        if not HEADER_SIZE <= size <= MAX_SIZE:
+            raise ValueError("Invalid Umzi model package size")
+        file.seek(0)
+        prefix = file.read(PREFIX.size)
+        if len(prefix) != PREFIX.size:
+            raise ValueError("Invalid Umzi model package header")
+        magic, version, family, schema, count, total = PREFIX.unpack(prefix)
+        if magic != MAGIC:
+            raise ValueError("Invalid Umzi model package magic")
+        if version != VERSION:
+            raise ValueError("Unsupported Umzi model package version")
+        if not family or not schema or not 0 < count <= MAX_SECTIONS or total != size:
+            raise ValueError("Invalid Umzi model package header")
+        checksum = file.read(DIGEST_SIZE)
+        table = file.read(count * SECTION.size)
+        if len(checksum) != DIGEST_SIZE or len(table) != count * SECTION.size:
+            raise ValueError("Invalid Umzi model package header")
+        hasher = hashlib.sha256(prefix + table)
+        while chunk := file.read(1 << 20):
+            hasher.update(chunk)
+        if hasher.digest() != checksum:
+            raise ValueError("Umzi model package checksum mismatch")
+
+        entries = []
+        position = HEADER_SIZE + count * SECTION.size
+        previous = 0
+        for kind, reserved, offset, length in SECTION.iter_unpack(table):
+            if kind <= previous or reserved or offset != position or not 0 < length <= size - position:
+                raise ValueError("Invalid Umzi model section table")
+            entries.append((kind, offset, length))
+            previous = kind
+            position += length
+        if position != size:
+            raise ValueError("Unexpected trailing Umzi model data")
+        # The weights can be hundreds of MiB, so only the small sections are read.
+        contents = {kind: _read_section(file, offset, length) for kind, offset, length in entries if kind in (1, 2, 4)}
+        weights = next((length for kind, _, length in entries if kind == 3), 0)
+
+    sections = tuple(
+        ModelSection(kind, SECTION_NAMES.get(kind, f"section {kind}"), offset, length)
+        for kind, offset, length in entries
+    )
+    family_name = FAMILIES.get(family)
+    problems: list[str] = []
+    payload = None
+    if family_name is None:
+        problems.append(f"Kernel family {family} is not supported by this build")
+    elif family_name == "gaterv3":
+        payload = _read_gaterv3(schema, contents.get(1), contents.get(2), weights, contents.get(4), problems)
+    return ModelInfo(
+        path=model,
+        size=size,
+        version=version,
+        family=family,
+        family_name=family_name,
+        schema=schema,
+        digest=checksum.hex(),
+        sections=sections,
+        payload=payload,
+        problems=tuple(problems),
+    )
+
+
+def _read_gaterv3(
+    schema: int,
+    architecture: bytes | None,
+    schedule: bytes | None,
+    weight_bytes: int,
+    checkpoint: bytes | None,
+    problems: list[str],
+) -> GateRV3Model | None:
+    """Mirror the checks in ``ModelFile::parse`` and the structural part of ``ModelFile::validate``."""
+    if schema != SCHEMAS["gaterv3"]:
+        problems.append("Unsupported GateRV3 model payload version")
+        return None
+    if (
+        architecture is None
+        or len(architecture) != ARCHITECTURE.size
+        or (checkpoint is not None and len(checkpoint) != DIGEST_SIZE)
+    ):
+        problems.append("Invalid GateRV3 model metadata size")
+        return None
+    (
+        input_channels,
+        scale,
+        height,
+        width,
+        base_channels,
+        output_channels,
+        tensors,
+        operations,
+    ) = ARCHITECTURE.unpack(architecture)
+    if (
+        (input_channels, output_channels, scale, base_channels) != (3, 3, 1, 32)
+        or height not in (8, 16)
+        or height != width
+    ):
+        problems.append("Unsupported GateRV3 model architecture or padding alignment")
+    op_kinds: dict[str, int] = {}
+    schedule_size = tensors * TENSOR_SPEC.size + operations * OPERATION.size
+    if (
+        not 2 <= operations <= 2000
+        or tensors != operations + 1
+        or schedule is None
+        or len(schedule) != schedule_size
+        or not 0 < weight_bytes <= MAX_WEIGHT_BYTES
+    ):
+        problems.append("Invalid GateRV3 execution data or weights")
+    else:
+        split = tensors * TENSOR_SPEC.size
+        specs = list(TENSOR_SPEC.iter_unpack(schedule[:split]))
+        ops = list(OPERATION.iter_unpack(schedule[split:]))
+        deepest = 3 if height == 8 else 4
+        if any(not -1 <= level <= deepest or not 1 <= channels <= 2560 for level, channels in specs):
+            problems.append("Invalid GateRV3 tensor description")
+        elif max(level for level, _ in specs) != deepest:
+            problems.append("GateRV3 padding alignment does not match the schedule depth")
+        if (specs[0], specs[-1]) != ((0, 3), (0, 3)):
+            problems.append("Invalid GateRV3 RGB shape")
+        for index, op in enumerate(ops):
+            kind, out = op[0], op[1]
+            inputs, weights = op[2:6], op[6:9]
+            ended = False
+            invalid = out != index + 1 or not 0 <= kind < len(OP_KINDS) or inputs[0] < 0
+            invalid |= (kind == PACK) != (index == 0) or (kind == RGB) != (index == len(ops) - 1)
+            for item in inputs:
+                invalid |= item < -1 or item > index or (ended and item != -1)
+                ended |= item < 0
+            for weight in weights:
+                invalid |= weight >= 0 and (weight % 256 or weight >= weight_bytes)
+            if invalid:
+                problems.append(f"Invalid native model operation {index}")
+                break
+        for op in ops:
+            name = OP_KINDS[op[0]] if 0 <= op[0] < len(OP_KINDS) else f"kind {op[0]}"
+            op_kinds[name] = op_kinds.get(name, 0) + 1
+    return GateRV3Model(
+        input_channels=input_channels,
+        output_channels=output_channels,
+        base_channels=base_channels,
+        scale=scale,
+        alignment=height,
+        tensors=tensors,
+        operations=operations,
+        weight_bytes=weight_bytes,
+        checkpoint=checkpoint.hex() if checkpoint else None,
+        op_kinds=op_kinds,
+    )

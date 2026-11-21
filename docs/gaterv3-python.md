@@ -175,6 +175,44 @@ library a session loaded.
 [Native build and deployment](gaterv3-native-refactor.md#target-usage) ·
 [NVIDIA cuDNN runtime dependencies](https://docs.nvidia.com/cudnn/installation/build-run-cudnn/)
 
+## Inspect a model package
+
+`peek_model` reads a `.ummodel` file without loading the native library or
+CUDA. It checks the container, checksum, kernel family, payload schema and
+declared architecture against what this build accepts, then returns the
+model information as a `ModelInfo`.
+
+```python
+import umzi_native as umzi
+
+info = umzi.peek_model("output/native/gaterv3.ummodel")
+info.supported  # True when a session can open the package
+info.family_name  # "gaterv3"
+info.payload.alignment  # required padding alignment
+info.payload.operations  # 400
+info.payload.op_kinds  # {"Pack": 1, "Conv": 142, ...}
+```
+
+`problems` explains why a well-formed package is unsupported, such as an
+unknown kernel family, a newer payload schema or an unsupported
+architecture. A file that is not a well-formed package, including a
+truncated file or a checksum mismatch, raises `ValueError`. `sections` lists
+the section table, and `payload.checkpoint` repeats the source checkpoint
+digest when the exporter recorded one.
+
+The same report is available from the command line. It exits non-zero when
+any package is unsupported or unreadable.
+
+```powershell
+$py = 'C:\Python314\python.exe'
+& $py -m umzi_native models/*.ummodel
+& $py -m umzi_native --json models/1x_umzi_idc_gaterv3.ummodel
+```
+
+Peeking checks the operation table's structure but not every operation
+against shapes. The native runtime performs the full validation when a
+session opens the model.
+
 ## Open a session and run a batch
 
 ```python
