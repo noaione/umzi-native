@@ -188,3 +188,58 @@ The local combined record is `output/native-qkv/verified-report.json`.
 It includes benchmark and checkpoint hashes, paired per-tile times, batch-16
 per-image times, profiles, VRAM and initialization data, and standalone
 verification.
+
+## Planned improvements
+
+The verified `output/native-qkv` bundle is the control for this work. Keep
+128×128 at batches 1 and 16 as regression cases for both precisions. The
+[runtime refactor plan](gaterv3-native-refactor.md) describes how the same
+optimizations carry over to variable input shapes and the single model file.
+
+### 1. Repack the activation arena
+
+- [ ] Replace append-order allocation with an offline packing pass that
+  places larger tensors first and assigns offsets using their lifetimes.
+  Treat fused launches as simultaneous reads and writes of all participating
+  tensors, including the two outputs of residual plus RMSNorm.
+- [ ] Validate each offset's alignment and confirm that overlapping lifetimes
+  never share memory. Run both precisions against the existing bundle at the
+  same shape and precision, with the same kernel plans when checking bitwise
+  parity. Remeasure exact runner buffers and warmed device usage separately.
+
+An offline packing of the current schedule reached **8 MiB per tile**.
+That corresponds to **128 MiB at batch 16** versus the current 164 MiB
+arena, a **36 MiB reduction in activation allocation**. This is an offline
+result. GPU output parity and the change in warmed device usage are pending.
+
+### 2. Persist selected kernel plans
+
+- [ ] Add an optional `cache_dir` session setting and `--cache-dir` CLI
+  flag. Save the selected cuDNN and cuBLASLt choices and workspace
+  requirements. Use the compatibility key and miss behavior in the
+  [refactor plan](gaterv3-native-refactor.md#configurable-kernel-plan-cache).
+- [ ] Benchmark a first load into an empty cache and a fresh process with
+  a populated cache. Record tune time, graph capture time, total time to first
+  output, warmed latency and output parity. Include mismatched and corrupt
+  cache tests.
+
+Batch-16 setup measured **1.04 s** for mixed and **5.68 s** for full FP16 in
+the isolated setup pass. The cache targets repeat setup time. Measure the
+remaining model load, allocation and graph capture costs on cache hits.
+
+### 3. Prototype convolution and SiLU fusion
+
+- [ ] Start with the repeated 128×128, 32-channel convolutions in the SISR
+  branch. Prototype a convolution with a SiLU epilogue using a compatible
+  cuDNN graph plan on the RTX 3050. Keep the current separate kernels as a
+  fallback, and check that fused intermediates preserve the intended rounding
+  or meet the same-precision fidelity criteria.
+- [ ] Compare the fused and split paths with batch 1 and 16, both precisions,
+  and identical inputs. Include workspace and startup cost alongside warm
+  page throughput. Extend to other shapes after the first candidate is measured.
+
+The batch-16 full-FP16 profile attributed **7.01 ms** to 19 full-resolution
+32-to-32 convolutions and **2.98 ms** to 12 SiLU dispatches. Only the
+convolutions with a following SiLU are fusion candidates. These are
+instrumented operation times. The end-to-end speedup is pending.
+[cuDNN graph fusion documentation](https://docs.nvidia.com/deeplearning/cudnn/latest/developer/graph-api.html)
