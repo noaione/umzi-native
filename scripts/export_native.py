@@ -37,6 +37,7 @@ class Op(IntEnum):
     GATE = 14
     ADD = 15
     RGB = 16
+    SHUFFLE_CONCAT = 17
 
 
 class Schedule:
@@ -96,10 +97,19 @@ class Schedule:
 
     def norm(self, a, layer):
         assert layer.eps == 1e-6
+        previous = self.ops[a - 1]
+        # The fused launch reads the residual inputs while producing both
+        # logical outputs. Keep them live so the norm output cannot alias them.
+        residual_inputs = (
+            tuple(i for i in previous[2:6] if i >= 0)
+            if previous[0] in (Op.LOCAL_SKIP, Op.GLOBAL_SKIP)
+            else ()
+        )
         return self.op(
             Op.RMS,
             self.shapes[a],
             a,
+            *residual_inputs,
             weights=(self.weight(layer.scale), self.weight(layer.offset)),
         )
 
@@ -135,7 +145,7 @@ class Schedule:
 
     def global_block(self, a, block, residual=None):
         h, w, c = self.shapes[a]
-        projected = self.conv(self.norm(a, block.norm), block.fc1)
+        normalized = self.norm(a, block.norm)
         mixed = block.token_mix
         assert block.split_indices == [3 * c // 2, c // 2, c]
         if hasattr(mixed, "qkv"):
@@ -146,20 +156,26 @@ class Schedule:
                 16,
                 True,
             )
-            # The attention input is the final C columns of the 3C projection.
-            qkv = self.op(
+            # The final C channels of fc1 feed only the linear QKV projection.
+            # Compose those weights and biases before packing the result.
+            first = block.fc1.weight.flatten(1)
+            assert block.fc1.bias is not None and mixed.qkv.bias is None
+            last = mixed.qkv.weight.flatten(1)
+            weight = torch.cat((first[: 2 * c], last @ first[2 * c :]))
+            bias = torch.cat((block.fc1.bias[: 2 * c], last @ block.fc1.bias[2 * c :]))
+            projected = self.op(
                 Op.CONV,
-                (h, w, 3 * c),
-                projected,
-                weights=(self.weight(mixed.qkv.weight.permute(0, 2, 3, 1)),),
-                args=(1, 2 * c),
+                (h, w, 5 * c),
+                normalized,
+                weights=(self.weight(weight), self.weight(bias)),
+                args=(1, 0),
             )
             spatial = mixed.qkv_dwconv
             assert spatial.groups == 3 * c and spatial.weight.shape == (3 * c, 1, 3, 3)
             qkv = self.op(
                 Op.DEPTHWISE,
                 (h, w, 3 * c),
-                qkv,
+                projected,
                 weights=(
                     self.weight(spatial.weight.permute(2, 3, 1, 0)),
                     self.weight(spatial.bias),
@@ -169,6 +185,7 @@ class Schedule:
             attended = self.conv(attended, mixed.project_out)
             gated = self.op(Op.GATE, (h, w, 3 * c // 2), projected, attended)
         else:
+            projected = self.conv(normalized, block.fc1)
             assert mixed.split_indexes == [5 * c // 8, c // 8, c // 8, c // 8]
             layers = (mixed.dwconv_hw, mixed.dwconv_w, mixed.dwconv_h)
             weight = torch.cat(
@@ -233,8 +250,11 @@ class Schedule:
         for block, shortcut in zip(model.decode, reversed(shortcuts), strict=True):
             current = self.conv(current, block.scale[0])
             h, w, c = self.shapes[current]
-            current = self.op(Op.SHUFFLE, (h * 2, w * 2, c // 4), current, args=(1, 0))
-            current = self.conv(self.concat(current, shortcut), block.shor)
+            assert self.shapes[shortcut] == (h * 2, w * 2, c // 4)
+            merged = self.op(
+                Op.SHUFFLE_CONCAT, (h * 2, w * 2, c // 2), current, shortcut
+            )
+            current = self.conv(merged, block.shor)
             current = self.meta(current, block.gated)
         current = self.op(Op.ADD, self.shapes[span], current, span)
         current = self.conv(current, model.dim_to_in, rgb_out=True)
@@ -243,7 +263,10 @@ class Schedule:
             (128, 128, 3),
             current,
             0,
-            weights=(self.weight(model.gamma, dtype=torch.float32),),
+            weights=(
+                self.weight(model.gamma, dtype=torch.float32),
+                self.weight(model.gamma),
+            ),
         )
 
     def write(self, path: Path):
@@ -254,7 +277,7 @@ class Schedule:
             file.write(
                 struct.pack(
                     "<4sIII",
-                    b"GTR2",
+                    b"GTR3",
                     len(self.shapes),
                     len(self.ops),
                     self.weights.tell(),

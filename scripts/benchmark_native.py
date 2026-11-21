@@ -12,6 +12,7 @@ import statistics
 import subprocess
 import time
 from collections import defaultdict
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
@@ -28,32 +29,34 @@ METRIC = Path(r"C:\Tools\imaging\ssimulacra2.exe")
 
 
 class Native:
-    def __init__(self, bundle, batch, graph=True):
+    def __init__(self, bundle, batch, graph=True, precision="mixed"):
         cuda, cudnn = libraries()
         self.dll_dirs = []
         try:
             for path in (cuda / "bin/x86_64", cudnn / "bin"):
                 self.dll_dirs.append(os.add_dll_directory(str(path)))
             self.dll = ctypes.CDLL(str((bundle / "gaterv3.dll").resolve()))
-            self.dll.gt_create.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
-            self.dll.gt_create.restype = ctypes.c_void_p
+            fp16 = precision == "fp16"
+            create = self.dll.gt_create_fp16 if fp16 else self.dll.gt_create
+            create.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+            create.restype = ctypes.c_void_p
             self.dll.gt_error.restype = ctypes.c_char_p
             self.dll.gt_destroy.argtypes = [ctypes.c_void_p]
             self.dll.gt_destroy.restype = None
             self.dll.gt_input.argtypes = [ctypes.c_void_p]
             self.dll.gt_input.restype = ctypes.c_uint64
-            self.dll.gt_run.argtypes = [ctypes.c_void_p] * 3
+            self.run = self.dll.gt_run_fp16 if fp16 else self.dll.gt_run
+            self.run.argtypes = [ctypes.c_void_p] * 3
             self.dll.gt_enqueue.argtypes = [ctypes.c_void_p] * 2
-            self.handle = self.dll.gt_create(
-                str(bundle.resolve()).encode(), batch, graph
-            )
+            self.handle = create(str(bundle.resolve()).encode(), batch, graph)
             if not self.handle:
                 self.check(-1)
         except BaseException:
             for directory in self.dll_dirs:
                 directory.close()
             raise
-        self.host_output = torch.empty((batch, *SHAPE))
+        self.dtype = torch.float16 if fp16 else torch.float32
+        self.host_output = torch.empty((batch, *SHAPE), dtype=self.dtype)
         self.device_input = self.dll.gt_input(self.handle)
 
     def check(self, status):
@@ -73,17 +76,22 @@ class Native:
             or not x.is_contiguous()
         ):
             raise ValueError(
-                "Native host input must be contiguous FP32 NCHW at the runner's batch size"
+                "Native benchmark input must be contiguous FP32 NCHW at the runner's batch size"
             )
+        packed = x.to(dtype=self.dtype)
         self.check(
-            self.dll.gt_run(self.handle, x.data_ptr(), self.host_output.data_ptr())
+            self.run(self.handle, packed.data_ptr(), self.host_output.data_ptr())
         )
-        return self.host_output
+        return self.host_output.float()
 
     def prepare_device(self, x):
         from cuda.bindings import driver
 
-        (status,) = driver.cuMemcpyDtoD(self.device_input, x.data_ptr(), x.numel() * 4)
+        packed = x.to(dtype=self.dtype)
+        torch.cuda.synchronize()
+        (status,) = driver.cuMemcpyDtoD(
+            self.device_input, packed.data_ptr(), packed.numel() * packed.element_size()
+        )
         if status:
             raise RuntimeError(f"Native device input copy failed: {status}")
 
@@ -95,6 +103,16 @@ class Native:
             )
 
         return run
+
+    def memory_values(self, symbol, keys):
+        query = getattr(self.dll, symbol, None)
+        if query is None:
+            return None
+        query.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64)]
+        query.restype = None
+        sizes = (ctypes.c_uint64 * 4)()
+        query(self.handle, sizes)
+        return dict(zip(keys, sizes, strict=True))
 
     def profile(self, schedule):
         self.dll.gt_operation_count.argtypes = [ctypes.c_void_p]
@@ -144,11 +162,13 @@ def batch_input(group, batch):
 
 def quality(args, images):
     reference, _ = load_model(args.model, device="cuda")
-    native = Native(args.bundle, 16)
-    single = Native(args.bundle, 1)
     rows = []
     scores = []
-    try:
+    with ExitStack() as runners:
+        native = Native(args.bundle, 16, precision=args.precision)
+        runners.callback(native.close)
+        single = Native(args.bundle, 1, precision=args.precision)
+        runners.callback(single.close)
         for name, image in images:
             result = torch.empty_like(image)
             expected = torch.empty_like(image)
@@ -206,9 +226,6 @@ def quality(args, images):
             }
             stress_rows.append(row)
             print(row, flush=True)
-    finally:
-        single.close()
-        native.close()
     pixels = [image.numel() for _, image in images]
     mse = sum(
         row["mse"] * count for row, count in zip(rows, pixels, strict=True)
@@ -274,50 +291,72 @@ def measure(call, repeats, *args):
     return times
 
 
-def page_timings(call, images, batch):
+def single_tile_timings(calls, images):
+    # Alternate blocks of real tiles to reduce bias from clock and load drift.
+    names = list(calls)
+    reports = {name: {"per_image": [], "per_tile": []} for name in names}
+    phase = 0
+    for image_name, image in images:
+        items = patches(image, 128)
+        page = {name: [] for name in names}
+        for start in range(0, len(items), 16):
+            order = names if phase % 2 == 0 else list(reversed(names))
+            phase += 1
+            group = items[start : start + 16]
+            for name in order:
+                for index, (top, left, sample) in enumerate(group, start):
+                    seconds = measure(calls[name], 1, sample.contiguous())[0] / 1000
+                    page[name].append(
+                        {
+                            "image": image_name,
+                            "tile_index": index,
+                            "top": top,
+                            "left": left,
+                            "seconds": seconds,
+                        }
+                    )
+        for name, rows in page.items():
+            reports[name]["per_tile"].extend(rows)
+            reports[name]["per_image"].append(
+                {
+                    "image": image_name,
+                    "tiles": len(items),
+                    "source_pixels": image.shape[-2] * image.shape[-1],
+                    "average_tile_ms": statistics.mean(row["seconds"] for row in rows)
+                    * 1000,
+                }
+            )
+    return {
+        name: {
+            **row,
+            "average_tile_ms": statistics.mean(
+                sample["seconds"] for sample in row["per_tile"]
+            )
+            * 1000,
+        }
+        for name, row in reports.items()
+    }
+
+
+def batch16_page_timings(call, images):
     rows = []
-    all_tiles = []
     for name, image in images:
         items = patches(image, 128)
         started = time.perf_counter()
-        tile_rows = []
-        for offset in range(0, len(items), batch):
-            group = items[offset : offset + batch]
-            if batch == 1:
-                top, left, sample = group[0]
-                sample = sample.contiguous()
-                seconds = measure(call, 1, sample)[0] / 1000
-                tile_rows.append(
-                    {
-                        "image": name,
-                        "tile_index": offset,
-                        "top": top,
-                        "left": left,
-                        "seconds": seconds,
-                    }
-                )
-            else:
-                call(batch_input(group, batch))
+        for offset in range(0, len(items), 16):
+            call(batch_input(items[offset : offset + 16], 16))
         torch.cuda.synchronize()
         image_seconds = time.perf_counter() - started
         pixels = image.shape[-2] * image.shape[-1]
-        row = {"image": name, "tiles": len(items), "source_pixels": pixels}
-        if batch == 1:
-            row["average_tile_ms"] = (
-                statistics.mean(item["seconds"] for item in tile_rows) * 1000
-            )
-            all_tiles.extend(tile_rows)
-        else:
-            row["batch16_seconds"] = image_seconds
-            row["batch16_megapixels_per_second"] = pixels / image_seconds / 1e6
-        rows.append(row)
-    if batch == 1:
-        return {
-            "per_image": rows,
-            "per_tile": all_tiles,
-            "average_tile_ms": statistics.mean(item["seconds"] for item in all_tiles)
-            * 1000,
-        }
+        rows.append(
+            {
+                "image": name,
+                "tiles": len(items),
+                "source_pixels": pixels,
+                "batch16_seconds": image_seconds,
+                "batch16_megapixels_per_second": pixels / image_seconds / 1e6,
+            }
+        )
     seconds = sum(row["batch16_seconds"] for row in rows)
     return {
         "per_image": rows,
@@ -333,19 +372,28 @@ def speed(args, images, batch, report, save):
     device_input = host_input.cuda()
     device_half = device_input.half()
     torch.cuda.synchronize()
-    native = Native(args.bundle, batch)
-    eager_native = Native(args.bundle, batch, graph=False)
-    cases = {
-        "native_graph": (
-            native.prepare_device(device_input),
-            native.host,
-        ),
-        "native_eager": (
-            eager_native.prepare_device(device_input),
-            eager_native.host,
-        ),
-    }
-    try:
+    with ExitStack() as stack:
+
+        def native_case(bundle, precision, graph=True):
+            instance = Native(bundle, batch, graph=graph, precision=precision)
+            stack.callback(instance.close)
+            return instance
+
+        native = native_case(args.bundle, args.precision)
+        cases = {"native_graph": (native.prepare_device(device_input), native.host)}
+        if args.control_bundle:
+            control = native_case(args.control_bundle, "mixed")
+            cases["native_control"] = (
+                control.prepare_device(device_input),
+                control.host,
+            )
+        fp16 = None
+        if args.compare_fp16:
+            fp16 = native_case(args.bundle, "fp16")
+            cases["native_fp16"] = (fp16.prepare_device(device_input), fp16.host)
+        elif not args.control_bundle:
+            eager = native_case(args.bundle, args.precision, graph=False)
+            cases["native_eager"] = (eager.prepare_device(device_input), eager.host)
         if "torch" in args.baselines:
             eager, _ = load_model(args.model, device="cuda", dtype=torch.float16)
 
@@ -436,16 +484,87 @@ def speed(args, images, batch, report, save):
                 flush=True,
             )
             save()
-        if not args.skip_pages:
-            for name, (_, host) in cases.items():
-                if name == "native_eager":
-                    continue
-                report[name]["pages"] = page_timings(host, images, batch)
+            if fp16 is not None:
+                report["native_fp16_profile"] = fp16.profile(
+                    args.bundle / "schedule.bin"
+                )
                 save()
-                print(f"Batch {batch} {name} page timings saved", flush=True)
-    finally:
-        eager_native.close()
-        native.close()
+        if not args.skip_pages:
+            calls = {
+                name: host
+                for name, (_, host) in cases.items()
+                if name != "native_eager"
+            }
+            if batch == 1:
+                report["tile_timing_order"] = "alternating runner order every 16 tiles"
+                for name, pages in single_tile_timings(calls, images).items():
+                    report[name]["pages"] = pages
+                save()
+                print("Batch 1 paired tile timings saved", flush=True)
+            else:
+                for name, host in calls.items():
+                    report[name]["pages"] = batch16_page_timings(host, images)
+                    save()
+                    print(f"Batch {batch} {name} page timings saved", flush=True)
+
+
+def memory(args, batch):
+    # Initialize the CUDA context before the baseline and sample outside timed runs.
+    values = {}
+    sample = torch.zeros((batch, *SHAPE), dtype=torch.float32)
+    torch.cuda.init()
+    runners = {"native_graph": (args.bundle, args.precision)}
+    if args.control_bundle:
+        runners["native_control"] = (args.control_bundle, "mixed")
+    if args.compare_fp16:
+        runners["native_fp16"] = (args.bundle, "fp16")
+
+    def used():
+        torch.cuda.synchronize()
+        free, total = torch.cuda.mem_get_info()
+        return total - free, total
+
+    for label, (bundle, precision) in runners.items():
+        torch.cuda.empty_cache()
+        before, capacity = used()
+        started = time.perf_counter()
+        native = Native(bundle, batch, precision=precision)
+        initialization_ms = (time.perf_counter() - started) * 1000
+        try:
+            captured, _ = used()
+            for _ in range(8):
+                native.host(sample)
+            warmed, _ = used()
+            buffers = native.memory_values(
+                "gt_buffer_sizes", ("weights", "activations", "workspace", "rgb_io")
+            )
+            startup = native.memory_values(
+                "gt_startup_memory",
+                ("context", "tuning_workspace", "tuned", "captured"),
+            )
+        finally:
+            native.close()
+        released, _ = used()
+        row = {
+            "initialization_wall_ms": initialization_ms,
+            "device_capacity_bytes": capacity,
+            "device_used_before_bytes": before,
+            "device_used_captured_bytes": captured,
+            "device_used_warmed_bytes": warmed,
+            "device_used_released_bytes": released,
+            "device_used_warmed_delta_bytes": warmed - before,
+            "runner_buffers_bytes": buffers,
+            "startup_device_used_bytes": startup,
+            "startup_sampled_max_delta_bytes": max(startup.values())
+            - startup["context"]
+            if startup
+            else None,
+        }
+        if buffers:
+            buffers["total"] = sum(buffers.values())
+        print(f"Batch {batch} {label} VRAM {row}", flush=True)
+        values[label] = row
+    return values
 
 
 def digest(path):
@@ -459,11 +578,20 @@ def main():
     parser.add_argument("--model", type=Path, default=CHECKPOINT)
     parser.add_argument("--input", type=Path, default=ROOT / "samples/input")
     parser.add_argument("--bundle", type=Path, default=ROOT / "output/native")
+    parser.add_argument("--control-bundle", type=Path)
+    parser.add_argument("--precision", choices=("mixed", "fp16"), default="mixed")
+    parser.add_argument(
+        "--compare-fp16",
+        action="store_true",
+        help="Include full FP16 in the timing and memory comparisons",
+    )
     parser.add_argument("--baseline", type=Path, default=ROOT / "output/baseline")
     parser.add_argument(
         "--output", type=Path, default=ROOT / "output/native-validation"
     )
-    parser.add_argument("--suite", choices=("quality", "speed", "all"), default="all")
+    parser.add_argument(
+        "--suite", choices=("quality", "speed", "memory", "all"), default="all"
+    )
     parser.add_argument(
         "--baselines",
         choices=("torch", "inductor", "rtx"),
@@ -488,6 +616,8 @@ def main():
         parser.error("Rounds and repeats must be positive")
     if "inductor" in args.baselines and "torch" not in args.baselines:
         parser.error("Include torch when benchmarking inductor")
+    if args.compare_fp16 and args.precision != "mixed":
+        parser.error("--compare-fp16 pairs the mixed runner with full FP16")
     args.output.mkdir(parents=True, exist_ok=True)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
@@ -502,29 +632,43 @@ def main():
         parser.error(f"No images found in {args.input}")
 
     checkpoint_hash = digest(args.model)
-    manifest = json.loads((args.bundle / "checkpoint.json").read_text(encoding="utf-8"))
-    bundle_hashes = {
-        name: digest(args.bundle / name)
-        for name in ("gaterv3.dll", "kernels.cubin", "schedule.bin", "weights.bin")
-    }
-    if manifest["checkpoint_sha256"] != checkpoint_hash or any(
-        bundle_hashes[name] != manifest["weights_and_schedule"][name]
-        for name in ("schedule.bin", "weights.bin")
-    ):
-        parser.error("Native schedule or weights do not match the checkpoint manifest")
+
+    def checked_bundle(bundle):
+        manifest = json.loads((bundle / "checkpoint.json").read_text(encoding="utf-8"))
+        hashes = {
+            name: digest(bundle / name)
+            for name in ("gaterv3.dll", "kernels.cubin", "schedule.bin", "weights.bin")
+        }
+        if manifest["checkpoint_sha256"] != checkpoint_hash or any(
+            hashes[name] != manifest["weights_and_schedule"][name]
+            for name in ("schedule.bin", "weights.bin")
+        ):
+            parser.error(
+                f"Native schedule or weights do not match the checkpoint manifest in {bundle}"
+            )
+        return hashes
+
     report: dict[str, Any] = {
         "gpu": torch.cuda.get_device_name(0),
         "torch": str(torch.__version__),
         "torch_cuda": torch.version.cuda,
         "checkpoint_sha256": checkpoint_hash,
-        "bundle_sha256": bundle_hashes,
+        "bundle_sha256": checked_bundle(args.bundle),
+        "precision": args.precision,
     }
+    if args.control_bundle:
+        report["control_sha256"] = checked_bundle(args.control_bundle)
 
     def save():
         (args.output / "report.json").write_text(
             json.dumps(report, indent=2), encoding="utf-8"
         )
 
+    if args.suite in ("all", "memory"):
+        report["memory"] = {}
+        for batch in args.batch:
+            report["memory"][str(batch)] = memory(args, batch)
+            save()
     if args.suite in ("all", "quality"):
         report["quality"] = quality(args, images)
         save()

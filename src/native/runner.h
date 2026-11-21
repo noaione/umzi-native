@@ -17,13 +17,21 @@ typedef struct CUstream_st* GtStream;
 
 // Uses CUDA device 0. The bundle contains schedule.bin, weights.bin and kernels.cubin.
 GT_API GtRunner* gt_create(const char* utf8_directory, int batch, int graph);
+GT_API GtRunner* gt_create_fp16(const char* utf8_directory, int batch, int graph);
 GT_API void gt_destroy(GtRunner* runner);
 GT_API const char* gt_error(void);
 
 // Synchronous host I/O. Both buffers contain batch × 3 × 128 × 128 FP32 values in NCHW order.
 GT_API int gt_run(GtRunner* runner, const float* input, float* output);
+// The FP16 entry point uses IEEE binary16 bit patterns in the same RGB layout.
+GT_API int gt_run_fp16(GtRunner* runner, const uint16_t* input, uint16_t* output);
+// Weights, activations, workspace and RGB input/output, respectively, in bytes.
+GT_API void gt_buffer_sizes(const GtRunner* runner, uint64_t bytes[4]);
+// Device-wide usage sampled at context setup, workspace allocation, after
+// tuning, and after warmup/capture, respectively, in bytes.
+GT_API void gt_startup_memory(const GtRunner* runner, uint64_t bytes[4]);
 
-// The buffers belong to the runner. Populate input before enqueue and synchronize the
+// The buffers use the runner's RGB precision. Populate input before enqueue and synchronize the
 // selected stream before reading output. Use the device's primary context. Serialize
 // calls on each runner, including any outstanding work, before using another stream
 // or destroying the runner.

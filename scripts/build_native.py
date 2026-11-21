@@ -91,6 +91,7 @@ def compile_kernels(cuda, crt_include, destination, arch):
                 f"--gpu-architecture={arch}".encode(),
                 f"--include-path={cuda / 'include'}".encode(),
                 f"--include-path={crt_include}".encode(),
+                f"--include-path={SOURCE}".encode(),
                 b"--std=c++17",
                 b"--use_fast_math",
             ]

@@ -36,9 +36,9 @@ extern "C" __global__ void rgb(float* out, const half* residual, const float* in
     out[i] = fmaf(gamma[c], in[i], read(residual, (image * pixels + p) * 8 + c));
 }
 
-template<int C>
-__device__ void normalize(half2* out, const half2* in, const half2* scale,
-                          const half2* offset, int pixels) {
+template<int C, class ReadPair>
+__device__ void normalize_from(half2* out, const half2* scale, const half2* offset,
+                               int pixels, ReadPair read_pair) {
     constexpr int lanes = C == 32 ? 16 : 32;
     constexpr int pairs = C / 2, steps = pairs / lanes;
     int lane = threadIdx.x % lanes;
@@ -48,7 +48,7 @@ __device__ void normalize(half2* out, const half2* in, const half2* scale,
     float sum = 0.0f;
     #pragma unroll
     for (int i = 0; i < steps; ++i) {
-        values[i] = __half22float2(in[pixel * pairs + i * lanes + lane]);
+        values[i] = __half22float2(read_pair(pixel, i * lanes + lane));
         sum = fmaf(values[i].y, values[i].y, fmaf(values[i].x, values[i].x, sum));
     }
     #pragma unroll
@@ -65,7 +65,9 @@ __device__ void normalize(half2* out, const half2* in, const half2* scale,
 
 #define NORMALIZE(C) \
 extern "C" __global__ void rms##C(half2* y, const half2* x, const half2* s, \
-                                  const half2* b, int pixels) { normalize<C>(y, x, s, b, pixels); }
+                                  const half2* b, int pixels) { \
+    normalize_from<C>(y, s, b, pixels, [=](int p, int c) { return x[p * (C / 2) + c]; }); \
+}
 NORMALIZE(32)
 NORMALIZE(64)
 NORMALIZE(128)
@@ -272,7 +274,7 @@ extern "C" __global__ void span_gate(half2* out, const half2* in, const half2* s
 }
 
 extern "C" __global__ void depthwise(half* out, const half* in, const half* weight,
-                                     const half* bias, int total) {
+                                     const half* bias, int stride, int total) {
     constexpr int h = 8, w = 8, channels = 1536;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= total) return;
@@ -284,17 +286,51 @@ extern "C" __global__ void depthwise(half* out, const half* in, const half* weig
         #pragma unroll
         for (int dx = -1; dx <= 1; ++dx) {
             if (y + dy < 0 || y + dy >= h || x + dx < 0 || x + dx >= w) continue;
-            v = fmaf(read(in, (pixel + dy * w + dx) * channels + c),
+            v = fmaf(read(in, (pixel + dy * w + dx) * stride + stride - channels + c),
                      read(weight, ((dy + 1) * 3 + dx + 1) * channels + c), v);
         }
     }
     out[i] = v;
 }
 
-extern "C" __global__ void attention(half* out, const half* in) {
+__device__ void attention_softmax(half* p, const float* scores, int query, int lane) {
+    float left = scores[query * 64 + lane] * 0.1767766953f;
+    float right = scores[query * 64 + lane + 32] * 0.1767766953f;
+    float max_value = fmaxf(left, right);
+    for (int delta = 16; delta; delta /= 2)
+        max_value = fmaxf(max_value, __shfl_xor_sync(0xffffffff, max_value, delta));
+    left = __expf(left - max_value);
+    right = __expf(right - max_value);
+    float sum = warp_sum(left + right);
+    p[query * 64 + lane] = left / sum;
+    p[query * 64 + lane + 32] = right / sum;
+}
+
+__device__ half warp_sum(half x) {
+    for (int delta = 16; delta; delta /= 2) x = __hadd(x, __shfl_xor_sync(0xffffffff, x, delta));
+    return x;
+}
+
+__device__ void attention_softmax(half* p, const half* scores, int query, int lane) {
+    half scale = __float2half(0.1767766953f);
+    half left = __hmul(scores[query * 64 + lane], scale);
+    half right = __hmul(scores[query * 64 + lane + 32], scale);
+    half max_value = __hmax(left, right);
+    for (int delta = 16; delta; delta /= 2)
+        max_value = __hmax(max_value, __shfl_xor_sync(0xffffffff, max_value, delta));
+    half2 logits = __halves2half2(__hsub(left, max_value), __hsub(right, max_value));
+    half2 exp = h2exp(logits);
+    half sum = warp_sum(__hadd(__low2half(exp), __high2half(exp)));
+    half2 probabilities = __hmul2(exp, __half2half2(hrcp(sum)));
+    p[query * 64 + lane] = __low2half(probabilities);
+    p[query * 64 + lane + 32] = __high2half(probabilities);
+}
+
+template<class Acc>
+__device__ void attend(half* out, const half* in) {
     // A CTA owns one complete head: 64 spatial tokens, 32 channels per token.
     __shared__ __align__(32) half q[64 * 32], k[64 * 32], v[64 * 32], p[64 * 64];
-    __shared__ __align__(32) float scores[64 * 64];
+    __shared__ __align__(32) Acc scores[64 * 64];
     int head = blockIdx.x % 16, n = blockIdx.x / 16;
     int t = threadIdx.x, warp = t / 32;
     for (int i = t; i < 64 * 32; i += 256) {
@@ -308,9 +344,9 @@ extern "C" __global__ void attention(half* out, const half* in) {
     int row = warp / 2 * 16, col = warp % 2 * 32;
     wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a;
     wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b;
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc0, acc1;
-    wmma::fill_fragment(acc0, 0.0f);
-    wmma::fill_fragment(acc1, 0.0f);
+    wmma::fragment<wmma::accumulator, 16, 16, 16, Acc> acc0, acc1;
+    wmma::fill_fragment(acc0, Acc(0.0f));
+    wmma::fill_fragment(acc1, Acc(0.0f));
     for (int i = 0; i < 32; i += 16) {
         wmma::load_matrix_sync(a, q + row * 32 + i, 32);
         wmma::load_matrix_sync(b, k + col * 32 + i, 32);
@@ -323,23 +359,13 @@ extern "C" __global__ void attention(half* out, const half* in) {
     __syncthreads();
 
     int lane = t % 32;
-    for (int query = warp; query < 64; query += 8) {
-        float left = scores[query * 64 + lane] * 0.1767766953f;
-        float right = scores[query * 64 + lane + 32] * 0.1767766953f;
-        float max_value = fmaxf(left, right);
-        for (int delta = 16; delta; delta /= 2)
-            max_value = fmaxf(max_value, __shfl_xor_sync(0xffffffff, max_value, delta));
-        left = __expf(left - max_value);
-        right = __expf(right - max_value);
-        float sum = warp_sum(left + right);
-        p[query * 64 + lane] = left / sum;
-        p[query * 64 + lane + 32] = right / sum;
-    }
+    for (int query = warp; query < 64; query += 8)
+        attention_softmax(p, scores, query, lane);
     __syncthreads();
 
     col = warp % 2 * 16;
     wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> value;
-    wmma::fill_fragment(acc0, 0.0f);
+    wmma::fill_fragment(acc0, Acc(0.0f));
     for (int i = 0; i < 64; i += 16) {
         wmma::load_matrix_sync(a, p + row * 64 + i, 64);
         wmma::load_matrix_sync(value, v + i * 32 + col, 32);
@@ -351,13 +377,16 @@ extern "C" __global__ void attention(half* out, const half* in) {
         out[(n * 64 + i / 32) * 512 + head * 32 + i % 32] = scores[(i / 32) * 64 + i % 32];
 }
 
+extern "C" __global__ void attention(half* y, const half* x) { attend<float>(y, x); }
+extern "C" __global__ void attention16(half* y, const half* x) { attend<half>(y, x); }
+
 extern "C" __global__ void gate(half* out, const half* in, const half* attn,
-                                 int total) {
+                                 int stride, int total) {
     constexpr int c = 512;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= total) return;
     int hidden = 3 * c / 2, pixel = i / hidden, ch = i % hidden;
-    int base = pixel * 3 * c;
+    int base = pixel * stride;
     float v = ch < c / 2 ? read(in, base + hidden + ch)
                          : read(attn, pixel * c + ch - c / 2);
     out[i] = mish(read(in, base + ch)) * v;
@@ -367,3 +396,81 @@ extern "C" __global__ void add(half* out, const half* a, const half* b, int tota
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < total) out[i] = read(a, i) + read(b, i);
 }
+
+extern "C" __global__ void shuffle_concat(half2* out, const half2* in, const half2* skip,
+                                           int h, int w, int channels, int total) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    int ch = i & (channels - 1), p = i / channels;
+    int x = p % w, y = p / w % h, n = p / (w * h);
+    if (ch >= channels / 2) {
+        out[i] = skip[p * (channels / 2) + ch - channels / 2];
+    } else {
+        int phase = 2 * (y & 1) + (x & 1);
+        int pixel = ((n * (h / 2) + y / 2) * (w / 2) + x / 2);
+        const auto scalar = reinterpret_cast<const half*>(in);
+        int index = (pixel * channels + 2 * ch) * 4 + phase;
+        out[i] = __halves2half2(scalar[index], scalar[index + 4]);
+    }
+}
+
+#include "fp16.cuh"
+
+template<int C, bool Local, bool Full>
+__device__ void residual_norm(half2* residual, half2* normalized, const half2* a,
+                              const half2* b, const half2* skip, const half2* gamma,
+                              const half2* scale, const half2* offset, int pixels, int total_pixels) {
+    constexpr int pairs = C / 2;
+    auto source = [=](int p, int c) {
+        int index = p * pairs + c;
+        half2 value;
+        if constexpr (Full) {
+            if constexpr (Local) {
+                half2 gate = __hmul2(a[index], b[(p / pixels) * pairs + c]);
+                value = __hfma2(gate, gamma[c], skip[index]);
+            } else {
+                half2 activation = mish16_pair(a[index]);
+                value = b ? __hfma2(activation, gamma[c], b[index]) : activation;
+            }
+        } else {
+            float2 x = __half22float2(a[index]);
+            if constexpr (Local) {
+                float2 gate = __half22float2(b[(p / pixels) * pairs + c]);
+                float2 gain = __half22float2(gamma[c]), s = __half22float2(skip[index]);
+                x.x = fmaf(x.x * gate.x, gain.x, s.x);
+                x.y = fmaf(x.y * gate.y, gain.y, s.y);
+            } else {
+                x.x = mish(x.x);
+                x.y = mish(x.y);
+                if (b) {
+                    float2 gain = __half22float2(gamma[c]), s = __half22float2(b[index]);
+                    x.x = fmaf(x.x, gain.x, s.x);
+                    x.y = fmaf(x.y, gain.y, s.y);
+                }
+            }
+            value = __float22half2_rn(x);
+        }
+        residual[index] = value;
+        return value;
+    };
+    if constexpr (Full) normalize16_from<C>(normalized, scale, offset, total_pixels, source);
+    else normalize_from<C>(normalized, scale, offset, total_pixels, source);
+}
+
+#define RESIDUAL_NORM(NAME, C, LOCAL, FULL) \
+extern "C" __global__ void NAME##C(half2* y, half2* z, const half2* a, const half2* b, \
+                                    const half2* skip, const half2* gamma, const half2* scale, \
+                                    const half2* offset, int p, int total) { \
+    residual_norm<C, LOCAL, FULL>(y, z, a, b, skip, gamma, scale, offset, p, total); \
+}
+#define FUSED_NORM(C) \
+    RESIDUAL_NORM(local_norm, C, true, false) \
+    RESIDUAL_NORM(global_norm, C, false, false) \
+    RESIDUAL_NORM(local_norm16_, C, true, true) \
+    RESIDUAL_NORM(global_norm16_, C, false, true)
+FUSED_NORM(32)
+FUSED_NORM(64)
+FUSED_NORM(128)
+FUSED_NORM(256)
+RESIDUAL_NORM(global_norm, 512, false, false)
+RESIDUAL_NORM(global_norm16_, 512, false, true)
