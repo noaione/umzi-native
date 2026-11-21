@@ -543,3 +543,167 @@ The combined report is
 the raw reports, including every tile time, per-page quality and
 throughput, measured VRAM and startup, and the individual operation
 profiles.
+
+## Packed-session rerun on 21 November 2026
+
+The run used the packed-session DLL and the same GateRV3 checkpoint on
+the RTX 3050 Laptop GPU with Torch 2.15.0+cu132. The original 18 reports matched
+the DLL, packed model and checkpoint hashes. Every timed runner used
+the same 528 tiles across three pages. The host tables use end-to-end
+inputs and outputs. The repeated device medians include the packed
+session's device-buffer copies. [Raw benchmark reports](../output/session-bench-20261121-135646/)
+
+Bold highlights the best aggregate results within native mixed,
+native full FP16, and the external FP16 baselines. Values are ranked
+before rounding. Exact ties share highlighting.
+
+### Output fidelity
+
+PSNR uses raw floats against untouched Torch CUDA FP32 with peak 1.
+Each page cell shows PSNR in dB followed by SSIMULACRA2 on the rendered
+PNG. The aggregate PSNR pools pixel errors across all three pages, and
+mean SSIMULACRA2 averages their three perceptual scores. The ten native
+quality reports and the follow-up for Torch eager, TorchInductor, and
+TensorRT-RTX used byte-identical FP32 reference PNGs. The follow-up used
+the same checkpoint and fixed batch-16 RTX graph and verified provider
+placement. [Baseline fidelity report](../output/session-bench-20261121-135646/baseline-fidelity-b16/report.json)
+
+| Runner | Aggregate PSNR (dB) | Mean SSIMULACRA2 | page-001 | page-005 | page-009 | Max page error |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Mixed, split | 85.547 | **92.352** | 83.800 / 94.469 | 88.843 / 91.111 | 85.391 / 91.475 | 0.001902 |
+| Mixed, replay tuning | 85.547 | **92.352** | 83.800 / 94.469 | 88.843 / 91.111 | 85.391 / 91.475 | 0.001902 |
+| Mixed, fused gate–pool | 85.547 | 92.290 | 83.800 / 94.465 | 88.842 / 90.969 | 85.391 / 91.436 | 0.001902 |
+| Mixed, FP16 QKV | **85.547** | 92.338 | 83.799 / 94.392 | 88.848 / 91.059 | 85.391 / 91.563 | 0.001898 |
+| Mixed, fused convolution–SiLU | 85.547 | 92.286 | 83.800 / 94.329 | 88.843 / 91.096 | 85.390 / 91.434 | 0.001902 |
+| Full FP16, split | 72.089 | 91.869 | 73.272 / 94.019 | 71.774 / 90.522 | 71.433 / 91.066 | 0.001923 |
+| Full FP16, replay tuning | 72.089 | 91.869 | 73.272 / 94.019 | 71.774 / 90.522 | 71.433 / 91.066 | 0.001923 |
+| Full FP16, fused gate–pool | **72.101** | **91.916** | 73.258 / 94.169 | 71.811 / 90.484 | 71.439 / 91.096 | 0.002005 |
+| Full FP16, SiLU requested | 72.089 | 91.869 | 73.272 / 94.019 | 71.774 / 90.522 | 71.433 / 91.066 | 0.001923 |
+| Full FP16, replay tuning + fused gate–pool | **72.101** | **91.916** | 73.258 / 94.169 | 71.811 / 90.484 | 71.439 / 91.096 | 0.002005 |
+| Torch eager FP16 | **72.436** | 91.943 | 74.190 / 94.126 | 71.889 / 90.568 | 71.652 / 91.134 | 0.002005 |
+| TorchInductor FP16 | 72.409 | **91.997** | 73.700 / 94.244 | 71.974 / 90.660 | 71.795 / 91.088 | 0.002005 |
+| ORT TensorRT-RTX FP16 | 72.133 | 91.899 | 73.818 / 94.070 | 71.707 / 90.548 | 71.275 / 91.080 | 0.001923 |
+
+Full FP16 gate–pool fusion lowered batch-1 checkerboard PSNR from
+69.347 to 65.404 dB. Replay tuning plus fusion gave the same checkerboard
+score and batch-16 page metrics as gate–pool fusion alone.
+
+### Individual batch-1 tile latency
+
+The means use 528 synchronized, individual batch-1 calls per runner.
+Each report records the image, tile index, coordinates and time for
+all 528 calls. The TensorRT-RTX row uses the separate fixed batch-1
+graph. Profiling confirmed RTX placement.
+
+| Runner | Mean tile (ms) | page-001 (ms) | page-005 (ms) | page-009 (ms) | Repeated device median (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Mixed, split | 4.901 | 4.960 | 4.874 | 4.868 | 4.677 |
+| Mixed, replay tuning | 4.853 | 4.908 | 4.835 | 4.816 | 4.672 |
+| Mixed, fused gate–pool | **4.819** | 4.837 | 4.827 | 4.793 | 4.607 |
+| Mixed, FP16 QKV | 4.844 | 4.873 | 4.829 | 4.829 | 4.631 |
+| Full FP16, split | 4.461 | 4.464 | 4.458 | 4.462 | 4.254 |
+| Full FP16, replay tuning | 4.495 | 4.497 | 4.497 | 4.493 | 4.323 |
+| Full FP16, fused gate–pool | **4.421** | 4.430 | 4.404 | 4.430 | 4.219 |
+| Torch eager FP16 | 42.459 | 42.574 | 42.251 | 42.552 | 39.407 |
+| TorchInductor FP16 | 16.225 | 16.329 | 16.252 | 16.094 | 15.601 |
+| ORT TensorRT-RTX FP16 | **5.667** | 5.755 | 5.659 | 5.585 | 5.555 |
+
+### Batch-16 page throughput
+
+Each runner made 33 batch-16 calls, with 11 calls per page. Times
+include batch assembly and synchronous host I/O. MPx/s counts source
+image pixels. Amortized ms/tile spreads the measured batch-16 wall time
+over all 528 tiles. Profiling confirmed RTX placement for the fixed
+batch-16 graph. The replay tuning plus gate–pool row comes from the
+separate full-FP16 comparison below.
+
+| Runner | Total (s) | MPx/s | ms/tile | page-001 s / MPx/s | page-005 s / MPx/s | page-009 s / MPx/s | Repeated device median (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Mixed, split | 1.941 | 4.339 | 3.677 | 0.647 / 4.340 | 0.648 / 4.335 | 0.646 / 4.344 | 56.737 |
+| Mixed, replay tuning | 1.938 | 4.347 | 3.670 | 0.646 / 4.345 | 0.646 / 4.344 | 0.645 / 4.354 | 56.703 |
+| Mixed, fused gate–pool | 1.920 | 4.388 | 3.636 | 0.641 / 4.381 | 0.639 / 4.398 | 0.641 / 4.384 | 55.983 |
+| Mixed, FP16 QKV | 1.919 | **4.390** | **3.634** | 0.642 / 4.374 | 0.639 / 4.395 | 0.638 / 4.402 | 56.065 |
+| Full FP16, split | 1.690 | 4.985 | 3.200 | 0.563 / 4.988 | 0.563 / 4.986 | 0.564 / 4.982 | 49.560 |
+| Full FP16, replay tuning | 1.693 | 4.977 | 3.206 | 0.564 / 4.982 | 0.564 / 4.978 | 0.565 / 4.971 | 49.514 |
+| Full FP16, fused gate–pool | 1.680 | 5.014 | 3.182 | 0.560 / 5.012 | 0.560 / 5.018 | 0.560 / 5.011 | 49.011 |
+| Full FP16, replay tuning + fused gate–pool | 1.663 | **5.064** | **3.151** | 0.554 / 5.066 | 0.556 / 5.054 | 0.554 / 5.072 | 48.815 |
+| Torch eager FP16 | 5.138 | 1.640 | 9.731 | 1.714 / 1.638 | 1.711 / 1.641 | 1.713 / 1.639 | 152.656 |
+| TorchInductor FP16 | 6.834 | 1.233 | 12.943 | 2.281 / 1.231 | 2.272 / 1.236 | 2.281 / 1.231 | 203.172 |
+| ORT TensorRT-RTX FP16 | 2.397 | **3.515** | **4.539** | 0.799 / 3.514 | 0.795 / 3.531 | 0.802 / 3.500 | 66.740 |
+
+The instrumented batch-16 profiles put mixed FP16 QKV at 1.519 ms
+across the 12 folded projections, down from 2.398 ms. Mixed page
+throughput went from 4.339 to 4.390 MPx/s, a gain of about 1.2%.
+At the four eligible gate–pool sites, fused operation time moved
+from 2.958 to 2.221 ms in mixed precision and from 2.800 to 2.292 ms
+in full FP16. Replay tuning alone changed page throughput by less than
+0.2% in both precisions.
+
+### Separate SiLU and combined FP16 runs
+
+The first four rows in each table come from the SiLU comparison.
+The final two rows compare full-FP16 replay tuning alone with replay
+tuning plus gate–pool fusion. Each comparison has its own control.
+
+| Runner | Mean tile (ms) | page-001 (ms) | page-005 (ms) | page-009 (ms) | Repeated device median (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Mixed, split | 4.841 | 4.823 | 4.838 | 4.861 | 4.609 |
+| Mixed, fused convolution–SiLU | **4.782** | 4.790 | 4.785 | 4.771 | 4.553 |
+| Full FP16, split | 4.507 | 4.489 | 4.508 | 4.524 | 4.210 |
+| Full FP16, SiLU requested | 4.458 | 4.404 | 4.454 | 4.515 | 4.204 |
+| Full FP16, replay tuning | 4.496 | 4.486 | 4.486 | 4.516 | 4.306 |
+| Full FP16, replay tuning + fused gate–pool | **4.467** | 4.463 | 4.463 | 4.475 | 4.274 |
+4.463 | 4.475 | 4.274 |
+
+| Runner | Total (s) | MPx/s | ms/tile | page-001 s / MPx/s | page-005 s / MPx/s | page-009 s / MPx/s | Repeated device median (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Mixed, split | 1.933 | 4.357 | 3.662 | 0.643 / 4.367 | 0.642 / 4.374 | 0.648 / 4.331 | 56.450 |
+| Mixed, fused convolution–SiLU | 1.886 | **4.467** | **3.572** | 0.629 / 4.467 | 0.629 / 4.464 | 0.628 / 4.471 | 55.147 |
+| Full FP16, split | 1.703 | 4.948 | 3.225 | 0.569 / 4.933 | 0.563 / 4.985 | 0.570 / 4.926 | 49.380 |
+| Full FP16, SiLU requested | 1.701 | 4.954 | 3.221 | 0.570 / 4.929 | 0.563 / 4.992 | 0.568 / 4.941 | 49.307 |
+| Full FP16, replay tuning | 1.683 | 5.005 | 3.187 | 0.562 / 4.996 | 0.560 / 5.013 | 0.561 / 5.008 | 49.417 |
+| Full FP16, replay tuning + fused gate–pool | 1.663 | **5.064** | **3.151** | 0.554 / 5.066 | 0.556 / 5.054 | 0.554 / 5.072 | 48.815 |
+
+Mixed convolution–SiLU fusion ran at 12 sites and improved batch-16
+page throughput by 2.5% in its matched comparison. The full-FP16
+SiLU request used split kernels because cuDNN reported no compatible
+fused plan. Adding gate–pool fusion to full-FP16 replay tuning raised
+throughput from 5.005 to 5.064 MPx/s, about 1.2%. Mean individual
+tile time changed from 4.496 to 4.467 ms in that comparison.
+
+### VRAM and startup
+
+Warmed VRAM measures device usage above the pre-run context baseline
+on the second memory pass. The startup columns show the initial
+pass and the populated-cache pass, respectively. Split, replay
+tuning and mixed FP16 QKV started with cache misses. SiLU and
+gate–pool reused the split library plans already written in the
+initial pass. The combined full-FP16 run had its own speed and quality
+reports. The native memory sweep covered the nine individual configurations.
+
+Each external baseline ran on its own in a fresh process for each
+batch size and pass. The device-wide deltas include retained allocator
+and runtime memory. Torch eager shows two independent starts. TorchInductor
+and TensorRT-RTX started with empty caches for each graph or shape and
+reused them on the second pass. The RTX provider was verified for both
+fixed graphs. [Baseline VRAM and startup report](../output/session-bench-20261121-135646/baseline-memory/report.json)
+
+| Runner | Batch 1 warmed MiB | Batch 1 first output (ms) | Batch 16 warmed MiB | Batch 16 first output (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| Mixed, split | 98 | 539 / 323 | **210** | 959 / 273 |
+| Mixed, replay tuning | **86** | 302 / 157 | 212 | 1711 / 252 |
+| Mixed, fused gate–pool | **86** | 135 / 140 | 212 | 237 / 240 |
+| Mixed, FP16 QKV | **86** | 236 / 144 | 212 | 941 / 259 |
+| Mixed, fused convolution–SiLU | **86** | 235 / 242 | **210** | 344 / 352 |
+| Full FP16, split | 84 | 623 / 181 | **204** | 5527 / 238 |
+| Full FP16, replay tuning | **82** | 567 / 141 | 206 | 6121 / 224 |
+| Full FP16, fused gate–pool | **82** | 156 / 149 | 206 | 249 / 230 |
+| Full FP16, SiLU requested | 82 | 149 / 155 | 204 | 237 / 234 |
+| Torch eager FP16 | **130** | 1350 / 1412 | 434 | 1739 / 1718 |
+| TorchInductor FP16 | 166 | 116637 / 12637 | 452 | 113774 / 11221 |
+| ORT TensorRT-RTX FP16 | 172 | 16746 / 8343 | **302** | 14857 / 6965 |
+
+Replay tuning selected plans for 13 shapes on a miss at each batch size
+and precision. Warmed batch-16 VRAM stayed within 210–212 MiB for
+mixed precision and 204–206 MiB for full FP16. The highest sampled
+native startup increases at batch 16 were 274 MiB and 268 MiB, respectively.

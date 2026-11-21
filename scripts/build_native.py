@@ -144,6 +144,17 @@ def build(output: Path, arch: str, crt_include: Path | None, cccl_include: Path 
     env = compiler_environment()
     output.mkdir(parents=True, exist_ok=True)
     compile_kernels(cuda, crt_include, output / "kernels.cubin", arch)
+    (output / "kernels.rc").write_text('101 RCDATA "kernels.cubin"\n', encoding="ascii")
+    sdk_path = next(value for name, value in env.items() if name.lower() == "path")
+    rc = shutil.which("rc.exe", path=sdk_path)
+    if rc is None:
+        raise RuntimeError("Windows SDK resource compiler rc.exe was not found")
+    subprocess.run(
+        [rc, "/nologo", "/fo", "kernels.res", "kernels.rc"],
+        env=env,
+        cwd=output,
+        check=True,
+    )
     cpp = SOURCE / "runner.cpp"
     obj = output / "runner.obj"
     subprocess.run(
@@ -198,6 +209,7 @@ def build(output: Path, arch: str, crt_include: Path | None, cccl_include: Path 
         "link.exe",
         "/nologo",
         str(obj),
+        str(output / "kernels.res"),
         str(cuda / "lib/x64/cuda.lib"),
         "bcrypt.lib",
         "version.lib",

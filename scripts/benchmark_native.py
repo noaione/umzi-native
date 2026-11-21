@@ -20,13 +20,103 @@ import numpy as np
 import torch
 from benchmark import IMAGE_EXTS, ROOT, image_tensor, load_model, patches, tensor_image
 from build_native import libraries
-from export_native import Op
+from export_native import (
+    MODEL_FORMAT_VERSION,
+    MODEL_HEADER,
+    MODEL_MAGIC,
+    MODEL_METADATA,
+    MODEL_SECTION,
+    Op,
+)
 from PIL import Image
+from rtx_session import create_rtx_session
 
 CHECKPOINT = ROOT / "models/1x_umzi_digital_decompress_gaterv3_1.pth"
 SHAPE = (3, 128, 128)
 METRIC = Path(r"C:\Tools\imaging\ssimulacra2.exe")
 KERNEL_OPTIONS = {"tune-projections": 8, "fuse-gate-pool": 16, "fp16-qkv": 32}
+CACHE_STATUSES = ("disabled", "miss", "hit", "rebuilt", "unavailable")
+OPTIMIZATION_STATS = (
+    "replay_tuned_shapes",
+    "fused_gate_pool_sites",
+    "fp16_qkv_projections",
+    "split_gate_registers",
+    "fused_gate_registers",
+)
+
+
+class SessionOptions(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32),
+        ("device", ctypes.c_int32),
+        ("flags", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32),
+        ("cache_dir", ctypes.c_char_p),
+    ]
+
+
+class SessionInfo(ctypes.Structure):
+    _fields_ = [
+        (name, ctypes.c_uint32)
+        for name in (
+            "struct_size",
+            "cache_status",
+            "batch",
+            "padded_height",
+            "padded_width",
+            "reserved",
+        )
+    ] + [
+        ("buffer_bytes", ctypes.c_uint64 * 4),
+        ("startup_device_used_bytes", ctypes.c_uint64 * 4),
+        ("model_load_ms", ctypes.c_double),
+        ("shape_setup_ms", ctypes.c_double * 4),
+        ("optimization_stats", ctypes.c_int32 * 5),
+        ("fused_silu_count", ctypes.c_int32),
+    ]
+
+
+def packed_schedule(path):
+    length = path.stat().st_size
+    with path.open("rb") as file:
+        magic, version, count, _ = MODEL_HEADER.unpack(file.read(MODEL_HEADER.size))
+        if (magic, version, count) != (MODEL_MAGIC, MODEL_FORMAT_VERSION, 4):
+            raise ValueError("Unsupported packed GateRV3 format")
+        position = MODEL_HEADER.size + count * MODEL_SECTION.size
+        table = file.read(count * MODEL_SECTION.size)
+        sections = {}
+        for index, (kind, reserved, offset, size) in enumerate(
+            MODEL_SECTION.iter_unpack(table), start=1
+        ):
+            if (
+                kind != index
+                or reserved
+                or offset != position
+                or size > length - position
+            ):
+                raise ValueError("Invalid packed GateRV3 sections")
+            sections[kind] = (offset, size)
+            position += size
+        if (
+            len(sections) != count
+            or position != length
+            or sections[1][1] != MODEL_METADATA.size
+            or sections[4][1] != 32
+        ):
+            raise ValueError("Invalid packed GateRV3 section sizes")
+        file.seek(sections[1][0])
+        *_, tensors, operations = MODEL_METADATA.unpack(file.read(MODEL_METADATA.size))
+        if (
+            not 2 <= operations <= 2000
+            or tensors != operations + 1
+            or sections[2][1] != tensors * 8 + operations * 44
+        ):
+            raise ValueError("Invalid packed GateRV3 schedule length")
+        file.seek(sections[2][0])
+        specs = np.frombuffer(file.read(tensors * 8), dtype="<i4").reshape(-1, 2)
+        ops = np.frombuffer(file.read(operations * 44), dtype="<i4").reshape(-1, 11)
+        file.seek(sections[4][0])
+        return specs, ops, file.read(32).hex()
 
 
 def enabled_optimizations(args):
@@ -54,77 +144,166 @@ class Native:
         cache_dir=None,
         fuse_silu=False,
         optimizations=(),
+        model_file=None,
     ):
         cuda, cudnn = libraries()
         self.dll_dirs = []
+        self.handle = None
+        self.model_file = model_file
+        self.bundle = bundle
+        fp16 = precision == "fp16"
+        self.dtype = torch.float16 if fp16 else torch.float32
+        flags = int(graph) | (2 if fp16 else 0) | (4 if fuse_silu else 0)
+        flags |= sum(KERNEL_OPTIONS[name] for name in set(optimizations))
+        cached = str(cache_dir.resolve()).encode() if cache_dir else None
         try:
             for path in (cuda / "bin/x86_64", cudnn / "bin"):
                 self.dll_dirs.append(os.add_dll_directory(str(path)))
             self.dll = ctypes.CDLL(str((bundle / "gaterv3.dll").resolve()))
-            fp16 = precision == "fp16"
-            create = self.dll.gt_create_fp16 if fp16 else self.dll.gt_create
-            create.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
-            create.restype = ctypes.c_void_p
             self.dll.gt_error.restype = ctypes.c_char_p
-            self.dll.gt_destroy.argtypes = [ctypes.c_void_p]
-            self.dll.gt_destroy.restype = None
-            self.dll.gt_input.argtypes = [ctypes.c_void_p]
-            self.dll.gt_input.restype = ctypes.c_uint64
-            self.run = self.dll.gt_run_fp16 if fp16 else self.dll.gt_run
-            self.run.argtypes = [ctypes.c_void_p] * 3
-            self.dll.gt_enqueue.argtypes = [ctypes.c_void_p] * 2
-            directory = str(bundle.resolve()).encode()
-            if cache_dir or fuse_silu or optimizations:
-                create_ex = self.dll.gt_create_ex
-                create_ex.argtypes = [
-                    ctypes.c_char_p,
-                    ctypes.c_int,
-                    ctypes.c_uint32,
-                    ctypes.c_char_p,
-                ]
-                create_ex.restype = ctypes.c_void_p
-                flags = int(graph) | (2 if fp16 else 0) | (4 if fuse_silu else 0)
-                flags |= sum(KERNEL_OPTIONS[name] for name in set(optimizations))
-                cached = str(cache_dir.resolve()).encode() if cache_dir else None
-                self.handle = create_ex(directory, batch, flags, cached)
+            if model_file is not None:
+                self.open_packed(model_file, batch, flags, cached)
             else:
-                self.handle = create(directory, batch, graph)
-            if not self.handle:
-                self.check(-1)
+                self.open_legacy(bundle, batch, graph, fp16, flags, cached)
+            self.host_output = torch.empty((batch, *SHAPE), dtype=self.dtype)
         except BaseException:
-            for directory in self.dll_dirs:
-                directory.close()
+            self.close()
             raise
-        self.dtype = torch.float16 if fp16 else torch.float32
-        self.host_output = torch.empty((batch, *SHAPE), dtype=self.dtype)
+
+    def open_legacy(self, bundle, batch, graph, fp16, flags, cached):
+        create = self.dll.gt_create_fp16 if fp16 else self.dll.gt_create
+        create.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+        create.restype = ctypes.c_void_p
+        self.destroy = self.dll.gt_destroy
+        self.destroy.argtypes = [ctypes.c_void_p]
+        self.destroy.restype = None
+        self.dll.gt_input.argtypes = [ctypes.c_void_p]
+        self.dll.gt_input.restype = ctypes.c_uint64
+        self.run = self.dll.gt_run_fp16 if fp16 else self.dll.gt_run
+        self.run.argtypes = [ctypes.c_void_p] * 3
+        self.dll.gt_enqueue.argtypes = [ctypes.c_void_p] * 2
+        directory = str(bundle.resolve()).encode()
+        if cached or flags & ~3:
+            create_ex = self.dll.gt_create_ex
+            create_ex.argtypes = [
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_uint32,
+                ctypes.c_char_p,
+            ]
+            create_ex.restype = ctypes.c_void_p
+            self.handle = create_ex(directory, batch, flags, cached)
+        else:
+            self.handle = create(directory, batch, graph)
+        if not self.handle:
+            self.check(-1)
         self.device_input = self.dll.gt_input(self.handle)
+
+    def open_packed(self, path, batch, flags, cached):
+        dims = [ctypes.c_void_p, *([ctypes.c_uint32] * 3)]
+        sizes = [ctypes.c_void_p, ctypes.c_uint64] * 2
+        self.dll.gt_session_open.argtypes = [
+            ctypes.c_char_p,
+            ctypes.POINTER(SessionOptions),
+        ]
+        self.dll.gt_session_open.restype = ctypes.c_void_p
+        self.destroy = self.dll.gt_session_close
+        self.destroy.argtypes = [ctypes.c_void_p]
+        self.destroy.restype = None
+        self.dll.gt_session_prepare.argtypes = dims
+        self.dll.gt_session_run.argtypes = dims + sizes
+        self.dll.gt_session_enqueue.argtypes = (
+            dims + [ctypes.c_uint64] * 4 + [ctypes.c_void_p]
+        )
+        self.dll.gt_session_info.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(SessionInfo),
+        ]
+        for name in ("gt_session_cache_message", "gt_session_fusion_message"):
+            fn = getattr(self.dll, name)
+            fn.argtypes = [ctypes.c_void_p]
+            fn.restype = ctypes.c_char_p
+        options = SessionOptions(ctypes.sizeof(SessionOptions), 0, flags, 0, cached)
+        self.handle = self.dll.gt_session_open(
+            str(path.resolve()).encode(), ctypes.byref(options)
+        )
+        if not self.handle:
+            self.check(-1)
+        self.check(self.dll.gt_session_prepare(self.handle, batch, *SHAPE[1:]))
+
+    def session_info(self):
+        info = SessionInfo()
+        info.struct_size = ctypes.sizeof(info)
+        self.check(self.dll.gt_session_info(self.handle, ctypes.byref(info)))
+        return info
 
     def check(self, status):
         if status:
             raise RuntimeError(self.dll.gt_error().decode())
 
     def close(self):
-        self.dll.gt_destroy(self.handle)
+        if self.handle:
+            self.destroy(self.handle)
+            self.handle = None
         for directory in self.dll_dirs:
             directory.close()
 
     def host(self, x):
         if (
-            x.shape != self.host_output.shape
-            or x.device.type != "cpu"
+            x.device.type != "cpu"
             or x.dtype != torch.float32
             or not x.is_contiguous()
+            or x.ndim != 4
+            or x.shape[1] != 3
+            or (self.model_file is None and x.shape != self.host_output.shape)
         ):
             raise ValueError(
                 "Native benchmark input must be contiguous FP32 NCHW at the runner's batch size"
             )
         packed = x.to(dtype=self.dtype)
-        self.check(
-            self.run(self.handle, packed.data_ptr(), self.host_output.data_ptr())
-        )
+        if self.model_file is None:
+            self.check(
+                self.run(self.handle, packed.data_ptr(), self.host_output.data_ptr())
+            )
+        else:
+            if x.shape != self.host_output.shape:
+                self.host_output = torch.empty_like(packed)
+            size = packed.nbytes
+            self.check(
+                self.dll.gt_session_run(
+                    self.handle,
+                    x.shape[0],
+                    x.shape[2],
+                    x.shape[3],
+                    packed.data_ptr(),
+                    size,
+                    self.host_output.data_ptr(),
+                    size,
+                )
+            )
         return self.host_output.float()
 
     def prepare_device(self, x):
+        if self.model_file is not None:
+            packed = x.to(dtype=self.dtype)
+            output = torch.empty_like(packed)
+
+            def run_packed():
+                self.check(
+                    self.dll.gt_session_enqueue(
+                        self.handle,
+                        x.shape[0],
+                        x.shape[2],
+                        x.shape[3],
+                        packed.data_ptr(),
+                        packed.nbytes,
+                        output.data_ptr(),
+                        output.nbytes,
+                        torch.cuda.current_stream().cuda_stream,
+                    )
+                )
+
+            return run_packed
         from cuda.bindings import driver
 
         packed = x.to(dtype=self.dtype)
@@ -145,6 +324,14 @@ class Native:
         return run
 
     def memory_values(self, symbol, keys):
+        if self.model_file is not None:
+            info = self.session_info()
+            values = (
+                info.buffer_bytes
+                if symbol == "gt_buffer_sizes"
+                else info.startup_device_used_bytes
+            )
+            return dict(zip(keys, values, strict=True))
         query = getattr(self.dll, symbol, None)
         if query is None:
             return None
@@ -155,6 +342,34 @@ class Native:
         return dict(zip(keys, sizes, strict=True))
 
     def setup(self):
+        if self.model_file is not None:
+            info = self.session_info()
+            return {
+                "stages_ms": dict(
+                    zip(
+                        (
+                            "model",
+                            "shape_allocation",
+                            "plans",
+                            "allocation_warmup",
+                            "capture",
+                        ),
+                        (info.model_load_ms, *info.shape_setup_ms),
+                        strict=True,
+                    )
+                ),
+                "cache_status": CACHE_STATUSES[info.cache_status],
+                "cache_message": self.dll.gt_session_cache_message(
+                    self.handle
+                ).decode(),
+                "fused_silu_count": info.fused_silu_count,
+                "fusion_message": self.dll.gt_session_fusion_message(
+                    self.handle
+                ).decode(),
+                "optimization": dict(
+                    zip(OPTIMIZATION_STATS, info.optimization_stats, strict=True)
+                ),
+            }
         timing = getattr(self.dll, "gt_setup_timings", None)
         if timing is None:
             return None
@@ -171,7 +386,6 @@ class Native:
         for function, dtype in functions:
             function.argtypes = [ctypes.c_void_p]
             function.restype = dtype
-        statuses = ("disabled", "miss", "hit", "rebuilt", "unavailable")
         result = {
             "stages_ms": dict(
                 zip(
@@ -180,7 +394,7 @@ class Native:
                     strict=True,
                 )
             ),
-            "cache_status": statuses[self.dll.gt_cache_status(self.handle)],
+            "cache_status": CACHE_STATUSES[self.dll.gt_cache_status(self.handle)],
             "cache_message": self.dll.gt_cache_message(self.handle).decode(),
             "fused_silu_count": self.dll.gt_fused_silu_count(self.handle),
             "fusion_message": self.dll.gt_fusion_message(self.handle).decode(),
@@ -193,28 +407,41 @@ class Native:
             query(self.handle, counts)
             result["optimization"] = dict(
                 zip(
-                    (
-                        "replay_tuned_shapes",
-                        "fused_gate_pool_sites",
-                        "fp16_qkv_projections",
-                        "split_gate_registers",
-                        "fused_gate_registers",
-                    ),
+                    OPTIMIZATION_STATS,
                     counts,
                     strict=True,
                 )
             )
         return result
 
-    def profile(self, schedule):
-        self.dll.gt_operation_count.argtypes = [ctypes.c_void_p]
-        self.dll.gt_profile.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
-        count = self.dll.gt_operation_count(self.handle)
+    def profile(self):
+        if self.model_file is None:
+            self.dll.gt_operation_count.argtypes = [ctypes.c_void_p]
+            count = self.dll.gt_operation_count(self.handle)
+            table = np.fromfile(self.bundle / "schedule.bin", dtype="<i4", offset=16)
+            shapes = table[: 4 * (count + 1)].reshape(-1, 4)
+            ops = table[4 * (count + 1) :].reshape(-1, 11)
+            profile = self.dll.gt_profile
+        else:
+            specs, ops, _ = packed_schedule(self.model_file)
+            count = len(ops)
+            info = self.session_info()
+            shapes = np.array(
+                [
+                    (1, 1, channels)
+                    if level < 0
+                    else (
+                        info.padded_height >> level,
+                        info.padded_width >> level,
+                        channels,
+                    )
+                    for level, channels in specs
+                ]
+            )
+            profile = self.dll.gt_session_profile
+        profile.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
         times = np.zeros(count, dtype=np.float32)
-        self.check(self.dll.gt_profile(self.handle, times.ctypes.data, count))
-        table = np.fromfile(schedule, dtype="<i4", offset=16)
-        shapes = table[: 4 * (count + 1)].reshape(-1, 4)
-        ops = table[4 * (count + 1) :].reshape(-1, 11)
+        self.check(profile(self.handle, times.ctypes.data, count))
         totals = defaultdict(float)
         rows = []
         for entry, ms in zip(ops, times, strict=True):
@@ -262,6 +489,7 @@ def quality(args, images):
             "cache_dir": args.cache_dir,
             "fuse_silu": args.fuse_silu,
             "optimizations": enabled_optimizations(args),
+            "model_file": args.model_file,
         }
         native = Native(args.bundle, 16, **options)
         runners.callback(native.close)
@@ -340,33 +568,10 @@ def quality(args, images):
     }
 
 
-def ort_session(onnx_path, profile_dir):
-    import onnxruntime as ort
-    import onnxruntime_ep_nv_tensorrt_rtx as rtx
-
-    ort.disable_telemetry_events()
-    ep = rtx.get_ep_name()
-    if not any(device.ep_name == ep for device in ort.get_ep_devices()):
-        ort.register_execution_provider_library(ep, rtx.get_library_path())
-
-    def make_session(profile):
-        options = ort.SessionOptions()
-        options.log_severity_level = 3
-        options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
-        options.add_provider_for_devices(
-            [d for d in ort.get_ep_devices() if d.ep_name == ep], {}
-        )
-        if profile:
-            options.enable_profiling = True
-            options.profile_file_prefix = str(profile_dir / onnx_path.stem)
-        session = ort.InferenceSession(
-            str(onnx_path), sess_options=options, enable_fallback=0
-        )
-        if ep not in session.get_providers():
-            raise RuntimeError(f"Inactive RTX provider: {session.get_providers()}")
-        return session
-
-    profiled = make_session(True)
+def ort_session(onnx_path, profile_dir, cache_dir, batch):
+    profiled, _ = create_rtx_session(
+        onnx_path, batch, 128, cache_dir, profile_dir / onnx_path.stem
+    )
     input_shape = profiled.get_inputs()[0].shape
     profiled.run(None, {"input": np.zeros(input_shape, dtype=np.float16)})
     events = json.loads(Path(profiled.end_profiling()).read_text(encoding="utf-8"))
@@ -376,9 +581,11 @@ def ort_session(onnx_path, profile_dir):
     placement = sorted(
         {event.get("args", {}).get("provider", "") for event in nodes} - {""}
     )
-    if placement != [ep]:
+    if placement != ["NvTensorRTRTXExecutionProvider"]:
         raise RuntimeError(f"Unexpected RTX node placement {placement}")
-    return make_session(False), placement
+    del profiled
+    session, options = create_rtx_session(onnx_path, batch, 128, cache_dir)
+    return session, placement, options
 
 
 def measure(call, repeats, *args):
@@ -491,6 +698,7 @@ def speed(args, images, batch, report, save):
                 cache_dir=None if control else args.cache_dir,
                 fuse_silu=fuse_silu and not control,
                 optimizations=() if control else optimizations,
+                model_file=None if control else args.model_file,
             )
             stack.callback(instance.close)
             return instance
@@ -499,7 +707,7 @@ def speed(args, images, batch, report, save):
         cases = {"native_graph": (native.prepare_device(device_input), native.host)}
         report["setup"] = {"native_graph": native.setup()}
         if args.control_bundle:
-            control = native_case(args.control_bundle, "mixed", control=True)
+            control = native_case(args.control_bundle, args.precision, control=True)
             cases["native_control"] = (
                 control.prepare_device(device_input),
                 control.host,
@@ -545,8 +753,12 @@ def speed(args, images, batch, report, save):
                 cases["torch_inductor"] = torch_calls(compiled)
         if "rtx" in args.baselines:
             graph = args.baseline / f"gaterv3-fp16-t128-b{batch}.onnx"
-            session, placement = ort_session(graph, args.output)
+            rtx_cache = args.rtx_cache_dir or args.baseline / "rtx-runtime-cache"
+            session, placement, options = ort_session(
+                graph, args.output, rtx_cache, batch
+            )
             report["rtx_provider_placement"] = placement
+            report["rtx_provider_options"] = options
             report["rtx_graph_sha256"] = digest(graph)
             binding = session.io_binding()
             device_output = torch.empty_like(device_half)
@@ -612,20 +824,18 @@ def speed(args, images, batch, report, save):
             )
         save()
         if args.profile:
-            report["native_profile"] = native.profile(args.bundle / "schedule.bin")
+            report["native_profile"] = native.profile()
             print(
                 f"Batch {batch} native profile {report['native_profile']['totals_ms']}",
                 flush=True,
             )
             save()
             if fp16 is not None:
-                report["native_fp16_profile"] = fp16.profile(
-                    args.bundle / "schedule.bin"
-                )
+                report["native_fp16_profile"] = fp16.profile()
                 save()
             if candidates:
                 report["optimization_profiles"] = {
-                    label: candidate.profile(args.bundle / "schedule.bin")
+                    label: candidate.profile()
                     for label, candidate in candidates.items()
                 }
                 save()
@@ -658,7 +868,7 @@ def memory(args, batch):
         "native_graph": (args.bundle, args.precision, args.fuse_silu, configured)
     }
     if args.control_bundle:
-        runners["native_control"] = (args.control_bundle, "mixed", False, ())
+        runners["native_control"] = (args.control_bundle, args.precision, False, ())
     if args.compare_fp16:
         runners["native_fp16"] = (args.bundle, "fp16", args.fuse_silu, configured)
     if args.compare_silu:
@@ -683,6 +893,7 @@ def memory(args, batch):
             fuse_silu=fuse_silu,
             cache_dir=None if label == "native_control" else args.cache_dir,
             optimizations=optimizations,
+            model_file=None if label == "native_control" else args.model_file,
         )
         initialization_ms = (time.perf_counter() - started) * 1000
         try:
@@ -718,8 +929,7 @@ def memory(args, batch):
             "device_used_warmed_delta_bytes": warmed - before,
             "runner_buffers_bytes": buffers,
             "startup_device_used_bytes": startup,
-            "startup_sampled_max_delta_bytes": max(startup.values())
-            - startup["context"]
+            "startup_sampled_max_delta_bytes": max(captured, *startup.values()) - before
             if startup
             else None,
         }
@@ -741,7 +951,17 @@ def main():
     parser.add_argument("--model", type=Path, default=CHECKPOINT)
     parser.add_argument("--input", type=Path, default=ROOT / "samples/input")
     parser.add_argument("--bundle", type=Path, default=ROOT / "output/native")
-    parser.add_argument("--control-bundle", type=Path)
+    parser.add_argument(
+        "--model-file", type=Path, help="Packed model for the native session API"
+    )
+    parser.add_argument(
+        "--legacy", action="store_true", help="Use the fixed bundle API"
+    )
+    parser.add_argument(
+        "--control-bundle",
+        type=Path,
+        help="Fixed bundle control at the selected precision",
+    )
     parser.add_argument(
         "--cache-dir", type=Path, help="Read and write tuned plans in this directory"
     )
@@ -780,6 +1000,9 @@ def main():
     )
     parser.add_argument("--baseline", type=Path, default=ROOT / "output/baseline")
     parser.add_argument(
+        "--rtx-cache-dir", type=Path, help="TensorRT-RTX runtime cache directory"
+    )
+    parser.add_argument(
         "--output", type=Path, default=ROOT / "output/native-validation"
     )
     parser.add_argument(
@@ -805,6 +1028,12 @@ def main():
         "--skip-pages", action="store_true", help="Time repeated batches only"
     )
     args = parser.parse_args()
+    if args.legacy and args.model_file is not None:
+        parser.error("--legacy and --model-file are mutually exclusive")
+    if args.model_file is None and not args.legacy:
+        model_file = args.bundle / "gaterv3.gtmodel"
+        if model_file.is_file():
+            args.model_file = model_file
     if args.rounds < 1 or args.repeats < 1:
         parser.error("Rounds and repeats must be positive")
     if "inductor" in args.baselines and "torch" not in args.baselines:
@@ -843,12 +1072,26 @@ def main():
             )
         return hashes
 
+    if args.model_file is not None:
+        _, _, packed_checkpoint = packed_schedule(args.model_file)
+        if packed_checkpoint != checkpoint_hash:
+            parser.error(f"Packed model does not match the checkpoint in {args.model}")
+        bundle_hashes = {
+            "gaterv3.dll": digest(args.bundle / "gaterv3.dll"),
+            "model_file": digest(args.model_file),
+        }
+    else:
+        bundle_hashes = checked_bundle(args.bundle)
+
     report: dict[str, Any] = {
         "gpu": torch.cuda.get_device_name(0),
         "torch": str(torch.__version__),
         "torch_cuda": torch.version.cuda,
         "checkpoint_sha256": checkpoint_hash,
-        "bundle_sha256": checked_bundle(args.bundle),
+        "bundle_sha256": bundle_hashes,
+        "native_api": "packed_session"
+        if args.model_file is not None
+        else "legacy_fixed",
         "precision": args.precision,
         "fuse_silu": args.fuse_silu,
         "optimizations": enabled_optimizations(args),

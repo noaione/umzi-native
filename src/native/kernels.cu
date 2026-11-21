@@ -79,17 +79,17 @@ extern "C" __global__ void bias(half* out, const half* b, int channels, int tota
     if (i < total) out[i] = read(out, i) + read(b, i % channels);
 }
 
-template<int channels, int w>
+template<int channels, int square>
 __device__ __forceinline__ half2 local_gate_value(const half2* in, const half2* weight,
-                                                  const half2* bias, int pixel, int g) {
+                                                  const half2* bias, int pixel, int g, int h = square, int w = square) {
     constexpr int groups = channels / 2;
-    int x = pixel % w, y = pixel / w % w;
+    int x = pixel % w, y = pixel / w % h;
     float2 a = __half22float2(bias[g]), b = __half22float2(bias[g + groups]);
     #pragma unroll
     for (int ky = -1; ky <= 1; ++ky) {
         #pragma unroll
         for (int kx = -1; kx <= 1; ++kx) {
-            if (y + ky < 0 || y + ky >= w || x + kx < 0 || x + kx >= w) continue;
+            if (y + ky < 0 || y + ky >= h || x + kx < 0 || x + kx >= w) continue;
             int pos = (pixel + ky * w + kx) * channels;
             int k = ((ky + 1) * 3 + kx + 1) * 2 * channels;
             float2 left = __half22float2(in[pos + g]);
@@ -107,21 +107,25 @@ __device__ __forceinline__ half2 local_gate_value(const half2* in, const half2* 
     return __floats2half2_rn(a.x * b.x, a.y * b.y);
 }
 
-template<int channels, int w>
+template<int channels, int square>
 __device__ void local_gate(half2* out, const half2* in, const half2* weight,
-                           const half2* bias, int total) {
+                           const half2* bias, int total, int h = square, int w = square) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < total)
-        out[i] = local_gate_value<channels, w>(in, weight, bias, i / (channels / 2), i % (channels / 2));
+        out[i] = local_gate_value<channels, square>(in, weight, bias, i / (channels / 2), i % (channels / 2), h, w);
 }
 
-extern "C" __global__ void mean_partial(float* out, const half* in, int pixels,
+template<bool Linear>
+__device__ void mean_partial_spatial(float* out, const half* in, int pixels,
                                          int channels, int chunks) {
     // Each warp reads 32 consecutive channels. Warps partition the spatial sum.
     __shared__ float partial[8][32];
     int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
-    int c = blockIdx.x * 32 + lane, n = blockIdx.y / chunks;
-    int start = blockIdx.y % chunks * 256;
+    int blocks = channels / 32;
+    int row = Linear ? blockIdx.x / blocks : blockIdx.y;
+    int c = (Linear ? blockIdx.x % blocks : blockIdx.x) * 32 + lane;
+    int n = row / chunks;
+    int start = row % chunks * 256;
     float acc = 0.0f;
     for (int p = start + warp; p < pixels && p < start + 256; p += 8)
         acc += read(in, (n * pixels + p) * channels + c);
@@ -130,8 +134,14 @@ extern "C" __global__ void mean_partial(float* out, const half* in, int pixels,
     if (!warp) {
         #pragma unroll
         for (int i = 1; i < 8; ++i) acc += partial[i][lane];
-        out[blockIdx.y * channels + c] = acc;
+        out[row * channels + c] = acc;
     }
+}
+extern "C" __global__ void mean_partial(float* y, const half* x, int pixels, int channels, int chunks) {
+    mean_partial_spatial<false>(y, x, pixels, channels, chunks);
+}
+extern "C" __global__ void mean_partial_dynamic(float* y, const half* x, int pixels, int channels, int chunks) {
+    mean_partial_spatial<true>(y, x, pixels, channels, chunks);
 }
 
 extern "C" __global__ void mean_project(half* out, const float* partial, const half* weight,
@@ -166,13 +176,13 @@ extern "C" __global__ void local_skip(half2* out, const half2* gated, const half
     out[i] = __floats2half2_rn(fmaf(g.x * a.x, m.x, s.x), fmaf(g.y * a.y, m.y, s.y));
 }
 
-template<int channels, int w>
+template<int channels, int square>
 __device__ void inception(half2* out, const half2* in, const half2* weight,
-                          const half2* bias, int total) {
+                          const half2* bias, int total, int h = square, int w = square) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= total) return;
     int hidden = channels * 3 / 2, stride = channels * 3;
-    int c = i % hidden, pixel = i / hidden, x = pixel % w, y = pixel / w % w;
+    int c = i % hidden, pixel = i / hidden, x = pixel % w, y = pixel / w % h;
     int band = channels / 8, branch = (c - (hidden - 3 * band)) / band;
     float2 v;
     if (c < hidden - 3 * band) {
@@ -185,7 +195,7 @@ __device__ void inception(half2* out, const half2* in, const half2* weight,
             for (int dy = -1; dy <= 1; ++dy) {
                 #pragma unroll
                 for (int dx = -1; dx <= 1; ++dx) {
-                    if (y + dy < 0 || y + dy >= w || x + dx < 0 || x + dx >= w) continue;
+                    if (y + dy < 0 || y + dy >= h || x + dx < 0 || x + dx >= w) continue;
                     int k = ((dy + 1) * 3 + dx + 1) * band + bc;
                     float2 a = __half22float2(in[(pixel + dy * w + dx) * stride + hidden + c]);
                     float2 b = __half22float2(weight[k]);
@@ -199,7 +209,7 @@ __device__ void inception(half2* out, const half2* in, const half2* weight,
             int step = branch == 1 ? 1 : w;
             #pragma unroll
             for (int j = -5; j <= 5; ++j) {
-                if (coord + j < 0 || coord + j >= w) continue;
+                if (coord + j < 0 || coord + j >= (branch == 1 ? w : h)) continue;
                 float2 a = __half22float2(in[(pixel + j * step) * stride + hidden + c]);
                 float2 b = __half22float2(weight[offset + (j + 5) * band]);
                 v.x = fmaf(a.x, b.x, v.x);
@@ -220,6 +230,16 @@ SPATIAL(32, 128)
 SPATIAL(64, 64)
 SPATIAL(128, 32)
 SPATIAL(256, 16)
+
+#define SPATIAL_DYNAMIC(C) \
+extern "C" __global__ void local_gate##C##_dynamic(half2* y, const half2* x, const half2* k, \
+    const half2* b, int h, int w, int total) { local_gate<C, 0>(y, x, k, b, total, h, w); } \
+extern "C" __global__ void inception##C##_dynamic(half2* y, const half2* x, const half2* k, \
+    const half2* b, int h, int w, int total) { inception<C / 2, 0>(y, x, k, b, total, h, w); }
+SPATIAL_DYNAMIC(32)
+SPATIAL_DYNAMIC(64)
+SPATIAL_DYNAMIC(128)
+SPATIAL_DYNAMIC(256)
 
 extern "C" __global__ void global_skip(half2* out, const half2* in, const half2* skip,
                                        const half2* gamma, int channels, int total) {
@@ -278,9 +298,10 @@ extern "C" __global__ void span_gate(half2* out, const half2* in, const half2* s
                               (a.y + b.y) * (sigmoid(a.y) - 0.5f));
 }
 
-extern "C" __global__ void depthwise(half* out, const half* in, const half* weight,
-                                     const half* bias, int stride, int total) {
-    constexpr int h = 8, w = 8, channels = 1536;
+template<int square>
+__device__ void depthwise_spatial(half* out, const half* in, const half* weight,
+                                     const half* bias, int stride, int total, int h = square, int w = square) {
+    constexpr int channels = 1536;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= total) return;
     int c = i % channels, pixel = i / channels;
@@ -296,6 +317,14 @@ extern "C" __global__ void depthwise(half* out, const half* in, const half* weig
         }
     }
     out[i] = v;
+}
+extern "C" __global__ void depthwise(half* y, const half* x, const half* k, const half* b,
+                                  int stride, int total) {
+    depthwise_spatial<8>(y, x, k, b, stride, total);
+}
+extern "C" __global__ void depthwise_dynamic(half* y, const half* x, const half* k, const half* b,
+                                          int stride, int h, int w, int total) {
+    depthwise_spatial<0>(y, x, k, b, stride, total, h, w);
 }
 
 __device__ void attention_softmax(half* p, const float* scores, int query, int lane) {
@@ -420,6 +449,85 @@ extern "C" __global__ void shuffle_concat(half2* out, const half2* in, const hal
 }
 
 #include "fp16.cuh"
+
+template<class T, bool Crop>
+__device__ void resize_rgb(T* out, const T* in, int h, int w, int ph, int pw, int total) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    if constexpr (Crop) {
+        int plane = i / (h * w), y = i / w % h, x = i % w;
+        out[i] = in[(plane * ph + y) * pw + x];
+    } else {
+        int plane = i / (ph * pw), y = i / pw % ph, x = i % pw;
+        if (y >= h) y = ph - h < h ? 2 * h - 2 - y : h - 1;
+        if (x >= w) x = pw - w < w ? 2 * w - 2 - x : w - 1;
+        out[i] = in[(plane * h + y) * w + x];
+    }
+}
+
+#define RESIZE_RGB(NAME, T, CROP) \
+extern "C" __global__ void NAME(T* y, const T* x, int h, int w, int ph, int pw, int n) { \
+    resize_rgb<T, CROP>(y, x, h, w, ph, pw, n); \
+}
+RESIZE_RGB(pad_rgb, float, false)
+RESIZE_RGB(crop_rgb, float, true)
+RESIZE_RGB(pad_rgb16, half, false)
+RESIZE_RGB(crop_rgb16, half, true)
+
+__device__ float attn_mul(float a, float b) { return a * b; }
+__device__ half attn_mul(half a, half b) { return __hmul(a, b); }
+__device__ float attn_fma(float a, float b, float c) { return fmaf(a, b, c); }
+__device__ half attn_fma(half a, half b, half c) { return __hfma(a, b, c); }
+__device__ float attn_max(float a, float b) { return fmaxf(a, b); }
+__device__ half attn_max(half a, half b) { return __hmax(a, b); }
+__device__ float attn_exp_diff(float a, float b) { return __expf(a - b); }
+__device__ half attn_exp_diff(half a, half b) { return hexp(__hsub(a, b)); }
+__device__ float attn_div(float a, float b) { return a / b; }
+__device__ half attn_div(half a, half b) { return __hdiv(a, b); }
+template<class Acc> __device__ Acc attn_read(half x) { return Acc(x); }
+
+template<class Acc>
+__device__ void attend_dynamic(half* out, const half* in, int tokens) {
+    // One warp per query. Combine 32-key softmax reductions without storing
+    // the score matrix, keeping the original global attention semantics.
+    constexpr int warps = 4, heads = 16, channels = 512, stride = 3 * channels;
+    int groups = (tokens + warps - 1) / warps;
+    int row = blockIdx.x % groups * warps + threadIdx.x / 32;
+    if (row >= tokens) return;
+    int head = blockIdx.x / groups % heads, image = blockIdx.x / groups / heads;
+    int col = head * 32 + threadIdx.x % 32;
+    const half* input = in + (image * tokens) * stride + col;
+    Acc query = attn_read<Acc>(input[row * stride]);
+    const float negative_infinity = __int_as_float(0xff800000);
+    Acc maximum(negative_infinity), denominator(0.f), numerator(0.f);
+    Acc norm_scale(fminf(1.f, 32.f / tokens)), logit_scale(0.1767766953f);
+    for (int start = 0; start < tokens; start += 32) {
+        Acc tile_max(negative_infinity), tile_sum(0.f), tile_value(0.f);
+        int end = min(tokens, start + 32);
+        for (int key = start; key < end; ++key) {
+            const half* location = input + key * stride;
+            Acc score = attn_mul(warp_sum(attn_mul(query, attn_read<Acc>(location[channels]))), logit_scale);
+            Acc next = attn_max(score, tile_max);
+            Acc a = attn_exp_diff(tile_max, next), b = attn_exp_diff(score, next);
+            tile_sum = attn_fma(tile_sum, a, b);
+            tile_value = attn_fma(attn_read<Acc>(location[2 * channels]), b, attn_mul(tile_value, a));
+            tile_max = next;
+        }
+        Acc next = attn_max(tile_max, maximum);
+        Acc a = attn_exp_diff(maximum, next), b = attn_mul(attn_exp_diff(tile_max, next), norm_scale);
+        numerator = attn_fma(numerator, a, attn_mul(tile_value, b));
+        denominator = attn_fma(denominator, a, attn_mul(tile_sum, b));
+        maximum = next;
+    }
+    out[(image * tokens + row) * channels + col] = attn_div(numerator, denominator);
+}
+
+extern "C" __global__ void attention_dynamic(half* y, const half* x, int tokens) {
+    attend_dynamic<float>(y, x, tokens);
+}
+extern "C" __global__ void attention16_dynamic(half* y, const half* x, int tokens) {
+    attend_dynamic<half>(y, x, tokens);
+}
 
 // Each half warp owns one pixel and all 32 gated channels. The gate is
 // materialized in FP16 because the later channel scaling also reads it.

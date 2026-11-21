@@ -96,17 +96,17 @@ extern "C" __global__ void bias16(half* out, const half* b, int channels, int to
     if (i < total) out[i] = __hadd(out[i], b[i % channels]);
 }
 
-template<int channels, int w>
+template<int channels, int square>
 __device__ __forceinline__ half2 local16_value(const half2* in, const half2* weight,
-                                               const half2* bias, int pixel, int g) {
+                                               const half2* bias, int pixel, int g, int h = square, int w = square) {
     constexpr int groups = channels / 2;
-    int x = pixel % w, y = pixel / w % w;
+    int x = pixel % w, y = pixel / w % h;
     half2 a = bias[g], b = bias[g + groups];
     #pragma unroll
     for (int ky = -1; ky <= 1; ++ky) {
         #pragma unroll
         for (int kx = -1; kx <= 1; ++kx) {
-            if (y + ky < 0 || y + ky >= w || x + kx < 0 || x + kx >= w) continue;
+            if (y + ky < 0 || y + ky >= h || x + kx < 0 || x + kx >= w) continue;
             int pos = (pixel + ky * w + kx) * channels;
             int k = ((ky + 1) * 3 + kx + 1) * 2 * channels + g;
             half2 left = in[pos + g], right = in[pos + g + groups];
@@ -119,21 +119,21 @@ __device__ __forceinline__ half2 local16_value(const half2* in, const half2* wei
     return __hmul2(a, b);
 }
 
-template<int channels, int w>
+template<int channels, int square>
 __device__ void local16(half2* out, const half2* in, const half2* weight,
-                        const half2* bias, int total) {
+                        const half2* bias, int total, int h = square, int w = square) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < total)
-        out[i] = local16_value<channels, w>(in, weight, bias, i / (channels / 2), i % (channels / 2));
+        out[i] = local16_value<channels, square>(in, weight, bias, i / (channels / 2), i % (channels / 2), h, w);
 }
 
-template<int channels, int w>
+template<int channels, int square>
 __device__ void inception16_pair(half2* out, const half2* in, const half2* weight,
-                                  const half2* bias, int total) {
+                                  const half2* bias, int total, int h = square, int w = square) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= total) return;
     constexpr int hidden = channels * 3 / 2, stride = channels * 3, band = channels / 8;
-    int c = i % hidden, pixel = i / hidden, x = pixel % w, y = pixel / w % w;
+    int c = i % hidden, pixel = i / hidden, x = pixel % w, y = pixel / w % h;
     half2 v;
     if (c < hidden - 3 * band) {
         v = in[pixel * stride + hidden + c];
@@ -145,7 +145,7 @@ __device__ void inception16_pair(half2* out, const half2* in, const half2* weigh
             for (int dy = -1; dy <= 1; ++dy) {
                 #pragma unroll
                 for (int dx = -1; dx <= 1; ++dx) {
-                    if (y + dy < 0 || y + dy >= w || x + dx < 0 || x + dx >= w) continue;
+                    if (y + dy < 0 || y + dy >= h || x + dx < 0 || x + dx >= w) continue;
                     int k = ((dy + 1) * 3 + dx + 1) * band + bc;
                     v = __hfma2(in[(pixel + dy * w + dx) * stride + hidden + c], weight[k], v);
                 }
@@ -155,7 +155,7 @@ __device__ void inception16_pair(half2* out, const half2* in, const half2* weigh
             int coord = branch == 1 ? x : y, step = branch == 1 ? 1 : w;
             #pragma unroll
             for (int j = -5; j <= 5; ++j) {
-                if (coord + j < 0 || coord + j >= w) continue;
+                if (coord + j < 0 || coord + j >= (branch == 1 ? w : h)) continue;
                 v = __hfma2(in[(pixel + j * step) * stride + hidden + c],
                             weight[offset + (j + 5) * band], v);
             }
@@ -174,12 +174,26 @@ SPATIAL16(64, 64)
 SPATIAL16(128, 32)
 SPATIAL16(256, 16)
 
-extern "C" __global__ void mean_partial16(half* out, const half* in, int pixels,
+#define SPATIAL16_DYNAMIC(C) \
+extern "C" __global__ void local_gate16_##C##_dynamic(half2* y, const half2* x, const half2* k, \
+    const half2* b, int h, int w, int total) { local16<C, 0>(y, x, k, b, total, h, w); } \
+extern "C" __global__ void inception16_##C##_dynamic(half2* y, const half2* x, const half2* k, \
+    const half2* b, int h, int w, int total) { inception16_pair<C / 2, 0>(y, x, k, b, total, h, w); }
+SPATIAL16_DYNAMIC(32)
+SPATIAL16_DYNAMIC(64)
+SPATIAL16_DYNAMIC(128)
+SPATIAL16_DYNAMIC(256)
+
+template<bool Linear>
+__device__ void mean_partial16_spatial(half* out, const half* in, int pixels,
                                            int channels, int chunks) {
     __shared__ half partial[8][32];
     int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
-    int c = blockIdx.x * 32 + lane, n = blockIdx.y / chunks;
-    int start = blockIdx.y % chunks * 256;
+    int blocks = channels / 32;
+    int row = Linear ? blockIdx.x / blocks : blockIdx.y;
+    int c = (Linear ? blockIdx.x % blocks : blockIdx.x) * 32 + lane;
+    int n = row / chunks;
+    int start = row % chunks * 256;
     half acc = __float2half(0);
     for (int p = start + warp; p < pixels && p < start + 256; p += 8)
         acc = __hadd(acc, in[(n * pixels + p) * channels + c]);
@@ -189,20 +203,35 @@ extern "C" __global__ void mean_partial16(half* out, const half* in, int pixels,
         acc = partial[0][lane];
         #pragma unroll
         for (int i = 1; i < 8; ++i) acc = __hadd(acc, partial[i][lane]);
-        out[blockIdx.y * channels + c] = acc;
+        out[row * channels + c] = acc;
     }
 }
+extern "C" __global__ void mean_partial16(half* y, const half* x, int pixels, int channels, int chunks) {
+    mean_partial16_spatial<false>(y, x, pixels, channels, chunks);
+}
+extern "C" __global__ void mean_partial16_dynamic(half* y, const half* x, int pixels, int channels, int chunks) {
+    mean_partial16_spatial<true>(y, x, pixels, channels, chunks);
+}
 
-extern "C" __global__ void mean_project16(half* out, const half* partial, const half* weight,
-                                          const half* bias, int, int channels, int chunks) {
+template<bool Dynamic>
+__device__ void mean_project16_spatial(half* out, const half* partial, const half* weight,
+                                          const half* bias, int pixels, int channels, int chunks) {
     __shared__ half average[256];
     int c = threadIdx.x, lane = c % 32, warp = c / 32, n = blockIdx.x;
     if (c < channels) {
         half sum = __float2half(0);
-        for (int j = 0; j < chunks; ++j) sum = __hadd(sum, partial[(n * chunks + j) * channels + c]);
-        // The partials are equally sized chunk means. Both supported chunk
-        // counts and their reciprocals are exactly representable in binary16.
-        average[c] = __hmul(sum, hrcp(__int2half_rn(chunks)));
+        if constexpr (Dynamic) {
+            // Partials all use the same divisor, even the final short chunk.
+            // Scale before adding to keep the FP16 running sum in range.
+            half scale = __float2half(256.0f / pixels);
+            for (int j = 0; j < chunks; ++j)
+                sum = __hfma(partial[(n * chunks + j) * channels + c], scale, sum);
+            average[c] = sum;
+        } else {
+            for (int j = 0; j < chunks; ++j)
+                sum = __hadd(sum, partial[(n * chunks + j) * channels + c]);
+            average[c] = __hmul(sum, hrcp(__int2half_rn(chunks)));
+        }
     }
     __syncthreads();
     for (int output = warp; output < channels; output += 8) {
@@ -212,6 +241,14 @@ extern "C" __global__ void mean_project16(half* out, const half* partial, const 
         dot = warp_sum(dot);
         if (lane == 0) out[n * channels + output] = __hadd(dot, bias[output]);
     }
+}
+extern "C" __global__ void mean_project16(half* y, const half* p, const half* k, const half* b,
+                                          int pixels, int channels, int chunks) {
+    mean_project16_spatial<false>(y, p, k, b, pixels, channels, chunks);
+}
+extern "C" __global__ void mean_project16_dynamic(half* y, const half* p, const half* k, const half* b,
+                                                  int pixels, int channels, int chunks) {
+    mean_project16_spatial<true>(y, p, k, b, pixels, channels, chunks);
 }
 
 extern "C" __global__ void local_skip16(half2* out, const half2* gated, const half2* scale,
@@ -244,9 +281,10 @@ extern "C" __global__ void span_gate16(half2* out, const half2* in, const half2*
     out[i] = __hmul2(__hadd2(x, skip[i]), __hsub2(sigmoid16_pair(x), splat16(0.5f)));
 }
 
-extern "C" __global__ void depthwise16(half* out, const half* in, const half* weight,
-                                       const half* bias, int stride, int total) {
-    constexpr int h = 8, w = 8, channels = 1536;
+template<int square>
+__device__ void depthwise16_spatial(half* out, const half* in, const half* weight,
+                                       const half* bias, int stride, int total, int h = square, int w = square) {
+    constexpr int channels = 1536;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= total) return;
     int c = i % channels, pixel = i / channels, x = pixel % w, y = pixel / w % h;
@@ -261,6 +299,14 @@ extern "C" __global__ void depthwise16(half* out, const half* in, const half* we
         }
     }
     out[i] = v;
+}
+extern "C" __global__ void depthwise16(half* y, const half* x, const half* k, const half* b,
+                                  int stride, int total) {
+    depthwise16_spatial<8>(y, x, k, b, stride, total);
+}
+extern "C" __global__ void depthwise16_dynamic(half* y, const half* x, const half* k, const half* b,
+                                          int stride, int h, int w, int total) {
+    depthwise16_spatial<0>(y, x, k, b, stride, total, h, w);
 }
 
 extern "C" __global__ void gate16(half* out, const half* in, const half* attn, int stride, int total) {

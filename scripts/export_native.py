@@ -1,10 +1,11 @@
-"""Pack the original GateRV3 checkpoint for the fixed 128px CUDA runner."""
+"""Export the original GateRV3 checkpoint as a native model."""
 
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
+import shutil
 import struct
 import sys
 import tempfile
@@ -18,6 +19,12 @@ from torch import Tensor, nn
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 from model import load_model
+
+MODEL_MAGIC = b"GTR3PCK\0"
+MODEL_FORMAT_VERSION = 1
+MODEL_HEADER = struct.Struct("<8sII32s")
+MODEL_SECTION = struct.Struct("<IIQQ")
+MODEL_METADATA = struct.Struct("<8I")
 
 
 class Op(IntEnum):
@@ -312,7 +319,7 @@ class Schedule:
             ),
         )
 
-    def write(self, path: Path):
+    def write(self, path: Path, weight_bytes: int):
         last_use = self.last_use.copy()
         for index, (conv, silu) in enumerate(zip(self.ops, self.ops[1:])):
             if conv[0] == Op.CONV and conv[9] == 3 and silu[0] == Op.SILU:
@@ -337,7 +344,7 @@ class Schedule:
                     b"GTR3",
                     len(self.shapes),
                     len(self.ops),
-                    self.weights.tell(),
+                    weight_bytes,
                 )
             )
             for index, (h, w, c) in enumerate(self.shapes):
@@ -345,6 +352,37 @@ class Schedule:
             for op in self.ops:
                 file.write(struct.pack("<11i", *op))
         return max(offsets[tensor.index] + tensor.size for tensor in activations)
+
+    def write_model(self, path: Path, weights: Path, checkpoint_sha256: str):
+        metadata = MODEL_METADATA.pack(
+            3, 1, 16, 16, 32, 3, len(self.shapes), len(self.ops)
+        )
+        levels = {128 >> level: level for level in range(5)}
+        levels[1] = -1
+        schedule = b"".join(
+            struct.pack("<2i", levels[h], c) for h, _w, c in self.shapes
+        ) + b"".join(struct.pack("<11i", *op) for op in self.ops)
+        identity = bytes.fromhex(checkpoint_sha256)
+        sizes = (len(metadata), len(schedule), weights.stat().st_size, len(identity))
+        offset = MODEL_HEADER.size + len(sizes) * MODEL_SECTION.size
+        sections = []
+        for index, size in enumerate(sizes, start=1):
+            sections.append(MODEL_SECTION.pack(index, 0, offset, size))
+            offset += size
+        with path.open("w+b") as file:
+            file.seek(MODEL_HEADER.size)
+            file.write(b"".join(sections))
+            file.write(metadata)
+            file.write(schedule)
+            with weights.open("rb") as source:
+                shutil.copyfileobj(source, file)
+            file.write(identity)
+            file.seek(MODEL_HEADER.size)
+            digest = hashlib.file_digest(file, "sha256").digest()
+            file.seek(0)
+            file.write(
+                MODEL_HEADER.pack(MODEL_MAGIC, MODEL_FORMAT_VERSION, len(sizes), digest)
+            )
 
 
 def main():
@@ -354,7 +392,14 @@ def main():
         type=Path,
         default=ROOT / "models/1x_umzi_digital_decompress_gaterv3_1.pth",
     )
-    parser.add_argument("--output", type=Path, default=ROOT / "output/native")
+    parser.add_argument(
+        "--output", type=Path, help="Model file, or bundle directory with --legacy"
+    )
+    parser.add_argument(
+        "--legacy",
+        action="store_true",
+        help="Export the fixed schedule and weights separately",
+    )
     args = parser.parse_args()
     torch.set_num_threads(4)
     model, config = load_model(args.model, device="cpu")
@@ -373,15 +418,29 @@ def main():
         raise ValueError(
             f"Unsupported native checkpoint configuration {config.describe()}"
         )
-    args.output.mkdir(parents=True, exist_ok=True)
+    default_dir = ROOT / "output/native"
+    # Existing callers that pass a bundle directory keep the original export.
+    legacy = args.legacy or (args.output is not None and args.output.suffix == "")
+    output = args.output or (default_dir if legacy else default_dir / "gaterv3.gtmodel")
+    parent = output if legacy else output.parent
+    parent.mkdir(parents=True, exist_ok=True)
     with args.model.open("rb") as file:
         digest = hashlib.file_digest(file, "sha256").hexdigest()
-    with tempfile.TemporaryDirectory(dir=args.output) as staging:
+    with tempfile.TemporaryDirectory(dir=parent) as staging:
         directory = Path(staging)
-        with torch.inference_mode(), (directory / "weights.bin").open("wb") as weights:
+        weights_path = directory / "weights.bin"
+        with torch.inference_mode(), weights_path.open("wb") as weights:
             schedule = Schedule(weights)
             schedule.build(model)
-            arena = schedule.write(directory / "schedule.bin")
+        if not legacy:
+            model_path = directory / "model"
+            schedule.write_model(model_path, weights_path, digest)
+            model_path.replace(output)
+            print(
+                f"Exported {output} with {len(schedule.ops)} operations\nCheckpoint {digest}"
+            )
+            return
+        arena = schedule.write(directory / "schedule.bin", weights_path.stat().st_size)
         artifacts = ("schedule.bin", "weights.bin")
         hashes = {}
         for name in artifacts:
@@ -395,7 +454,7 @@ def main():
             encoding="utf-8",
         )
         for name in (*artifacts, "checkpoint.json"):
-            (directory / name).replace(args.output / name)
+            (directory / name).replace(output / name)
     print(
         f"Checkpoint {digest}, {len(schedule.ops)} operations, {arena:,} arena bytes per tile"
     )

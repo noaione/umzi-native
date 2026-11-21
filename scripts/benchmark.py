@@ -17,6 +17,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from rtx_session import create_rtx_session
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -116,6 +117,9 @@ def main():
     ap.add_argument("--tile", type=int, default=128)
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--skip-trt", action="store_true")
+    ap.add_argument(
+        "--rtx-cache-dir", type=Path, help="TensorRT-RTX runtime cache directory"
+    )
     args = ap.parse_args()
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required for this baseline matrix")
@@ -287,21 +291,10 @@ def main():
                 opset_version=17,
                 dynamo=False,
             )
-        import onnxruntime as ort
-        import onnxruntime_ep_nv_tensorrt_rtx as rtx
-
-        ort.disable_telemetry_events()
-        ort.register_execution_provider_library(
-            rtx.get_ep_name(), rtx.get_library_path()
+        rtx_cache = args.rtx_cache_dir or args.output / "rtx-runtime-cache"
+        sess, rtx_options = create_rtx_session(
+            onnx_path, args.batch, args.tile, rtx_cache
         )
-        opt = ort.SessionOptions()
-        opt.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
-        opt.add_provider_for_devices(
-            [d for d in ort.get_ep_devices() if d.ep_name == rtx.get_ep_name()], {}
-        )
-        sess = ort.InferenceSession(str(onnx_path), sess_options=opt, enable_fallback=0)
-        if rtx.get_ep_name() not in sess.get_providers():
-            raise RuntimeError(f"TensorRT-RTX did not activate: {sess.get_providers()}")
         input_name = sess.get_inputs()[0].name
 
         single_onnx_path = args.output / f"gaterv3-fp16-t{args.tile}-b1.onnx"
@@ -318,18 +311,9 @@ def main():
                 opset_version=17,
                 dynamo=False,
             )
-        single_opt = ort.SessionOptions()
-        single_opt.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
-        single_opt.add_provider_for_devices(
-            [d for d in ort.get_ep_devices() if d.ep_name == rtx.get_ep_name()], {}
+        single_sess, single_rtx_options = create_rtx_session(
+            single_onnx_path, 1, args.tile, rtx_cache
         )
-        single_sess = ort.InferenceSession(
-            str(single_onnx_path), sess_options=single_opt, enable_fallback=0
-        )
-        if rtx.get_ep_name() not in single_sess.get_providers():
-            raise RuntimeError(
-                f"TensorRT-RTX batch-1 session did not activate: {single_sess.get_providers()}"
-            )
         single_input_name = single_sess.get_inputs()[0].name
 
         def make_ort_runner(session, name):
@@ -353,6 +337,10 @@ def main():
         report["variants"]["onnx_tensorrt_rtx_fp16"]["providers"] = sess.get_providers()
         report["variants"]["onnx_tensorrt_rtx_fp16"]["batch1_providers"] = (
             single_sess.get_providers()
+        )
+        report["variants"]["onnx_tensorrt_rtx_fp16"]["provider_options"] = rtx_options
+        report["variants"]["onnx_tensorrt_rtx_fp16"]["batch1_provider_options"] = (
+            single_rtx_options
         )
         report["variants"]["onnx_tensorrt_rtx_fp16"]["onnx"] = str(onnx_path)
         report["variants"]["onnx_tensorrt_rtx_fp16"]["batch1_onnx"] = str(

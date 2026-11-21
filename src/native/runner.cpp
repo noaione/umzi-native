@@ -6,10 +6,11 @@
 
 #define GATERV3_BUILD
 #include "runner.h"
-#include "plan_cache.h"
+#include "model_file.h"
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -26,7 +27,6 @@
 namespace {
 namespace fs = std::filesystem;
 constexpr int tile = 128;
-constexpr size_t rgb_elements = 3 * tile * tile;
 constexpr size_t scratch_bytes = 64 * 1024 * 1024;
 constexpr int threads = 256;
 constexpr int gate_pool_chunk = 64;
@@ -42,11 +42,17 @@ double milliseconds_since(Clock::time_point started) {
     return std::chrono::duration<double, std::milli>(Clock::now() - started).count();
 }
 
+struct AllocationError : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 void check(CUresult status, const char* operation) {
     if (status == CUDA_SUCCESS) return;
     const char* detail = nullptr;
     cuGetErrorString(status, &detail);
-    throw std::runtime_error(std::string(operation) + ": " + (detail ? detail : "CUDA error"));
+    std::string message = std::string(operation) + ": " + (detail ? detail : "CUDA error");
+    if (status == CUDA_ERROR_OUT_OF_MEMORY) throw AllocationError(message);
+    throw std::runtime_error(message);
 }
 
 void check(cudnnStatus_t status, const char* operation) {
@@ -60,6 +66,21 @@ void check(cublasStatus_t status, const char* operation) {
 }
 
 #define CHECK(expr) check((expr), #expr)
+
+void allocate(CUdeviceptr& pointer, size_t bytes, const char* name) {
+    auto status = cuMemAlloc(&pointer, bytes);
+    if (status == CUDA_ERROR_OUT_OF_MEMORY)
+        throw AllocationError(std::string("Could not allocate ") + std::to_string(bytes)
+            + " bytes for " + name + "; try a smaller tile or batch");
+    check(status, name);
+}
+
+void allocate_host(void*& pointer, size_t bytes) {
+    auto status = cuMemAllocHost(&pointer, bytes);
+    if (status == CUDA_ERROR_OUT_OF_MEMORY)
+        throw AllocationError("Could not allocate " + std::to_string(bytes) + " bytes for pinned RGB staging");
+    check(status, "Allocate pinned RGB staging");
+}
 
 struct ContextScope {
     bool pushed = false;
@@ -79,24 +100,7 @@ struct ContextScope {
     }
 };
 
-enum Kind {
-    Pack, Conv, Rms, Local, MeanProject, LocalSkip, Inception, GlobalSkip, Shuffle,
-    Concat, Silu, Span, Depthwise, Attention, Gate, Add, Rgb, ShuffleConcat,
-};
-
-struct Tensor {
-    int h, w, c, offset;
-    int pixels() const { return h * w; }
-    int elements() const { return pixels() * c; }
-};
-
-struct Op {
-    int kind, out;
-    std::array<int, 4> input;
-    std::array<int, 3> weight;
-    int x, y;
-};
-static_assert(sizeof(Op) == 44 && sizeof(Tensor) == 16);
+using namespace gt;
 
 void read(std::ifstream& file, void* target, size_t bytes) {
     if (!file.read(static_cast<char*>(target), bytes))
@@ -214,7 +218,7 @@ public:
     void* host_output = nullptr;
     cudnnHandle_t cudnn = nullptr;
     cublasLtHandle_t blas = nullptr;
-    int batch = 0;
+    int batch = 0, height = 0, width = 0;
     bool fp16 = false;
     bool fuse_silu = false;
     bool tune_projections = false;
@@ -225,7 +229,7 @@ public:
     std::array<double, 4> setup_ms{};
     int fused_silu_count = 0;
     std::string fusion_diagnostic;
-    std::array<int, 5> optimization_stats{};
+    std::array<int, GT_OPT_STAT_COUNT> optimization_stats{};
 
     void buffer_sizes(uint64_t bytes[4]) const {
         bytes[0] = weight_bytes;
@@ -238,26 +242,30 @@ public:
         std::copy(startup_used.begin(), startup_used.end(), bytes);
     }
 
-    void initialize(const fs::path& directory, int size, uint32_t flags, const fs::path& cache_dir) {
-        if (size != 1 && size != 16) throw std::runtime_error("Supported batches are 1 and 16");
+    void configure(Shape shape, uint32_t flags) {
         constexpr uint32_t supported = GT_CREATE_GRAPH | GT_CREATE_FP16 | GT_CREATE_FUSE_SILU
             | GT_CREATE_TUNE_PROJECTIONS | GT_CREATE_FUSE_GATE_POOL | GT_CREATE_FP16_QKV;
-        if (flags & ~supported)
-            throw std::runtime_error("Unsupported native runner flags");
-        auto stage_start = Clock::now();
-        batch = size;
+        if (flags & ~supported) throw std::runtime_error("Unsupported native runner flags");
+        batch = shape.n;
+        height = shape.h;
+        width = shape.w;
         fp16 = (flags & GT_CREATE_FP16) != 0;
         fuse_silu = (flags & GT_CREATE_FUSE_SILU) != 0;
         tune_projections = (flags & GT_CREATE_TUNE_PROJECTIONS) != 0;
         fuse_gate_pool = (flags & GT_CREATE_FUSE_GATE_POOL) != 0;
         fp16_qkv = !fp16 && (flags & GT_CREATE_FP16_QKV) != 0;
-        io_bytes = rgb_elements * (fp16 ? sizeof(uint16_t) : sizeof(float));
+        io_bytes = (shape.rgb_bytes(fp16) / shape.n);
+    }
+
+    void initialize(const fs::path& directory, int size, uint32_t flags, const fs::path& cache_dir) {
+        if (size != 1 && size != 16) throw std::runtime_error("Supported batches are 1 and 16");
+        auto stage_start = Clock::now();
+        configure({size, tile, tile}, flags);
         CHECK(cuInit(0));
         CHECK(cuDeviceGet(&device, 0));
         CHECK(cuDevicePrimaryCtxRetain(&context, device));
         ContextScope scope(context);
         record_memory(0);
-        CHECK(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
         auto module_path = directory / "kernels.cubin";
         auto module_size = fs::file_size(module_path);
         if (!module_size || module_size > (16u << 20)) throw std::runtime_error("Invalid CUDA module size");
@@ -265,13 +273,56 @@ public:
         std::ifstream kernel_file(module_path, std::ios::binary);
         read(kernel_file, module_data.data(), module_data.size());
         CHECK(cuModuleLoadData(&module, module_data.data()));
+        create_handles();
+        load(directory, !cache_dir.empty(), module_data);
+        finish_setup(flags, cache_dir, stage_start);
+    }
+
+    void initialize_shape(Shape shape, uint32_t flags, const fs::path& cache_dir,
+                          CUdevice selected_device, CUcontext shared_context, CUmodule shared_module,
+                          CUdeviceptr shared_weights, const gt::Digest& build,
+                          const gt::ModelFile& model, gt::ResolvedModel resolved) {
+        auto stage_start = Clock::now();
+        configure(shape, flags);
+        borrowed_resources = true;
+        device = selected_device;
+        context = shared_context;
+        module = shared_module;
+        weights = shared_weights;
+        weight_bytes = model.weight_bytes;
+        tensors = std::move(resolved.tensors);
+        ops = model.ops;
+        arena_bytes = resolved.arena_bytes;
+        ContextScope scope(context);
+        record_memory(0);
+        if (!cache_dir.empty()) {
+            try {
+                gt::Sha256 hash;
+                hash.add(build);
+                hash.add(model.content_digest);
+                hash.add(std::array<int, 3>{batch, height, width});
+                add_plan_environment(hash);
+                plan_key = hash.finish();
+            } catch (const std::exception& error) {
+                plan_cache.unavailable(error);
+            }
+        }
+        create_handles();
+        allocate_shape();
+        finish_setup(flags, cache_dir, stage_start);
+    }
+
+    void create_handles() {
+        CHECK(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
         CHECK(cudnnCreate(&cudnn));
         CHECK(cublasLtCreate(&blas));
         CHECK(cudnnSetStream(cudnn, stream));
-        load(directory, !cache_dir.empty(), module_data);
+    }
+
+    void finish_setup(uint32_t flags, const fs::path& cache_dir, Clock::time_point stage_start) {
         record_memory(1);
-        CHECK(cuMemAllocHost(&host_input, io_bytes * batch));
-        CHECK(cuMemAllocHost(&host_output, io_bytes * batch));
+        allocate_host(host_input, io_bytes * batch);
+        allocate_host(host_output, io_bytes * batch);
         setup_ms[0] = milliseconds_since(stage_start);
         stage_start = Clock::now();
         if (plan_cache.status != GT_CACHE_UNAVAILABLE) {
@@ -291,7 +342,7 @@ public:
             CHECK(cuMemFree(scratch));
             scratch = 0;
         }
-        CHECK(cuMemAlloc(&scratch, workspace_bytes));
+        if (workspace_bytes) allocate(scratch, workspace_bytes, "inference workspace");
         if (silu_plan) bind_silu();
         CHECK(cuMemsetD8Async(input, 0, io_bytes * batch, stream));
         forward(stream);
@@ -329,14 +380,17 @@ public:
         convolutions.clear();
         if (cudnn) cudnnDestroy(cudnn);
         if (blas) cublasLtDestroy(blas);
-        if (module) cuModuleUnload(module);
-        for (auto ptr : {weights, arena, scratch, input, output}) if (ptr) cuMemFree(ptr);
+        if (!borrowed_resources) {
+            if (module) cuModuleUnload(module);
+            if (weights) cuMemFree(weights);
+        }
+        for (auto ptr : {arena, scratch, input, output}) if (ptr) cuMemFree(ptr);
         if (host_input) cuMemFreeHost(host_input);
         if (host_output) cuMemFreeHost(host_output);
         if (stream) cuStreamDestroy(stream);
         CUcontext previous;
         cuCtxPopCurrent(&previous);
-        cuDevicePrimaryCtxRelease(device);
+        if (!borrowed_resources) cuDevicePrimaryCtxRelease(device);
     }
 
     void enqueue(CUstream target) {
@@ -349,13 +403,53 @@ public:
     }
 
     void run_host(const void* pixels, void* restored) {
+        run_host({batch, height, width}, pixels, restored);
+    }
+
+    void run_host(Shape shape, const void* pixels, void* restored) {
         ContextScope scope(context);
-        std::memcpy(host_input, pixels, batch * io_bytes);
+        if (shape.h == height && shape.w == width) {
+            std::memcpy(host_input, pixels, batch * io_bytes);
+        } else if (fp16) {
+            pad_host<uint16_t>(shape, pixels);
+        } else {
+            pad_host<float>(shape, pixels);
+        }
         CHECK(cuMemcpyHtoDAsync(input, host_input, batch * io_bytes, stream));
         enqueue(stream);
         CHECK(cuMemcpyDtoHAsync(host_output, output, batch * io_bytes, stream));
         CHECK(cuStreamSynchronize(stream));
-        std::memcpy(restored, host_output, batch * io_bytes);
+        if (shape.h == height && shape.w == width) {
+            std::memcpy(restored, host_output, batch * io_bytes);
+        } else {
+            size_t element = fp16 ? sizeof(uint16_t) : sizeof(float);
+            auto* dst = static_cast<char*>(restored);
+            const auto* src = static_cast<const char*>(host_output);
+            for (int plane = 0; plane < batch * 3; ++plane) {
+                for (int y = 0; y < shape.h; ++y) {
+                    std::memcpy(dst, src + (size_t(plane) * height + y) * width * element, shape.w * element);
+                    dst += shape.w * element;
+                }
+            }
+        }
+    }
+
+    void run_device(Shape shape, CUdeviceptr pixels, CUdeviceptr restored, CUstream target) {
+        if (shape.h == height && shape.w == width) {
+            CHECK(cuMemcpyDtoDAsync(input, pixels, batch * io_bytes, target));
+            enqueue(target);
+            CHECK(cuMemcpyDtoDAsync(restored, output, batch * io_bytes, target));
+            return;
+        }
+        int padded_elements = batch * 3 * height * width;
+        int cropped_elements = batch * 3 * shape.h * shape.w;
+        launch(lookup(fp16 ? "pad_rgb16" : "pad_rgb"), target,
+               (padded_elements + threads - 1) / threads, 1, threads,
+               input, pixels, shape.h, shape.w, height, width, padded_elements);
+        enqueue(target);
+        launch(lookup(fp16 ? "crop_rgb16" : "crop_rgb"), target,
+               (cropped_elements + threads - 1) / threads, 1, threads,
+               restored, output, shape.h, shape.w, height, width, cropped_elements);
     }
 
     int operation_count() const { return int(ops.size()); }
@@ -389,6 +483,67 @@ public:
     }
 
 private:
+    bool borrowed_resources = false;
+    CUfunction dynamic_mean_project = nullptr;
+
+    template<class T>
+    void pad_host(Shape shape, const void* source) {
+        auto* dst = static_cast<T*>(host_input);
+        const auto* src = static_cast<const T*>(source);
+        for (int plane = 0; plane < batch * 3; ++plane) {
+            for (int y = 0; y < height; ++y) {
+                int row = y < shape.h ? y : (height - shape.h < shape.h ? 2 * shape.h - 2 - y : shape.h - 1);
+                const T* input_row = src + (size_t(plane) * shape.h + row) * shape.w;
+                std::memcpy(dst, input_row, shape.w * sizeof(T));
+                for (int x = shape.w; x < width; ++x) {
+                    int column = width - shape.w < shape.w ? 2 * shape.w - 2 - x : shape.w - 1;
+                    dst[x] = input_row[column];
+                }
+                dst += width;
+            }
+        }
+    }
+
+    void add_plan_environment(gt::Sha256& hash) const {
+        hash.add(fp16);
+        hash.add(tune_projections);
+        hash.add(fp16_qkv);
+        hash.add(scratch_bytes);
+        CUuuid uuid{};
+        CHECK(cuDeviceGetUuid(&uuid, device));
+        hash.add(uuid);
+        hash.add(gt::driver_file_version());
+        hash.add(cudnnGetVersion());
+        hash.add(cublasLtGetVersion());
+    }
+
+    void allocate_shape() {
+        if (borrowed_resources) {
+            size_t free_bytes, capacity;
+            CHECK(cuMemGetInfo(&free_bytes, &capacity));
+            size_t required = arena_bytes + 2 * batch * io_bytes;
+            if (required > free_bytes)
+                throw AllocationError("Shape buffers require " + std::to_string(required)
+                    + " bytes with " + std::to_string(free_bytes)
+                    + " bytes available; try a smaller tile or batch");
+        }
+        allocate(input, batch * io_bytes, "device RGB input");
+        allocate(output, batch * io_bytes, "device RGB output");
+        allocate(arena, arena_bytes, "activation arena");
+        addresses.resize(tensors.size());
+        addresses.front() = input;
+        addresses.back() = output;
+        for (size_t i = 1; i + 1 < tensors.size(); ++i)
+            addresses[i] = arena + size_t(tensors[i].offset) * batch;
+    }
+
+    bool variable_pool() const { return height != tile || width != tile; }
+
+    static bool variable_spatial(int channels, const Tensor& tensor) {
+        int expected = tile * 32 / channels;
+        return tensor.h != expected || tensor.w != expected;
+    }
+
     std::vector<Tensor> tensors;
     std::vector<Op> ops;
     std::vector<CUdeviceptr> addresses;
@@ -413,7 +568,7 @@ private:
 
     void ensure_tuning_workspace() {
         if (scratch) return;
-        CHECK(cuMemAlloc(&scratch, scratch_bytes));
+        allocate(scratch, scratch_bytes, "tuning workspace");
         CHECK(cuMemsetD8Async(arena, 0x28, arena_bytes, stream));
         record_memory(1);
     }
@@ -497,32 +652,16 @@ private:
                 hash.add(ops.data(), ops.size() * sizeof(Op));
                 hash.add(staging.data(), staging.size());
                 hash.add(batch);
-                hash.add(fp16);
-                hash.add(tune_projections);
-                hash.add(fp16_qkv);
-                hash.add(scratch_bytes);
-                CUuuid uuid{};
-                CHECK(cuDeviceGetUuid(&uuid, device));
-                hash.add(uuid);
-                hash.add(gt::driver_file_version());
-                hash.add(cudnnGetVersion());
-                hash.add(cublasLtGetVersion());
+                add_plan_environment(hash);
                 plan_key = hash.finish();
             } catch (const std::exception& error) {
                 plan_cache.unavailable(error);
             }
         }
-        CHECK(cuMemAlloc(&weights, staging.size()));
+        allocate(weights, staging.size(), "model weights");
         CHECK(cuMemcpyHtoD(weights, staging.data(), staging.size()));
-        CHECK(cuMemAlloc(&input, batch * io_bytes));
-        CHECK(cuMemAlloc(&output, batch * io_bytes));
         arena_bytes = extent * batch;
-        CHECK(cuMemAlloc(&arena, arena_bytes));
-        addresses.resize(tensors.size());
-        addresses.front() = input;
-        addresses.back() = output;
-        for (size_t i = 1; i + 1 < tensors.size(); ++i)
-            addresses[i] = arena + size_t(tensors[i].offset) * batch;
+        allocate_shape();
     }
 
     CUfunction lookup(std::string name) {
@@ -549,9 +688,9 @@ private:
 
     void prepare_matmul(size_t index, const Tensor& a, const Tensor& out, const Op& op, TuningTimer& timer) {
         auto plan = std::make_unique<Matmul>();
-        bool selective = fp16_qkv && a.h == 8 && a.w == 8 && a.c == 512 && out.c == 2560;
-        bool replay = tune_projections && (a.h >= 64 || (a.h == 8 && a.c >= 512));
-        if (selective) ++optimization_stats[2];
+        bool selective = fp16_qkv && a.c == 512 && out.c == 2560;
+        bool replay = tune_projections && (a.pixels() >= 4096 || a.c >= 512);
+        if (selective) ++optimization_stats[GT_OPT_FP16_QKV_PROJECTIONS];
         plan->half_compute = fp16 || selective;
         CHECK(cublasLtMatmulDescCreate(&plan->desc,
             plan->half_compute ? CUBLAS_COMPUTE_16F : CUBLAS_COMPUTE_32F,
@@ -628,7 +767,7 @@ private:
         };
         if (replay) {
             test_candidates(found, true);
-            if (best != bad_timing) ++optimization_stats[0];
+            if (best != bad_timing) ++optimization_stats[GT_OPT_REPLAY_TUNED_SHAPES];
         }
         if (best == bad_timing) test_candidates(std::min(found, baseline_candidates), false);
         if (best == bad_timing) throw std::runtime_error("No working cuBLASLt plan for operation " + std::to_string(index));
@@ -725,6 +864,7 @@ private:
         timer.initialize();
         add_bias = lookup(fp16 ? "bias16" : "bias");
         mean_project = lookup(fp16 ? "mean_project16" : "mean_project");
+        if (fp16 && variable_pool()) dynamic_mean_project = lookup("mean_project16_dynamic");
         if (fuse_gate_pool) gate_pool_kernel = lookup(fp16 ? "gate_pool16_32" : "gate_pool32");
         constexpr const char* names[] = {
             "pack", nullptr, nullptr, nullptr, "mean_partial", "local_skip",
@@ -745,9 +885,11 @@ private:
                     * (fp16 ? sizeof(uint16_t) : sizeof(float));
                 workspace_bytes = std::max(workspace_bytes, partial_bytes);
                 if (pool_fused[i]) {
-                    ++optimization_stats[1];
-                    CHECK(cuFuncGetAttribute(&optimization_stats[3], CU_FUNC_ATTRIBUTE_NUM_REGS, kernel_by_op[i - 1]));
-                    CHECK(cuFuncGetAttribute(&optimization_stats[4], CU_FUNC_ATTRIBUTE_NUM_REGS, gate_pool_kernel));
+                    ++optimization_stats[GT_OPT_FUSED_GATE_POOL_SITES];
+                    CHECK(cuFuncGetAttribute(&optimization_stats[GT_OPT_SPLIT_GATE_REGISTERS],
+                                              CU_FUNC_ATTRIBUTE_NUM_REGS, kernel_by_op[i - 1]));
+                    CHECK(cuFuncGetAttribute(&optimization_stats[GT_OPT_FUSED_GATE_REGISTERS],
+                                              CU_FUNC_ATTRIBUTE_NUM_REGS, gate_pool_kernel));
                 }
             }
             if (op.kind == Conv) {
@@ -763,13 +905,20 @@ private:
                     if (fp16) name += "16_";
                 }
                 kernel_by_op[i] = lookup(name + std::to_string(out.c));
-            } else if (op.kind == Local) {
-                kernel_by_op[i] = lookup((fp16 ? "local_gate16_" : "local_gate") + std::to_string(out.c));
-            } else if (op.kind == Inception) {
-                kernel_by_op[i] = lookup((fp16 ? "inception16_" : "inception") + std::to_string(2 * out.c / 3));
+            } else if (op.kind == Local || op.kind == Inception) {
+                int channels = op.kind == Local ? out.c : 2 * out.c / 3;
+                const char* base = op.kind == Local ? (fp16 ? "local_gate16_" : "local_gate")
+                                                    : (fp16 ? "inception16_" : "inception");
+                auto name = base + std::to_string(channels);
+                if (variable_spatial(channels, out)) name += "_dynamic";
+                kernel_by_op[i] = lookup(name);
             } else {
                 std::string name = names[op.kind];
                 if (fp16 && op.kind != Shuffle && op.kind != Concat && op.kind != ShuffleConcat) name += "16";
+                if ((op.kind == MeanProject && variable_pool())
+                    || (op.kind == Depthwise && (out.h != 8 || out.w != 8))
+                    || (op.kind == Attention && out.pixels() != 64))
+                    name += "_dynamic";
                 kernel_by_op[i] = lookup(name);
             }
         }
@@ -891,6 +1040,8 @@ private:
                 if (i + 1 < ops.size() && pool_fused[i + 1]) {
                     launch(gate_pool_kernel, target, pixels * batch / gate_pool_chunk, 1,
                            threads, y, scratch, a, w0, w1);
+                } else if (variable_spatial(o.c, o)) {
+                    pairs(y, a, w0, w1, o.h, o.w);
                 } else {
                     pairs(y, a, w0, w1);
                 }
@@ -898,14 +1049,20 @@ private:
             case MeanProject: {
                 int chunk = pool_fused[i] ? gate_pool_chunk : 256;
                 int chunks = (in.pixels() + chunk - 1) / chunk;
-                if (!pool_fused[i])
-                    launch(kernel, target, o.c / 32, batch * chunks, threads,
-                           scratch, a, in.pixels(), o.c, chunks);
-                launch(mean_project, target, batch, 1, threads, y, scratch, w0, w1, in.pixels(), o.c, chunks);
+                if (!pool_fused[i]) {
+                    unsigned sites = batch * chunks;
+                    launch(kernel, target, (o.c / 32) * (variable_pool() ? sites : 1),
+                           variable_pool() ? 1 : sites, threads, scratch, a, in.pixels(), o.c, chunks);
+                }
+                auto project = dynamic_mean_project && !pool_fused[i] ? dynamic_mean_project : mean_project;
+                launch(project, target, batch, 1, threads, y, scratch, w0, w1, in.pixels(), o.c, chunks);
                 break;
             }
             case LocalSkip: pairs(y, a, b, c, w0, pixels, o.c / 2); break;
-            case Inception: pairs(y, a, w0, w1); break;
+            case Inception:
+                if (variable_spatial(2 * o.c / 3, o)) pairs(y, a, w0, w1, o.h, o.w);
+                else pairs(y, a, w0, w1);
+                break;
             case GlobalSkip: pairs(y, a, b, w0, o.c / 2); break;
             case Shuffle: run(y, a, o.h, o.w, o.c, op.x, total); break;
             case Concat:
@@ -915,8 +1072,14 @@ private:
                 break;
             case Silu: pairs(y, a); break;
             case Span: pairs(y, a, b); break;
-            case Depthwise: run(y, a, w0, w1, in.c, total); break;
-            case Attention: launch(kernel, target, batch * 16, 1, threads, y, a); break;
+            case Depthwise:
+                if (o.h == 8 && o.w == 8) run(y, a, w0, w1, in.c, total);
+                else run(y, a, w0, w1, in.c, o.h, o.w, total);
+                break;
+            case Attention:
+                if (pixels == 64) launch(kernel, target, batch * 16, 1, threads, y, a);
+                else launch(kernel, target, batch * 16 * ((pixels + 3) / 4), 1, 128, y, a, pixels);
+                break;
             case Gate: run(y, a, b, in.c, total); break;
             case Add: run(y, a, b, total); break;
             case Rgb: run(y, a, b, fp16 ? w1 : w0, pixels, total); break;
@@ -931,21 +1094,247 @@ private:
     static void* pointer(CUdeviceptr p) { return reinterpret_cast<void*>(p); }
 };
 
+struct GtSession {
+    gt::ModelFile model;
+    fs::path cache;
+    uint32_t flags = GT_CREATE_GRAPH;
+    CUdevice device = 0;
+    CUcontext context = nullptr;
+    CUmodule module = nullptr;
+    CUdeviceptr weights = 0;
+    CUevent completed = nullptr;
+    bool pending = false;
+    gt::Digest build{};
+    double model_load_ms = 0;
+    std::unique_ptr<GtRunner> active;
+
+    void open(const fs::path& path, const GtSessionOptions* options) {
+        auto start = Clock::now();
+        int device_index = 0;
+        if (options) {
+            if (options->struct_size < sizeof(*options) || options->reserved)
+                throw std::runtime_error("Invalid GateRV3 session options size or reserved field");
+            device_index = options->device;
+            flags = options->flags;
+            if (options->cache_dir) cache = fs::u8path(options->cache_dir);
+        }
+        GtRunner validator;
+        validator.configure({1, tile, tile}, flags);
+
+        auto size = fs::file_size(path);
+        if (size < 48 || size > (256u << 20))
+            throw std::runtime_error("Invalid GateRV3 model file size");
+        std::vector<char> bytes(static_cast<size_t>(size));
+        std::ifstream file(path, std::ios::binary);
+        read(file, bytes.data(), bytes.size());
+        if (file.peek() != EOF) throw std::runtime_error("Model changed while it was being read");
+        model.parse(bytes);
+
+        // Locate the resource in the EXE or DLL that owns this copy of the runner.
+        static const char module_anchor = 0;
+        HMODULE image = nullptr;
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<LPCWSTR>(&module_anchor), &image))
+            throw std::runtime_error("Could not locate the native runtime image");
+        auto resource = FindResourceW(image, MAKEINTRESOURCEW(101), MAKEINTRESOURCEW(10));
+        auto embedded = resource ? LoadResource(image, resource) : nullptr;
+        auto* cubin = embedded ? LockResource(embedded) : nullptr;
+        if (!cubin) throw std::runtime_error("Missing embedded GateRV3 CUDA kernels");
+        if (!cache.empty()) {
+            gt::Sha256 hash;
+            const char build_id[] = __DATE__ " " __TIME__;
+            hash.add(build_id);
+            hash.add(cubin, SizeofResource(image, resource));
+            build = hash.finish();
+        }
+        CHECK(cuInit(0));
+        CHECK(cuDeviceGet(&device, device_index));
+        CHECK(cuDevicePrimaryCtxRetain(&context, device));
+        ContextScope scope(context);
+        CHECK(cuModuleLoadData(&module, cubin));
+        allocate(weights, model.weight_bytes, "model weights");
+        CHECK(cuMemcpyHtoD(weights, bytes.data() + model.weight_offset, model.weight_bytes));
+        CHECK(cuEventCreate(&completed, CU_EVENT_DISABLE_TIMING));
+        model_load_ms = milliseconds_since(start);
+    }
+
+    ~GtSession() {
+        if (!context || cuCtxPushCurrent(context) != CUDA_SUCCESS) return;
+        if (pending) cuEventSynchronize(completed);
+        active.reset();
+        if (completed) cuEventDestroy(completed);
+        if (module) cuModuleUnload(module);
+        if (weights) cuMemFree(weights);
+        CUcontext previous;
+        cuCtxPopCurrent(&previous);
+        cuDevicePrimaryCtxRelease(device);
+    }
+
+    bool fp16() const { return (flags & GT_CREATE_FP16) != 0; }
+
+    bool matches(Shape padded) const {
+        return active && active->batch == padded.n && active->height == padded.h && active->width == padded.w;
+    }
+
+    uint64_t bytes_for(Shape shape) const {
+        auto padded = shape.padded();
+        if (!matches(padded)) model.check_shape(padded);
+        return shape.rgb_bytes(fp16());
+    }
+
+    void wait() {
+        if (pending) {
+            CHECK(cuEventSynchronize(completed));
+            pending = false;
+        }
+    }
+
+    GtRunner& prepare(Shape shape) {
+        ContextScope scope(context);
+        wait();
+        auto padded = shape.padded();
+        if (!matches(padded)) {
+            auto resolved = model.resolve(padded);
+            active.reset();
+            auto plan = std::make_unique<GtRunner>();
+            plan->initialize_shape(padded, flags, cache, device, context, module, weights, build, model, std::move(resolved));
+            active = std::move(plan);
+        }
+        return *active;
+    }
+
+    void check_buffers(Shape shape, bool pointers, uint64_t input_bytes, uint64_t output_bytes) const {
+        auto expected = bytes_for(shape);
+        if (!pointers || input_bytes < expected || output_bytes < expected)
+            throw std::runtime_error("Contiguous RGB input and output each require "
+                + std::to_string(expected) + " bytes");
+    }
+
+    void enqueue(Shape shape, CUdeviceptr input, CUdeviceptr output, CUstream target) {
+        ContextScope scope(context);
+        auto& plan = prepare(shape);
+        try {
+            plan.run_device(shape, input, output, target);
+            CHECK(cuEventRecord(completed, target));
+            pending = true;
+        } catch (...) {
+            cuStreamSynchronize(target);
+            throw;
+        }
+    }
+};
+
 namespace {
 template<class F>
 int report_errors(F action) noexcept {
     try {
         action();
         return 0;
+    } catch (const AllocationError& error) {
+        error_text = error.what();
+        return GT_STATUS_OUT_OF_MEMORY;
     } catch (const std::exception& error) {
         error_text = error.what();
-        return -1;
+        return GT_STATUS_ERROR;
     }
 }
 } // namespace
 
 extern "C" {
 const char* gt_error() { return error_text.c_str(); }
+
+GtSession* gt_session_open(const char* model, const GtSessionOptions* options) {
+    GtSession* result = nullptr;
+    report_errors([&] {
+        if (!model || !*model) throw std::runtime_error("A GateRV3 model path is required");
+        auto session = std::make_unique<GtSession>();
+        session->open(fs::u8path(model), options);
+        result = session.release();
+    });
+    return result;
+}
+
+void gt_session_close(GtSession* session) { delete session; }
+
+int gt_session_describe(const GtSession* session, uint32_t batch, uint32_t height,
+                        uint32_t width, GtIo* io) {
+    return report_errors([&] {
+        if (!session || !io || io->struct_size < sizeof(*io))
+            throw std::runtime_error("Invalid session or I/O description size");
+        auto bytes = session->bytes_for(Shape::checked(batch, height, width));
+        auto rgb = static_cast<uint32_t>(session->fp16() ? GT_RGB_F16 : GT_RGB_F32);
+        *io = {io->struct_size, rgb, batch, 3, height, width, bytes, bytes};
+    });
+}
+
+int gt_session_prepare(GtSession* session, uint32_t batch, uint32_t height, uint32_t width) {
+    return report_errors([&] {
+        if (!session) throw std::runtime_error("A GateRV3 session is required");
+        session->prepare(Shape::checked(batch, height, width));
+    });
+}
+
+int gt_session_run(GtSession* session, uint32_t batch, uint32_t height, uint32_t width,
+                   const void* input, uint64_t input_bytes, void* output, uint64_t output_bytes) {
+    return report_errors([&] {
+        if (!session) throw std::runtime_error("A GateRV3 session is required");
+        auto shape = Shape::checked(batch, height, width);
+        session->check_buffers(shape, input && output, input_bytes, output_bytes);
+        session->prepare(shape).run_host(shape, input, output);
+    });
+}
+
+int gt_session_enqueue(GtSession* session, uint32_t batch, uint32_t height, uint32_t width,
+                       uint64_t input, uint64_t input_bytes, uint64_t output,
+                       uint64_t output_bytes, GtStream stream) {
+    return report_errors([&] {
+        if (!session) throw std::runtime_error("A GateRV3 session is required");
+        auto shape = Shape::checked(batch, height, width);
+        session->check_buffers(shape, input && output, input_bytes, output_bytes);
+        session->enqueue(shape, input, output, stream);
+    });
+}
+
+int gt_session_info(const GtSession* session, GtSessionInfo* info) {
+    return report_errors([&] {
+        if (!session || !info || info->struct_size < sizeof(*info))
+            throw std::runtime_error("Invalid session or session info size");
+        GtSessionInfo result{};
+        result.struct_size = info->struct_size;
+        result.buffer_bytes[0] = session->model.weight_bytes;
+        result.model_load_ms = session->model_load_ms;
+        if (auto* plan = session->active.get()) {
+            result.cache_status = plan->plan_cache.status;
+            result.batch = plan->batch;
+            result.padded_height = plan->height;
+            result.padded_width = plan->width;
+            plan->buffer_sizes(result.buffer_bytes);
+            plan->startup_memory(result.startup_device_used_bytes);
+            std::copy(plan->setup_ms.begin(), plan->setup_ms.end(), result.shape_setup_ms);
+            std::copy(plan->optimization_stats.begin(), plan->optimization_stats.end(), result.optimization_stats);
+            result.fused_silu_count = plan->fused_silu_count;
+        }
+        *info = result;
+    });
+}
+
+const char* gt_session_cache_message(const GtSession* session) {
+    return session && session->active ? session->active->plan_cache.diagnostic.c_str() : "";
+}
+
+const char* gt_session_fusion_message(const GtSession* session) {
+    return session && session->active ? session->active->fusion_diagnostic.c_str() : "";
+}
+
+int gt_session_profile(GtSession* session, float* milliseconds, int count) {
+    return report_errors([&] {
+        if (!session || !session->active || !milliseconds)
+            throw std::runtime_error("Prepare a GateRV3 shape before profiling");
+        ContextScope scope(session->context);
+        session->wait();
+        session->active->profile(milliseconds, count);
+    });
+}
 
 GtRunner* gt_create(const char* directory, int batch, int graph) {
     return gt_create_ex(directory, batch, graph ? GT_CREATE_GRAPH : 0, nullptr);
@@ -973,7 +1362,7 @@ void gt_setup_timings(const GtRunner* runner, double milliseconds[4]) {
 }
 int gt_fused_silu_count(const GtRunner* runner) { return runner->fused_silu_count; }
 const char* gt_fusion_message(const GtRunner* runner) { return runner->fusion_diagnostic.c_str(); }
-void gt_optimization_stats(const GtRunner* runner, int values[5]) {
+void gt_optimization_stats(const GtRunner* runner, int values[GT_OPT_STAT_COUNT]) {
     std::copy(runner->optimization_stats.begin(), runner->optimization_stats.end(), values);
 }
 
@@ -1016,9 +1405,99 @@ void gt_startup_memory(const GtRunner* runner, uint64_t bytes[4]) {
 }
 }
 
-int main(int argc, char** argv) {
+namespace {
+uint32_t cli_switch(const std::string& name) {
+    if (name == "--fuse-silu") return GT_CREATE_FUSE_SILU;
+    if (name == "--tune-projections") return GT_CREATE_TUNE_PROJECTIONS;
+    if (name == "--fuse-gate-pool") return GT_CREATE_FUSE_GATE_POOL;
+    if (name == "--fp16-qkv") return GT_CREATE_FP16_QKV;
+    return 0;
+}
+
+uint32_t cli_int(const std::string& value, const std::string& name) {
+    uint32_t number{};
+    const auto* end = value.data() + value.size();
+    auto parsed = std::from_chars(value.data(), end, number);
+    if (parsed.ec != std::errc{} || parsed.ptr != end)
+        throw std::runtime_error("Invalid number for " + name);
+    return number;
+}
+
+int session_cli(int argc, char** argv) {
+    if (argc == 2 || (argc == 3 && std::string(argv[2]) == "--help")) {
+        std::cout
+            << "Usage: gaterv3 run --model file --batch N --height H --width W --input raw --output raw\n"
+            << "  --precision mixed|fp16   Select RGB and accumulator precision (default: mixed)\n"
+            << "  --device index           Select a CUDA device (default: 0)\n"
+            << "  --cache-dir path         Read and write tuned plans in this directory\n"
+            << "  --direct                 Dispatch inference without capturing a CUDA Graph\n"
+            << "  --fuse-silu              Try cuDNN convolution/SiLU fusion at eligible sites\n"
+            << "  --tune-projections       Time a wider cuBLASLt candidate search under CUDA Graph replay\n"
+            << "  --fuse-gate-pool         Fuse eligible 128x128 grouped gate/pooling sites\n"
+            << "  --fp16-qkv               Use FP16 accumulation for QKV in mixed precision\n";
+        return argc == 2 ? 2 : 0;
+    }
+    return report_errors([&] {
+        GtSessionOptions options{sizeof(GtSessionOptions), 0, GT_CREATE_GRAPH, 0, nullptr};
+        std::string model, input, output;
+        uint32_t batch = 0, height = 0, width = 0;
+        for (int i = 2; i < argc; ++i) {
+            std::string name = argv[i];
+            if (auto flag = cli_switch(name)) {
+                options.flags |= flag;
+                continue;
+            }
+            if (name == "--direct") {
+                options.flags &= ~GT_CREATE_GRAPH;
+                continue;
+            }
+            if (++i >= argc) throw std::runtime_error("Missing value for " + name);
+            if (name == "--model") model = argv[i];
+            else if (name == "--input") input = argv[i];
+            else if (name == "--output") output = argv[i];
+            else if (name == "--cache-dir") options.cache_dir = argv[i];
+            else if (name == "--batch") batch = cli_int(argv[i], name);
+            else if (name == "--height") height = cli_int(argv[i], name);
+            else if (name == "--width") width = cli_int(argv[i], name);
+            else if (name == "--device") {
+                auto device = cli_int(argv[i], name);
+                if (device > INT_MAX) throw std::runtime_error("Invalid CUDA device index");
+                options.device = static_cast<int32_t>(device);
+            } else if (name == "--precision") {
+                std::string mode = argv[i];
+                if (mode == "fp16") options.flags |= GT_CREATE_FP16;
+                else if (mode == "mixed") options.flags &= ~GT_CREATE_FP16;
+                else throw std::runtime_error("Precision must be mixed or fp16");
+            } else throw std::runtime_error("Invalid option " + name);
+        }
+        if (model.empty() || input.empty() || output.empty())
+            throw std::runtime_error("--model, --input and --output are required");
+        Shape::checked(batch, height, width);
+        std::unique_ptr<GtSession> session(gt_session_open(model.c_str(), &options));
+        if (!session) throw std::runtime_error(gt_error());
+        GtIo io{};
+        io.struct_size = sizeof(io);
+        if (gt_session_describe(session.get(), batch, height, width, &io)) throw std::runtime_error(gt_error());
+        if (fs::file_size(fs::u8path(input)) != io.input_bytes)
+            throw std::runtime_error("Raw input must contain exactly " + std::to_string(io.input_bytes) + " bytes");
+        std::vector<char> pixels(static_cast<size_t>(io.input_bytes));
+        std::vector<char> restored(static_cast<size_t>(io.output_bytes));
+        std::ifstream file(fs::u8path(input), std::ios::binary);
+        read(file, pixels.data(), pixels.size());
+        if (gt_session_run(session.get(), batch, height, width, pixels.data(), pixels.size(),
+                           restored.data(), restored.size())) throw std::runtime_error(gt_error());
+        std::ofstream out(fs::u8path(output), std::ios::binary);
+        if (!out.write(restored.data(), restored.size()))
+            throw std::runtime_error("Could not write restored RGB output");
+        if (*gt_session_cache_message(session.get()))
+            std::cerr << "Plan cache: " << gt_session_cache_message(session.get()) << '\n';
+    }) == 0 ? 0 : (std::cerr << error_text << '\n', 1);
+}
+
+int legacy_cli(int argc, char** argv) {
     if (argc < 5) {
-        std::cerr << "Usage: gaterv3 <bundle-directory> <batch: 1|16> <input> <output> "
+        std::cerr << "For packed models, see gaterv3 run --help.\n"
+                     "Legacy usage: gaterv3 <bundle-directory> <batch: 1|16> <input> <output> "
                      "[--fp16] [--cache-dir <directory>] [--fuse-silu] "
                      "[--tune-projections] [--fuse-gate-pool] [--fp16-qkv]\n";
         return 2;
@@ -1029,10 +1508,7 @@ int main(int argc, char** argv) {
         for (int i = 5; i < argc; ++i) {
             std::string option = argv[i];
             if (option == "--fp16") flags |= GT_CREATE_FP16;
-            else if (option == "--fuse-silu") flags |= GT_CREATE_FUSE_SILU;
-            else if (option == "--tune-projections") flags |= GT_CREATE_TUNE_PROJECTIONS;
-            else if (option == "--fuse-gate-pool") flags |= GT_CREATE_FUSE_GATE_POOL;
-            else if (option == "--fp16-qkv") flags |= GT_CREATE_FP16_QKV;
+            else if (auto flag = cli_switch(option)) flags |= flag;
             else if (option == "--cache-dir" && i + 1 < argc) cache_dir = argv[++i];
             else throw std::runtime_error("Invalid option " + option);
         }
@@ -1055,4 +1531,13 @@ int main(int argc, char** argv) {
         if (!out.write(restored.data(), restored.size()))
             throw std::runtime_error("Could not write restored RGB output");
     }) == 0 ? 0 : (std::cerr << error_text << '\n', 1);
+}
+} // namespace
+
+int wmain(int argc, wchar_t** wide_argv) {
+    std::vector<std::string> arguments;
+    for (int i = 0; i < argc; ++i) arguments.push_back(fs::path(wide_argv[i]).u8string());
+    std::vector<char*> argv;
+    for (auto& text : arguments) argv.push_back(text.data());
+    return argc >= 2 && arguments[1] == "run" ? session_cli(argc, argv.data()) : legacy_cli(argc, argv.data());
 }

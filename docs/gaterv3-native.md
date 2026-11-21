@@ -82,7 +82,7 @@ $py = 'C:\Python314\python.exe'
 & $py -m pip install --no-deps --target output/native-toolchain nvidia-cuda-crt==13.4.59
 & $py -m pip install --no-deps --target output/native-toolchain/cccl nvidia-cuda-cccl==13.3.5.0.6
 & $py scripts/build_native.py
-& $py scripts/export_native.py
+& $py scripts/export_native.py --legacy
 ```
 
 The build uses MSVC x64 and produces an Ampere `sm_86` CUDA binary. The weight
