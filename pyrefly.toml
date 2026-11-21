@@ -1,2 +1,2 @@
 project-includes = ["src", "scripts"]
-search-path = ["src"]
+search-path = ["src", "scripts"]

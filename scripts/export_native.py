@@ -1,0 +1,358 @@
+"""Pack the original GateRV3 checkpoint for the fixed 128px CUDA runner."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import struct
+import sys
+import tempfile
+from enum import IntEnum
+from pathlib import Path
+
+import torch
+from torch import Tensor, nn
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+from model import load_model
+
+
+class Op(IntEnum):
+    PACK = 0
+    CONV = 1
+    RMS = 2
+    LOCAL = 3
+    MEAN_PROJECT = 4
+    LOCAL_SKIP = 5
+    INCEPTION = 6
+    GLOBAL_SKIP = 7
+    SHUFFLE = 8
+    CONCAT = 9
+    SILU = 10
+    SPAN = 11
+    DEPTHWISE = 12
+    ATTENTION = 13
+    GATE = 14
+    ADD = 15
+    RGB = 16
+
+
+class Schedule:
+    def __init__(self, weights):
+        self.weights = weights
+        self.shapes = [(128, 128, 3)]
+        self.ops: list[tuple[int, ...]] = []
+        self.last_use = [-1]
+
+    def weight(self, value: Tensor | None, *, dtype=torch.float16) -> int:
+        if value is None:
+            return -1
+        offset = (self.weights.tell() + 255) & ~255
+        self.weights.write(bytes(offset - self.weights.tell()))
+        self.weights.write(value.detach().to(dtype).contiguous().numpy().tobytes())
+        return offset
+
+    def op(self, kind, shape, *inputs, weights=(), args=(0, 0)):
+        output = len(self.shapes)
+        self.shapes.append(shape)
+        for index in inputs:
+            self.last_use[index] = len(self.ops)
+        self.last_use.append(len(self.ops))
+        self.ops.append(
+            (
+                int(kind),
+                output,
+                *inputs,
+                *([-1] * (4 - len(inputs))),
+                *weights,
+                *([-1] * (3 - len(weights))),
+                *args,
+            )
+        )
+        return output
+
+    def conv(self, a, layer: nn.Conv2d, *, rgb_in=False, rgb_out=False):
+        h, w, c = self.shapes[a]
+        k = layer.kernel_size[0]
+        assert layer.groups == 1 and layer.in_channels == (3 if rgb_in else c)
+        assert layer.kernel_size == (k, k) and layer.padding == (k // 2, k // 2)
+        assert layer.stride == layer.dilation == (1, 1)
+        weight, bias = layer.weight, layer.bias
+        if rgb_in:
+            weight = torch.nn.functional.pad(weight, (0, 0, 0, 0, 0, 5))
+        if rgb_out:
+            weight = torch.nn.functional.pad(weight, (0, 0, 0, 0, 0, 0, 0, 5))
+            if bias is not None:
+                bias = torch.nn.functional.pad(bias, (0, 5))
+        return self.op(
+            Op.CONV,
+            (h, w, weight.shape[0]),
+            a,
+            weights=(self.weight(weight.permute(0, 2, 3, 1)), self.weight(bias)),
+            args=(k, 0),
+        )
+
+    def norm(self, a, layer):
+        assert layer.eps == 1e-6
+        return self.op(
+            Op.RMS,
+            self.shapes[a],
+            a,
+            weights=(self.weight(layer.scale), self.weight(layer.offset)),
+        )
+
+    def local(self, a, block):
+        h, w, c = self.shapes[a]
+        norm, project, spatial, _ = block.local
+        projected = self.conv(self.norm(a, norm), project)
+        assert spatial.groups == c and spatial.weight.shape == (2 * c, 2, 3, 3)
+        gated = self.op(
+            Op.LOCAL,
+            (h, w, c),
+            projected,
+            weights=(
+                self.weight(spatial.weight.permute(2, 3, 1, 0)),
+                self.weight(spatial.bias),
+            ),
+        )
+        layer = block.sca[1]
+        scale = self.op(
+            Op.MEAN_PROJECT,
+            (1, 1, c),
+            gated,
+            weights=(self.weight(layer.weight), self.weight(layer.bias)),
+        )
+        return self.op(
+            Op.LOCAL_SKIP,
+            (h, w, c),
+            gated,
+            scale,
+            a,
+            weights=(self.weight(block.gamma0),),
+        )
+
+    def global_block(self, a, block, residual=None):
+        h, w, c = self.shapes[a]
+        projected = self.conv(self.norm(a, block.norm), block.fc1)
+        mixed = block.token_mix
+        assert block.split_indices == [3 * c // 2, c // 2, c]
+        if hasattr(mixed, "qkv"):
+            assert (h, w, c, mixed.num_heads, mixed.flash_enabled) == (
+                8,
+                8,
+                512,
+                16,
+                True,
+            )
+            # The attention input is the final C columns of the 3C projection.
+            qkv = self.op(
+                Op.CONV,
+                (h, w, 3 * c),
+                projected,
+                weights=(self.weight(mixed.qkv.weight.permute(0, 2, 3, 1)),),
+                args=(1, 2 * c),
+            )
+            spatial = mixed.qkv_dwconv
+            assert spatial.groups == 3 * c and spatial.weight.shape == (3 * c, 1, 3, 3)
+            qkv = self.op(
+                Op.DEPTHWISE,
+                (h, w, 3 * c),
+                qkv,
+                weights=(
+                    self.weight(spatial.weight.permute(2, 3, 1, 0)),
+                    self.weight(spatial.bias),
+                ),
+            )
+            attended = self.op(Op.ATTENTION, (h, w, c), qkv)
+            attended = self.conv(attended, mixed.project_out)
+            gated = self.op(Op.GATE, (h, w, 3 * c // 2), projected, attended)
+        else:
+            assert mixed.split_indexes == [5 * c // 8, c // 8, c // 8, c // 8]
+            layers = (mixed.dwconv_hw, mixed.dwconv_w, mixed.dwconv_h)
+            weight = torch.cat(
+                [layer.weight.flatten(1).T.flatten() for layer in layers]
+            )
+            bias = torch.cat([layer.bias for layer in layers])
+            gated = self.op(
+                Op.INCEPTION,
+                (h, w, 3 * c // 2),
+                projected,
+                weights=(self.weight(weight), self.weight(bias)),
+            )
+        out = self.conv(gated, block.fc2)
+        inputs, weights = (
+            ((out,), ()) if residual is None else ((out, a), (self.weight(residual),))
+        )
+        return self.op(Op.GLOBAL_SKIP, (h, w, c), *inputs, weights=weights)
+
+    def meta(self, a, blocks):
+        for block in blocks:
+            a = self.global_block(self.local(a, block), block.glob, block.gamma1)
+        return a
+
+    def span(self, a, block):
+        first = self.conv(a, block.c1_r.eval_conv)
+        h, w, c = self.shapes[first]
+        first = self.op(Op.SILU, self.shapes[first], first)
+        current = self.conv(first, block.c2_r.eval_conv)
+        current = self.op(Op.SILU, self.shapes[current], current)
+        current = self.conv(current, block.c3_r.eval_conv)
+        return self.op(Op.SPAN, (h, w, c), current, a), first
+
+    def concat(self, *inputs):
+        h, w, _ = self.shapes[inputs[0]]
+        return self.op(
+            Op.CONCAT, (h, w, sum(self.shapes[i][2] for i in inputs)), *inputs
+        )
+
+    def build(self, model):
+        image = self.op(Op.PACK, (128, 128, 8), 0)
+        features = self.conv(image, model.in_to_dim, rgb_in=True)
+        span, _ = self.span(features, model.span_block0)
+        shortcut = span
+        for block in model.span_n_b:
+            span, _ = self.span(span, block)
+        span, first = self.span(span, model.span_end)
+        span = self.conv(span, model.sisr_end_conv.eval_conv)
+        span = self.conv(
+            self.concat(features, span, shortcut, first), model.sisr_cat_conv
+        )
+
+        current = features
+        shortcuts = []
+        for block in model.gater_encode:
+            current = self.meta(current, block.gated)
+            shortcuts.append(current)
+            current = self.conv(current, block.scale[0])
+            h, w, c = self.shapes[current]
+            current = self.op(Op.SHUFFLE, (h // 2, w // 2, 4 * c), current, args=(0, 0))
+        for block in model.latent:
+            current = self.global_block(current, block)
+        for block, shortcut in zip(model.decode, reversed(shortcuts), strict=True):
+            current = self.conv(current, block.scale[0])
+            h, w, c = self.shapes[current]
+            current = self.op(Op.SHUFFLE, (h * 2, w * 2, c // 4), current, args=(1, 0))
+            current = self.conv(self.concat(current, shortcut), block.shor)
+            current = self.meta(current, block.gated)
+        current = self.op(Op.ADD, self.shapes[span], current, span)
+        current = self.conv(current, model.dim_to_in, rgb_out=True)
+        self.op(
+            Op.RGB,
+            (128, 128, 3),
+            current,
+            0,
+            weights=(self.weight(model.gamma, dtype=torch.float32),),
+        )
+
+    def write(self, path: Path):
+        end = 0
+        free: list[tuple[int, int]] = []
+        live: dict[int, tuple[int, int]] = {}
+        with path.open("wb") as file:
+            file.write(
+                struct.pack(
+                    "<4sIII",
+                    b"GTR2",
+                    len(self.shapes),
+                    len(self.ops),
+                    self.weights.tell(),
+                )
+            )
+            for index, (h, w, c) in enumerate(self.shapes):
+                if index in (0, len(self.shapes) - 1):
+                    file.write(struct.pack("<4i", h, w, c, -1))
+                    continue
+                for i, allocation in list(live.items()):
+                    if self.last_use[i] < index - 1:
+                        free.append(allocation)
+                        del live[i]
+                merged: list[tuple[int, int]] = []
+                for offset, length in sorted(free):
+                    if merged and sum(merged[-1]) == offset:
+                        start, previous = merged.pop()
+                        merged.append((start, previous + length))
+                    else:
+                        merged.append((offset, length))
+                free = merged
+                size = (h * w * c * 2 + 255) & ~255
+                available = min(
+                    (
+                        (length, offset, j)
+                        for j, (offset, length) in enumerate(free)
+                        if length >= size
+                    ),
+                    default=None,
+                )
+                if available is None:
+                    offset = end
+                    end += size
+                else:
+                    length, offset, j = available
+                    free.pop(j)
+                    if length > size:
+                        free.append((offset + size, length - size))
+                live[index] = (offset, size)
+                file.write(struct.pack("<4i", h, w, c, offset))
+            for op in self.ops:
+                file.write(struct.pack("<11i", *op))
+        return end
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--model",
+        type=Path,
+        default=ROOT / "models/1x_umzi_digital_decompress_gaterv3_1.pth",
+    )
+    parser.add_argument("--output", type=Path, default=ROOT / "output/native")
+    args = parser.parse_args()
+    torch.set_num_threads(4)
+    model, config = load_model(args.model, device="cpu")
+    actual = (
+        config.in_ch,
+        config.dim,
+        config.enc_blocks,
+        config.dec_blocks,
+        config.num_latent,
+        config.sisr_blocks,
+        config.scale,
+        config.attention,
+        config.flash,
+    )
+    if actual != (3, 32, (2, 2, 4, 8), (2, 2, 2, 2), 12, 4, 1, True, True):
+        raise ValueError(
+            f"Unsupported native checkpoint configuration {config.describe()}"
+        )
+    args.output.mkdir(parents=True, exist_ok=True)
+    with args.model.open("rb") as file:
+        digest = hashlib.file_digest(file, "sha256").hexdigest()
+    with tempfile.TemporaryDirectory(dir=args.output) as staging:
+        directory = Path(staging)
+        with torch.inference_mode(), (directory / "weights.bin").open("wb") as weights:
+            schedule = Schedule(weights)
+            schedule.build(model)
+            arena = schedule.write(directory / "schedule.bin")
+        artifacts = ("schedule.bin", "weights.bin")
+        hashes = {}
+        for name in artifacts:
+            with (directory / name).open("rb") as file:
+                hashes[name] = hashlib.file_digest(file, "sha256").hexdigest()
+        (directory / "checkpoint.json").write_text(
+            json.dumps(
+                {"checkpoint_sha256": digest, "weights_and_schedule": hashes}, indent=2
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        for name in (*artifacts, "checkpoint.json"):
+            (directory / name).replace(args.output / name)
+    print(
+        f"Checkpoint {digest}, {len(schedule.ops)} operations, {arena:,} arena bytes per tile"
+    )
+
+
+if __name__ == "__main__":
+    main()
