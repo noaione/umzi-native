@@ -28,9 +28,7 @@ def create_rtx_session(
     profile = f"input:{batch}x3x{tile}x{tile}"
     config = {
         "enable_cuda_graph": "1",
-        "nv_max_workspace_size": str(
-            torch.cuda.get_device_properties(0).total_memory * 3 // 4
-        ),
+        "nv_max_workspace_size": str(torch.cuda.get_device_properties(0).total_memory * 3 // 4),
         "nv_detailed_build_log": "0",
         "nv_runtime_cache_path": str(cache_dir.resolve()),
         "nv_profile_min_shapes": profile,

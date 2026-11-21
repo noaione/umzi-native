@@ -63,7 +63,7 @@ DLL beside the resulting EXE or on the DLL search path.
 [C session example](../examples/run_gaterv3.c)
 
 ```powershell
-cl /std:c17 /O2 /MD /I src/native examples/run_gaterv3.c output/native-refactor/gaterv3.lib /Fe:output/native-refactor/run_gaterv3.exe
+cl /std:c17 /O2 /MD /I native/gaterv3 examples/run_gaterv3.c output/native-refactor/gaterv3.lib /Fe:output/native-refactor/run_gaterv3.exe
 & .\output\native-refactor\run_gaterv3.exe .\output\native-refactor\gaterv3.gtmodel
 ```
 
@@ -78,7 +78,7 @@ structure and one inference entry point for both precisions:
 | Inspect | Report status and a readable diagnostic, including allocation size for memory failures, and expose buffer sizes and cache status for the active shape. |
 | Close | Release the session and its owned GPU resources. |
 
-Initialize `struct_size` in the [C declarations](../src/native/runner.h).
+Initialize `struct_size` in the [C declarations](../native/gaterv3/runner.h).
 `gt_session_describe` reports the required byte lengths, and run and
 enqueue validate them before dispatch. `gt_session_info` reports active
 shape, setup times, cache state, and memory. A shape allocation failure
@@ -127,7 +127,7 @@ After preparing a shape, `gt_session_info` reports the active fusion
 and QKV counts. `GT_OPT_REPLAY_TUNED_SHAPES` counts only shapes tuned
 during that preparation, so a disk-plan hit can report zero.
 `gt_session_fusion_message` describes a convolution/SiLU fallback.
-[C API declarations](../src/native/runner.h)
+[C API declarations](../native/gaterv3/runner.h)
 
 The combined flag check at 128×128 replay-tuned 13 projection shapes
 and fused four gate–pool sites in each precision. Mixed precision fused

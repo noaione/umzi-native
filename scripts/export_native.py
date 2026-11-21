@@ -61,11 +61,7 @@ def pack_activations(activations: list[Activation]) -> dict[int, int]:
     placed: list[Activation] = []
     for tensor in sorted(activations, key=lambda item: (-item.size, item.first)):
         offset = 0
-        conflicts = sorted(
-            (offsets[other.index], other.size)
-            for other in placed
-            if tensor.overlaps(other)
-        )
+        conflicts = sorted((offsets[other.index], other.size) for other in placed if tensor.overlaps(other))
         for start, size in conflicts:
             if offset + tensor.size <= start:
                 break
@@ -79,12 +75,8 @@ def pack_activations(activations: list[Activation]) -> dict[int, int]:
             raise RuntimeError(f"Misaligned arena offset for tensor {tensor.index}")
         for other in activations[:i]:
             addr = offsets[other.index]
-            if tensor.overlaps(other) and max(start, addr) < min(
-                start + tensor.size, addr + other.size
-            ):
-                raise RuntimeError(
-                    f"Arena overlap for tensors {tensor.index} and {other.index}"
-                )
+            if tensor.overlaps(other) and max(start, addr) < min(start + tensor.size, addr + other.size):
+                raise RuntimeError(f"Arena overlap for tensors {tensor.index} and {other.index}")
     return offsets
 
 
@@ -109,17 +101,15 @@ class Schedule:
         for index in inputs:
             self.last_use[index] = len(self.ops)
         self.last_use.append(len(self.ops))
-        self.ops.append(
-            (
-                int(kind),
-                output,
-                *inputs,
-                *([-1] * (4 - len(inputs))),
-                *weights,
-                *([-1] * (3 - len(weights))),
-                *args,
-            )
-        )
+        self.ops.append((
+            int(kind),
+            output,
+            *inputs,
+            *([-1] * (4 - len(inputs))),
+            *weights,
+            *([-1] * (3 - len(weights))),
+            *args,
+        ))
         return output
 
     def conv(self, a, layer: nn.Conv2d, *, rgb_in=False, rgb_out=False):
@@ -144,14 +134,13 @@ class Schedule:
         )
 
     def norm(self, a, layer):
-        assert layer.eps == 1e-6
+        # The packed kernel hard-codes this epsilon; reject any other value.
+        assert layer.eps == 1e-6  # ruff: ignore[float-equality-comparison]
         previous = self.ops[a - 1]
         # The fused launch reads the residual inputs while producing both
         # logical outputs. Keep them live so the norm output cannot alias them.
         residual_inputs = (
-            tuple(i for i in previous[2:6] if i >= 0)
-            if previous[0] in (Op.LOCAL_SKIP, Op.GLOBAL_SKIP)
-            else ()
+            tuple(i for i in previous[2:6] if i >= 0) if previous[0] in (Op.LOCAL_SKIP, Op.GLOBAL_SKIP) else ()
         )
         return self.op(
             Op.RMS,
@@ -236,9 +225,7 @@ class Schedule:
             projected = self.conv(normalized, block.fc1)
             assert mixed.split_indexes == [5 * c // 8, c // 8, c // 8, c // 8]
             layers = (mixed.dwconv_hw, mixed.dwconv_w, mixed.dwconv_h)
-            weight = torch.cat(
-                [layer.weight.flatten(1).T.flatten() for layer in layers]
-            )
+            weight = torch.cat([layer.weight.flatten(1).T.flatten() for layer in layers])
             bias = torch.cat([layer.bias for layer in layers])
             gated = self.op(
                 Op.INCEPTION,
@@ -247,9 +234,7 @@ class Schedule:
                 weights=(self.weight(weight), self.weight(bias)),
             )
         out = self.conv(gated, block.fc2)
-        inputs, weights = (
-            ((out,), ()) if residual is None else ((out, a), (self.weight(residual),))
-        )
+        inputs, weights = ((out,), ()) if residual is None else ((out, a), (self.weight(residual),))
         return self.op(Op.GLOBAL_SKIP, (h, w, c), *inputs, weights=weights)
 
     def meta(self, a, blocks):
@@ -268,9 +253,7 @@ class Schedule:
 
     def concat(self, *inputs):
         h, w, _ = self.shapes[inputs[0]]
-        return self.op(
-            Op.CONCAT, (h, w, sum(self.shapes[i][2] for i in inputs)), *inputs
-        )
+        return self.op(Op.CONCAT, (h, w, sum(self.shapes[i][2] for i in inputs)), *inputs)
 
     def build(self, model):
         image = self.op(Op.PACK, (128, 128, 8), 0)
@@ -281,9 +264,7 @@ class Schedule:
             span, _ = self.span(span, block)
         span, first = self.span(span, model.span_end)
         span = self.conv(span, model.sisr_end_conv.eval_conv)
-        span = self.conv(
-            self.concat(features, span, shortcut, first), model.sisr_cat_conv
-        )
+        span = self.conv(self.concat(features, span, shortcut, first), model.sisr_cat_conv)
 
         current = features
         shortcuts = []
@@ -299,9 +280,7 @@ class Schedule:
             current = self.conv(current, block.scale[0])
             h, w, c = self.shapes[current]
             assert self.shapes[shortcut] == (h * 2, w * 2, c // 4)
-            merged = self.op(
-                Op.SHUFFLE_CONCAT, (h * 2, w * 2, c // 2), current, shortcut
-            )
+            merged = self.op(Op.SHUFFLE_CONCAT, (h * 2, w * 2, c // 2), current, shortcut)
             current = self.conv(merged, block.shor)
             current = self.meta(current, block.gated)
         current = self.op(Op.ADD, self.shapes[span], current, span)
@@ -319,7 +298,7 @@ class Schedule:
 
     def write(self, path: Path, weight_bytes: int):
         last_use = self.last_use.copy()
-        for index, (conv, silu) in enumerate(zip(self.ops, self.ops[1:])):
+        for index, (conv, silu) in enumerate(zip(self.ops, self.ops[1:], strict=False)):
             if conv[0] == Op.CONV and conv[9] == 3 and silu[0] == Op.SILU:
                 # An optional fused launch reads the original convolution input
                 # while writing the SiLU result.
@@ -352,14 +331,12 @@ class Schedule:
         return max(offsets[tensor.index] + tensor.size for tensor in activations)
 
     def write_model(self, path: Path, weights: Path, checkpoint_sha256: str):
-        metadata = MODEL_METADATA.pack(
-            3, 1, 16, 16, 32, 3, len(self.shapes), len(self.ops)
-        )
+        metadata = MODEL_METADATA.pack(3, 1, 16, 16, 32, 3, len(self.shapes), len(self.ops))
         levels = {128 >> level: level for level in range(5)}
         levels[1] = -1
-        schedule = b"".join(
-            struct.pack("<2i", levels[h], c) for h, _w, c in self.shapes
-        ) + b"".join(struct.pack("<11i", *op) for op in self.ops)
+        schedule = b"".join(struct.pack("<2i", levels[h], c) for h, _w, c in self.shapes) + b"".join(
+            struct.pack("<11i", *op) for op in self.ops
+        )
         identity = bytes.fromhex(checkpoint_sha256)
         sizes = (len(metadata), len(schedule), weights.stat().st_size, len(identity))
         offset = MODEL_HEADER.size + len(sizes) * MODEL_SECTION.size
@@ -378,9 +355,7 @@ class Schedule:
             file.seek(MODEL_HEADER.size)
             digest = hashlib.file_digest(file, "sha256").digest()
             file.seek(0)
-            file.write(
-                MODEL_HEADER.pack(MODEL_MAGIC, MODEL_FORMAT_VERSION, len(sizes), digest)
-            )
+            file.write(MODEL_HEADER.pack(MODEL_MAGIC, MODEL_FORMAT_VERSION, len(sizes), digest))
 
 
 def main():
@@ -390,9 +365,7 @@ def main():
         type=Path,
         default=ROOT / "models/1x_umzi_digital_decompress_gaterv3_1.pth",
     )
-    parser.add_argument(
-        "--output", type=Path, help="Model file, or bundle directory with --legacy"
-    )
+    parser.add_argument("--output", type=Path, help="Model file, or bundle directory with --legacy")
     parser.add_argument(
         "--legacy",
         action="store_true",
@@ -413,9 +386,7 @@ def main():
         config.flash,
     )
     if actual != (3, 32, (2, 2, 4, 8), (2, 2, 2, 2), 12, 4, 1, True, True):
-        raise ValueError(
-            f"Unsupported native checkpoint configuration {config.describe()}"
-        )
+        raise ValueError(f"Unsupported native checkpoint configuration {config.describe()}")
     default_dir = ROOT / "output/native"
     # Existing callers that pass a bundle directory keep the original export.
     legacy = args.legacy or (args.output is not None and args.output.suffix == "")
@@ -434,9 +405,7 @@ def main():
             model_path = directory / "model"
             schedule.write_model(model_path, weights_path, digest)
             model_path.replace(output)
-            print(
-                f"Exported {output} with {len(schedule.ops)} operations\nCheckpoint {digest}"
-            )
+            print(f"Exported {output} with {len(schedule.ops)} operations\nCheckpoint {digest}")
             return
         arena = schedule.write(directory / "schedule.bin", weights_path.stat().st_size)
         artifacts = ("schedule.bin", "weights.bin")
@@ -445,17 +414,12 @@ def main():
             with (directory / name).open("rb") as file:
                 hashes[name] = hashlib.file_digest(file, "sha256").hexdigest()
         (directory / "checkpoint.json").write_text(
-            json.dumps(
-                {"checkpoint_sha256": digest, "weights_and_schedule": hashes}, indent=2
-            )
-            + "\n",
+            json.dumps({"checkpoint_sha256": digest, "weights_and_schedule": hashes}, indent=2) + "\n",
             encoding="utf-8",
         )
         for name in (*artifacts, "checkpoint.json"):
             (directory / name).replace(output / name)
-    print(
-        f"Checkpoint {digest}, {len(schedule.ops)} operations, {arena:,} arena bytes per tile"
-    )
+    print(f"Checkpoint {digest}, {len(schedule.ops)} operations, {arena:,} arena bytes per tile")
 
 
 if __name__ == "__main__":

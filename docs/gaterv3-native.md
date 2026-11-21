@@ -97,7 +97,7 @@ The standalone executable takes raw contiguous little-endian float32 RGB
 input in NCHW order, with pixels scaled to `[0, 1]`. It writes a batch of the
 same shape. Use batches 1 or 16 at 128×128. The caller handles image decoding,
 border tile replication, reassembly, and clamping if needed. The DLL API in
-[`src/native/runner.h`](../src/native/runner.h) provides synchronous host
+[`native/gaterv3/runner.h`](../native/gaterv3/runner.h) provides synchronous host
 I/O and enqueue on a caller-owned CUDA stream.
 
 ```powershell

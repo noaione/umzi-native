@@ -55,15 +55,8 @@ def packed_schedule(path):
         position = MODEL_HEADER.size + count * MODEL_SECTION.size
         table = file.read(count * MODEL_SECTION.size)
         sections = {}
-        for index, (kind, reserved, offset, size) in enumerate(
-            MODEL_SECTION.iter_unpack(table), start=1
-        ):
-            if (
-                kind != index
-                or reserved
-                or offset != position
-                or size > length - position
-            ):
+        for index, (kind, reserved, offset, size) in enumerate(MODEL_SECTION.iter_unpack(table), start=1):
+            if kind != index or reserved or offset != position or size > length - position:
                 raise ValueError("Invalid packed GateRV3 sections")
             sections[kind] = (offset, size)
             position += size
@@ -76,11 +69,7 @@ def packed_schedule(path):
             raise ValueError("Invalid packed GateRV3 section sizes")
         file.seek(sections[1][0])
         *_, tensors, operations = MODEL_METADATA.unpack(file.read(MODEL_METADATA.size))
-        if (
-            not 2 <= operations <= 2000
-            or tensors != operations + 1
-            or sections[2][1] != tensors * 8 + operations * 44
-        ):
+        if not 2 <= operations <= 2000 or tensors != operations + 1 or sections[2][1] != tensors * 8 + operations * 44:
             raise ValueError("Invalid packed GateRV3 schedule length")
         file.seek(sections[2][0])
         specs = np.frombuffer(file.read(tensors * 8), dtype="<i4").reshape(-1, 2)
@@ -90,9 +79,7 @@ def packed_schedule(path):
 
 
 def enabled_optimizations(args):
-    return tuple(
-        name for name in KERNEL_OPTIONS if getattr(args, name.replace("-", "_"))
-    )
+    return tuple(name for name in KERNEL_OPTIONS if getattr(args, name.replace("-", "_")))
 
 
 def optimization_candidates(args):
@@ -128,7 +115,8 @@ class Native:
         try:
             library_path = (bundle / "gaterv3.dll").resolve()
             if model_file is not None:
-                self.dll, self.dll_dirs = load_session_library(library_path)
+                # The Torch import above has already loaded cuBLASLt and cuDNN.
+                self.dll = load_session_library(library_path)
                 self.open_packed(model_file, batch, flags, cached)
             else:
                 cuda, cudnn = libraries()
@@ -174,9 +162,7 @@ class Native:
     def open_packed(self, path, batch, flags, cached):
         self.destroy = self.dll.gt_session_close
         options = OptionsABI(ctypes.sizeof(OptionsABI), 0, flags, 0, cached)
-        self.handle = self.dll.gt_session_open(
-            str(path.resolve()).encode(), ctypes.byref(options)
-        )
+        self.handle = self.dll.gt_session_open(str(path.resolve()).encode(), ctypes.byref(options))
         if not self.handle:
             self.check(-1)
         self.check(self.dll.gt_session_prepare(self.handle, batch, *SHAPE[1:]))
@@ -203,14 +189,10 @@ class Native:
             or x.shape[1] != 3
             or (self.model_file is None and x.shape != self.host_output.shape)
         ):
-            raise ValueError(
-                "Native benchmark input must be contiguous FP32 NCHW at the runner's batch size"
-            )
+            raise ValueError("Native benchmark input must be contiguous FP32 NCHW at the runner's batch size")
         packed = x.to(dtype=self.dtype)
         if self.model_file is None:
-            self.check(
-                self.run(self.handle, packed.data_ptr(), self.host_output.data_ptr())
-            )
+            self.check(self.run(self.handle, packed.data_ptr(), self.host_output.data_ptr()))
         else:
             if x.shape != self.host_output.shape:
                 self.host_output = torch.empty_like(packed)
@@ -254,29 +236,19 @@ class Native:
 
         packed = x.to(dtype=self.dtype)
         torch.cuda.synchronize()
-        (status,) = driver.cuMemcpyDtoD(
-            self.device_input, packed.data_ptr(), packed.numel() * packed.element_size()
-        )
+        (status,) = driver.cuMemcpyDtoD(self.device_input, packed.data_ptr(), packed.numel() * packed.element_size())
         if status:
             raise RuntimeError(f"Native device input copy failed: {status}")
 
         def run():
-            self.check(
-                self.dll.gt_enqueue(
-                    self.handle, torch.cuda.current_stream().cuda_stream
-                )
-            )
+            self.check(self.dll.gt_enqueue(self.handle, torch.cuda.current_stream().cuda_stream))
 
         return run
 
     def memory_values(self, symbol, keys):
         if self.model_file is not None:
             info = self.session_info()
-            values = (
-                info.buffer_bytes
-                if symbol == "gt_buffer_sizes"
-                else info.startup_device_used_bytes
-            )
+            values = info.buffer_bytes if symbol == "gt_buffer_sizes" else info.startup_device_used_bytes
             return dict(zip(keys, values, strict=True))
         query = getattr(self.dll, symbol, None)
         if query is None:
@@ -351,25 +323,19 @@ class Native:
             specs, ops, _ = packed_schedule(self.model_file)
             count = len(ops)
             info = self.session_info()
-            shapes = np.array(
-                [
-                    (1, 1, channels)
-                    if level < 0
-                    else (
-                        info.padded_height >> level,
-                        info.padded_width >> level,
-                        channels,
-                    )
-                    for level, channels in specs
-                ]
-            )
+            shapes = np.array([
+                (1, 1, channels)
+                if level < 0
+                else (
+                    info.padded_height >> level,
+                    info.padded_width >> level,
+                    channels,
+                )
+                for level, channels in specs
+            ])
             profile = self.dll.gt_session_profile
         times = np.zeros(count, dtype=np.float32)
-        self.check(
-            profile(
-                self.handle, times.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), count
-            )
-        )
+        self.check(profile(self.handle, times.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), count))
         totals = defaultdict(float)
         rows = []
         for entry, ms in zip(ops, times, strict=True):
@@ -378,14 +344,12 @@ class Native:
             if kind == Op.CONV:
                 label = f"conv{int(entry[9])}x{int(entry[9])}"
             totals[label] += float(ms)
-            rows.append(
-                {
-                    "operation": label,
-                    "input_shape": shapes[source, :3].tolist(),
-                    "output_shape": shapes[output, :3].tolist(),
-                    "milliseconds": float(ms),
-                }
-            )
+            rows.append({
+                "operation": label,
+                "input_shape": shapes[source, :3].tolist(),
+                "output_shape": shapes[output, :3].tolist(),
+                "milliseconds": float(ms),
+            })
         return {"totals_ms": dict(totals), "operations": rows}
 
 
@@ -448,9 +412,7 @@ def quality(args, images):
                 **error_metrics(expected, result),
             }
             if METRIC.is_file():
-                score = subprocess.check_output(
-                    [str(METRIC), str(ref_file), str(native_file)], text=True
-                )
+                score = subprocess.check_output([str(METRIC), str(ref_file), str(native_file)], text=True)
                 values = re.findall(r"-?\d+(?:\.\d+)?", score)
                 score = float(values[-1])
                 row["ssimulacra2"] = score
@@ -482,33 +444,23 @@ def quality(args, images):
             stress_rows.append(row)
             print(row, flush=True)
     pixels = [image.numel() for _, image in images]
-    mse = sum(
-        row["mse"] * count for row, count in zip(rows, pixels, strict=True)
-    ) / sum(pixels)
+    mse = sum(row["mse"] * count for row, count in zip(rows, pixels, strict=True)) / sum(pixels)
     return {
         "pages": rows,
         "aggregate_psnr_db": -10 * np.log10(mse) if mse else None,
-        "ssimulacra2": {"mean": statistics.mean(scores), "minimum": min(scores)}
-        if scores
-        else None,
+        "ssimulacra2": {"mean": statistics.mean(scores), "minimum": min(scores)} if scores else None,
         "batch1": stress_rows,
         "setup": setup,
     }
 
 
 def ort_session(onnx_path, profile_dir, cache_dir, batch):
-    profiled, _ = create_rtx_session(
-        onnx_path, batch, 128, cache_dir, profile_dir / onnx_path.stem
-    )
+    profiled, _ = create_rtx_session(onnx_path, batch, 128, cache_dir, profile_dir / onnx_path.stem)
     input_shape = profiled.get_inputs()[0].shape
     profiled.run(None, {"input": np.zeros(input_shape, dtype=np.float16)})
     events = json.loads(Path(profiled.end_profiling()).read_text(encoding="utf-8"))
-    nodes = [
-        event for event in events if event.get("cat") == "Node" and event.get("dur", 0)
-    ]
-    placement = sorted(
-        {event.get("args", {}).get("provider", "") for event in nodes} - {""}
-    )
+    nodes = [event for event in events if event.get("cat") == "Node" and event.get("dur", 0)]
+    placement = sorted({event.get("args", {}).get("provider", "") for event in nodes} - {""})
     if placement != ["NvTensorRTRTXExecutionProvider"]:
         raise RuntimeError(f"Unexpected RTX node placement {placement}")
     del profiled
@@ -541,33 +493,25 @@ def single_tile_timings(calls, images):
             for name in order:
                 for index, (top, left, sample) in enumerate(group, start):
                     seconds = measure(calls[name], 1, sample.contiguous())[0] / 1000
-                    page[name].append(
-                        {
-                            "image": image_name,
-                            "tile_index": index,
-                            "top": top,
-                            "left": left,
-                            "seconds": seconds,
-                        }
-                    )
+                    page[name].append({
+                        "image": image_name,
+                        "tile_index": index,
+                        "top": top,
+                        "left": left,
+                        "seconds": seconds,
+                    })
         for name, rows in page.items():
             reports[name]["per_tile"].extend(rows)
-            reports[name]["per_image"].append(
-                {
-                    "image": image_name,
-                    "tiles": len(items),
-                    "source_pixels": image.shape[-2] * image.shape[-1],
-                    "average_tile_ms": statistics.mean(row["seconds"] for row in rows)
-                    * 1000,
-                }
-            )
+            reports[name]["per_image"].append({
+                "image": image_name,
+                "tiles": len(items),
+                "source_pixels": image.shape[-2] * image.shape[-1],
+                "average_tile_ms": statistics.mean(row["seconds"] for row in rows) * 1000,
+            })
     return {
         name: {
             **row,
-            "average_tile_ms": statistics.mean(
-                sample["seconds"] for sample in row["per_tile"]
-            )
-            * 1000,
+            "average_tile_ms": statistics.mean(sample["seconds"] for sample in row["per_tile"]) * 1000,
         }
         for name, row in reports.items()
     }
@@ -583,22 +527,18 @@ def batch16_page_timings(call, images):
         torch.cuda.synchronize()
         image_seconds = time.perf_counter() - started
         pixels = image.shape[-2] * image.shape[-1]
-        rows.append(
-            {
-                "image": name,
-                "tiles": len(items),
-                "source_pixels": pixels,
-                "batch16_seconds": image_seconds,
-                "batch16_megapixels_per_second": pixels / image_seconds / 1e6,
-            }
-        )
+        rows.append({
+            "image": name,
+            "tiles": len(items),
+            "source_pixels": pixels,
+            "batch16_seconds": image_seconds,
+            "batch16_megapixels_per_second": pixels / image_seconds / 1e6,
+        })
     seconds = sum(row["batch16_seconds"] for row in rows)
     return {
         "per_image": rows,
         "batch16_seconds": seconds,
-        "batch16_megapixels_per_second": sum(row["source_pixels"] for row in rows)
-        / seconds
-        / 1e6,
+        "batch16_megapixels_per_second": sum(row["source_pixels"] for row in rows) / seconds / 1e6,
     }
 
 
@@ -645,11 +585,7 @@ def speed(args, images, batch, report, save):
             fp16 = native_case(args.bundle, "fp16")
             cases["native_fp16"] = (fp16.prepare_device(device_input), fp16.host)
             report["setup"]["native_fp16"] = fp16.setup()
-        elif (
-            not args.control_bundle
-            and not args.compare_silu
-            and not args.compare_optimization
-        ):
+        elif not args.control_bundle and not args.compare_silu and not args.compare_optimization:
             eager = native_case(args.bundle, args.precision, graph=False)
             cases["native_eager"] = (eager.prepare_device(device_input), eager.host)
         if args.compare_silu:
@@ -670,9 +606,7 @@ def speed(args, images, batch, report, save):
             def torch_calls(model):
                 return (
                     lambda: model(device_half),
-                    lambda x: (
-                        model(x.to(device="cuda", dtype=torch.float16)).float().cpu()
-                    ),
+                    lambda x: model(x.to(device="cuda", dtype=torch.float16)).float().cpu(),
                 )
 
             cases["torch_eager"] = torch_calls(eager)
@@ -682,9 +616,7 @@ def speed(args, images, batch, report, save):
         if "rtx" in args.baselines:
             graph = args.baseline / f"gaterv3-fp16-t128-b{batch}.onnx"
             rtx_cache = args.rtx_cache_dir or args.baseline / "rtx-runtime-cache"
-            session, placement, options = ort_session(
-                graph, args.output, rtx_cache, batch
-            )
+            session, placement, options = ort_session(graph, args.output, rtx_cache, batch)
             report["rtx_provider_placement"] = placement
             report["rtx_provider_options"] = options
             report["rtx_graph_sha256"] = digest(graph)
@@ -737,11 +669,7 @@ def speed(args, images, batch, report, save):
                     "median_ms": median,
                     "mean_ms": statistics.mean(pooled),
                     "p95_ms": float(np.percentile(pooled, 95)),
-                    "megapixels_per_second_at_median": batch
-                    * 128
-                    * 128
-                    / median
-                    / 1000,
+                    "megapixels_per_second_at_median": batch * 128 * 128 / median / 1000,
                     "round_samples_ms": samples,
                 }
             print(
@@ -763,16 +691,11 @@ def speed(args, images, batch, report, save):
                 save()
             if candidates:
                 report["optimization_profiles"] = {
-                    label: candidate.profile()
-                    for label, candidate in candidates.items()
+                    label: candidate.profile() for label, candidate in candidates.items()
                 }
                 save()
         if not args.skip_pages:
-            calls = {
-                name: host
-                for name, (_, host) in cases.items()
-                if name != "native_eager"
-            }
+            calls = {name: host for name, (_, host) in cases.items() if name != "native_eager"}
             if batch == 1:
                 report["tile_timing_order"] = "alternating runner order every 16 tiles"
                 for name, pages in single_tile_timings(calls, images).items():
@@ -792,9 +715,7 @@ def memory(args, batch):
     sample = torch.zeros((batch, *SHAPE), dtype=torch.float32)
     torch.cuda.init()
     configured = enabled_optimizations(args)
-    runners = {
-        "native_graph": (args.bundle, args.precision, args.fuse_silu, configured)
-    }
+    runners = {"native_graph": (args.bundle, args.precision, args.fuse_silu, configured)}
     if args.control_bundle:
         runners["native_control"] = (args.control_bundle, args.precision, False, ())
     if args.compare_fp16:
@@ -828,15 +749,11 @@ def memory(args, batch):
             captured, _ = used()
             first_call = time.perf_counter()
             native.host(sample)
-            time_to_first_output_ms = (
-                initialization_ms + (time.perf_counter() - first_call) * 1000
-            )
+            time_to_first_output_ms = initialization_ms + (time.perf_counter() - first_call) * 1000
             for _ in range(7):
                 native.host(sample)
             warmed, _ = used()
-            buffers = native.memory_values(
-                "gt_buffer_sizes", ("weights", "activations", "workspace", "rgb_io")
-            )
+            buffers = native.memory_values("gt_buffer_sizes", ("weights", "activations", "workspace", "rgb_io"))
             startup = native.memory_values(
                 "gt_startup_memory",
                 ("context", "tuning_workspace", "tuned", "captured"),
@@ -857,9 +774,7 @@ def memory(args, batch):
             "device_used_warmed_delta_bytes": warmed - before,
             "runner_buffers_bytes": buffers,
             "startup_device_used_bytes": startup,
-            "startup_sampled_max_delta_bytes": max(captured, *startup.values()) - before
-            if startup
-            else None,
+            "startup_sampled_max_delta_bytes": max(captured, *startup.values()) - before if startup else None,
         }
         if buffers:
             buffers["total"] = sum(buffers.values())
@@ -879,23 +794,15 @@ def main():
     parser.add_argument("--model", type=Path, default=CHECKPOINT)
     parser.add_argument("--input", type=Path, default=ROOT / "samples/input")
     parser.add_argument("--bundle", type=Path, default=ROOT / "output/native")
-    parser.add_argument(
-        "--model-file", type=Path, help="Packed model for the native session API"
-    )
-    parser.add_argument(
-        "--legacy", action="store_true", help="Use the fixed bundle API"
-    )
+    parser.add_argument("--model-file", type=Path, help="Packed model for the native session API")
+    parser.add_argument("--legacy", action="store_true", help="Use the fixed bundle API")
     parser.add_argument(
         "--control-bundle",
         type=Path,
         help="Fixed bundle control at the selected precision",
     )
-    parser.add_argument(
-        "--cache-dir", type=Path, help="Read and write tuned plans in this directory"
-    )
-    parser.add_argument(
-        "--fuse-silu", action="store_true", help="Try the cuDNN convolution/SiLU graph"
-    )
+    parser.add_argument("--cache-dir", type=Path, help="Read and write tuned plans in this directory")
+    parser.add_argument("--fuse-silu", action="store_true", help="Try the cuDNN convolution/SiLU graph")
     parser.add_argument(
         "--compare-silu",
         action="store_true",
@@ -927,24 +834,16 @@ def main():
         help="Include full FP16 in the timing and memory comparisons",
     )
     parser.add_argument("--baseline", type=Path, default=ROOT / "output/baseline")
-    parser.add_argument(
-        "--rtx-cache-dir", type=Path, help="TensorRT-RTX runtime cache directory"
-    )
-    parser.add_argument(
-        "--output", type=Path, default=ROOT / "output/native-validation"
-    )
-    parser.add_argument(
-        "--suite", choices=("quality", "speed", "memory", "all"), default="all"
-    )
+    parser.add_argument("--rtx-cache-dir", type=Path, help="TensorRT-RTX runtime cache directory")
+    parser.add_argument("--output", type=Path, default=ROOT / "output/native-validation")
+    parser.add_argument("--suite", choices=("quality", "speed", "memory", "all"), default="all")
     parser.add_argument(
         "--baselines",
         choices=("torch", "inductor", "rtx"),
         nargs="*",
         default=["torch", "inductor", "rtx"],
     )
-    parser.add_argument(
-        "--batch", type=int, choices=(1, 16), nargs="+", default=[1, 16]
-    )
+    parser.add_argument("--batch", type=int, choices=(1, 16), nargs="+", default=[1, 16])
     parser.add_argument("--rounds", type=int, default=6)
     parser.add_argument("--repeats", type=int, default=20)
     parser.add_argument(
@@ -952,9 +851,7 @@ def main():
         action="store_true",
         help="Collect an instrumented native op profile",
     )
-    parser.add_argument(
-        "--skip-pages", action="store_true", help="Time repeated batches only"
-    )
+    parser.add_argument("--skip-pages", action="store_true", help="Time repeated batches only")
     args = parser.parse_args()
     if args.legacy and args.model_file is not None:
         parser.error("--legacy and --model-file are mutually exclusive")
@@ -988,16 +885,12 @@ def main():
     def checked_bundle(bundle):
         manifest = json.loads((bundle / "checkpoint.json").read_text(encoding="utf-8"))
         hashes = {
-            name: digest(bundle / name)
-            for name in ("gaterv3.dll", "kernels.cubin", "schedule.bin", "weights.bin")
+            name: digest(bundle / name) for name in ("gaterv3.dll", "kernels.cubin", "schedule.bin", "weights.bin")
         }
         if manifest["checkpoint_sha256"] != checkpoint_hash or any(
-            hashes[name] != manifest["weights_and_schedule"][name]
-            for name in ("schedule.bin", "weights.bin")
+            hashes[name] != manifest["weights_and_schedule"][name] for name in ("schedule.bin", "weights.bin")
         ):
-            parser.error(
-                f"Native schedule or weights do not match the checkpoint manifest in {bundle}"
-            )
+            parser.error(f"Native schedule or weights do not match the checkpoint manifest in {bundle}")
         return hashes
 
     if args.model_file is not None:
@@ -1017,9 +910,7 @@ def main():
         "torch_cuda": torch.version.cuda,
         "checkpoint_sha256": checkpoint_hash,
         "bundle_sha256": bundle_hashes,
-        "native_api": "packed_session"
-        if args.model_file is not None
-        else "legacy_fixed",
+        "native_api": "packed_session" if args.model_file is not None else "legacy_fixed",
         "precision": args.precision,
         "fuse_silu": args.fuse_silu,
         "optimizations": enabled_optimizations(args),
@@ -1028,9 +919,7 @@ def main():
         report["control_sha256"] = checked_bundle(args.control_bundle)
 
     def save():
-        (args.output / "report.json").write_text(
-            json.dumps(report, indent=2), encoding="utf-8"
-        )
+        (args.output / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
 
     if args.suite in ("all", "memory"):
         report["memory"] = {}

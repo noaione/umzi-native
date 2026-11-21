@@ -1,17 +1,17 @@
-"""Windows DLL discovery and shared GateRV3 session bindings."""
+"""Native library loading and shared GateRV3 session bindings."""
 
 from __future__ import annotations
 
 import ctypes
 import os
-import site
 import sys
-from collections.abc import Sequence
-from contextlib import ExitStack
 from pathlib import Path
 from threading import Lock
 
 PathArg = str | os.PathLike[str]
+WINDOWS = sys.platform == "win32"
+LIBRARY_NAME = "gaterv3.dll" if WINDOWS else "libgaterv3.so"
+PACKAGE_DIR = Path(__file__).resolve().parent
 KERNEL_OPTIONS = {"tune-projections": 8, "fuse-gate-pool": 16, "fp16-qkv": 32}
 CACHE_STATUSES = ("disabled", "miss", "hit", "rebuilt", "unavailable")
 OPTIMIZATION_STATS = (
@@ -21,7 +21,13 @@ OPTIMIZATION_STATS = (
     "split_gate_registers",
     "fused_gate_registers",
 )
+# The session library links these directly. cuDNN loads its remaining
+# components by name at run time, so the explicit loader preloads them too.
+CUDA_LIBRARIES = ("cublasLt64_13.dll", "cudnn64_9.dll") if WINDOWS else ("libcublasLt.so.13", "libcudnn.so.9")
+CUDNN_COMPONENTS = "cudnn_*64_9.dll" if WINDOWS else "libcudnn_*.so.9"
 _load_lock = Lock()
+_session_libraries: dict[Path, ctypes.CDLL] = {}
+_cuda_libraries: dict[Path, ctypes.CDLL] = {}
 
 
 class OptionsABI(ctypes.Structure):
@@ -36,8 +42,7 @@ class OptionsABI(ctypes.Structure):
 
 class IoABI(ctypes.Structure):
     _fields_ = [
-        (name, ctypes.c_uint32)
-        for name in ("struct_size", "rgb_type", "batch", "channels", "height", "width")
+        (name, ctypes.c_uint32) for name in ("struct_size", "rgb_type", "batch", "channels", "height", "width")
     ] + [("input_bytes", ctypes.c_uint64), ("output_bytes", ctypes.c_uint64)]
 
 
@@ -62,100 +67,103 @@ class InfoABI(ctypes.Structure):
     ]
 
 
-def _runtime_dirs(dll_path: Path, extra: Sequence[PathArg]) -> list[Path]:
-    provided = [Path(path).resolve() for path in extra]
-    for path in provided:
-        if not path.is_dir():
-            raise FileNotFoundError(f"CUDA DLL directory does not exist: {path}")
+def _load(path: Path) -> ctypes.CDLL:
+    # Windows resolves a full-path load's dependencies among loaded modules,
+    # beside the library, and in the system and add_dll_directory folders.
+    # Linux matches NEEDED entries against loaded sonames and RUNPATH.
+    return ctypes.CDLL(str(path))
 
-    sites = [*site.getsitepackages(), site.getusersitepackages()]
-    wheels = [
-        Path(base) / "nvidia" / suffix
-        for base in sites
-        for suffix in ("cu13/bin/x86_64", "cudnn/bin")
-    ]
-    search = [
-        dll_path.parent,
-        *provided,
-        *wheels,
-        *(Path(value) for value in os.get_exec_path() if value),
-    ]
-    directories = dict.fromkeys(provided)
-    for name in ("cublasLt64_13.dll", "cudnn64_9.dll"):
-        path = next(
-            (candidate for candidate in search if (candidate / name).is_file()), None
+
+def load_cuda_libraries(*directories: PathArg) -> dict[str, Path]:
+    """Load cuBLASLt 13 and cuDNN 9 from explicit directories.
+
+    Call this before opening a session when no other module, such as CUDA
+    PyTorch, has already loaded these libraries into the process. Each
+    library is taken from the first listed directory that contains it, and
+    the cuDNN components beside ``cudnn`` are preloaded because cuDNN opens
+    them by name later. Neither ``PATH`` nor ``LD_LIBRARY_PATH`` is changed.
+
+    Returns the resolved path of each loaded library, keyed by file name.
+    """
+    folders = [Path(path).resolve() for path in directories]
+    if not folders:
+        raise ValueError("Supply at least one directory containing cuBLASLt 13 or cuDNN 9")
+    for folder in folders:
+        if not folder.is_dir():
+            raise FileNotFoundError(f"CUDA library directory does not exist: {folder}")
+    required: list[Path] = []
+    for name in CUDA_LIBRARIES:
+        path = next((folder / name for folder in folders if (folder / name).is_file()), None)
+        if path is None:
+            searched = ", ".join(str(folder) for folder in folders)
+            raise FileNotFoundError(f"{name} was not found in {searched}")
+        required.append(path)
+    cublas, cudnn = required
+    # Components that cuBLASLt and cuDNN load by name when they are present.
+    optional = sorted(
+        path
+        for pattern in (
+            ("cublas64_13.dll", "cudart64_13.dll", "nvJitLink_13*.dll", "nvrtc*64_13*.dll")
+            if WINDOWS
+            else ("libcublas.so.13", "libcudart.so.13", "libnvJitLink.so.13", "libnvrtc*.so.13*")
         )
-        if path is not None and path != dll_path.parent:
-            directories[path.resolve()] = None
-    return list(directories)
-
-
-def _preload_runtime_components() -> None:
-    # cuDNN uses LoadLibraryA for some components after the DLL is loaded.
-    # Use the already selected installations without changing process PATH.
-    kernel = ctypes.WinDLL("kernel32")
-    loaded = kernel.GetModuleHandleW
-    loaded.argtypes = [ctypes.c_wchar_p]
-    loaded.restype = ctypes.c_void_p
-    filename = kernel.GetModuleFileNameW
-    filename.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint32]
-    filename.restype = ctypes.c_uint32
-
-    def directory(name: str) -> Path:
-        handle = loaded(name)
-        path = ctypes.create_unicode_buffer(32768)
-        if not handle or not 0 < filename(handle, path, len(path)) < len(path):
-            raise OSError(f"Could not locate the loaded library {name}")
-        return Path(path.value).parent
-
-    def preload(folder: Path, patterns: tuple[str, ...]) -> None:
-        for pattern in patterns:
-            for path in sorted(folder.glob(pattern)):
-                if not loaded(path.name):
-                    ctypes.WinDLL(str(path))
-
-    cuda = directory("cublasLt64_13.dll")
-    cudnn = directory("cudnn64_9.dll")
-    graph = "cudnn_graph64_9.dll"
-    if not loaded(graph) and not (cudnn / graph).is_file():
-        raise OSError(f"Missing {graph} in the cuDNN installation at {cudnn}")
-    preload(
-        cuda,
-        ("cublas64_13.dll", "cudart64_13.dll", "nvJitLink_13*.dll", "nvrtc*64_13*.dll"),
+        for path in cublas.parent.glob(pattern)
     )
-    preload(cudnn, ("cudnn*64_9.dll",))
+    components = sorted(cudnn.parent.glob(CUDNN_COMPONENTS))
+    # cuDNN's engine libraries import the graph library, so load it first.
+    components.sort(key=lambda path: "graph" not in path.name)
+    loaded = {}
+    with _load_lock:
+        for path in (*optional, cublas, *components, cudnn):
+            if path not in _cuda_libraries:
+                try:
+                    _cuda_libraries[path] = _load(path)
+                except OSError as error:
+                    raise OSError(f"Could not load {path}: {error}") from error
+            loaded[path.name] = path
+    return loaded
 
 
-def load_session_library(
-    dll_path: Path, extra: Sequence[PathArg] = ()
-) -> tuple[ctypes.CDLL, ExitStack]:
-    if sys.platform != "win32":
-        raise OSError("GateRV3 inference currently requires the Windows CUDA DLL")
-    if not dll_path.is_file():
-        raise FileNotFoundError(f"GateRV3 DLL not found: {dll_path}")
-    stack = ExitStack()
-    try:
-        with _load_lock:
-            for path in _runtime_dirs(dll_path, extra):
-                stack.enter_context(os.add_dll_directory(str(path)))
-            try:
-                dll = ctypes.CDLL(str(dll_path))
-                _preload_runtime_components()
-            except OSError as error:
-                raise OSError(
-                    f"Could not load the runtime for {dll_path}. Check the CUDA driver, cuBLASLt 13, "
-                    "cuDNN 9 and the MSVC runtime. SessionOptions.dll_dirs can locate CUDA DLLs."
-                ) from error
+def find_session_library(model: Path, explicit: PathArg | None = None) -> Path:
+    """Select the explicit library, the installed package copy, or the one beside the model."""
+    if explicit is not None:
+        path = Path(explicit).resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"GateRV3 library not found: {path}")
+        return path
+    for directory in (PACKAGE_DIR, model.parent):
+        path = directory / LIBRARY_NAME
+        if path.is_file():
+            return path.resolve()
+    raise FileNotFoundError(
+        f"{LIBRARY_NAME} was not found in the installed package ({PACKAGE_DIR}) or beside "
+        f"the model ({model.parent}). Install a platform wheel or set SessionOptions(dll_path=...)."
+    )
+
+
+def load_session_library(path: Path) -> ctypes.CDLL:
+    """Load and bind a GateRV3 session library once per process."""
+    if not path.is_file():
+        raise FileNotFoundError(f"GateRV3 library not found: {path}")
+    with _load_lock:
+        library = _session_libraries.get(path)
+        if library is not None:
+            return library
         try:
-            _bind_session_api(dll)
-        except AttributeError as error:
+            library = _load(path)
+        except OSError as error:
+            libraries = " and ".join(CUDA_LIBRARIES)
             raise OSError(
-                f"{dll_path} does not expose the packed GateRV3 session API"
+                f"Could not load {path} or one of its dependencies. It needs the CUDA driver, {libraries}. "
+                "Import CUDA PyTorch first or call umzi_native.load_cuda_libraries() "
+                "with the directories that contain them."
             ) from error
-    except BaseException:
-        stack.close()
-        raise
-    return dll, stack
+        try:
+            _bind_session_api(library)
+        except AttributeError as error:
+            raise OSError(f"{path} does not expose the packed GateRV3 session API") from error
+        _session_libraries[path] = library
+    return library
 
 
 def _bind_session_api(dll: ctypes.CDLL) -> None:
@@ -217,14 +225,8 @@ def session_setup(dll: ctypes.CDLL, handle: int | None, info: InfoABI) -> dict:
             )
         ),
         "cache_status": CACHE_STATUSES[info.cache_status],
-        "cache_message": dll.gt_session_cache_message(handle).decode(
-            "utf-8", errors="replace"
-        ),
+        "cache_message": dll.gt_session_cache_message(handle).decode("utf-8", errors="replace"),
         "fused_silu_count": info.fused_silu_count,
-        "fusion_message": dll.gt_session_fusion_message(handle).decode(
-            "utf-8", errors="replace"
-        ),
-        "optimization": dict(
-            zip(OPTIMIZATION_STATS, info.optimization_stats, strict=True)
-        ),
+        "fusion_message": dll.gt_session_fusion_message(handle).decode("utf-8", errors="replace"),
+        "optimization": dict(zip(OPTIMIZATION_STATS, info.optimization_stats, strict=True)),
     }

@@ -55,14 +55,9 @@ class ModelConfig:
         in_ch = in_to_dim.shape[1]
 
         enc_levels = _child_count(state_dict, "gater_encode")
-        enc_blocks = tuple(
-            _child_count(state_dict, f"gater_encode.{i}.gated")
-            for i in range(enc_levels)
-        )
+        enc_blocks = tuple(_child_count(state_dict, f"gater_encode.{i}.gated") for i in range(enc_levels))
         dec_levels = _child_count(state_dict, "decode")
-        dec_blocks = tuple(
-            _child_count(state_dict, f"decode.{i}.gated") for i in range(dec_levels)
-        )
+        dec_blocks = tuple(_child_count(state_dict, f"decode.{i}.gated") for i in range(dec_levels))
 
         num_latent = _child_count(state_dict, "latent")
         sisr_blocks = _child_count(state_dict, "span_n_b")
@@ -151,11 +146,7 @@ def read_state_dict(path: str | Path) -> dict[str, Tensor]:
             checkpoint = inner
             break
 
-    state_dict = {
-        key.removeprefix("module."): value
-        for key, value in checkpoint.items()
-        if isinstance(value, Tensor)
-    }
+    state_dict = {key.removeprefix("module."): value for key, value in checkpoint.items() if isinstance(value, Tensor)}
     if not state_dict:
         msg = f"No tensors found in checkpoint {path}"
         raise ValueError(msg)

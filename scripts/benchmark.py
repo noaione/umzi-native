@@ -15,10 +15,10 @@ from typing import Any
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from PIL import Image
 from reference.model import load_model
 from rtx_session import create_rtx_session
+from torch.nn import functional
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -32,9 +32,7 @@ def tensor_image(image: Image.Image) -> torch.Tensor:
 
 
 def image_tensor(t: torch.Tensor) -> Image.Image:
-    a = (t[0].float().clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255 + 0.5).astype(
-        np.uint8
-    )
+    a = (t[0].float().clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255 + 0.5).astype(np.uint8)
     return Image.fromarray(a, "RGB")
 
 
@@ -44,7 +42,7 @@ def patches(image: torch.Tensor, tile: int):
     chunks = []
     for y, x in coords:
         p = image[:, :, y : min(y + tile, h), x : min(x + tile, w)]
-        p = F.pad(p, (0, tile - p.shape[-1], 0, tile - p.shape[-2]), mode="replicate")
+        p = functional.pad(p, (0, tile - p.shape[-1], 0, tile - p.shape[-2]), mode="replicate")
         chunks.append((y, x, p))
     return chunks
 
@@ -54,11 +52,7 @@ def run_tiled(run, image, tile, batch, device):
     h, w = image.shape[-2:]
     out = torch.empty((1, 3, h, w), dtype=torch.float32)
     target = getattr(run, "_orig_mod", run)
-    input_dtype = (
-        next(target.parameters()).dtype
-        if isinstance(target, torch.nn.Module)
-        else torch.float32
-    )
+    input_dtype = next(target.parameters()).dtype if isinstance(target, torch.nn.Module) else torch.float32
     items = patches(image, tile)
     for i in range(0, len(items), batch):
         group = items[i : i + batch]
@@ -74,11 +68,7 @@ def run_tiled(run, image, tile, batch, device):
 def measure_single_tile_latencies(run, label, image, tile, device):
     """Time each tile as its own synchronized batch-1 invocation."""
     target = getattr(run, "_orig_mod", run)
-    input_dtype = (
-        next(target.parameters()).dtype
-        if isinstance(target, torch.nn.Module)
-        else torch.float32
-    )
+    input_dtype = next(target.parameters()).dtype if isinstance(target, torch.nn.Module) else torch.float32
     samples = patches(image, tile)
     # Exclude first-call setup from per-tile samples.
     warmup = samples[0][2].to(device=device, dtype=input_dtype)
@@ -92,16 +82,14 @@ def measure_single_tile_latencies(run, label, image, tile, device):
         run(x)
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - started
-        timings.append(
-            {
-                "image": label,
-                "tile_index": tile_index,
-                "top": top,
-                "left": left,
-                "seconds": elapsed,
-                "milliseconds": elapsed * 1000,
-            }
-        )
+        timings.append({
+            "image": label,
+            "tile_index": tile_index,
+            "top": top,
+            "left": left,
+            "seconds": elapsed,
+            "milliseconds": elapsed * 1000,
+        })
     return timings
 
 
@@ -117,9 +105,7 @@ def main():
     ap.add_argument("--tile", type=int, default=128)
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--skip-trt", action="store_true")
-    ap.add_argument(
-        "--rtx-cache-dir", type=Path, help="TensorRT-RTX runtime cache directory"
-    )
+    ap.add_argument("--rtx-cache-dir", type=Path, help="TensorRT-RTX runtime cache directory")
     args = ap.parse_args()
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required for this baseline matrix")
@@ -155,11 +141,15 @@ def main():
         "variants": {},
         "quality_tool": r"C:\Tools\imaging\ssimulacra2.exe",
         "metric_definitions": {
-            "per_tile_latency": "synchronized batch-1 wall time measured separately for every tile; startup warmup excluded",
+            "per_tile_latency": (
+                "synchronized batch-1 wall time measured separately for every tile; startup warmup excluded"
+            ),
             "average_per_tile_latency": "arithmetic mean of the individually measured batch-1 tile latencies",
             "batch16_seconds": "synchronized inference wall time for batch-16 tiled inference",
             "megapixels_per_second": "source image pixels divided by synchronized inference wall time",
-            "psnr_db": "raw float model output versus the matching Torch CUDA FP32 output, peak=1, before PNG quantization",
+            "psnr_db": (
+                "raw float model output versus the matching Torch CUDA FP32 output, peak=1, before PNG quantization"
+            ),
         },
     }
     references: list[torch.Tensor] | None = None
@@ -194,18 +184,10 @@ def main():
                 mse = float(delta.square().mean())
                 row["psnr_db"] = None if mse == 0 else float(10 * np.log10(1 / mse))
             image_stats.append(row)
-            tile_timings = measure_single_tile_latencies(
-                single_tile_runner or runner, label, img, args.tile, device
-            )
-            row["individual_tile_latency_seconds"] = [
-                item["seconds"] for item in tile_timings
-            ]
-            row["average_individual_tile_latency_seconds"] = float(
-                np.mean(row["individual_tile_latency_seconds"])
-            )
-            row["average_individual_tile_latency_milliseconds"] = (
-                row["average_individual_tile_latency_seconds"] * 1000
-            )
+            tile_timings = measure_single_tile_latencies(single_tile_runner or runner, label, img, args.tile, device)
+            row["individual_tile_latency_seconds"] = [item["seconds"] for item in tile_timings]
+            row["average_individual_tile_latency_seconds"] = float(np.mean(row["individual_tile_latency_seconds"]))
+            row["average_individual_tile_latency_milliseconds"] = row["average_individual_tile_latency_seconds"] * 1000
             individual_tile_times.extend(tile_timings)
             print(
                 f"{name} {label}: batch-{args.batch} {image_seconds:.2f}s; "
@@ -226,12 +208,8 @@ def main():
                 "measurement_batch_size": 1,
                 "timing_scope": "one synchronized forward call for each tile, including host/device transfer",
                 "measured_tile_count": len(individual_tile_times),
-                "average_seconds": float(
-                    np.mean([item["seconds"] for item in individual_tile_times])
-                ),
-                "average_milliseconds": float(
-                    np.mean([item["milliseconds"] for item in individual_tile_times])
-                ),
+                "average_seconds": float(np.mean([item["seconds"] for item in individual_tile_times])),
+                "average_milliseconds": float(np.mean([item["milliseconds"] for item in individual_tile_times])),
                 "per_tile": individual_tile_times,
             },
             "outputs": str(directory),
@@ -248,12 +226,8 @@ def main():
                 total_squared_error += float(delta.square().sum())
                 total_values += delta.numel()
             mse = total_squared_error / total_values
-            report["variants"][name]["psnr_db"] = (
-                None if mse == 0 else float(10 * np.log10(1 / mse))
-            )
-        (args.output / "report.json").write_text(
-            json.dumps(report, indent=2), encoding="utf-8"
-        )
+            report["variants"][name]["psnr_db"] = None if mse == 0 else float(10 * np.log10(1 / mse))
+        (args.output / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
         print(
             f"{name}: batch-{args.batch} {overall_seconds:.2f}s, "
             f"mean single-tile latency "
@@ -268,20 +242,14 @@ def main():
     compiled = torch.compile(model16, mode="reduce-overhead", dynamic=False)
     # Explicitly warm up the exact batch/tile signature before timed execution.
     with torch.inference_mode():
-        compiled(
-            torch.zeros(
-                args.batch, 3, args.tile, args.tile, device=device, dtype=torch.float16
-            )
-        )
+        compiled(torch.zeros(args.batch, 3, args.tile, args.tile, device=device, dtype=torch.float16))
     torch.cuda.synchronize()
     evaluate("torch_inductor_cuda_fp16", compiled, args.output / "inductor-fp16")
 
     if not args.skip_trt:
         onnx_path = args.output / f"gaterv3-fp16-t{args.tile}-b{args.batch}.onnx"
         if not onnx_path.exists():
-            dummy = torch.zeros(
-                args.batch, 3, args.tile, args.tile, device=device, dtype=torch.float16
-            )
+            dummy = torch.zeros(args.batch, 3, args.tile, args.tile, device=device, dtype=torch.float16)
             torch.onnx.export(
                 model16,
                 (dummy,),
@@ -292,16 +260,12 @@ def main():
                 dynamo=False,
             )
         rtx_cache = args.rtx_cache_dir or args.output / "rtx-runtime-cache"
-        sess, rtx_options = create_rtx_session(
-            onnx_path, args.batch, args.tile, rtx_cache
-        )
+        sess, rtx_options = create_rtx_session(onnx_path, args.batch, args.tile, rtx_cache)
         input_name = sess.get_inputs()[0].name
 
         single_onnx_path = args.output / f"gaterv3-fp16-t{args.tile}-b1.onnx"
         if not single_onnx_path.exists():
-            single_dummy = torch.zeros(
-                1, 3, args.tile, args.tile, device=device, dtype=torch.float16
-            )
+            single_dummy = torch.zeros(1, 3, args.tile, args.tile, device=device, dtype=torch.float16)
             torch.onnx.export(
                 model16,
                 (single_dummy,),
@@ -311,17 +275,13 @@ def main():
                 opset_version=17,
                 dynamo=False,
             )
-        single_sess, single_rtx_options = create_rtx_session(
-            single_onnx_path, 1, args.tile, rtx_cache
-        )
+        single_sess, single_rtx_options = create_rtx_session(single_onnx_path, 1, args.tile, rtx_cache)
         single_input_name = single_sess.get_inputs()[0].name
 
         def make_ort_runner(session, name):
             def run(x):
                 arr = x.detach().cpu().numpy().astype(np.float16, copy=False)
-                return torch.from_numpy(session.run(None, {name: arr})[0]).to(
-                    device=device, dtype=torch.float32
-                )
+                return torch.from_numpy(session.run(None, {name: arr})[0]).to(device=device, dtype=torch.float32)
 
             return run
 
@@ -335,21 +295,13 @@ def main():
             single_tile_runner=single_ort_run,
         )
         report["variants"]["onnx_tensorrt_rtx_fp16"]["providers"] = sess.get_providers()
-        report["variants"]["onnx_tensorrt_rtx_fp16"]["batch1_providers"] = (
-            single_sess.get_providers()
-        )
+        report["variants"]["onnx_tensorrt_rtx_fp16"]["batch1_providers"] = single_sess.get_providers()
         report["variants"]["onnx_tensorrt_rtx_fp16"]["provider_options"] = rtx_options
-        report["variants"]["onnx_tensorrt_rtx_fp16"]["batch1_provider_options"] = (
-            single_rtx_options
-        )
+        report["variants"]["onnx_tensorrt_rtx_fp16"]["batch1_provider_options"] = single_rtx_options
         report["variants"]["onnx_tensorrt_rtx_fp16"]["onnx"] = str(onnx_path)
-        report["variants"]["onnx_tensorrt_rtx_fp16"]["batch1_onnx"] = str(
-            single_onnx_path
-        )
+        report["variants"]["onnx_tensorrt_rtx_fp16"]["batch1_onnx"] = str(single_onnx_path)
 
-    report["quality_comparison"] = (
-        "ssimulacra2 pairwise against per-image Torch CUDA FP32 output"
-    )
+    report["quality_comparison"] = "ssimulacra2 pairwise against per-image Torch CUDA FP32 output"
     quality_tool = Path(r"C:\Tools\imaging\ssimulacra2.exe")
     report["quality_scores"] = {}
     if quality_tool.is_file():
@@ -374,9 +326,7 @@ def main():
                 )
                 values = re.findall(r"-?\d+(?:\.\d+)?", result.stdout)
                 if not values:
-                    raise RuntimeError(
-                        f"Could not parse SSIMULACRA2 output: {result.stdout!r}"
-                    )
+                    raise RuntimeError(f"Could not parse SSIMULACRA2 output: {result.stdout!r}")
                 scores.append({"image": candidate.name, "score": float(values[-1])})
             if scores:
                 report["quality_scores"][variant] = {
@@ -384,9 +334,7 @@ def main():
                     "mean": sum(item["score"] for item in scores) / len(scores),
                     "minimum": min(item["score"] for item in scores),
                 }
-    (args.output / "report.json").write_text(
-        json.dumps(report, indent=2), encoding="utf-8"
-    )
+    (args.output / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(f"Wrote {args.output / 'report.json'}")
 
 

@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 from benchmark_native import CHECKPOINT, ROOT, Native, error_metrics, load_model
+from torch.nn import functional
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from umzi_native._native import IoABI
@@ -41,7 +41,7 @@ def reference_output(reference, sample):
             return reference(x).cpu()
         for pad, gap, length in (((0, pw, 0, 0), pw, w), ((0, 0, 0, ph), ph, h)):
             if gap:
-                x = F.pad(x, pad, mode="reflect" if gap < length else "replicate")
+                x = functional.pad(x, pad, mode="reflect" if gap < length else "replicate")
         return reference(x)[:, :, :h, :w].cpu()
 
 
@@ -127,13 +127,9 @@ def check_cache_recovery(bundle, model_file):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bundle", type=Path, default=ROOT / "output/native-refactor")
-    parser.add_argument(
-        "--legacy-bundle", type=Path, default=ROOT / "output/native-projections"
-    )
+    parser.add_argument("--legacy-bundle", type=Path, default=ROOT / "output/native-projections")
     parser.add_argument("--checkpoint", type=Path, default=CHECKPOINT)
-    parser.add_argument(
-        "--output", type=Path, default=ROOT / "output/native-refactor-validation"
-    )
+    parser.add_argument("--output", type=Path, default=ROOT / "output/native-refactor-validation")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     torch.set_num_threads(4)
@@ -169,11 +165,7 @@ def main():
                 sample_generator = torch.Generator().manual_seed(700)
                 for index, shape in enumerate(CASES):
                     batch, height, width = shape
-                    g = (
-                        torch.Generator().manual_seed(700)
-                        if shape == CASES[0]
-                        else sample_generator
-                    )
+                    g = torch.Generator().manual_seed(700) if shape == CASES[0] else sample_generator
                     x = torch.rand((batch, 3, height, width), generator=g)
                     describe_and_check_buffers(graph, x, shape)
                     expected = reference_output(reference, x)
@@ -202,19 +194,11 @@ def main():
                     if index == 0:
                         first = output
                     if index == len(CASES) - 1:
-                        assert (
-                            first is not None
-                            and torch.equal(first, output)
-                            and setup["cache_status"] == "hit"
-                        )
+                        assert first is not None and torch.equal(first, output) and setup["cache_status"] == "hit"
                     if height == width == 128 and batch in (1, 16) and index < 2:
-                        old = Native(
-                            args.legacy_bundle, batch, precision=mode, cache_dir=cache
-                        )
+                        old = Native(args.legacy_bundle, batch, precision=mode, cache_dir=cache)
                         try:
-                            row["old_fixed_comparison"] = error_metrics(
-                                old.host(x), output
-                            )
+                            row["old_fixed_comparison"] = error_metrics(old.host(x), output)
                         finally:
                             old.close()
                     print(mode, row, flush=True)
@@ -231,9 +215,7 @@ def main():
                 "retried_after_allocation_failure": allocation_message,
             }
     result["cache_recovery"] = check_cache_recovery(args.bundle, model_file)
-    (args.output / "shapes.json").write_text(
-        json.dumps(result, indent=2) + "\n", encoding="utf-8"
-    )
+    (args.output / "shapes.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":

@@ -5,9 +5,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-SampleMods = Literal[
-    "conv", "pixelshuffledirect", "pixelshuffle", "nearest+conv", "dysample"
-]
+SampleMods = Literal["conv", "pixelshuffledirect", "pixelshuffle", "nearest+conv", "dysample"]
 _SAMPLE_MODES = (
     "conv",
     "pixelshuffledirect",
@@ -56,7 +54,8 @@ class DySample(nn.Module):
     def _init_pos(self) -> Tensor:
         h = torch.arange((-self.scale + 1) / 2, (self.scale - 1) / 2 + 1) / self.scale
         return (
-            torch.stack(torch.meshgrid([h, h], indexing="ij"))
+            torch
+            .stack(torch.meshgrid([h, h], indexing="ij"))
             .transpose(1, 2)
             .repeat(1, self.groups, 1)
             .reshape(1, -1, 1, 1)
@@ -70,20 +69,20 @@ class DySample(nn.Module):
         coords_w = torch.arange(W) + 0.5
 
         coords = (
-            torch.stack(torch.meshgrid([coords_w, coords_h], indexing="ij"))
+            torch
+            .stack(torch.meshgrid([coords_w, coords_h], indexing="ij"))
             .transpose(1, 2)
             .unsqueeze(1)
             .unsqueeze(0)
             .type(x.dtype)
             .to(x.device, non_blocking=True)
         )
-        normalizer = torch.tensor(
-            [W, H], dtype=x.dtype, device=x.device, pin_memory=True
-        ).view(1, 2, 1, 1, 1)
+        normalizer = torch.tensor([W, H], dtype=x.dtype, device=x.device, pin_memory=True).view(1, 2, 1, 1, 1)
         coords = 2 * (coords + offset) / normalizer - 1
 
         coords = (
-            F.pixel_shuffle(coords.reshape(B, -1, H, W), self.scale)
+            F
+            .pixel_shuffle(coords.reshape(B, -1, H, W), self.scale)
             .view(B, 2, -1, self.scale * H, self.scale * W)
             .permute(0, 2, 3, 4, 1)
             .contiguous()
@@ -119,60 +118,44 @@ class UniUpsample(nn.Sequential):
         if scale == 1 or upsample == "conv":
             m.append(nn.Conv2d(in_dim, out_dim, 3, 1, 1))
         elif upsample == "pixelshuffledirect":
-            m.extend(
-                [nn.Conv2d(in_dim, out_dim * scale**2, 3, 1, 1), nn.PixelShuffle(scale)]
-            )
+            m.extend([nn.Conv2d(in_dim, out_dim * scale**2, 3, 1, 1), nn.PixelShuffle(scale)])
         elif upsample == "pixelshuffle":
             m.extend([nn.Conv2d(in_dim, mid_dim, 3, 1, 1), nn.LeakyReLU(inplace=True)])
             if (scale & (scale - 1)) == 0:  # scale = 2^n
                 for _ in range(int(math.log2(scale))):
-                    m.extend(
-                        [nn.Conv2d(mid_dim, 4 * mid_dim, 3, 1, 1), nn.PixelShuffle(2)]
-                    )
+                    m.extend([nn.Conv2d(mid_dim, 4 * mid_dim, 3, 1, 1), nn.PixelShuffle(2)])
             elif scale == 3:
                 m.extend([nn.Conv2d(mid_dim, 9 * mid_dim, 3, 1, 1), nn.PixelShuffle(3)])
             else:
-                raise ValueError(
-                    f"scale {scale} is not supported. Supported scales: 2^n and 3."
-                )
+                raise ValueError(f"scale {scale} is not supported. Supported scales: 2^n and 3.")
             m.append(nn.Conv2d(mid_dim, out_dim, 3, 1, 1))
         elif upsample == "nearest+conv":
             if (scale & (scale - 1)) == 0:
                 for _ in range(int(math.log2(scale))):
-                    m.extend(
-                        (
-                            nn.Conv2d(in_dim, in_dim, 3, 1, 1),
-                            nn.Upsample(scale_factor=2),
-                            nn.LeakyReLU(negative_slope=0.2, inplace=True),
-                        )
-                    )
-                m.extend(
-                    (
+                    m.extend((
                         nn.Conv2d(in_dim, in_dim, 3, 1, 1),
+                        nn.Upsample(scale_factor=2),
                         nn.LeakyReLU(negative_slope=0.2, inplace=True),
-                    )
-                )
+                    ))
+                m.extend((
+                    nn.Conv2d(in_dim, in_dim, 3, 1, 1),
+                    nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                ))
             elif scale == 3:
-                m.extend(
-                    (
-                        nn.Conv2d(in_dim, in_dim, 3, 1, 1),
-                        nn.Upsample(scale_factor=scale),
-                        nn.LeakyReLU(negative_slope=0.2, inplace=True),
-                        nn.Conv2d(in_dim, in_dim, 3, 1, 1),
-                        nn.LeakyReLU(negative_slope=0.2, inplace=True),
-                    )
-                )
+                m.extend((
+                    nn.Conv2d(in_dim, in_dim, 3, 1, 1),
+                    nn.Upsample(scale_factor=scale),
+                    nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                    nn.Conv2d(in_dim, in_dim, 3, 1, 1),
+                    nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                ))
             else:
-                raise ValueError(
-                    f"scale {scale} is not supported. Supported scales: 2^n and 3."
-                )
+                raise ValueError(f"scale {scale} is not supported. Supported scales: 2^n and 3.")
             m.append(nn.Conv2d(in_dim, out_dim, 3, 1, 1))
         elif upsample == "dysample":
             m.append(DySample(in_dim, out_dim, scale, group))
         else:
-            raise ValueError(
-                f"An invalid Upsample was selected. Please choose one of {SampleMods}"
-            )
+            raise ValueError(f"An invalid Upsample was selected. Please choose one of {SampleMods}")
         super().__init__(*m)
 
         self.register_buffer(
@@ -255,27 +238,17 @@ class Conv3XC(nn.Module):
         w1 = conv1.weight.data.clone().detach()
         w2 = conv2.weight.data.clone().detach()
         w3 = conv3.weight.data.clone().detach()
-        w = (
-            F.conv2d(w1.flip(2, 3).permute(1, 0, 2, 3), w2, padding=2, stride=1)
-            .flip(2, 3)
-            .permute(1, 0, 2, 3)
-        )
+        w = F.conv2d(w1.flip(2, 3).permute(1, 0, 2, 3), w2, padding=2, stride=1).flip(2, 3).permute(1, 0, 2, 3)
 
         self.weight_concat = (
-            F.conv2d(w.flip(2, 3).permute(1, 0, 2, 3), w3, padding=0, stride=1)
-            .flip(2, 3)
-            .permute(1, 0, 2, 3)
+            F.conv2d(w.flip(2, 3).permute(1, 0, 2, 3), w3, padding=0, stride=1).flip(2, 3).permute(1, 0, 2, 3)
         )
 
         sk_w = self.sk.weight.data.clone().detach()
         sk_b: Tensor | None = None
 
         if self.bias:
-            assert (
-                conv1.bias is not None
-                and conv2.bias is not None
-                and conv3.bias is not None
-            )
+            assert conv1.bias is not None and conv2.bias is not None and conv3.bias is not None
             assert self.sk.bias is not None and self.eval_conv.bias is not None
             b1 = conv1.bias.data.clone().detach()
             b2 = conv2.bias.data.clone().detach()
@@ -288,9 +261,7 @@ class Conv3XC(nn.Module):
 
         H_pixels_to_pad = (target_kernel_size - 1) // 2
         W_pixels_to_pad = (target_kernel_size - 1) // 2
-        sk_w = F.pad(
-            sk_w, [H_pixels_to_pad, H_pixels_to_pad, W_pixels_to_pad, W_pixels_to_pad]
-        )
+        sk_w = F.pad(sk_w, [H_pixels_to_pad, H_pixels_to_pad, W_pixels_to_pad, W_pixels_to_pad])
         self.weight_concat = self.weight_concat + sk_w
         self.eval_conv.weight.data = self.weight_concat
         if self.bias:
@@ -317,9 +288,7 @@ class Conv3XC(nn.Module):
 
 
 class SPAB(nn.Module):
-    def __init__(
-        self, in_channels, mid_dim=None, out_dim=None, bias=False, end=False
-    ) -> None:
+    def __init__(self, in_channels, mid_dim=None, out_dim=None, bias=False, end=False) -> None:
         super().__init__()
         mid_dim = mid_dim if mid_dim else in_channels
         out_dim = out_dim if out_dim else in_channels
@@ -361,15 +330,11 @@ class RMSNorm(nn.Module):
 class InceptionDWConv2d(nn.Module):
     """Inception depthweise convolution"""
 
-    def __init__(
-        self, in_channels, square_kernel_size=3, band_kernel_size=11, branch_ratio=0.125
-    ) -> None:
+    def __init__(self, in_channels, square_kernel_size=3, band_kernel_size=11, branch_ratio=0.125) -> None:
         super().__init__()
 
         gc = int(in_channels * branch_ratio)  # channel numbers of a convolution branch
-        self.dwconv_hw = nn.Conv2d(
-            gc, gc, square_kernel_size, padding=square_kernel_size // 2, groups=gc
-        )
+        self.dwconv_hw = nn.Conv2d(gc, gc, square_kernel_size, padding=square_kernel_size // 2, groups=gc)
         self.dwconv_w = nn.Conv2d(
             gc,
             gc,
@@ -426,9 +391,7 @@ class Attention(nn.Module):
             q = F.normalize(q, dim=3)
             k = F.normalize(k, dim=3)
 
-            attn = (
-                torch.matmul(q, k.transpose(2, 3)) * self.temperature
-            )  # (b, num_heads, hw, hw)
+            attn = torch.matmul(q, k.transpose(2, 3)) * self.temperature  # (b, num_heads, hw, hw)
             attn = attn.softmax(dim=3)
 
             out = torch.matmul(attn, v)  # (b, num_heads, head_dim, hw)
@@ -462,9 +425,7 @@ class GatedCNNBlock(nn.Module):
         self.act = nn.Mish()
         conv_channels = int(conv_ratio * dim)
         self.split_indices = [hidden, hidden - conv_channels, conv_channels]
-        self.token_mix = (
-            Attention(conv_channels, 16, flash) if att else InceptionDWConv2d(dim)
-        )
+        self.token_mix = Attention(conv_channels, 16, flash) if att else InceptionDWConv2d(dim)
         self.fc2 = nn.Conv2d(hidden, dim, 1, 1, 0)
         self.apply(self._init_weights)
 
@@ -531,16 +492,12 @@ class MetaGated(nn.Module):
 
 class Down(nn.Sequential):
     def __init__(self, dim) -> None:
-        super().__init__(
-            nn.Conv2d(dim, dim // 2, 3, 1, 1, bias=False), nn.PixelUnshuffle(2)
-        )
+        super().__init__(nn.Conv2d(dim, dim // 2, 3, 1, 1, bias=False), nn.PixelUnshuffle(2))
 
 
 class Upsample(nn.Sequential):
     def __init__(self, dim) -> None:
-        super().__init__(
-            nn.Conv2d(dim, dim * 2, 3, 1, 1, bias=False), nn.PixelShuffle(2)
-        )
+        super().__init__(nn.Conv2d(dim, dim * 2, 3, 1, 1, bias=False), nn.PixelShuffle(2))
 
 
 class Block(nn.Module):
@@ -589,39 +546,31 @@ class GateRV3(nn.Module):
 
         self.scale = scale
         self.in_to_dim = nn.Conv2d(in_ch, dim, 3, 1, 1)
-        self.gater_encode = nn.ModuleList(
-            [Block(dim * (2**i), enc_blocks[i]) for i in range(len(enc_blocks))]
-        )
+        self.gater_encode = nn.ModuleList([Block(dim * (2**i), enc_blocks[i]) for i in range(len(enc_blocks))])
         self.span_block0 = SPAB(dim, end=False)
-        self.span_n_b = nn.Sequential(
-            *[SPAB(dim, end=False) for _ in range(sisr_blocks)]
-        )
+        self.span_n_b = nn.Sequential(*[SPAB(dim, end=False) for _ in range(sisr_blocks)])
         self.span_end = SPAB(dim, end=True)
         self.sisr_end_conv = Conv3XC(dim, dim, bias=True)
         self.sisr_cat_conv = nn.Conv2d(dim * 4, dim, 1)
         nn.init.trunc_normal_(self.sisr_cat_conv.weight, std=0.02)
-        self.latent = nn.Sequential(
-            *[
-                GatedCNNBlock(
-                    dim * (2 ** len(enc_blocks)),
-                    expansion_ratio=1.5,
-                    conv_ratio=1.00,
-                    att=attention,
-                    flash=flash,
-                )
-                for _ in range(num_latent)
-            ]
-        )
-        self.decode = nn.ModuleList(
-            [
-                Block(
-                    dim * (2 ** (len(dec_blocks) - i)),
-                    dec_blocks[i],
-                    False,
-                )
-                for i in range(len(dec_blocks))
-            ]
-        )
+        self.latent = nn.Sequential(*[
+            GatedCNNBlock(
+                dim * (2 ** len(enc_blocks)),
+                expansion_ratio=1.5,
+                conv_ratio=1.00,
+                att=attention,
+                flash=flash,
+            )
+            for _ in range(num_latent)
+        ])
+        self.decode = nn.ModuleList([
+            Block(
+                dim * (2 ** (len(dec_blocks) - i)),
+                dec_blocks[i],
+                False,
+            )
+            for i in range(len(dec_blocks))
+        ])
         self.pad = 2 ** (len(enc_blocks))
 
         self.gamma = nn.Parameter(torch.ones(1, in_ch, 1, 1) * end_gamma_init)
@@ -660,7 +609,7 @@ class GateRV3(nn.Module):
         del sisr_short, sisr_out
         shorts = []
 
-        for index, block in enumerate(self.gater_encode):
+        for block in self.gater_encode:
             x, short = block(x)
             shorts.append(short)
 

@@ -24,12 +24,8 @@ CUDNN = "bin/cudnn64_9.dll" if WINDOWS else "lib/libcudnn.so.9"
 
 def libraries(cuda_root=None, cudnn_root=None):
     sites = [Path(path) / "nvidia" for path in (*sys.path, *site.getsitepackages())]
-    cuda = cuda_root or next(
-        (site / "cu13" for site in sites if (site / "cu13" / NVRTC).is_file()), None
-    )
-    cudnn = cudnn_root or next(
-        (site / "cudnn" for site in sites if (site / "cudnn" / CUDNN).is_file()), None
-    )
+    cuda = cuda_root or next((site / "cu13" for site in sites if (site / "cu13" / NVRTC).is_file()), None)
+    cudnn = cudnn_root or next((site / "cudnn" for site in sites if (site / "cudnn" / CUDNN).is_file()), None)
     if cuda is None or cudnn is None:
         raise RuntimeError('Install the CUDA 13 build tools with pip install ".[dev]"')
     header = cuda / "include" / "cuda.h"
@@ -46,10 +42,7 @@ def libraries(cuda_root=None, cudnn_root=None):
 def compiler_environment():
     if os.environ.get("INCLUDE") and os.environ.get("LIB") and shutil.which("cl"):
         return os.environ
-    vswhere = (
-        Path(os.environ["ProgramFiles(x86)"])
-        / "Microsoft Visual Studio/Installer/vswhere.exe"
-    )
+    vswhere = Path(os.environ["ProgramFiles(x86)"]) / "Microsoft Visual Studio/Installer/vswhere.exe"
     install = subprocess.check_output(
         [
             str(vswhere),
@@ -70,11 +63,7 @@ def compiler_environment():
         f'cmd.exe /d /s /c ""{setup}" >nul && set"',
         text=True,
     )
-    return dict(
-        line.split("=", 1)
-        for line in output.splitlines()
-        if "=" in line and not line.startswith("=")
-    )
+    return dict(line.split("=", 1) for line in output.splitlines() if "=" in line and not line.startswith("="))
 
 
 def load_nvrtc(cuda):
@@ -84,10 +73,7 @@ def load_nvrtc(cuda):
         os.environ["PATH"] = str(path.parent) + os.pathsep + os.environ["PATH"]
     nvrtc = ctypes.CDLL(str(path))
     major, minor = ctypes.c_int(), ctypes.c_int()
-    if (
-        nvrtc.nvrtcVersion(ctypes.byref(major), ctypes.byref(minor))
-        or major.value != 13
-    ):
+    if nvrtc.nvrtcVersion(ctypes.byref(major), ctypes.byref(minor)) or major.value != 13:
         raise RuntimeError(f"Expected CUDA 13 NVRTC at {path}")
     print(f"CUDA NVRTC {major.value}.{minor.value}", flush=True)
     return nvrtc
@@ -102,9 +88,7 @@ def compile_kernels(nvrtc, includes, arch):
             raise RuntimeError(f"NVRTC status {status} for {arch}")
 
     code = (SOURCE / "kernels.cu").read_bytes()
-    check(
-        nvrtc.nvrtcCreateProgram(ctypes.byref(prog), code, b"kernels.cu", 0, None, None)
-    )
+    check(nvrtc.nvrtcCreateProgram(ctypes.byref(prog), code, b"kernels.cu", 0, None, None))
     try:
         options = [
             f"--gpu-architecture={arch}".encode(),
@@ -144,9 +128,7 @@ def embed_images(output, cubins, ptx):
         for name, data in (*cubins.items(), (PTX_TARGET, ptx)):
             header.write(f"inline constexpr unsigned char {name}[] = {{\n")
             for start in range(0, len(data), 24):
-                header.write(
-                    ", ".join(hex_bytes[byte] for byte in data[start : start + 24])
-                )
+                header.write(", ".join(hex_bytes[byte] for byte in data[start : start + 24]))
                 header.write(",\n")
             header.write("};\n")
         header.write("inline constexpr KernelImage embedded_cubins[] = {\n")
@@ -180,9 +162,7 @@ def build_windows(output, cuda, includes):
         str(cpp),
     )
     # The development wheels omit the cuBLASLt and cuDNN MSVC import libraries.
-    sources = "\n".join(
-        path.read_text(encoding="utf-8") for path in (cpp, *sorted(SOURCE.glob("*.h")))
-    )
+    sources = "\n".join(path.read_text(encoding="utf-8") for path in (cpp, *sorted(SOURCE.glob("*.h"))))
     imports = []
     for dll, symbol in (("cudnn64_9", r"cudnn\w+"), ("cublasLt64_13", r"cublasLt\w+")):
         names = set(re.findall(rf"\b({symbol})\(", sources))
@@ -213,9 +193,7 @@ def build_windows(output, cuda, includes):
     )
     library = output / "gaterv3.dll"
     run(*link, "/DLL", f"/OUT:{library}")
-    run(
-        *link, f"/OUT:{output / 'gaterv3.exe'}", f"/IMPLIB:{output / 'gaterv3-cli.lib'}"
-    )
+    run(*link, f"/OUT:{output / 'gaterv3.exe'}", f"/IMPLIB:{output / 'gaterv3-cli.lib'}")
     return library
 
 
@@ -279,7 +257,8 @@ def bundle_wheel(library, directory):
         shutil.copytree(
             ROOT / "src" / "umzi_native",
             package,
-            ignore=shutil.ignore_patterns("__pycache__"),
+            # Package only the library built by this run.
+            ignore=shutil.ignore_patterns("__pycache__", "*.dll", "*.so"),
         )
         shutil.copy2(library, package)
         subprocess.run(
@@ -305,9 +284,7 @@ def find_include(supplied, relative, *candidates):
         None,
     )
     if path is None or not (path / relative).is_file():
-        raise RuntimeError(
-            f'Missing {relative}. Install the CUDA 13 tools with pip install ".[dev]"'
-        )
+        raise RuntimeError(f'Missing {relative}. Install the CUDA 13 tools with pip install ".[dev]"')
     return path.resolve()
 
 
@@ -337,9 +314,7 @@ def main():
     cuda, cudnn = libraries(args.cuda_root, args.cudnn_root)
     headers = cuda / "include"
     toolchain = ROOT / "output" / "native-toolchain"
-    crt = find_include(
-        args.crt_include, "crt/mma.h", headers, toolchain / "nvidia/cu13/include"
-    )
+    crt = find_include(args.crt_include, "crt/mma.h", headers, toolchain / "nvidia/cu13/include")
     cccl = find_include(
         args.cccl_include,
         "nv/target",
@@ -351,10 +326,7 @@ def main():
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     nvrtc = load_nvrtc(cuda)
-    cubins = {
-        arch: compile_kernels(nvrtc, includes, arch)
-        for arch in dict.fromkeys(args.arch or CUBIN_TARGETS)
-    }
+    cubins = {arch: compile_kernels(nvrtc, includes, arch) for arch in dict.fromkeys(args.arch or CUBIN_TARGETS)}
     ptx = compile_kernels(nvrtc, includes, PTX_TARGET)
     for arch, image in cubins.items():
         (output / f"kernels-{arch}.cubin").write_bytes(image)
