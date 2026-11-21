@@ -21,3 +21,6 @@ output/
 
 pip-*
 tmp_*
+
+*.ummodel
+*.umplan

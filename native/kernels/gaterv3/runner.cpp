@@ -1190,7 +1190,7 @@ public:
     }
 
     uint64_t bytes_for(Shape shape) const {
-        auto padded = shape.padded();
+        auto padded = model.padded(shape);
         if (!matches(padded)) model.check_shape(padded);
         return shape.rgb_bytes(fp16());
     }
@@ -1205,7 +1205,7 @@ public:
     GtRunner& prepare(Shape shape) {
         ContextScope scope(context);
         wait();
-        auto padded = shape.padded();
+        auto padded = model.padded(shape);
         if (!matches(padded)) {
             auto resolved = model.resolve(padded);
             active.reset();

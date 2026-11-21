@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from benchmark_native import CHECKPOINT, ROOT, Native, error_metrics, load_model
+from benchmark_native import CHECKPOINT, ROOT, Native, digest, error_metrics, load_model, packed_schedule
 from torch.nn import functional
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
@@ -22,7 +22,8 @@ CASES = (
     (16, 128, 128),
     (3, 192, 160),
     (7, 65, 79),
-    (7, 79, 65),  # Same padded geometry as the previous case.
+    (7, 66, 78),  # Same padded geometry as the previous case for both alignments.
+    (7, 79, 65),
     (17, 128, 128),
     (1, 160, 112),
     (1, 1, 7),
@@ -33,9 +34,9 @@ CASES = (
 def reference_output(reference, sample):
     x = sample.cuda()
     h, w = x.shape[-2:]
-    ph, pw = (-h) % 16, (-w) % 16
+    ph, pw = (-h) % reference.pad, (-w) % reference.pad
     # The fused Torch backend rejects the singleton latent token's strides.
-    backend = sdpa_kernel(SDPBackend.MATH) if h + ph == w + pw == 16 else nullcontext()
+    backend = sdpa_kernel(SDPBackend.MATH) if h + ph == w + pw == reference.pad else nullcontext()
     with backend:
         if ph < h and pw < w:
             return reference(x).cpu()
@@ -127,15 +128,26 @@ def check_cache_recovery(bundle, model_file):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bundle", type=Path, default=ROOT / "output/native")
-    parser.add_argument("--legacy-bundle", type=Path, default=ROOT / "output/native-projections")
+    parser.add_argument("--legacy-bundle", type=Path, help="Compare with a fixed bundle built from the same checkpoint")
     parser.add_argument("--checkpoint", type=Path, default=CHECKPOINT)
+    parser.add_argument("--model-file", type=Path, help="Packed model path, defaults to gaterv3.ummodel in --bundle")
     parser.add_argument("--output", type=Path, default=ROOT / "output/native-refactor-validation")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     torch.set_num_threads(4)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    model_file = args.bundle / "gaterv3.ummodel"
+    model_file = args.model_file or args.bundle / "gaterv3.ummodel"
+    checkpoint_hash = digest(args.checkpoint)
+    if packed_schedule(model_file)[2] != checkpoint_hash:
+        parser.error("Packed model does not match the reference checkpoint")
+    legacy_bundle = args.legacy_bundle
+    if legacy_bundle is None and args.checkpoint.resolve() == CHECKPOINT.resolve():
+        legacy_bundle = ROOT / "output/native-projections"
+    if legacy_bundle is not None:
+        manifest = json.loads((legacy_bundle / "checkpoint.json").read_text(encoding="utf-8"))
+        if manifest["checkpoint_sha256"] != checkpoint_hash:
+            parser.error("Legacy bundle does not match the reference checkpoint")
     reference, _ = load_model(args.checkpoint, device="cuda")
     result: dict[str, Any] = {}
     with tempfile.TemporaryDirectory(dir=args.output) as directory:
@@ -172,11 +184,12 @@ def main():
                     output = graph.host(x).clone()
                     info = graph.session_info()
                     assert info.model_load_ms == start_model_load
-                    assert info.prepared_input.dimensions_tuple() == (
+                    padded_shape = info.prepared_input.dimensions_tuple()
+                    assert padded_shape == (
                         batch,
                         3,
-                        (height + 15) // 16 * 16,
-                        (width + 15) // 16 * 16,
+                        height + (-height) % reference.pad,
+                        width + (-width) % reference.pad,
                     )
                     assert torch.equal(output, direct.host(x))
                     assert torch.equal(output, run_device(graph, x, shape))
@@ -186,6 +199,7 @@ def main():
                     assert psnr is None or psnr > (70 if mode == "mixed" else 58)
                     row = {
                         "shape": list(shape),
+                        "padded_shape": list(padded_shape),
                         "graph_direct_device_identical": True,
                         "cache_status": setup["cache_status"],
                         "shape_allocation_ms": setup["stages_ms"]["shape_allocation"],
@@ -196,8 +210,8 @@ def main():
                         first = output
                     if index == len(CASES) - 1:
                         assert first is not None and torch.equal(first, output) and setup["cache_status"] == "hit"
-                    if height == width == 128 and batch in (1, 16) and index < 2:
-                        old = Native(args.legacy_bundle, batch, precision=mode, cache_dir=cache)
+                    if legacy_bundle is not None and height == width == 128 and batch in (1, 16) and index < 2:
+                        old = Native(legacy_bundle, batch, precision=mode, cache_dir=cache)
                         try:
                             row["old_fixed_comparison"] = error_metrics(old.host(x), output)
                         finally:

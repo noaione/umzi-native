@@ -34,7 +34,10 @@ struct Shape {
             throw std::runtime_error("Batch, height and width must be positive and fit native indexing");
         return {static_cast<int>(n), static_cast<int>(h), static_cast<int>(w)};
     }
-    Shape padded() const { return {n, (h + 15) / 16 * 16, (w + 15) / 16 * 16}; }
+    Shape padded(int alignment) const {
+        const int round_up = alignment - 1;
+        return {n, (h + round_up) / alignment * alignment, (w + round_up) / alignment * alignment};
+    }
     bool operator==(const Shape& other) const { return n == other.n && h == other.h && w == other.w; }
     uint64_t rgb_bytes(bool fp16) const {
         return uint64_t(n) * h * w * 3 * (fp16 ? 2 : 4);
@@ -52,6 +55,7 @@ class ModelFile {
 
     std::vector<TensorSpec> specs;
     std::vector<size_t> last_use;
+    int padding_alignment = 16;
 
     void validate(const std::vector<Tensor>& tensors) {
         last_use.resize(tensors.size());
@@ -208,6 +212,7 @@ public:
     size_t weight_bytes = 0;
     std::vector<Op> ops;
 
+    Shape padded(Shape shape) const { return shape.padded(padding_alignment); }
     void check_shape(const Shape& shape) const { tensor_shapes(shape); }
 
     void parse(const umzi::ModelPackage& package) {
@@ -219,9 +224,16 @@ public:
         if (architecture.size() != 32 || (!checkpoint.empty() && checkpoint.size() != 32))
             throw std::runtime_error("Invalid GateRV3 model metadata size");
         umzi::BinaryReader reader(architecture);
-        for (auto value : {3u, 1u, 16u, 16u, 32u, 3u})
-            if (reader.number<uint32_t>() != value)
-                throw std::runtime_error("Unsupported GateRV3 model architecture");
+        auto input_channels = reader.number<uint32_t>();
+        auto scale = reader.number<uint32_t>();
+        auto height_alignment = reader.number<uint32_t>();
+        auto width_alignment = reader.number<uint32_t>();
+        auto base_channels = reader.number<uint32_t>();
+        auto output_channels = reader.number<uint32_t>();
+        if (input_channels != 3 || output_channels != 3 || scale != 1 || base_channels != 32
+            || (height_alignment != 8 && height_alignment != 16) || height_alignment != width_alignment)
+            throw std::runtime_error("Unsupported GateRV3 model architecture or padding alignment");
+        padding_alignment = static_cast<int>(height_alignment);
         auto tensors = reader.number<uint32_t>();
         auto operations = reader.number<uint32_t>();
         if (operations < 2 || operations > 2000 || tensors != operations + 1
@@ -236,10 +248,15 @@ public:
         std::memcpy(specs.data(), schedule.data(), spec_bytes);
         std::memcpy(ops.data(), schedule.data() + spec_bytes, ops.size() * sizeof(Op));
         weight_bytes = weights.size();
+        const int deepest_level = padding_alignment == 8 ? 3 : 4;
+        int max_level = 0;
         for (const auto& spec : specs) {
-            if (spec.level < -1 || spec.level > 4 || spec.channels < 1 || spec.channels > 2560)
+            if (spec.level < -1 || spec.level > deepest_level || spec.channels < 1 || spec.channels > 2560)
                 throw std::runtime_error("Invalid GateRV3 tensor description");
+            max_level = std::max(max_level, spec.level);
         }
+        if (max_level != deepest_level)
+            throw std::runtime_error("GateRV3 padding alignment does not match the schedule depth");
         for (auto spec : {specs.front(), specs.back()})
             if (spec.level || spec.channels != 3) throw std::runtime_error("Invalid GateRV3 RGB shape");
         validate(tensor_shapes({1, 128, 128}));

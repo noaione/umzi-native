@@ -135,7 +135,13 @@ class ModelConfig:
 
 def read_state_dict(path: str | Path) -> dict[str, Tensor]:
     """Load a checkpoint file and normalise common wrapper formats."""
-    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    path = Path(path)
+    if path.suffix.lower() == ".safetensors":
+        from safetensors.torch import load_file
+
+        checkpoint = load_file(path, device="cpu")
+    else:
+        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     if not isinstance(checkpoint, dict):
         msg = f"Unexpected checkpoint type: {type(checkpoint).__name__}"
         raise TypeError(msg)

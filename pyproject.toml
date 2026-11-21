@@ -29,6 +29,7 @@ dev = [
     "nvidia-cublas>=13.7,<14",
     "nvidia-cudnn-cu13>=9.26,<10",
     "nvidia-nvjitlink>=13.4,<13.5",
+    "safetensors>=0.5.3",
     "ruff>=0.17",
     "pyrefly>=1.5",
     "hatchling>=1.27",

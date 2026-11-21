@@ -328,8 +328,8 @@ class Schedule:
                 file.write(struct.pack("<11i", *op))
         return max(offsets[tensor.index] + tensor.size for tensor in activations)
 
-    def write_model(self, path: Path, weights: Path, checkpoint_sha256: str):
-        metadata = MODEL_METADATA.pack(3, 1, 16, 16, 32, 3, len(self.shapes), len(self.ops))
+    def write_model(self, path: Path, weights: Path, checkpoint_sha256: str, alignment: int):
+        metadata = MODEL_METADATA.pack(3, 1, alignment, alignment, 32, 3, len(self.shapes), len(self.ops))
         levels = {128 >> level: level for level in range(5)}
         levels[1] = -1
         schedule = b"".join(struct.pack("<2i", levels[h], c) for h, _w, c in self.shapes) + b"".join(
@@ -357,23 +357,20 @@ def main():
     args = parser.parse_args()
     torch.set_num_threads(4)
     model, config = load_model(args.model, device="cpu")
-    actual = (
-        config.in_ch,
-        config.dim,
-        config.enc_blocks,
-        config.dec_blocks,
-        config.num_latent,
-        config.sisr_blocks,
-        config.scale,
-        config.attention,
-        config.flash,
-    )
-    if actual != (3, 32, (2, 2, 4, 8), (2, 2, 2, 2), 12, 4, 1, True, True):
+    architecture = (config.enc_blocks, config.dec_blocks, config.num_latent, config.attention)
+    baseline = ((2, 2, 4, 8), (2, 2, 2, 2), 12, True)
+    idc = ((2, 2, 4), (2, 2, 2), 8, False)
+    if (
+        (config.in_ch, config.dim, config.sisr_blocks, config.scale) != (3, 32, 4, 1)
+        or architecture not in (baseline, idc)
+        or (config.attention and not config.flash)
+    ):
         raise ValueError(f"Unsupported native checkpoint configuration {config.describe()}")
     default_dir = ROOT / "output/native"
     # Existing callers that pass a bundle directory keep the original export.
     legacy = args.legacy or (args.output is not None and args.output.suffix == "")
-    output = args.output or (default_dir if legacy else default_dir / "gaterv3.ummodel")
+    name = "gaterv3.ummodel" if architecture == baseline else f"{args.model.stem}.ummodel"
+    output = args.output or (default_dir if legacy else default_dir / name)
     if not legacy and output.suffix.lower() != ".ummodel":
         parser.error("The model package filename must end in .ummodel")
     parent = output if legacy else output.parent
@@ -388,7 +385,7 @@ def main():
             schedule.build(model)
         if not legacy:
             model_path = directory / "model"
-            schedule.write_model(model_path, weights_path, digest)
+            schedule.write_model(model_path, weights_path, digest, model.pad)
             model_path.replace(output)
             print(f"Exported {output} with {len(schedule.ops)} operations\nCheckpoint {digest}")
             return

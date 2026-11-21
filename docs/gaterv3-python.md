@@ -16,6 +16,47 @@ also needs the MSVC runtime.
 
 ## Install
 
+### GateRV3 checkpoints
+
+| Checkpoint | Intended use | Padding alignment |
+| --- | --- | ---: |
+| `1x_umzi_digital_decompress_gaterv3_1.pth` | 1× Digital Decompression | 16 |
+| `1x_umzi_idc_gaterv3.safetensors` | 1× Digital Decompression, fine-tuned for specific images | 8 |
+
+Both export as `gaterv3` model packages. IDC uses three encoder levels and
+Inception depthwise convolutions in its latent blocks. The package records
+its required padding alignment.
+
+With PyTorch and `safetensors` installed, export IDC from the repository root.
+
+```powershell
+$py = 'C:\Python314\python.exe'
+& $py scripts/export_native.py --model models/1x_umzi_idc_gaterv3.safetensors `
+    --output output/native/1x_umzi_idc_gaterv3.ummodel
+```
+
+Pass the resulting `.ummodel` path to `InferenceSession`. Use a runtime
+built with 8-pixel alignment support for this package. The original
+GateRV3 model still uses the same v1 payload and 16-pixel alignment.
+
+On Windows, the IDC shape suite verified both precisions against the
+matching Torch CUDA FP32 checkpoint. It covered batch 1 and 16, odd
+rectangles, tiny tiles, CUDA Graph and direct dispatch, device buffers,
+and cache recovery. A batch of seven 65×79 tiles padded to 72×80 and
+scored 71.22 dB in mixed precision and 65.86 dB in FP16. The original
+checkpoint passed the same checks with its own padding, and its export
+was byte-identical to the previous package.
+[IDC shape report](../output/gaterv3-idc-support/idc-shapes/shapes.json) ·
+[Original checkpoint regression report](../output/gaterv3-idc-support/baseline-shapes/shapes.json)
+
+The installed Windows wheel improved the original single-tile 65×79
+probe from 35.44 to 71.49 dB in mixed precision and from 35.47 to 65.56 dB
+in FP16. Both models kept their own alignment when open simultaneously,
+and the installed IDC session matched the CLI bit for bit in both
+precisions.
+[Same-input comparison](../output/gaterv3-idc-support/same-input-probe.json) ·
+[Installed wheel check](../output/gaterv3-idc-support/wheel-check.json)
+
 Installing the package compiles the native library. `pip install .` from
 the checkout, from an sdist, or from a Git URL builds a wheel with
 [Hatchling](https://hatch.pypa.io/latest/config/build/), and Hatchling runs
