@@ -21,5 +21,12 @@ release. The uploaded version comes from `project.version` in
 - [Planned optimizations](docs/gaterv3-native-optimization.md#planned-improvements)
 - [Native runtime refactor plan](docs/gaterv3-native-refactor.md)
 - [Multi-kernel runtime and `.ummodel` plan](docs/umzi-native-runtime-plan.md)
+- [Built-in model exporter plan](docs/umzi-model-exporter-plan.md)
 - [Prepared PyTorch and TensorRT-RTX baseline](docs/gaterv3-baseline.md)
 - [Manga page tiling and batch-size benchmark](docs/gaterv3-manga-tiling.md)
+
+### Links
+
+- [umzi](https://github.com/umzi2)
+- [GateRV3](https://github.com/umzi2/GaterV3)
+- [Resselt](https://github.com/rewaifu/resselt)
