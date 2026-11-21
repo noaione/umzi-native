@@ -1,10 +1,10 @@
-"""Build the GateRV3 session library and bundle it in platform wheels.
+"""Build the Umzi session library and bundle it in platform wheels.
 
 Hatchling runs ``NativeLibraryHook`` for every standard wheel, including the
 wheel pip builds while installing from source. ``scripts/build_native.py``
 runs the same ``build()`` from the command line. NVRTC compiles the CUDA
 kernels into cubins and PTX, which are embedded in one host library:
-``gaterv3.dll`` built with MSVC on Windows, or ``libgaterv3.so`` built with
+``umzi_native.dll`` built with MSVC on Windows, or ``libumzi_native.so`` built with
 the system C++ compiler on Linux. The CLI is linked from the same object.
 """
 
@@ -22,10 +22,18 @@ from pathlib import Path
 from typing import NamedTuple
 
 ROOT = Path(__file__).resolve().parent
-SOURCE = ROOT / "native" / "gaterv3"
+NATIVE = ROOT / "native"
+KERNEL_SOURCES = {"gaterv3": NATIVE / "kernels" / "gaterv3"}
+HOST_SOURCES = (
+    *(source / "runner.cpp" for source in KERNEL_SOURCES.values()),
+    NATIVE / "runtime" / "api.cpp",
+    NATIVE / "runtime" / "registry.cpp",
+    NATIVE / "runtime" / "model_package.cpp",
+    NATIVE / "runtime" / "plan_cache_file.cpp",
+)
 WINDOWS = sys.platform == "win32"
-LIBRARY_NAME = "gaterv3.dll" if WINDOWS else "libgaterv3.so"
-CLI_NAME = "gaterv3.exe" if WINDOWS else "gaterv3"
+LIBRARY_NAME = "umzi_native.dll" if WINDOWS else "libumzi_native.so"
+CLI_NAME = "umzi_native.exe" if WINDOWS else "umzi_native"
 CUBIN_TARGETS = ("sm_86", "sm_89", "sm_120")
 PTX_TARGET = "compute_86"
 NVRTC = "bin/x86_64/nvrtc64_130_0.dll" if WINDOWS else "lib/libnvrtc.so.13"
@@ -62,6 +70,7 @@ class BuildSettings(NamedTuple):
     cccl_include: Path | None = None
     openssl_include: Sequence[Path] = ()
     cuda_driver_lib: Path | None = None
+    test_kernel: bool = False
 
 
 def _log(message: str) -> None:
@@ -123,7 +132,7 @@ def _load_nvrtc(path: Path) -> ctypes.CDLL:
     return nvrtc
 
 
-def _compile_kernels(nvrtc: ctypes.CDLL, includes: Sequence[Path], arch: str) -> bytes:
+def _compile_kernels(nvrtc: ctypes.CDLL, includes: Sequence[Path], arch: str, source: Path) -> bytes:
     _log(f"Compiling GateRV3 kernels for {arch}")
     prog = ctypes.c_void_p()
 
@@ -131,12 +140,12 @@ def _compile_kernels(nvrtc: ctypes.CDLL, includes: Sequence[Path], arch: str) ->
         if status:
             raise RuntimeError(f"NVRTC status {status} for {arch}")
 
-    code = (SOURCE / "kernels.cu").read_bytes()
+    code = (source / "kernels.cu").read_bytes()
     check(nvrtc.nvrtcCreateProgram(ctypes.byref(prog), code, b"kernels.cu", 0, None, None))
     try:
         options = [
             f"--gpu-architecture={arch}".encode(),
-            *[f"--include-path={path}".encode() for path in (*includes, SOURCE)],
+            *[f"--include-path={path}".encode() for path in (*includes, source)],
             b"--std=c++17",
             b"--use_fast_math",
         ]
@@ -158,24 +167,21 @@ def _compile_kernels(nvrtc: ctypes.CDLL, includes: Sequence[Path], arch: str) ->
         nvrtc.nvrtcDestroyProgram(ctypes.byref(prog))
 
 
-def _embed_images(output: Path, cubins: dict[str, bytes], ptx: bytes) -> None:
+def _embed_images(output: Path, cubins: dict[str, bytes], ptx: bytes, family: str) -> None:
     hex_bytes = [f"0x{value:02x}" for value in range(256)]
-    with (output / "cuda_images.h").open("w", encoding="ascii") as header:
-        header.write(
-            "#pragma once\n#include <cstddef>\nnamespace gt {\n"
-            "struct KernelImage { int capability; const unsigned char* data; std::size_t size; };\n"
-        )
+    with (output / f"{family}_images.h").open("w", encoding="ascii") as header:
+        header.write(f'#pragma once\n#include "cuda_module.h"\nnamespace {family}_images {{\n')
         for name, data in (*cubins.items(), (PTX_TARGET, ptx)):
             header.write(f"inline constexpr unsigned char {name}[] = {{\n")
             for start in range(0, len(data), 24):
                 header.write(", ".join(hex_bytes[byte] for byte in data[start : start + 24]))
                 header.write(",\n")
             header.write("};\n")
-        header.write("inline constexpr KernelImage embedded_cubins[] = {\n")
+        header.write("inline constexpr umzi::KernelImage embedded_cubins[] = {\n")
         for name in cubins:
             header.write(f"    {{{name[3:]}, {name}, sizeof({name})}},\n")
         header.write(
-            f"}};\ninline constexpr KernelImage embedded_ptx = "
+            f"}};\ninline constexpr umzi::KernelImage embedded_ptx = "
             f"{{{PTX_TARGET[8:]}, {PTX_TARGET}, sizeof({PTX_TARGET})}};\n}}\n"
         )
 
@@ -185,7 +191,7 @@ def _msvc_environment() -> dict[str, str]:
         return dict(os.environ)
     vswhere = Path(os.environ["ProgramFiles(x86)"]) / "Microsoft Visual Studio/Installer/vswhere.exe"
     if not vswhere.is_file():
-        raise RuntimeError("Visual Studio with the MSVC x64 tools is required to build gaterv3.dll")
+        raise RuntimeError("Visual Studio with the MSVC x64 tools is required to build umzi_native.dll")
     install = subprocess.check_output(
         [
             str(vswhere),
@@ -196,7 +202,7 @@ def _msvc_environment() -> dict[str, str]:
         text=True,
     ).strip()
     if not install:
-        raise RuntimeError("Visual Studio with the MSVC x64 tools is required to build gaterv3.dll")
+        raise RuntimeError("Visual Studio with the MSVC x64 tools is required to build umzi_native.dll")
     setup = Path(install) / "VC/Auxiliary/Build/vcvars64.bat"
     output = subprocess.check_output(f'cmd.exe /d /s /c ""{setup}" >nul && set"', text=True)
     return dict(line.split("=", 1) for line in output.splitlines() if "=" in line and not line.startswith("="))
@@ -207,20 +213,25 @@ def _run(*args: str, env: dict[str, str] | None = None, cwd: Path | None = None)
     subprocess.run(args, env=env, cwd=cwd, check=True, stdout=sys.stderr)
 
 
-def _build_windows(output: Path, toolchain: Toolchain, includes: Sequence[Path]) -> Path:
+def _build_windows(output: Path, toolchain: Toolchain, includes: Sequence[Path], test_kernel: bool) -> Path:
     env = _msvc_environment()
     # Keep the compiler and linker scratch files in the build directory.
     # Some environments let Python write to %TEMP% but deny it to link.exe.
     scratch = output / "tmp"
     scratch.mkdir(exist_ok=True)
     env = {**env, "TEMP": str(scratch), "TMP": str(scratch)}
-    cpp = SOURCE / "runner.cpp"
-    obj = output / "runner.obj"
+    objects = []
     flags = ("/nologo", "/std:c++17", "/O2", "/EHsc", "/MD", "/wd4996")
-    _run("cl.exe", *flags, "/c", *(f"/I{path}" for path in includes), f"/Fo{obj}", str(cpp), env=env, cwd=output)
+    if test_kernel:
+        flags += ("/DUMZI_TEST_KERNEL",)
+    for cpp in HOST_SOURCES:
+        obj = output / "_".join(cpp.relative_to(NATIVE).with_suffix(".obj").parts)
+        _run("cl.exe", *flags, "/c", *(f"/I{path}" for path in includes), f"/Fo{obj}", str(cpp), env=env, cwd=output)
+        objects.append(str(obj))
     # The development wheels omit the cuBLASLt and cuDNN MSVC import
     # libraries, so generate them from the functions the runtime calls.
-    sources = "\n".join(path.read_text(encoding="utf-8") for path in (cpp, *sorted(SOURCE.glob("*.h"))))
+    headers = (path for source in KERNEL_SOURCES.values() for path in sorted(source.glob("*.h")))
+    sources = "\n".join(path.read_text(encoding="utf-8") for path in (*HOST_SOURCES, *headers))
     imports = []
     for dll, symbol in (("cudnn64_9", r"cudnn\w+"), ("cublasLt64_13", r"cublasLt\w+")):
         names = set(re.findall(rf"\b({symbol})\(", sources))
@@ -232,22 +243,29 @@ def _build_windows(output: Path, toolchain: Toolchain, includes: Sequence[Path])
         library = output / f"{dll}.lib"
         _run("lib.exe", "/nologo", "/machine:x64", f"/def:{definition}", f"/out:{library}", env=env, cwd=output)
         imports.append(str(library))
-    link = ("link.exe", "/nologo", str(obj), str(toolchain.cuda / "lib/x64/cuda.lib"), "bcrypt.lib", "version.lib")
+    link = ("link.exe", "/nologo", *objects, str(toolchain.cuda / "lib/x64/cuda.lib"), "bcrypt.lib", "version.lib")
     library = output / LIBRARY_NAME
     _run(*link, *imports, "/DLL", f"/OUT:{library}", env=env, cwd=output)
-    _run(*link, *imports, f"/OUT:{output / CLI_NAME}", f"/IMPLIB:{output / 'gaterv3-cli.lib'}", env=env, cwd=output)
+    _run(*link, *imports, f"/OUT:{output / CLI_NAME}", f"/IMPLIB:{output / 'umzi_native-cli.lib'}", env=env, cwd=output)
     return library
 
 
-def _build_linux(output: Path, toolchain: Toolchain, includes: Sequence[Path], driver: Path | None) -> Path:
+def _build_linux(
+    output: Path, toolchain: Toolchain, includes: Sequence[Path], driver: Path | None, test_kernel: bool
+) -> Path:
     compiler = os.environ.get("CXX", "c++")
-    obj = output / "runner.o"
-    _run(
-        compiler,
-        *("-std=c++17", "-O3", "-fPIC", "-fvisibility=hidden", "-Wno-deprecated-declarations", "-c"),
-        *(f"-I{path}" for path in includes),
-        *("-o", str(obj), str(SOURCE / "runner.cpp")),
-    )
+    objects = []
+    extra_flags = ("-DUMZI_TEST_KERNEL",) if test_kernel else ()
+    for cpp in HOST_SOURCES:
+        obj = output / "_".join(cpp.relative_to(NATIVE).with_suffix(".o").parts)
+        _run(
+            compiler,
+            *("-std=c++17", "-O3", "-fPIC", "-fvisibility=hidden", "-Wno-deprecated-declarations", "-c"),
+            *extra_flags,
+            *(f"-I{path}" for path in includes),
+            *("-o", str(obj), str(cpp)),
+        )
+        objects.append(str(obj))
     if driver is None:
         # The driver is linked by soname; any copy of libcuda.so.1 will do.
         driver = next(
@@ -256,7 +274,7 @@ def _build_linux(output: Path, toolchain: Toolchain, includes: Sequence[Path], d
         )
     link = [
         compiler,
-        str(obj),
+        *objects,
         "-Wl,-z,defs",
         "-Wl,-rpath,$ORIGIN",
         str(driver) if driver else "-l:libcuda.so.1",
@@ -285,19 +303,25 @@ def build(output: Path, settings: BuildSettings | None = None) -> Path:
     output = output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     nvrtc = _load_nvrtc(toolchain.nvrtc)
-    cubins = {arch: _compile_kernels(nvrtc, toolchain.includes, arch) for arch in dict.fromkeys(settings.arches)}
-    ptx = _compile_kernels(nvrtc, toolchain.includes, PTX_TARGET)
-    for arch, image in cubins.items():
-        (output / f"kernels-{arch}.cubin").write_bytes(image)
-    (output / f"kernels-{PTX_TARGET}.ptx").write_bytes(ptx)
-    # Bundle directories also carry the first cubin under its legacy name.
-    (output / "kernels.cubin").write_bytes(next(iter(cubins.values())))
-    _embed_images(output, cubins, ptx)
-    includes = (*toolchain.includes, toolchain.cudnn / "include", output)
+    for family, source in KERNEL_SOURCES.items():
+        cubins = {
+            arch: _compile_kernels(nvrtc, toolchain.includes, arch, source) for arch in dict.fromkeys(settings.arches)
+        }
+        ptx = _compile_kernels(nvrtc, toolchain.includes, PTX_TARGET, source)
+        for arch, image in cubins.items():
+            (output / f"{family}-{arch}.cubin").write_bytes(image)
+        (output / f"{family}-{PTX_TARGET}.ptx").write_bytes(ptx)
+        if family == "gaterv3":
+            # The legacy fixed-bundle runner takes a cubin from its bundle directory.
+            (output / "kernels.cubin").write_bytes(next(iter(cubins.values())))
+        _embed_images(output, cubins, ptx, family)
+    includes = (*toolchain.includes, toolchain.cudnn / "include", NATIVE / "common", output)
     if WINDOWS:
-        library = _build_windows(output, toolchain, includes)
+        library = _build_windows(output, toolchain, includes, settings.test_kernel)
     else:
-        library = _build_linux(output, toolchain, (*includes, *settings.openssl_include), settings.cuda_driver_lib)
+        library = _build_linux(
+            output, toolchain, (*includes, *settings.openssl_include), settings.cuda_driver_lib, settings.test_kernel
+        )
     _log(f"Built {library}")
     return library
 

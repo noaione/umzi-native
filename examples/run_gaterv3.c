@@ -3,11 +3,11 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-#include "runner.h"
+#include "umzi_native.h"
 
 int wmain(int argc, wchar_t** argv) {
     if (argc != 2) {
-        fputs("Usage: run_gaterv3 input.gtmodel\n", stderr);
+        fputs("Usage: run_gaterv3 input.ummodel\n", stderr);
         return 2;
     }
 
@@ -20,34 +20,34 @@ int wmain(int argc, wchar_t** argv) {
         return 2;
     }
 
-    GtSessionOptions options = {sizeof(options), 0, GT_CREATE_GRAPH, 0, NULL};
-    GtSession* session = gt_session_open(path, &options);
+    UmziSession* session = umzi_session_open(path, NULL);
     free(path);
     if (!session) {
-        fprintf(stderr, "%s\n", gt_error());
+        fprintf(stderr, "%s\n", umzi_error());
         return 1;
     }
 
     const uint32_t batch = 3, height = 63, width = 79;
-    GtIo io = {0};
+    UmziShape shape = {4, {batch, 3, height, width}};
+    UmziIo io = {0};
     io.struct_size = sizeof(io);
-    int status = gt_session_describe(session, batch, height, width, &io);
+    int status = umzi_session_describe(session, &shape, &io);
     if (!status) {
-        void* input = calloc(1, (size_t)io.input_bytes);
-        void* output = malloc((size_t)io.output_bytes);
+        void* input = calloc(1, (size_t)io.input.bytes);
+        void* output = malloc((size_t)io.output.bytes);
         if (input && output) {
-            status = gt_session_run(session, batch, height, width, input, io.input_bytes, output, io.output_bytes);
+            status = umzi_session_run(session, &shape, input, io.input.bytes, output, io.output.bytes);
             if (!status)
                 printf("Restored %u tiles of %ux%u, first RGB sample %.6f\n", batch, height, width, ((float*)output)[0]);
         } else {
             fputs("Could not allocate caller buffers\n", stderr);
-            status = GT_STATUS_OUT_OF_MEMORY;
+            status = UMZI_OUT_OF_MEMORY;
         }
         free(output);
         free(input);
     }
-    if (status == GT_STATUS_ERROR || status == GT_STATUS_OUT_OF_MEMORY)
-        fprintf(stderr, "%s\n", gt_error());
-    gt_session_close(session);
+    if (status == UMZI_ERROR || status == UMZI_OUT_OF_MEMORY)
+        fprintf(stderr, "%s\n", umzi_error());
+    umzi_session_close(session);
     return status ? 1 : 0;
 }

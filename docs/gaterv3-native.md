@@ -1,5 +1,9 @@
 # Native GateRV3 implementation and verification
 
+The original GateRV3 paths and commands below document historical
+runs. See the [current runtime guide](gaterv3-python.md) for `.ummodel`
+and `.umplan` usage.
+
 The target is the 1× GateRV3 checkpoint in this checkout, using RGB 128×128 tiles
 at batch 1 for latency and batch 16 for throughput. Keep all 12 latent blocks,
 the checkpoint's attention mode, both model branches, and the reference's

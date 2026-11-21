@@ -1,4 +1,4 @@
-"""Build the native GateRV3 session library and CLI without packaging a wheel.
+"""Build the native Umzi session library and CLI without packaging a wheel.
 
 The build itself lives in hatch_build.py at the repository root, which also
 runs for every wheel build. Use this script for a bundle directory next to a
@@ -49,6 +49,7 @@ def main() -> None:
     parser.add_argument("--cccl-include", type=Path)
     parser.add_argument("--openssl-include", type=Path, action="append", default=[])
     parser.add_argument("--cuda-driver-lib", type=Path)
+    parser.add_argument("--test-kernel", action="store_true", help="Include the host-only kernel for ABI validation")
     args = parser.parse_args()
     native.build(
         args.output,
@@ -61,6 +62,7 @@ def main() -> None:
             cccl_include=args.cccl_include,
             openssl_include=args.openssl_include,
             cuda_driver_lib=args.cuda_driver_lib,
+            test_kernel=args.test_kernel,
         ),
     )
 

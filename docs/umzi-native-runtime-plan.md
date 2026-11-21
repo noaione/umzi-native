@@ -1,5 +1,64 @@
 # Multi-kernel Umzi native runtime plan
 
+## Implementation log
+
+- **Container and exporter.** The shared reader and Python writer now
+  use `UMZINPKG` v1. GateRV3 exports directly from the checkpoint and
+  its decoder validates the existing architecture, schedule and weights
+  payload. Two exports matched byte for byte. All four payload sections
+  matched the frozen GateRV3 baseline.
+- **Plan cache.** GateRV3 now writes its tuning records through the
+  shared `UMZIPLAN` envelope as `gaterv3_<hex-key>.umplan`. Backend
+  validation of restored tactics remains in the GateRV3 runner. The
+  Windows shape check exercised a miss, a hit, rebuilding after
+  corruption, and an unavailable cache directory.
+- **Native boundary.** Host entry points, registration, and package
+  parsing are in `native/runtime/`. GateRV3 lives under
+  `native/kernels/gaterv3/`, and the CUDA image selector lives in
+  `native/common/`. The small runtime keeps lifecycle and dispatch in
+  `api.cpp`; the GateRV3 adapter shares `runner.cpp` with its executor.
+- **Python and builds.** Python now binds the versioned Umzi ABI and
+  allocates output from the kernel descriptor. The Windows wheel ships
+  `umzi_native.dll`. The installed wheel matched the CLI in mixed and
+  FP16 with both PyTorch-first and explicit CUDA loading. A standalone
+  `sm_89`-only build verified the PTX fallback on the RTX 3050 Laptop.
+- **Boundary test.** The standalone `--test-kernel` build supported a
+  synthetic 2× output, custom tensor names, and one-channel input through
+  the same Python API. The wheel rejected its family ID. Truncation,
+  checksum, section bounds, and unsupported schema checks passed.
+- **Performance check.** The example and existing benchmarks now target
+  the new ABI. The Windows shape suite passed host/device and graph/direct
+  parity in both precisions, including batch 16 and odd tiles. The C
+  example compiled and ran. The native-only manga rerun used the same
+  three pages, zero overlap, and the default optimization flags.
+
+| Precision | Batch-1 measured ms/tile, previous → shared runtime | Batch-16 s/page, previous → shared runtime | Warmed batch-16 VRAM |
+| --- | ---: | ---: | ---: |
+| Mixed | 5.185 → 5.168 | 0.819 → 0.779 | 210 MiB |
+| FP16 | 4.810 → 4.815 | 0.727 → 0.707 | 204 MiB |
+
+The separate runs show no material steady-state regression. Warmed VRAM
+is device usage above the pre-session baseline. GateRV3 still keeps one
+active shape. Linux validation and the production GFISRv2 adapter are
+deferred. Ruff and Pyrefly passed.
+[Shape validation](../output/umzi-multi-kernel/validation/shapes.json) ·
+[Manga timings](../output/umzi-multi-kernel/manga/report.json) ·
+[VRAM](../output/umzi-multi-kernel/memory/report.json)
+
+### Local pickup
+
+```powershell
+$py = 'C:\Python314\python.exe'
+& $py -m pip wheel . --no-deps -w output/umzi-multi-kernel/final-wheel
+& $py scripts/export_native.py --kernel gaterv3 --output output/native/gaterv3.ummodel
+```
+
+The verified standalone Windows build used `--nvrtc-root
+output/nvrtc-13.0/nvidia/cu13` so the system Python could keep its newer
+NVRTC. To check the kernel boundary again, build with `--test-kernel`
+in a separate directory and run `scripts/check_runtime_contract.py`
+with the production and test DLL paths.
+
 Build one Umzi runtime that loads a `.ummodel` file and selects the
 compiled kernel family declared in its header. GateRV3 is the only kernel
 family shipped in this rework. The runtime should be able to accept a 4×
@@ -21,17 +80,15 @@ native/
     platform.h                       OS services, SHA-256, atomic cache writes
     cuda_module.h                    Cubin selection and PTX fallback
   runtime/
-    api.cpp                          C entry points, status and error translation
-    session.cpp                      Model dispatch, lifecycle, buffer validation
+    api.cpp                          C entry points, dispatch, lifecycle and validation
     kernel.h                         Internal kernel contract
     registry.cpp                     Compiled kernel factories and stable IDs
     model_package.h / .cpp           Container parsing and validation
     plan_cache_file.h / .cpp         Shared .umplan envelope and atomic writes
   kernels/
     gaterv3/
-      kernel.cpp                     Implements the kernel contract
       model_file.h                   GateRV3 payload decoder and validator
-      runner.h / .cpp                 GateRV3 execution, shape plans and graph capture
+      runner.h / .cpp                 GateRV3 adapter, execution, shape plans and graphs
       kernels.cu
       fp16.cuh
       plan_cache.h
@@ -46,7 +103,7 @@ scripts/
   export_native.py                   Select exporter and write one .ummodel
   exporters/
     package.py                       Shared .ummodel writer
-    gaterv3.py                       GateRV3 checkpoint conversion
+    gaterv3.py                       GateRV3 checkpoint export
   reference/                         Torch models and checkpoint loaders
 hatch_build.py                       Compile registered kernels and bundle one runtime
 ```

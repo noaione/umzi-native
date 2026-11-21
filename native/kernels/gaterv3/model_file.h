@@ -47,13 +47,8 @@ struct ResolvedModel {
 };
 
 class ModelFile {
-    static constexpr char magic[] = "GTR3PCK";
-    static constexpr uint32_t format_version = 1;
-
     struct TensorSpec { int level, channels; };
-    struct Section { uint32_t kind, reserved; uint64_t offset, size; };
-    struct Header { std::array<char, 8> magic; uint32_t version, sections; Digest digest; };
-    static_assert(sizeof(Header) == 48 && sizeof(Section) == 24 && sizeof(TensorSpec) == 8);
+    static_assert(sizeof(TensorSpec) == 8);
 
     std::vector<TensorSpec> specs;
     std::vector<size_t> last_use;
@@ -209,57 +204,38 @@ class ModelFile {
     }
 
 public:
-    Digest content_digest{}, checkpoint{};
-    size_t weight_offset = 0, weight_bytes = 0;
+    Digest content_digest{};
+    size_t weight_bytes = 0;
     std::vector<Op> ops;
 
     void check_shape(const Shape& shape) const { tensor_shapes(shape); }
 
-    void parse(const std::vector<char>& bytes) {
-        auto copy = [&](size_t position, void* target, size_t count) {
-            if (position > bytes.size() || count > bytes.size() - position)
-                throw std::runtime_error("Truncated GateRV3 model");
-            std::memcpy(target, bytes.data() + position, count);
-        };
-        Header header{};
-        copy(0, &header, sizeof(header));
-        if (std::memcmp(header.magic.data(), magic, sizeof(magic))
-            || header.version != format_version || header.sections != 4)
-            throw std::runtime_error("Unsupported GateRV3 model format");
-        std::array<Section, 4> sections{};
-        copy(sizeof(header), sections.data(), sizeof(sections));
-        size_t position = sizeof(header) + sizeof(sections);
-        for (size_t i = 0; i < sections.size(); ++i) {
-            const auto& section = sections[i];
-            if (section.kind != i + 1 || section.reserved || section.offset != position
-                || section.size > bytes.size() - position)
-                throw std::runtime_error("Invalid GateRV3 model section table");
-            position += static_cast<size_t>(section.size);
-        }
-        if (position != bytes.size()) throw std::runtime_error("Unexpected trailing GateRV3 model data");
-        Sha256 hash;
-        hash.add(bytes.data() + sizeof(header), bytes.size() - sizeof(header));
-        content_digest = hash.finish();
-        if (content_digest != header.digest) throw std::runtime_error("GateRV3 model checksum mismatch");
-
-        std::array<uint32_t, 8> metadata{};
-        if (sections[0].size != sizeof(metadata) || sections[3].size != sizeof(checkpoint))
+    void parse(const umzi::ModelPackage& package) {
+        if (package.schema != 1) throw std::runtime_error("Unsupported GateRV3 model payload version");
+        auto architecture = package.section(1);
+        auto schedule = package.section(2);
+        auto weights = package.section(3);
+        auto checkpoint = package.section(4);
+        if (architecture.size() != 32 || (!checkpoint.empty() && checkpoint.size() != 32))
             throw std::runtime_error("Invalid GateRV3 model metadata size");
-        copy(sections[0].offset, metadata.data(), sizeof(metadata));
-        constexpr std::array<uint32_t, 6> required{3, 1, 16, 16, 32, 3};
-        uint32_t tensors = metadata[6], operations = metadata[7];
-        if (!std::equal(required.begin(), required.end(), metadata.begin())
-            || operations < 2 || operations > 2000 || tensors != operations + 1
-            || sections[1].size != tensors * sizeof(TensorSpec) + operations * sizeof(Op)
-            || !sections[2].size)
-            throw std::runtime_error("Unsupported GateRV3 model architecture");
+        umzi::BinaryReader reader(architecture);
+        for (auto value : {3u, 1u, 16u, 16u, 32u, 3u})
+            if (reader.number<uint32_t>() != value)
+                throw std::runtime_error("Unsupported GateRV3 model architecture");
+        auto tensors = reader.number<uint32_t>();
+        auto operations = reader.number<uint32_t>();
+        if (operations < 2 || operations > 2000 || tensors != operations + 1
+            || schedule.size() != tensors * sizeof(TensorSpec) + operations * sizeof(Op)
+            || weights.empty() || weights.size() > (256u << 20))
+            throw std::runtime_error("Invalid GateRV3 execution data or weights");
+        content_digest = package.digest;
         specs.resize(tensors);
         ops.resize(operations);
-        copy(sections[1].offset, specs.data(), specs.size() * sizeof(TensorSpec));
-        copy(sections[1].offset + specs.size() * sizeof(TensorSpec), ops.data(), ops.size() * sizeof(Op));
-        copy(sections[3].offset, checkpoint.data(), sizeof(checkpoint));
-        weight_offset = sections[2].offset;
-        weight_bytes = sections[2].size;
+        // The existing GateRV3 payload is a little-endian table of int32 values.
+        auto spec_bytes = specs.size() * sizeof(TensorSpec);
+        std::memcpy(specs.data(), schedule.data(), spec_bytes);
+        std::memcpy(ops.data(), schedule.data() + spec_bytes, ops.size() * sizeof(Op));
+        weight_bytes = weights.size();
         for (const auto& spec : specs) {
             if (spec.level < -1 || spec.level > 4 || spec.channels < 1 || spec.channels > 2560)
                 throw std::runtime_error("Invalid GateRV3 tensor description");

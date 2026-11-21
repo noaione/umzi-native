@@ -1,5 +1,9 @@
 # GateRV3 kernel tuning and full-FP16 experiment
 
+The original GateRV3 paths and commands below document historical
+runs. See the [current runtime guide](gaterv3-python.md) for `.ummodel`
+and `.umplan` usage.
+
 The control is the validated mixed-precision CUDA Graph runner. Keep the
 checkpoint, all 12 spatial-attention blocks and the 128×128 tile geometry.
 Use batch 1 for individual tile latency and batch 16 for page throughput.

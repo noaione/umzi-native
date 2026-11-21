@@ -9,6 +9,9 @@
 #include <vector>
 
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <bcrypt.h>
 #else
@@ -17,7 +20,7 @@
 #include <unistd.h>
 #endif
 
-namespace gt {
+namespace umzi {
 using Digest = std::array<unsigned char, 32>;
 
 class Sha256 {
@@ -138,4 +141,4 @@ inline void publish_cache(const std::filesystem::path& temporary,
     std::filesystem::rename(temporary, target);
 #endif
 }
-} // namespace gt
+} // namespace umzi

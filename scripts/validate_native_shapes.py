@@ -15,7 +15,7 @@ from benchmark_native import CHECKPOINT, ROOT, Native, error_metrics, load_model
 from torch.nn import functional
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from umzi_native._native import IoABI
+from umzi_native._abi import IoABI, ShapeABI
 
 CASES = (
     (1, 128, 128),
@@ -49,21 +49,18 @@ def describe_and_check_buffers(runner, sample, shape):
     dll = runner.dll
     info = IoABI()
     info.struct_size = ctypes.sizeof(info)
-    runner.check(dll.gt_session_describe(runner.handle, *shape, ctypes.byref(info)))
     batch, height, width = shape
+    actual = (batch, 3, height, width)
+    concrete = ShapeABI.from_dimensions(actual)
+    runner.check(dll.umzi_session_describe(runner.handle, ctypes.byref(concrete), ctypes.byref(info)))
     packed = sample.to(runner.dtype)
-    assert (info.batch, info.channels, info.height, info.width) == (
-        batch,
-        3,
-        height,
-        width,
-    )
-    assert info.rgb_type == (1 if runner.dtype == torch.float32 else 2)
-    assert info.input_bytes == info.output_bytes == packed.nbytes
+    assert info.input.shape.dimensions_tuple() == info.output.shape.dimensions_tuple() == actual
+    assert info.input.dtype == info.output.dtype == (1 if runner.dtype == torch.float32 else 2)
+    assert info.input.bytes == info.output.bytes == packed.nbytes
     assert (
-        dll.gt_session_run(
+        dll.umzi_session_run(
             runner.handle,
-            *shape,
+            ctypes.byref(concrete),
             packed.data_ptr(),
             packed.nbytes - 1,
             packed.data_ptr(),
@@ -71,16 +68,16 @@ def describe_and_check_buffers(runner, sample, shape):
         )
         == -1
     )
-    assert b"require" in dll.gt_error()
+    assert b"require" in dll.umzi_error()
 
 
 def run_device(runner, sample, shape):
     x = sample.to(device="cuda", dtype=runner.dtype)
     y = torch.empty_like(x)
     runner.check(
-        runner.dll.gt_session_enqueue(
+        runner.dll.umzi_session_enqueue(
             runner.handle,
-            *shape,
+            ctypes.byref(ShapeABI.from_dimensions(x.shape)),
             x.data_ptr(),
             x.nbytes,
             y.data_ptr(),
@@ -104,7 +101,10 @@ def check_cache_recovery(bundle, model_file):
             runner = Native(bundle, 1, model_file=model_file, cache_dir=base)
             stack.callback(runner.close)
             assert packed_setup(runner)["cache_status"] == "miss"
-        [entry] = base.glob("*.gtplan")
+        [entry] = base.glob("gaterv3_*.umplan")
+        header = entry.read_bytes()[:96]
+        assert header[:8] == b"UMZIPLAN"
+        assert entry.stem == f"gaterv3_{header[32:64].hex()}"
         entry.write_bytes(b"corrupt entry")
         with ExitStack() as stack:
             rebuilt = Native(bundle, 1, model_file=model_file, cache_dir=base)
@@ -126,7 +126,7 @@ def check_cache_recovery(bundle, model_file):
 @torch.inference_mode()
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--bundle", type=Path, default=ROOT / "output/native-refactor")
+    parser.add_argument("--bundle", type=Path, default=ROOT / "output/native")
     parser.add_argument("--legacy-bundle", type=Path, default=ROOT / "output/native-projections")
     parser.add_argument("--checkpoint", type=Path, default=CHECKPOINT)
     parser.add_argument("--output", type=Path, default=ROOT / "output/native-refactor-validation")
@@ -135,7 +135,7 @@ def main():
     torch.set_num_threads(4)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    model_file = args.bundle / "gaterv3.gtmodel"
+    model_file = args.bundle / "gaterv3.ummodel"
     reference, _ = load_model(args.checkpoint, device="cuda")
     result: dict[str, Any] = {}
     with tempfile.TemporaryDirectory(dir=args.output) as directory:
@@ -172,8 +172,9 @@ def main():
                     output = graph.host(x).clone()
                     info = graph.session_info()
                     assert info.model_load_ms == start_model_load
-                    assert (info.batch, info.padded_height, info.padded_width) == (
+                    assert info.prepared_input.dimensions_tuple() == (
                         batch,
+                        3,
                         (height + 15) // 16 * 16,
                         (width + 15) // 16 * 16,
                     )
@@ -204,8 +205,10 @@ def main():
                     print(mode, row, flush=True)
                     rows.append(row)
                 assert rows[3]["shape_allocation_ms"] == rows[4]["shape_allocation_ms"]
-                status = graph.dll.gt_session_prepare(graph.handle, 60, 512, 512)
-                allocation_message = graph.dll.gt_error().decode()
+                status = graph.dll.umzi_session_prepare(
+                    graph.handle, ctypes.byref(ShapeABI.from_dimensions((60, 3, 512, 512)))
+                )
+                allocation_message = graph.dll.umzi_error().decode()
                 assert status == -2, (status, allocation_message)
                 assert "bytes" in allocation_message
                 small = torch.rand((1, 3, 33, 48), generator=sample_generator)

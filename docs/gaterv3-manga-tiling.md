@@ -25,11 +25,12 @@ the Windows GateRV3 build and export.
 
 ```powershell
 $py = 'C:\Python314\python.exe'
-$dll = 'output/windows-ptx-fix/native/gaterv3.dll'
+$dll = 'output/native/umzi_native.dll'
+$model = 'output/native/gaterv3.ummodel'
 $root = 'output/manga-tiling'
-& $py scripts/benchmark_manga.py --library $dll --batch 64 16 1 --overlap 0 --quality `
+& $py scripts/benchmark_manga.py --library $dll --model $model --batch 64 16 1 --overlap 0 --quality `
     --native-cache "$root/native-cache" --rtx-cache "$root/rtx-cache" --output "$root/default"
-& $py scripts/benchmark_manga.py --library $dll --batch 16 --overlap 16 --quality `
+& $py scripts/benchmark_manga.py --library $dll --model $model --batch 16 --overlap 16 --quality `
     --native-cache "$root/native-cache" --rtx-cache "$root/rtx-cache" --output "$root/overlap"
 ```
 

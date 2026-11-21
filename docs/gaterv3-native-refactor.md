@@ -1,5 +1,9 @@
 # GateRV3 native runtime refactor plan
 
+The original GateRV3 paths and commands below document historical
+runs. See the [current runtime guide](gaterv3-python.md) for `.ummodel`
+and `.umplan` usage.
+
 Package the current 1× GateRV3 checkpoint as one model file loadable by
 one Windows DLL. A session selects mixed precision or full FP16 and accepts
 new tile and batch sizes on subsequent calls. Keep the verified 128×128

@@ -288,7 +288,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manga-repo", type=Path, default=ROOT.parent / "nao-manga-rls")
     parser.add_argument("--library", type=Path, required=True)
-    parser.add_argument("--model", type=Path, default=ROOT / "output/native-refactor/gaterv3.gtmodel")
+    parser.add_argument("--model", type=Path, default=ROOT / "output/native/gaterv3.ummodel")
     parser.add_argument("--onnx-dir", type=Path, default=ROOT / "output/baseline")
     parser.add_argument("--input", type=Path, default=ROOT / "samples/input")
     parser.add_argument("--output", type=Path, required=True)

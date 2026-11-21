@@ -5,9 +5,12 @@
 #include <cudnn.h>
 
 #define GATERV3_BUILD
+#define UMZI_BUILD
 #include "runner.h"
 #include "model_file.h"
-#include "cuda_images.h"
+#include "gaterv3_images.h"
+#include "../../common/cuda_module.h"
+#include "../../runtime/kernel.h"
 
 #include <algorithm>
 #include <array>
@@ -43,9 +46,7 @@ double milliseconds_since(Clock::time_point started) {
     return std::chrono::duration<double, std::milli>(Clock::now() - started).count();
 }
 
-struct AllocationError : std::runtime_error {
-    using std::runtime_error::runtime_error;
-};
+using umzi::AllocationError;
 
 void check(CUresult status, const char* operation) {
     if (status == CUDA_SUCCESS) return;
@@ -506,14 +507,23 @@ private:
     }
 
     void add_plan_environment(gt::Sha256& hash) const {
-        hash.add(fp16);
-        hash.add(tune_projections);
-        hash.add(fp16_qkv);
-        hash.add(scratch_bytes);
+        auto add_u32 = [&](uint32_t value) {
+            std::vector<char> bytes;
+            umzi::append_number(bytes, value);
+            hash.add(bytes.data(), bytes.size());
+        };
+        add_u32(umzi::plan_format_version);
+        add_u32(umzi::gaterv3_id);
+        add_u32(gt::plan_schema);
+        add_u32(sizeof(void*));
+        add_u32(sizeof(cublasLtMatmulAlgo_t));
+        add_u32(static_cast<uint32_t>(scratch_bytes));
+        add_u32(static_cast<uint32_t>(fp16) | (tune_projections << 1) | (fp16_qkv << 2)
+            | (fuse_silu << 3) | (fuse_gate_pool << 4));
         CUuuid uuid{};
         CHECK(cuDeviceGetUuid(&uuid, device));
         hash.add(uuid);
-        gt::hash_driver_version(hash);
+        umzi::hash_driver_version(hash);
         hash.add(cudnnGetVersion());
         hash.add(cublasLtGetVersion());
     }
@@ -1095,7 +1105,21 @@ private:
     static void* pointer(CUdeviceptr p) { return reinterpret_cast<void*>(p); }
 };
 
-struct GtSession {
+namespace {
+constexpr std::pair<const char*, uint32_t> gate_options[] = {
+    {"fuse_silu", GT_CREATE_FUSE_SILU},
+    {"tune_projections", GT_CREATE_TUNE_PROJECTIONS},
+    {"fuse_gate_pool", GT_CREATE_FUSE_GATE_POOL},
+    {"fp16_qkv", GT_CREATE_FP16_QKV},
+};
+constexpr const char* gate_stats[] = {
+    "replay_tuned_shapes", "fused_gate_pool_sites", "fp16_qkv_projections",
+    "split_gate_registers", "fused_gate_registers", "fused_silu_count",
+};
+static_assert(std::size(gate_stats) == GT_OPT_STAT_COUNT + 1);
+
+class GateSession final : public umzi::KernelSession {
+public:
     gt::ModelFile model;
     fs::path cache;
     uint32_t flags = GT_CREATE_GRAPH;
@@ -1106,70 +1130,48 @@ struct GtSession {
     CUevent completed = nullptr;
     bool pending = false;
     gt::Digest build{};
-    double model_load_ms = 0;
     std::unique_ptr<GtRunner> active;
 
-    void open(const fs::path& path, const GtSessionOptions* options) {
-        auto start = Clock::now();
-        int device_index = 0;
-        if (options) {
-            if (options->struct_size < sizeof(*options) || options->reserved)
-                throw std::runtime_error("Invalid GateRV3 session options size or reserved field");
-            device_index = options->device;
-            flags = options->flags;
-            if (options->cache_dir) cache = fs::u8path(options->cache_dir);
+    void open(const umzi::ModelPackage& package, const UmziSessionOptions& options) {
+        flags = (options.flags & UMZI_CUDA_GRAPH ? GT_CREATE_GRAPH : 0)
+            | (options.precision == UMZI_FP16 ? GT_CREATE_FP16 : 0);
+        if (options.cache_dir) cache = fs::u8path(options.cache_dir);
+        uint32_t seen = 0;
+        for (uint32_t i = 0; i < options.kernel_option_count; ++i) {
+            const auto& option = options.kernel_options[i];
+            auto found = std::find_if(std::begin(gate_options), std::end(gate_options), [&](const auto& item) {
+                return option.name && std::strcmp(item.first, option.name) == 0;
+            });
+            if (found == std::end(gate_options))
+                throw std::runtime_error("Unknown GateRV3 option: " + std::string(option.name ? option.name : ""));
+            if ((seen & found->second) || (option.value != 0 && option.value != 1))
+                throw std::runtime_error("Duplicate or invalid GateRV3 option: " + std::string(option.name));
+            seen |= found->second;
+            if (option.value) flags |= found->second;
         }
         GtRunner validator;
         validator.configure({1, tile, tile}, flags);
-
-        auto size = fs::file_size(path);
-        if (size < 48 || size > (256u << 20))
-            throw std::runtime_error("Invalid GateRV3 model file size");
-        std::vector<char> bytes(static_cast<size_t>(size));
-        std::ifstream file(path, std::ios::binary);
-        read(file, bytes.data(), bytes.size());
-        if (file.peek() != EOF) throw std::runtime_error("Model changed while it was being read");
-        model.parse(bytes);
+        model.parse(package);
 
         CHECK(cuInit(0));
-        CHECK(cuDeviceGet(&device, device_index));
-        int major = 0, minor = 0;
-        CHECK(cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device));
-        CHECK(cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device));
-        int capability = 10 * major + minor;
-        if (capability < gt::embedded_ptx.capability)
-            throw std::runtime_error("GateRV3 requires CUDA compute capability 8.6 or higher");
-        const auto* image = &gt::embedded_ptx;
-        for (const auto& cubin : gt::embedded_cubins) {
-            if (cubin.capability / 10 == major && cubin.capability <= capability
-                && (image == &gt::embedded_ptx || cubin.capability > image->capability))
-                image = &cubin;
-        }
+        CHECK(cuDeviceGet(&device, options.device));
         CHECK(cuDevicePrimaryCtxRetain(&context, device));
         ContextScope scope(context);
-        auto status = cuModuleLoadData(&module, image->data);
-        if (status == CUDA_ERROR_NO_BINARY_FOR_GPU && image != &gt::embedded_ptx) {
-            image = &gt::embedded_ptx;
-            status = cuModuleLoadData(&module, image->data);
-        }
-        if (image == &gt::embedded_ptx
-            && (status == CUDA_ERROR_UNSUPPORTED_PTX_VERSION || status == CUDA_ERROR_JIT_COMPILER_NOT_FOUND))
-            check(status, "Could not JIT the GateRV3 PTX fallback; install a CUDA 13-capable NVIDIA driver with PTX JIT support");
-        check(status, "Load GateRV3 CUDA kernels");
+        const auto& image = umzi::load_kernel_module(device, module, gaterv3_images::embedded_cubins, gaterv3_images::embedded_ptx);
         if (!cache.empty()) {
             gt::Sha256 hash;
             const char build_id[] = __DATE__ " " __TIME__;
             hash.add(build_id);
-            hash.add(image->data, image->size);
+            hash.add(package.schema);
+            hash.add(image.data, image.size);
             build = hash.finish();
         }
         allocate(weights, model.weight_bytes, "model weights");
-        CHECK(cuMemcpyHtoD(weights, bytes.data() + model.weight_offset, model.weight_bytes));
+        CHECK(cuMemcpyHtoD(weights, package.section(3).data(), model.weight_bytes));
         CHECK(cuEventCreate(&completed, CU_EVENT_DISABLE_TIMING));
-        model_load_ms = milliseconds_since(start);
     }
 
-    ~GtSession() {
+    ~GateSession() override {
         if (!context || cuCtxPushCurrent(context) != CUDA_SUCCESS) return;
         if (pending) cuEventSynchronize(completed);
         active.reset();
@@ -1214,13 +1216,6 @@ struct GtSession {
         return *active;
     }
 
-    void check_buffers(Shape shape, bool pointers, uint64_t input_bytes, uint64_t output_bytes) const {
-        auto expected = bytes_for(shape);
-        if (!pointers || input_bytes < expected || output_bytes < expected)
-            throw std::runtime_error("Contiguous RGB input and output each require "
-                + std::to_string(expected) + " bytes");
-    }
-
     void enqueue(Shape shape, CUdeviceptr input, CUdeviceptr output, CUstream target) {
         ContextScope scope(context);
         auto& plan = prepare(shape);
@@ -1233,9 +1228,75 @@ struct GtSession {
             throw;
         }
     }
+
+    static Shape checked(const UmziShape& shape) {
+        if (shape.rank != 4 || shape.dimensions[1] != 3)
+            throw std::runtime_error("GateRV3 input requires RGB NCHW");
+        return Shape::checked(shape.dimensions[0], shape.dimensions[2], shape.dimensions[3]);
+    }
+
+    UmziModelInfo model_info() const override { return {sizeof(UmziModelInfo), "gaterv3", 1, 0}; }
+
+    UmziIo tensors() const override {
+        auto dtype = static_cast<uint32_t>(fp16() ? UMZI_FLOAT16 : UMZI_FLOAT32);
+        return {sizeof(UmziIo), {"input", {4, {0, 3, 0, 0}}, dtype, 0},
+            {"output", {4, {0, 3, 0, 0}}, dtype, 0}};
+    }
+
+    UmziIo describe(const UmziShape& shape) const override {
+        auto bytes = bytes_for(checked(shape));
+        auto io = tensors();
+        io.input.shape = io.output.shape = shape;
+        io.input.bytes = io.output.bytes = bytes;
+        return io;
+    }
+
+    void prepare_shape(const UmziShape& shape) override { prepare(checked(shape)); }
+
+    void run_host(const UmziShape& shape, const void* input, void* output) override {
+        auto concrete = checked(shape);
+        prepare(concrete).run_host(concrete, input, output);
+    }
+
+    void enqueue_device(const UmziShape& shape, uint64_t input, uint64_t output, UmziStream stream) override {
+        enqueue(checked(shape), input, output, stream);
+    }
+
+    UmziSessionInfo session_info() const override {
+        UmziSessionInfo result{};
+        result.struct_size = sizeof(result);
+        result.buffer_bytes[0] = model.weight_bytes;
+        if (active) {
+            result.cache_status = active->plan_cache.status;
+            result.prepared_input = {4, {static_cast<uint32_t>(active->batch), 3,
+                static_cast<uint32_t>(active->height), static_cast<uint32_t>(active->width)}};
+            active->buffer_sizes(result.buffer_bytes);
+            active->startup_memory(result.startup_device_used_bytes);
+            std::copy(active->setup_ms.begin(), active->setup_ms.end(), result.shape_setup_ms);
+        }
+        return result;
+    }
+
+    uint32_t diagnostic_count() const override { return std::size(gate_stats); }
+    UmziDiagnostic diagnostic(uint32_t index) const override {
+        if (index >= diagnostic_count()) throw std::runtime_error("Invalid GateRV3 diagnostic index");
+        int64_t value = 0;
+        if (active) value = index == GT_OPT_STAT_COUNT ? active->fused_silu_count : active->optimization_stats[index];
+        return {sizeof(UmziDiagnostic), gate_stats[index], value};
+    }
+
+    const char* cache_message() const override { return active ? active->plan_cache.diagnostic.c_str() : ""; }
+    const char* kernel_message() const override { return active ? active->fusion_diagnostic.c_str() : ""; }
+
+    void profile(float* milliseconds, uint32_t count) override {
+        if (!active) throw std::runtime_error("Prepare a GateRV3 shape before profiling");
+        ContextScope scope(context);
+        wait();
+        active->profile(milliseconds, static_cast<int>(count));
+    }
+
 };
 
-namespace {
 template<class F>
 int report_errors(F action) noexcept {
     try {
@@ -1251,101 +1312,15 @@ int report_errors(F action) noexcept {
 }
 } // namespace
 
+std::unique_ptr<umzi::KernelSession> umzi::make_gaterv3(const ModelPackage& package,
+                                                      const UmziSessionOptions& options) {
+    auto session = std::make_unique<GateSession>();
+    session->open(package, options);
+    return session;
+}
+
 extern "C" {
 const char* gt_error() { return error_text.c_str(); }
-
-GtSession* gt_session_open(const char* model, const GtSessionOptions* options) {
-    GtSession* result = nullptr;
-    report_errors([&] {
-        if (!model || !*model) throw std::runtime_error("A GateRV3 model path is required");
-        auto session = std::make_unique<GtSession>();
-        session->open(fs::u8path(model), options);
-        result = session.release();
-    });
-    return result;
-}
-
-void gt_session_close(GtSession* session) { delete session; }
-
-int gt_session_describe(const GtSession* session, uint32_t batch, uint32_t height,
-                        uint32_t width, GtIo* io) {
-    return report_errors([&] {
-        if (!session || !io || io->struct_size < sizeof(*io))
-            throw std::runtime_error("Invalid session or I/O description size");
-        auto bytes = session->bytes_for(Shape::checked(batch, height, width));
-        auto rgb = static_cast<uint32_t>(session->fp16() ? GT_RGB_F16 : GT_RGB_F32);
-        *io = {io->struct_size, rgb, batch, 3, height, width, bytes, bytes};
-    });
-}
-
-int gt_session_prepare(GtSession* session, uint32_t batch, uint32_t height, uint32_t width) {
-    return report_errors([&] {
-        if (!session) throw std::runtime_error("A GateRV3 session is required");
-        session->prepare(Shape::checked(batch, height, width));
-    });
-}
-
-int gt_session_run(GtSession* session, uint32_t batch, uint32_t height, uint32_t width,
-                   const void* input, uint64_t input_bytes, void* output, uint64_t output_bytes) {
-    return report_errors([&] {
-        if (!session) throw std::runtime_error("A GateRV3 session is required");
-        auto shape = Shape::checked(batch, height, width);
-        session->check_buffers(shape, input && output, input_bytes, output_bytes);
-        session->prepare(shape).run_host(shape, input, output);
-    });
-}
-
-int gt_session_enqueue(GtSession* session, uint32_t batch, uint32_t height, uint32_t width,
-                       uint64_t input, uint64_t input_bytes, uint64_t output,
-                       uint64_t output_bytes, GtStream stream) {
-    return report_errors([&] {
-        if (!session) throw std::runtime_error("A GateRV3 session is required");
-        auto shape = Shape::checked(batch, height, width);
-        session->check_buffers(shape, input && output, input_bytes, output_bytes);
-        session->enqueue(shape, input, output, stream);
-    });
-}
-
-int gt_session_info(const GtSession* session, GtSessionInfo* info) {
-    return report_errors([&] {
-        if (!session || !info || info->struct_size < sizeof(*info))
-            throw std::runtime_error("Invalid session or session info size");
-        GtSessionInfo result{};
-        result.struct_size = info->struct_size;
-        result.buffer_bytes[0] = session->model.weight_bytes;
-        result.model_load_ms = session->model_load_ms;
-        if (auto* plan = session->active.get()) {
-            result.cache_status = plan->plan_cache.status;
-            result.batch = plan->batch;
-            result.padded_height = plan->height;
-            result.padded_width = plan->width;
-            plan->buffer_sizes(result.buffer_bytes);
-            plan->startup_memory(result.startup_device_used_bytes);
-            std::copy(plan->setup_ms.begin(), plan->setup_ms.end(), result.shape_setup_ms);
-            std::copy(plan->optimization_stats.begin(), plan->optimization_stats.end(), result.optimization_stats);
-            result.fused_silu_count = plan->fused_silu_count;
-        }
-        *info = result;
-    });
-}
-
-const char* gt_session_cache_message(const GtSession* session) {
-    return session && session->active ? session->active->plan_cache.diagnostic.c_str() : "";
-}
-
-const char* gt_session_fusion_message(const GtSession* session) {
-    return session && session->active ? session->active->fusion_diagnostic.c_str() : "";
-}
-
-int gt_session_profile(GtSession* session, float* milliseconds, int count) {
-    return report_errors([&] {
-        if (!session || !session->active || !milliseconds)
-            throw std::runtime_error("Prepare a GateRV3 shape before profiling");
-        ContextScope scope(session->context);
-        session->wait();
-        session->active->profile(milliseconds, count);
-    });
-}
 
 GtRunner* gt_create(const char* directory, int batch, int graph) {
     return gt_create_ex(directory, batch, graph ? GT_CREATE_GRAPH : 0, nullptr);
@@ -1437,7 +1412,7 @@ uint32_t cli_int(const std::string& value, const std::string& name) {
 int session_cli(int argc, char** argv) {
     if (argc == 2 || (argc == 3 && std::string(argv[2]) == "--help")) {
         std::cout
-            << "Usage: gaterv3 run --model file --batch N --height H --width W --input raw --output raw\n"
+            << "Usage: umzi_native run --model file --batch N --height H --width W --input raw --output raw\n"
             << "  --precision mixed|fp16   Select RGB and accumulator precision (default: mixed)\n"
             << "  --device index           Select a CUDA device (default: 0)\n"
             << "  --cache-dir path         Read and write tuned plans in this directory\n"
@@ -1449,17 +1424,18 @@ int session_cli(int argc, char** argv) {
         return argc == 2 ? 2 : 0;
     }
     return report_errors([&] {
-        GtSessionOptions options{sizeof(GtSessionOptions), 0, GT_CREATE_GRAPH, 0, nullptr};
+        UmziSessionOptions options{sizeof(UmziSessionOptions), 0, UMZI_MIXED, UMZI_CUDA_GRAPH};
+        uint32_t gate_flags = 0;
         std::string model, input, output;
         uint32_t batch = 0, height = 0, width = 0;
         for (int i = 2; i < argc; ++i) {
             std::string name = argv[i];
             if (auto flag = cli_switch(name)) {
-                options.flags |= flag;
+                gate_flags |= flag;
                 continue;
             }
             if (name == "--direct") {
-                options.flags &= ~GT_CREATE_GRAPH;
+                options.flags &= ~UMZI_CUDA_GRAPH;
                 continue;
             }
             if (++i >= argc) throw std::runtime_error("Missing value for " + name);
@@ -1476,38 +1452,44 @@ int session_cli(int argc, char** argv) {
                 options.device = static_cast<int32_t>(device);
             } else if (name == "--precision") {
                 std::string mode = argv[i];
-                if (mode == "fp16") options.flags |= GT_CREATE_FP16;
-                else if (mode == "mixed") options.flags &= ~GT_CREATE_FP16;
+                if (mode == "fp16") options.precision = UMZI_FP16;
+                else if (mode == "mixed") options.precision = UMZI_MIXED;
                 else throw std::runtime_error("Precision must be mixed or fp16");
             } else throw std::runtime_error("Invalid option " + name);
         }
         if (model.empty() || input.empty() || output.empty())
             throw std::runtime_error("--model, --input and --output are required");
-        Shape::checked(batch, height, width);
-        std::unique_ptr<GtSession> session(gt_session_open(model.c_str(), &options));
-        if (!session) throw std::runtime_error(gt_error());
-        GtIo io{};
+        std::vector<UmziOption> flags;
+        for (const auto& flag : gate_options)
+            if (gate_flags & flag.second) flags.push_back({flag.first, 1});
+        options.kernel_options = flags.data();
+        options.kernel_option_count = static_cast<uint32_t>(flags.size());
+        std::unique_ptr<UmziSession, decltype(&umzi_session_close)> session(
+            umzi_session_open(model.c_str(), &options), umzi_session_close);
+        if (!session) throw std::runtime_error(umzi_error());
+        UmziShape shape{4, {batch, 3, height, width}};
+        UmziIo io{};
         io.struct_size = sizeof(io);
-        if (gt_session_describe(session.get(), batch, height, width, &io)) throw std::runtime_error(gt_error());
-        if (fs::file_size(fs::u8path(input)) != io.input_bytes)
-            throw std::runtime_error("Raw input must contain exactly " + std::to_string(io.input_bytes) + " bytes");
-        std::vector<char> pixels(static_cast<size_t>(io.input_bytes));
-        std::vector<char> restored(static_cast<size_t>(io.output_bytes));
+        if (umzi_session_describe(session.get(), &shape, &io)) throw std::runtime_error(umzi_error());
+        if (fs::file_size(fs::u8path(input)) != io.input.bytes)
+            throw std::runtime_error("Raw input must contain exactly " + std::to_string(io.input.bytes) + " bytes");
+        std::vector<char> pixels(static_cast<size_t>(io.input.bytes));
+        std::vector<char> restored(static_cast<size_t>(io.output.bytes));
         std::ifstream file(fs::u8path(input), std::ios::binary);
         read(file, pixels.data(), pixels.size());
-        if (gt_session_run(session.get(), batch, height, width, pixels.data(), pixels.size(),
-                           restored.data(), restored.size())) throw std::runtime_error(gt_error());
+        if (umzi_session_run(session.get(), &shape, pixels.data(), pixels.size(), restored.data(), restored.size()))
+            throw std::runtime_error(umzi_error());
         std::ofstream out(fs::u8path(output), std::ios::binary);
         if (!out.write(restored.data(), restored.size()))
             throw std::runtime_error("Could not write restored RGB output");
-        if (*gt_session_cache_message(session.get()))
-            std::cerr << "Plan cache: " << gt_session_cache_message(session.get()) << '\n';
+        if (*umzi_session_cache_message(session.get()))
+            std::cerr << "Plan cache: " << umzi_session_cache_message(session.get()) << '\n';
     }) == 0 ? 0 : (std::cerr << error_text << '\n', 1);
 }
 
 int legacy_cli(int argc, char** argv) {
     if (argc < 5) {
-        std::cerr << "For packed models, see gaterv3 run --help.\n"
+        std::cerr << "For packed models, see umzi_native run --help.\n"
                      "Legacy usage: gaterv3 <bundle-directory> <batch: 1|16> <input> <output> "
                      "[--fp16] [--cache-dir <directory>] [--fuse-silu] "
                      "[--tune-projections] [--fuse-gate-pool] [--fp16-qkv]\n";

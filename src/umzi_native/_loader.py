@@ -1,4 +1,4 @@
-"""Native library loading and shared GateRV3 session bindings."""
+"""Umzi runtime discovery and explicit CUDA dependency loading."""
 
 from __future__ import annotations
 
@@ -8,19 +8,12 @@ import sys
 from pathlib import Path
 from threading import Lock
 
+from ._abi import bind_session_api
+
 PathArg = str | os.PathLike[str]
 WINDOWS = sys.platform == "win32"
-LIBRARY_NAME = "gaterv3.dll" if WINDOWS else "libgaterv3.so"
+LIBRARY_NAME = "umzi_native.dll" if WINDOWS else "libumzi_native.so"
 PACKAGE_DIR = Path(__file__).resolve().parent
-KERNEL_OPTIONS = {"tune-projections": 8, "fuse-gate-pool": 16, "fp16-qkv": 32}
-CACHE_STATUSES = ("disabled", "miss", "hit", "rebuilt", "unavailable")
-OPTIMIZATION_STATS = (
-    "replay_tuned_shapes",
-    "fused_gate_pool_sites",
-    "fp16_qkv_projections",
-    "split_gate_registers",
-    "fused_gate_registers",
-)
 # The session library links these directly. cuDNN loads its remaining
 # components by name at run time, so the explicit loader preloads them too.
 CUDA_LIBRARIES = ("cublasLt64_13.dll", "cudnn64_9.dll") if WINDOWS else ("libcublasLt.so.13", "libcudnn.so.9")
@@ -28,43 +21,6 @@ CUDNN_COMPONENTS = "cudnn_*64_9.dll" if WINDOWS else "libcudnn_*.so.9"
 _load_lock = Lock()
 _session_libraries: dict[Path, ctypes.CDLL] = {}
 _cuda_libraries: dict[Path, ctypes.CDLL] = {}
-
-
-class OptionsABI(ctypes.Structure):
-    _fields_ = [
-        ("struct_size", ctypes.c_uint32),
-        ("device", ctypes.c_int32),
-        ("flags", ctypes.c_uint32),
-        ("reserved", ctypes.c_uint32),
-        ("cache_dir", ctypes.c_char_p),
-    ]
-
-
-class IoABI(ctypes.Structure):
-    _fields_ = [
-        (name, ctypes.c_uint32) for name in ("struct_size", "rgb_type", "batch", "channels", "height", "width")
-    ] + [("input_bytes", ctypes.c_uint64), ("output_bytes", ctypes.c_uint64)]
-
-
-class InfoABI(ctypes.Structure):
-    _fields_ = [
-        (name, ctypes.c_uint32)
-        for name in (
-            "struct_size",
-            "cache_status",
-            "batch",
-            "padded_height",
-            "padded_width",
-            "reserved",
-        )
-    ] + [
-        ("buffer_bytes", ctypes.c_uint64 * 4),
-        ("startup_device_used_bytes", ctypes.c_uint64 * 4),
-        ("model_load_ms", ctypes.c_double),
-        ("shape_setup_ms", ctypes.c_double * 4),
-        ("optimization_stats", ctypes.c_int32 * 5),
-        ("fused_silu_count", ctypes.c_int32),
-    ]
 
 
 def _load(path: Path) -> ctypes.CDLL:
@@ -129,7 +85,7 @@ def find_session_library(model: Path, explicit: PathArg | None = None) -> Path:
     if explicit is not None:
         path = Path(explicit).resolve()
         if not path.is_file():
-            raise FileNotFoundError(f"GateRV3 library not found: {path}")
+            raise FileNotFoundError(f"Umzi library not found: {path}")
         return path
     for directory in (PACKAGE_DIR, model.parent):
         path = directory / LIBRARY_NAME
@@ -142,9 +98,9 @@ def find_session_library(model: Path, explicit: PathArg | None = None) -> Path:
 
 
 def load_session_library(path: Path) -> ctypes.CDLL:
-    """Load and bind a GateRV3 session library once per process."""
+    """Load and bind a Umzi session library once per process."""
     if not path.is_file():
-        raise FileNotFoundError(f"GateRV3 library not found: {path}")
+        raise FileNotFoundError(f"Umzi library not found: {path}")
     with _load_lock:
         library = _session_libraries.get(path)
         if library is not None:
@@ -159,74 +115,8 @@ def load_session_library(path: Path) -> ctypes.CDLL:
                 "with the directories that contain them."
             ) from error
         try:
-            _bind_session_api(library)
+            bind_session_api(library)
         except AttributeError as error:
-            raise OSError(f"{path} does not expose the packed GateRV3 session API") from error
+            raise OSError(f"{path} does not expose the Umzi session API") from error
         _session_libraries[path] = library
     return library
-
-
-def _bind_session_api(dll: ctypes.CDLL) -> None:
-    pointer = ctypes.c_void_p
-    dimensions = [pointer, *([ctypes.c_uint32] * 3)]
-    bindings = (
-        ("gt_error", [], ctypes.c_char_p),
-        ("gt_session_open", [ctypes.c_char_p, ctypes.POINTER(OptionsABI)], pointer),
-        ("gt_session_close", [pointer], None),
-        ("gt_session_describe", [*dimensions, ctypes.POINTER(IoABI)], ctypes.c_int),
-        ("gt_session_prepare", dimensions, ctypes.c_int),
-        (
-            "gt_session_run",
-            [*dimensions, *([pointer, ctypes.c_uint64] * 2)],
-            ctypes.c_int,
-        ),
-        (
-            "gt_session_enqueue",
-            [*dimensions, *([ctypes.c_uint64] * 4), pointer],
-            ctypes.c_int,
-        ),
-        ("gt_session_info", [pointer, ctypes.POINTER(InfoABI)], ctypes.c_int),
-        ("gt_session_cache_message", [pointer], ctypes.c_char_p),
-        ("gt_session_fusion_message", [pointer], ctypes.c_char_p),
-        (
-            "gt_session_profile",
-            [pointer, ctypes.POINTER(ctypes.c_float), ctypes.c_int],
-            ctypes.c_int,
-        ),
-    )
-    for name, args, result in bindings:
-        function = getattr(dll, name)
-        function.argtypes = args
-        function.restype = result
-
-
-def check_status(dll: ctypes.CDLL, status: int) -> None:
-    if status:
-        message = dll.gt_error().decode("utf-8", errors="replace")
-        if status == -2:
-            raise MemoryError(message)
-        raise RuntimeError(message)
-
-
-def read_session_info(dll: ctypes.CDLL, handle: int | None) -> InfoABI:
-    info = InfoABI()
-    info.struct_size = ctypes.sizeof(info)
-    check_status(dll, dll.gt_session_info(handle, ctypes.byref(info)))
-    return info
-
-
-def session_setup(dll: ctypes.CDLL, handle: int | None, info: InfoABI) -> dict:
-    return {
-        "stages_ms": dict(
-            zip(
-                ("model", "shape_allocation", "plans", "allocation_warmup", "capture"),
-                (info.model_load_ms, *info.shape_setup_ms),
-                strict=True,
-            )
-        ),
-        "cache_status": CACHE_STATUSES[info.cache_status],
-        "cache_message": dll.gt_session_cache_message(handle).decode("utf-8", errors="replace"),
-        "fused_silu_count": info.fused_silu_count,
-        "fusion_message": dll.gt_session_fusion_message(handle).decode("utf-8", errors="replace"),
-        "optimization": dict(zip(OPTIMIZATION_STATS, info.optimization_stats, strict=True)),
-    }

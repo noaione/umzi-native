@@ -20,25 +20,21 @@ import numpy as np
 import torch
 from benchmark import IMAGE_EXTS, ROOT, image_tensor, load_model, patches, tensor_image
 from build_native import load_build_module
-from export_native import (
-    MODEL_FORMAT_VERSION,
-    MODEL_HEADER,
-    MODEL_MAGIC,
-    MODEL_METADATA,
-    MODEL_SECTION,
-    Op,
-)
+from exporters.gaterv3 import MODEL_METADATA, SCHEMA_VERSION, Op
+from exporters.package import GATERV3, read_sections
 from PIL import Image
 from rtx_session import create_rtx_session
 
-from umzi_native._native import (
-    CACHE_STATUSES,
-    KERNEL_OPTIONS,
-    OPTIMIZATION_STATS,
-    OptionsABI,
-    load_session_library,
-    read_session_info,
-    session_setup,
+from umzi_native._abi import CACHE_STATUSES, ShapeABI, check_status, open_session, read_session_info, session_setup
+from umzi_native._loader import LIBRARY_NAME, load_session_library
+
+KERNEL_OPTIONS = {"tune-projections": 8, "fuse-gate-pool": 16, "fp16-qkv": 32}
+OPTIMIZATION_STATS = (
+    "replay_tuned_shapes",
+    "fused_gate_pool_sites",
+    "fp16_qkv_projections",
+    "split_gate_registers",
+    "fused_gate_registers",
 )
 
 CHECKPOINT = ROOT / "models/1x_umzi_digital_decompress_gaterv3_1.pth"
@@ -49,23 +45,8 @@ METRIC = Path(r"C:\Tools\imaging\ssimulacra2.exe")
 def packed_schedule(path):
     length = path.stat().st_size
     with path.open("rb") as file:
-        magic, version, count, _ = MODEL_HEADER.unpack(file.read(MODEL_HEADER.size))
-        if (magic, version, count) != (MODEL_MAGIC, MODEL_FORMAT_VERSION, 4):
-            raise ValueError("Unsupported packed GateRV3 format")
-        position = MODEL_HEADER.size + count * MODEL_SECTION.size
-        table = file.read(count * MODEL_SECTION.size)
-        sections = {}
-        for index, (kind, reserved, offset, size) in enumerate(MODEL_SECTION.iter_unpack(table), start=1):
-            if kind != index or reserved or offset != position or size > length - position:
-                raise ValueError("Invalid packed GateRV3 sections")
-            sections[kind] = (offset, size)
-            position += size
-        if (
-            len(sections) != count
-            or position != length
-            or sections[1][1] != MODEL_METADATA.size
-            or sections[4][1] != 32
-        ):
+        sections = read_sections(file, length, GATERV3, SCHEMA_VERSION)
+        if not {1, 2, 3, 4}.issubset(sections) or sections[1][1] != MODEL_METADATA.size or sections[4][1] != 32:
             raise ValueError("Invalid packed GateRV3 section sizes")
         file.seek(sections[1][0])
         *_, tensors, operations = MODEL_METADATA.unpack(file.read(MODEL_METADATA.size))
@@ -91,6 +72,11 @@ def optimization_candidates(args):
             yield f"native_{mode}_{name.replace('-', '_')}", mode, (*base, name)
 
 
+def legacy_library(bundle: Path) -> Path:
+    frozen = bundle / "gaterv3.dll"
+    return frozen if frozen.is_file() else bundle / LIBRARY_NAME
+
+
 class Native:
     def __init__(
         self,
@@ -113,17 +99,19 @@ class Native:
         flags |= sum(KERNEL_OPTIONS[name] for name in set(optimizations))
         cached = str(cache_dir.resolve()).encode() if cache_dir else None
         try:
-            library_path = (bundle / "gaterv3.dll").resolve()
             if model_file is not None:
                 # The Torch import above has already loaded cuBLASLt and cuDNN.
-                self.dll = load_session_library(library_path)
-                self.open_packed(model_file, batch, flags, cached)
+                self.dll = load_session_library((bundle / LIBRARY_NAME).resolve())
+                kernel_options = {name.replace("-", "_"): 1 for name in optimizations}
+                if fuse_silu:
+                    kernel_options["fuse_silu"] = 1
+                self.open_packed(model_file, batch, precision, graph, cached, kernel_options)
             else:
                 native = load_build_module()
                 toolchain = native.find_toolchain(native.BuildSettings())
                 for path in (toolchain.cuda / "bin/x86_64", toolchain.cudnn / "bin"):
                     self.dll_dirs.enter_context(os.add_dll_directory(str(path)))
-                self.dll = ctypes.CDLL(str(library_path))
+                self.dll = ctypes.CDLL(str(legacy_library(bundle).resolve()))
                 self.dll.gt_error.restype = ctypes.c_char_p
                 self.open_legacy(bundle, batch, graph, fp16, flags, cached)
             self.host_output = torch.empty((batch, *SHAPE), dtype=self.dtype)
@@ -160,19 +148,19 @@ class Native:
             self.check(-1)
         self.device_input = self.dll.gt_input(self.handle)
 
-    def open_packed(self, path, batch, flags, cached):
-        self.destroy = self.dll.gt_session_close
-        options = OptionsABI(ctypes.sizeof(OptionsABI), 0, flags, 0, cached)
-        self.handle = self.dll.gt_session_open(str(path.resolve()).encode(), ctypes.byref(options))
-        if not self.handle:
-            self.check(-1)
-        self.check(self.dll.gt_session_prepare(self.handle, batch, *SHAPE[1:]))
+    def open_packed(self, path, batch, precision, graph, cached, kernel_options):
+        self.destroy = self.dll.umzi_session_close
+        self.handle = open_session(self.dll, path.resolve(), 0, precision, graph, cached, kernel_options)
+        shape = ShapeABI.from_dimensions((batch, *SHAPE))
+        self.check(self.dll.umzi_session_prepare(self.handle, ctypes.byref(shape)))
 
     def session_info(self):
         return read_session_info(self.dll, self.handle)
 
     def check(self, status):
-        if status:
+        if self.model_file is not None:
+            check_status(self.dll, status)
+        elif status:
             raise RuntimeError(self.dll.gt_error().decode())
 
     def close(self):
@@ -199,11 +187,9 @@ class Native:
                 self.host_output = torch.empty_like(packed)
             size = packed.nbytes
             self.check(
-                self.dll.gt_session_run(
+                self.dll.umzi_session_run(
                     self.handle,
-                    x.shape[0],
-                    x.shape[2],
-                    x.shape[3],
+                    ctypes.byref(ShapeABI.from_dimensions(x.shape)),
                     packed.data_ptr(),
                     size,
                     self.host_output.data_ptr(),
@@ -216,14 +202,13 @@ class Native:
         if self.model_file is not None:
             packed = x.to(dtype=self.dtype)
             output = torch.empty_like(packed)
+            shape = ShapeABI.from_dimensions(x.shape)
 
             def run_packed():
                 self.check(
-                    self.dll.gt_session_enqueue(
+                    self.dll.umzi_session_enqueue(
                         self.handle,
-                        x.shape[0],
-                        x.shape[2],
-                        x.shape[3],
+                        ctypes.byref(shape),
                         packed.data_ptr(),
                         packed.nbytes,
                         output.data_ptr(),
@@ -262,7 +247,11 @@ class Native:
 
     def setup(self):
         if self.model_file is not None:
-            return session_setup(self.dll, self.handle, self.session_info())
+            setup = session_setup(self.dll, self.handle, self.session_info())
+            setup["optimization"] = {name: setup["diagnostics"][name] for name in OPTIMIZATION_STATS}
+            setup["fused_silu_count"] = setup["diagnostics"]["fused_silu_count"]
+            setup["fusion_message"] = setup["kernel_message"]
+            return setup
         timing = getattr(self.dll, "gt_setup_timings", None)
         if timing is None:
             return None
@@ -323,18 +312,18 @@ class Native:
         else:
             specs, ops, _ = packed_schedule(self.model_file)
             count = len(ops)
-            info = self.session_info()
+            _, _, height, width = self.session_info().prepared_input.dimensions_tuple()
             shapes = np.array([
                 (1, 1, channels)
                 if level < 0
                 else (
-                    info.padded_height >> level,
-                    info.padded_width >> level,
+                    height >> level,
+                    width >> level,
                     channels,
                 )
                 for level, channels in specs
             ])
-            profile = self.dll.gt_session_profile
+            profile = self.dll.umzi_session_profile
         times = np.zeros(count, dtype=np.float32)
         self.check(profile(self.handle, times.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), count))
         totals = defaultdict(float)
@@ -857,7 +846,7 @@ def main():
     if args.legacy and args.model_file is not None:
         parser.error("--legacy and --model-file are mutually exclusive")
     if args.model_file is None and not args.legacy:
-        model_file = args.bundle / "gaterv3.gtmodel"
+        model_file = args.bundle / "gaterv3.ummodel"
         if model_file.is_file():
             args.model_file = model_file
     if args.rounds < 1 or args.repeats < 1:
@@ -886,7 +875,8 @@ def main():
     def checked_bundle(bundle):
         manifest = json.loads((bundle / "checkpoint.json").read_text(encoding="utf-8"))
         hashes = {
-            name: digest(bundle / name) for name in ("gaterv3.dll", "kernels.cubin", "schedule.bin", "weights.bin")
+            name: digest(bundle / name)
+            for name in (legacy_library(bundle).name, "kernels.cubin", "schedule.bin", "weights.bin")
         }
         if manifest["checkpoint_sha256"] != checkpoint_hash or any(
             hashes[name] != manifest["weights_and_schedule"][name] for name in ("schedule.bin", "weights.bin")
@@ -899,7 +889,7 @@ def main():
         if packed_checkpoint != checkpoint_hash:
             parser.error(f"Packed model does not match the checkpoint in {args.model}")
         bundle_hashes = {
-            "gaterv3.dll": digest(args.bundle / "gaterv3.dll"),
+            LIBRARY_NAME: digest(args.bundle / LIBRARY_NAME),
             "model_file": digest(args.model_file),
         }
     else:

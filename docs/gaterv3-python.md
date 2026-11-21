@@ -2,11 +2,11 @@
 
 The runtime source lives in `src/umzi_native/`. Each native kernel
 family has its own directory under `native/`, starting with
-`native/gaterv3/`. The Torch reference and checkpoint loader live under
+`native/kernels/gaterv3/`. The Torch reference and checkpoint loader live under
 `scripts/reference/` for export and validation.
 
-`umzi_native` runs packed `.gtmodel` files with NumPy through the native
-GateRV3 library: `gaterv3.dll` on Windows or `libgaterv3.so` on Linux. It
+`umzi_native` runs packed `.ummodel` files with NumPy through the native
+Umzi runtime: `umzi_native.dll` on Windows or `libumzi_native.so` on Linux. It
 uses the familiar ONNX Runtime pattern of opening a session, inspecting
 named inputs and outputs, and calling `run` with an input dictionary. The
 package depends only on NumPy. The library needs the CUDA driver,
@@ -21,14 +21,14 @@ the checkout, from an sdist, or from a Git URL builds a wheel with
 [Hatchling](https://hatch.pypa.io/latest/config/build/), and Hatchling runs
 the build hook in `hatch_build.py` at the repository root. The hook:
 
-1. Compiles `native/gaterv3/kernels.cu` with CUDA 13.0 NVRTC into `sm_86`,
+1. Compiles `native/kernels/gaterv3/kernels.cu` with CUDA 13.0 NVRTC into `sm_86`,
    `sm_89` and `sm_120` cubins plus `compute_86` PTX, and embeds them in a
    generated `cuda_images.h`. CUDA 13.0 emits PTX ISA 9.0 so the fallback
    can run on drivers that support the CUDA 13.0 baseline.
-2. Compiles `native/gaterv3/runner.cpp` and links `gaterv3.dll` with MSVC on
-   Windows, or `libgaterv3.so` with `c++` on Linux.
-3. Adds the library to the wheel as `umzi_native/gaterv3.dll` or
-   `umzi_native/libgaterv3.so`, and tags the wheel `py3-none-<platform>`,
+2. Compiles `native/kernels/gaterv3/runner.cpp` and links `umzi_native.dll` with MSVC on
+   Windows, or `libumzi_native.so` with `c++` on Linux.
+3. Adds the library to the wheel as `umzi_native/umzi_native.dll` or
+   `umzi_native/libumzi_native.so`, and tags the wheel `py3-none-<platform>`,
    such as `win_amd64` or `linux_x86_64`. The library is loaded through
    ctypes, so the tag names no Python version or ABI.
 
@@ -51,7 +51,7 @@ The build machine needs:
 $py = 'C:\Python314\python.exe'
 & $py -m pip install .                 # builds the DLL, then installs
 & $py -m pip wheel . --no-deps -w dist  # or keep the platform wheel
-& $py scripts/export_native.py --output output/native-refactor/gaterv3.gtmodel
+& $py scripts/export_native.py --output output/native/gaterv3.ummodel
 ```
 
 On this machine, an isolated `pip wheel .` took about 30 seconds on Windows
@@ -71,7 +71,7 @@ frontends pass no command-line arguments to the hook:
 | `UMZI_CRT_INCLUDE`, `UMZI_CCCL_INCLUDE` | Use these CRT and CCCL header roots. |
 | `UMZI_OPENSSL_INCLUDE` | Linux OpenSSL include directories, separated by `os.pathsep`. |
 | `UMZI_CUDA_DRIVER_LIB` | Linux `libcuda.so.1` to link against. |
-| `UMZI_NATIVE_BUILD_DIR` | Build in this directory and keep it, including the `gaterv3` CLI linked from the same object. |
+| `UMZI_NATIVE_BUILD_DIR` | Build in this directory and keep it, including the `umzi_native` CLI linked from the same object. |
 | `UMZI_NATIVE_LIBRARY` | Skip compilation and bundle this prebuilt library. |
 
 Editable installs (`pip install -e .`) skip the native build. Build the
@@ -105,7 +105,7 @@ build the wheel with `UMZI_NATIVE_BUILD_DIR` set, or use the files that
 
 ### Library loading
 
-A session loads the first GateRV3 library it finds in this order:
+A session loads the first Umzi runtime it finds in this order:
 
 1. `SessionOptions(dll_path=...)`
 2. The installed package directory
@@ -140,12 +140,14 @@ library a session loaded.
 from pathlib import Path
 
 import numpy as np
+import torch
+
 import umzi_native as umzi
 
 options = umzi.SessionOptions(cache_dir=Path("output/cache/gaterv3"))
 tiles = np.zeros((3, 3, 192, 160), dtype=np.float32)
 
-with umzi.InferenceSession("output/native-refactor/gaterv3.gtmodel", sess_options=options) as session:
+with umzi.InferenceSession("output/native/gaterv3.ummodel", sess_options=options) as session:
     input_name = session.get_inputs()[0].name
     (restored,) = session.run(None, {input_name: tiles})
     print(restored.shape, restored.dtype)
@@ -172,22 +174,31 @@ and releases its device resources.
 | --- | --- |
 | `precision` | `"mixed"` or `"fp16"`. |
 | `device_id` | CUDA device index. Defaults to 0. |
-| `cache_dir` | Directory for tuned plans. Defaults to `None`, which disables disk caching. |
+| `cache_dir` | Tuned plans use `gaterv3_<hex-key>.umplan` in this directory. Defaults to `None`, which disables disk caching. |
 | `enable_cuda_graph` | Enables replay for the prepared shape. Defaults to `True`. |
 | `fuse_silu` | Tries convolution–SiLU fusion at eligible sites. |
 | `tune_projections` | Runs the wider cuBLASLt candidate search. |
 | `fuse_gate_pool` | Fuses eligible grouped gate and pooling sites. |
 | `fp16_qkv` | Enables FP16 QKV accumulation in mixed precision. |
-| `dll_path` | Load this GateRV3 library instead of the package or model-directory copy. |
+| `kernel_options` | Pass family-specific settings as named integer values. GateRV3 accepts its four optimization flags as 0 or 1. |
+| `dll_path` | Load this Umzi runtime instead of the package or model-directory copy. |
 | `dll_dirs` | Directories passed to `load_cuda_libraries()` before the session library loads. |
 
 After preparing or running a shape, `get_session_info()` returns the
 padded shape, cache status, setup times, runner buffer sizes and
-optimization counters. An out-of-memory error during shape preparation
+kernel-specific counters in the `diagnostics` dictionary. An out-of-memory error during shape preparation
 or inference raises `MemoryError`, and the same session can accept
 a smaller batch. [Native optimization details](gaterv3-native-refactor.md#session-optimization-options)
 
-## Verification
+The package header dispatches to GateRV3. `session.kernel`,
+`session.scale_factor` and `session.context` expose model metadata.
+[Runtime and format spec](umzi-native-runtime-plan.md)
+
+## Historical verification
+
+The reports and commands in this section describe the previous GateRV3
+DLL and package names.
+
 
 `scripts/check_python_session.py` needs only NumPy and the package under
 test. For each precision it runs a 1×3×128×128 tile and a 3×3×65×79 batch

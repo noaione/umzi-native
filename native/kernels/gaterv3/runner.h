@@ -17,7 +17,6 @@ extern "C" {
 #endif
 
 typedef struct GtRunner GtRunner;
-typedef struct GtSession GtSession;
 typedef struct CUstream_st* GtStream;
 
 typedef enum GtCreateFlags {
@@ -52,57 +51,6 @@ typedef enum GtStatus {
     GT_STATUS_ERROR = -1,
     GT_STATUS_OUT_OF_MEMORY = -2,
 } GtStatus;
-
-typedef struct GtSessionOptions {
-    uint32_t struct_size;
-    int32_t device;
-    uint32_t flags; // Bitwise OR of GtCreateFlags. Applies to every shape in this session.
-    uint32_t reserved;
-    const char* cache_dir;
-} GtSessionOptions;
-
-typedef enum GtRgbType {
-    GT_RGB_F32 = 1,
-    GT_RGB_F16 = 2,
-} GtRgbType;
-
-typedef struct GtIo {
-    uint32_t struct_size;
-    uint32_t rgb_type, batch, channels, height, width;
-    uint64_t input_bytes, output_bytes;
-} GtIo;
-
-typedef struct GtSessionInfo {
-    uint32_t struct_size;
-    uint32_t cache_status, batch, padded_height, padded_width, reserved;
-    uint64_t buffer_bytes[4]; // Weights, activation arena, scratch, RGB buffers.
-    uint64_t startup_device_used_bytes[4];
-    double model_load_ms;
-    double shape_setup_ms[4]; // Shape allocation, planning, warmup, capture.
-    int32_t optimization_stats[GT_OPT_STAT_COUNT];
-    int32_t fused_silu_count;
-} GtSessionInfo;
-
-// Initialize struct_size in every ABI struct. Null options select device 0,
-// mixed precision, and a CUDA Graph. Kernel optimizations are opt-in.
-// Empty cache_dir disables disk caching.
-GT_API GtSession* gt_session_open(const char* utf8_model, const GtSessionOptions* options);
-GT_API void gt_session_close(GtSession* session);
-GT_API int gt_session_describe(const GtSession* session, uint32_t batch, uint32_t height,
-                               uint32_t width, GtIo* io);
-GT_API int gt_session_prepare(GtSession* session, uint32_t batch, uint32_t height, uint32_t width);
-GT_API int gt_session_run(GtSession* session, uint32_t batch, uint32_t height, uint32_t width,
-                          const void* input, uint64_t input_bytes, void* output, uint64_t output_bytes);
-// Device pointers and stream belong to the selected device's primary context.
-// The call queues work. Synchronize the stream before reusing caller buffers.
-// Serialize calls on a session. The session waits before reusing its workspace.
-GT_API int gt_session_enqueue(GtSession* session, uint32_t batch, uint32_t height, uint32_t width,
-                              uint64_t input, uint64_t input_bytes, uint64_t output,
-                              uint64_t output_bytes, GtStream stream);
-GT_API int gt_session_info(const GtSession* session, GtSessionInfo* info);
-GT_API const char* gt_session_cache_message(const GtSession* session);
-GT_API const char* gt_session_fusion_message(const GtSession* session);
-GT_API int gt_session_profile(GtSession* session, float* milliseconds, int count);
 
 // Uses CUDA device 0. The bundle contains schedule.bin, weights.bin and kernels.cubin.
 GT_API GtRunner* gt_create(const char* utf8_directory, int batch, int graph);
