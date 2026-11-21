@@ -17,7 +17,7 @@ build-backend = "hatchling.build"
 name = "umzi-native"
 version = "0.1.0"
 description = "Faster inference for umzi models/kernels on CUDA"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = ["numpy>=2.5"]
 
 [project.optional-dependencies]
