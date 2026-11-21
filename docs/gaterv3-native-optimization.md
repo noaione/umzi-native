@@ -355,3 +355,191 @@ row times the same split execution path as the regular full-FP16 row.
 The combined report is `output/native-next-validation/verified-report.json`.
 It records bundle hashes, output parity, cache cases, VRAM, per-image
 quality, all tile timings, and per-page throughput.
+
+## Projection and gate–pooling optimization plan
+
+Use the verified `output/native-arena` bundle as the control. Keep the
+full checkpoint, the repacked arena, and the 128×128 tile geometry. The
+latest batch-16 profile attributed 14.02 ms to 1×1 projections in full
+FP16 and 18.55 ms in mixed precision. Measure the changes below independently
+before combining any winners.
+
+1. [x] **Replay-based projection tuning.** Widen the cuBLASLt candidate
+   search for the latent projections and the busiest high-resolution
+   matrix shapes. Warm and time candidates under CUDA Graph replay.
+   Keep mode and search policy in the plan-cache key. Compare warm
+   latency, throughput, startup with a populated cache, and VRAM against
+   the existing eight-candidate tuner.
+2. [x] **Grouped gate and pooling.** Have the grouped convolution and gate
+   write its FP16 output and partial spatial sums together. Keep the
+   channel projection and its input rounding. Compare with the existing
+   gate followed by a separate pooling pass. Start with the 128×128,
+   32-channel blocks, where the gate reads and writes the largest
+   feature maps. Compare register pressure, GPU time, and fidelity in
+   both precisions before extending the fusion to smaller shapes.
+3. [x] **Selective FP16 accumulation.** Start with the 12 folded QKV
+   projections in the mixed runner. Request FP16 accumulation for those
+   projections and keep its existing FP32 normalization reductions,
+   final RGB skip arithmetic, and FP32 RGB I/O. Cache this plan separately
+   and compare its latency and fidelity with both existing precision modes.
+
+Validate through the native DLL and compare with untouched Torch CUDA FP32
+across all three pages and the existing stress inputs. Save raw-float
+PSNR, per-image SSIMULACRA2 and maximum error, all 528 synchronized
+individual batch-1 tile times, batch-16 page throughput, and isolated
+VRAM. Collect the Torch and TensorRT-RTX controls at their existing
+validated shapes. Retain a candidate as an opt-in experiment when its
+speed or quality benefit is inconclusive.
+
+### Prototype and cache checks
+
+The DLL exposes the independent experiments through `gt_create_ex`.
+The CLI and Python benchmark accept `--tune-projections`,
+`--fuse-gate-pool` and `--fp16-qkv`. The QKV switch applies to mixed
+precision. The original flags still select the existing execution paths.
+
+Replay tuning requests up to 24 cuBLASLt candidates for the targeted
+shapes. It times eight launches of each candidate in a graph, then
+compares the median of three CUDA-event measurements. If no candidate
+can be timed that way, it retries the original search over up to eight
+candidates.
+[cuBLAS CUDA Graph support](https://docs.nvidia.com/cuda/cublas/index.html#cuda-graphs-support)
+
+On the RTX 3050 Laptop GPU, a cold replay-tuning run selected plans for
+12 shapes at each batch size in each precision. The gate fused at four
+sites, and the mixed QKV switch selected 12 projections. Populated cache
+runs skipped replay tuning. Gate fusion reused the split cuBLASLt plans.
+The fused gate used 35 registers per thread in mixed precision and 38 in
+full FP16. The split gate used 30 and 40, respectively.
+
+Batch-16 warmed device usage was about 210 MiB above the CUDA context in
+mixed precision and 204–206 MiB in full FP16. Cold plan selection sampled
+274 MiB and 268 MiB, respectively. For replay tuning, mixed batch-16
+time to first output was 1.90 s cold and 0.41 s with a populated cache.
+Full FP16 took 6.52 s cold and 0.25 s with a populated cache. These are
+single measurements and include model loading, graph capture, and the
+first host call.
+
+### Output fidelity
+
+The rebuilt control and prototypes used the same checkpoint, packed
+weights, and schedule as `output/native-arena`. For both rebuilt split
+controls, aggregate PSNR and all six rendered PNGs matched the previous
+validation run. All configurations produced finite output on the three
+pages and five batch-1 stress tiles.
+PSNR uses raw floats, peak 1, and untouched Torch CUDA FP32 as the
+reference. Each page cell shows raw PSNR in dB followed by SSIMULACRA2
+on the rendered PNG. Maximum error is over the raw page output.
+
+| Runner | Aggregate PSNR (dB) | page-001 | page-005 | page-009 | Max page error | Minimum stress PSNR (dB) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Mixed, split | 85.547 | 83.800 / 94.469 | 88.843 / 91.111 | 85.391 / 91.475 | 0.001902 | 78.988 |
+| Mixed, replay tuning | 85.547 | 83.800 / 94.469 | 88.843 / 91.111 | 85.391 / 91.475 | 0.001902 | 78.961 |
+| Mixed, fused gate–pool | 85.547 | 83.800 / 94.465 | 88.842 / 90.969 | 85.391 / 91.436 | 0.001902 | 78.988 |
+| Mixed, FP16 QKV | 85.547 | 83.799 / 94.392 | 88.848 / 91.059 | 85.391 / 91.563 | 0.001898 | 78.998 |
+| Full FP16, split | 72.089 | 73.272 / 94.019 | 71.774 / 90.522 | 71.433 / 91.066 | 0.001923 | 68.218 |
+| Full FP16, replay tuning | 72.089 | 73.272 / 94.019 | 71.774 / 90.522 | 71.433 / 91.066 | 0.001923 | 69.132 |
+| Full FP16, fused gate–pool | 72.101 | 73.258 / 94.169 | 71.811 / 90.484 | 71.439 / 91.096 | 0.002005 | 68.117 |
+
+### Individual batch-1 tile latency
+
+Every runner made 528 synchronized calls with one tile each, 176 per
+page. The overall and per-page columns show arithmetic means of the
+individual calls with host I/O. The final column comes from a separate
+repeated batch test with input and output on the GPU. Torch and RTX
+rows below come from the mixed comparison. The full-FP16 comparison
+also ran these baselines and saved their timings. ORT profiling verified
+RTX placement for the fixed batch-1 graph in both comparisons.
+
+| Runner | Mean tile (ms) | page-001 (ms) | page-005 (ms) | page-009 (ms) | Repeated device median (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Mixed, split | 5.679 | 5.807 | 5.621 | 5.608 | 5.751 |
+| Mixed, replay tuning | 5.467 | 5.695 | 5.358 | 5.349 | 4.824 |
+| Mixed, fused gate–pool | 5.728 | 5.984 | 5.566 | 5.634 | 5.033 |
+| Mixed, FP16 QKV | 5.523 | 5.619 | 5.468 | 5.481 | 4.987 |
+| Full FP16, split | 5.085 | 5.156 | 5.058 | 5.040 | 4.608 |
+| Full FP16, replay tuning | 4.946 | 4.933 | 5.082 | 4.824 | 4.339 |
+| Full FP16, fused gate–pool | 5.078 | 4.986 | 5.214 | 5.033 | 4.496 |
+| Torch eager FP16 | 52.167 | 59.483 | 48.482 | 48.537 | 45.404 |
+| TorchInductor FP16 | 18.319 | 19.860 | 17.537 | 17.559 | 16.935 |
+| ORT TensorRT-RTX FP16 | 6.491 | 6.972 | 6.199 | 6.304 | 5.478 |
+
+### Batch-16 page throughput
+
+Total and per-page wall times include batch assembly and synchronous host
+I/O. Each runner made 33 batch-16 calls across three pages. The last
+column shows the separate repeated test with device-resident I/O. ORT
+profiling verified RTX placement for the fixed batch-16 graph. The
+baseline rows below are from the mixed comparison. The matched RTX
+row in the full-FP16 comparison measured 3.311 MPx/s.
+
+| Runner | Total (s) | MPx/s | page-001 s / MPx/s | page-005 s / MPx/s | page-009 s / MPx/s | Repeated device median (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Mixed, split | 2.081 | 4.047 | 0.690 / 4.070 | 0.693 / 4.054 | 0.699 / 4.018 | 60.345 |
+| Mixed, replay tuning | 2.115 | 3.983 | 0.716 / 3.922 | 0.702 / 4.002 | 0.697 / 4.026 | 60.159 |
+| Mixed, fused gate–pool | 2.123 | 3.968 | 0.722 / 3.889 | 0.695 / 4.038 | 0.706 / 3.980 | 59.766 |
+| Mixed, FP16 QKV | 2.079 | 4.053 | 0.698 / 4.024 | 0.693 / 4.055 | 0.688 / 4.080 | 60.514 |
+| Full FP16, split | 1.959 | 4.301 | 0.621 / 4.523 | 0.658 / 4.271 | 0.680 / 4.126 | 52.700 |
+| Full FP16, replay tuning | 1.876 | 4.490 | 0.616 / 4.555 | 0.649 / 4.328 | 0.611 / 4.597 | 52.281 |
+| Full FP16, fused gate–pool | 1.832 | 4.598 | 0.602 / 4.666 | 0.604 / 4.650 | 0.626 / 4.482 | 51.563 |
+| Torch eager FP16 | 5.580 | 1.510 | 1.890 / 1.486 | 1.839 / 1.527 | 1.851 / 1.517 | 163.712 |
+| TorchInductor FP16 | 7.479 | 1.126 | 2.559 / 1.097 | 2.494 / 1.126 | 2.426 / 1.158 | 217.301 |
+| ORT TensorRT-RTX FP16 | 2.648 | 3.182 | 0.876 / 3.204 | 0.907 / 3.096 | 0.864 / 3.248 | 76.084 |
+
+The instrumented batch-16 profile put the four mixed gate and pooling
+sites at 2.99 ms split and 2.25 ms fused. For full FP16, that measured
+2.87 ms split and 2.88 ms fused. The 12 folded QKV projections in the
+mixed runner went from 2.76 ms to 1.55 ms with FP16 accumulation.
+These are per-operation sums from an instrumented replay. Mixed page
+throughput stayed within 2% of the split control across the three
+experiments.
+
+### Full-FP16 follow-up
+
+The follow-up used the same replay-tuned cuBLASLt plans on both sides.
+Adding gate–pool fusion improved batch-16 page throughput by 4.6%.
+The batch-16 device median fell from 54.044 ms to 52.075 ms. At batch 1,
+the combination's repeated device median fell from 4.414 ms to
+4.340 ms, and its mean of 528 individual host calls rose from 4.834 ms
+to 5.218 ms.
+
+| Runner | Mean tile (ms) | page-001 (ms) | page-005 (ms) | page-009 (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| Full FP16, replay tuning | 4.834 | 4.732 | 4.839 | 4.930 |
+| Full FP16, both switches | 5.218 | 5.352 | 5.358 | 4.944 |
+
+| Runner | Total (s) | MPx/s | page-001 s / MPx/s | page-005 s / MPx/s | page-009 s / MPx/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Full FP16, replay tuning | 1.852 | 4.549 | 0.613 / 4.582 | 0.604 / 4.646 | 0.635 / 4.424 |
+| Full FP16, both switches | 1.771 | 4.758 | 0.591 / 4.750 | 0.591 / 4.749 | 0.588 / 4.775 |
+
+The combination reproduced the gate-only batch-16 page quality
+metrics. Aggregate raw PSNR was 72.101 dB with mean SSIMULACRA2
+91.916 and minimum 90.484. Batch-1 checkerboard PSNR was 65.516 dB
+with both switches, 69.132 dB with replay tuning alone, and 68.218 dB
+with the split control.
+
+With a populated cache, both switches used 204 MiB of warmed device
+memory above the context baseline at batch 16. The runner reported
+201.56 MiB in its own weights, activations, scratch, and RGB buffers.
+Time to first output was 254 ms.
+
+The standalone EXE and the DLL produced bit-identical outputs on a
+seeded batch-1 input with the combined flags in each precision when
+both loaded the same CUDA libraries. The standalone NVIDIA wheel path
+and the Torch process loaded different cuBLASLt builds and used
+separate plan keys. The maximum raw RGB difference across those
+environments was 0.000366 in mixed precision and 0.000977 in full FP16.
+The benchmark tables use the DLL inside the system Python process.
+
+Keep all three switches opt-in. Use replay tuning alone when testing
+single-tile latency. Both switches are useful for batch-16 full-FP16
+throughput on this GPU. Mixed precision remains the higher-fidelity
+path. Its selective QKV switch speeds up those projections with
+little change to page throughput.
+
+The combined report is
+`output/native-projection-validation/verified-report.json`. It links
+the raw reports, including every tile time, per-page quality and
+throughput, measured VRAM and startup, and the individual operation
+profiles.

@@ -97,12 +97,10 @@ extern "C" __global__ void bias16(half* out, const half* b, int channels, int to
 }
 
 template<int channels, int w>
-__device__ void local16(half2* out, const half2* in, const half2* weight,
-                        const half2* bias, int total) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= total) return;
+__device__ __forceinline__ half2 local16_value(const half2* in, const half2* weight,
+                                               const half2* bias, int pixel, int g) {
     constexpr int groups = channels / 2;
-    int g = i % groups, pixel = i / groups, x = pixel % w, y = pixel / w % w;
+    int x = pixel % w, y = pixel / w % w;
     half2 a = bias[g], b = bias[g + groups];
     #pragma unroll
     for (int ky = -1; ky <= 1; ++ky) {
@@ -118,7 +116,15 @@ __device__ void local16(half2* out, const half2* in, const half2* weight,
             b = __hfma2(__high2half2(right), weight[k + channels + groups], b);
         }
     }
-    out[i] = __hmul2(a, b);
+    return __hmul2(a, b);
+}
+
+template<int channels, int w>
+__device__ void local16(half2* out, const half2* in, const half2* weight,
+                        const half2* bias, int total) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total)
+        out[i] = local16_value<channels, w>(in, weight, bias, i / (channels / 2), i % (channels / 2));
 }
 
 template<int channels, int w>
@@ -188,15 +194,15 @@ extern "C" __global__ void mean_partial16(half* out, const half* in, int pixels,
 }
 
 extern "C" __global__ void mean_project16(half* out, const half* partial, const half* weight,
-                                          const half* bias, int pixels, int channels, int chunks) {
+                                          const half* bias, int, int channels, int chunks) {
     __shared__ half average[256];
     int c = threadIdx.x, lane = c % 32, warp = c / 32, n = blockIdx.x;
     if (c < channels) {
         half sum = __float2half(0);
         for (int j = 0; j < chunks; ++j) sum = __hadd(sum, partial[(n * chunks + j) * channels + c]);
-        // The reduced features are square powers of two, with at least 256 pixels.
-        // chunks == pixels / 256 and chunks and its reciprocal are exact in binary16.
-        average[c] = __hmul(sum, hrcp(__int2half_rn(pixels / 256)));
+        // The partials are equally sized chunk means. Both supported chunk
+        // counts and their reciprocals are exactly representable in binary16.
+        average[c] = __hmul(sum, hrcp(__int2half_rn(chunks)));
     }
     __syncthreads();
     for (int output = warp; output < channels; output += 8) {

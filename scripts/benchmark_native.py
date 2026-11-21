@@ -26,6 +26,22 @@ from PIL import Image
 CHECKPOINT = ROOT / "models/1x_umzi_digital_decompress_gaterv3_1.pth"
 SHAPE = (3, 128, 128)
 METRIC = Path(r"C:\Tools\imaging\ssimulacra2.exe")
+KERNEL_OPTIONS = {"tune-projections": 8, "fuse-gate-pool": 16, "fp16-qkv": 32}
+
+
+def enabled_optimizations(args):
+    return tuple(
+        name for name in KERNEL_OPTIONS if getattr(args, name.replace("-", "_"))
+    )
+
+
+def optimization_candidates(args):
+    base = enabled_optimizations(args)
+    for mode in ("mixed", "fp16") if args.compare_fp16 else (args.precision,):
+        for name in args.compare_optimization:
+            if name in base or (name == "fp16-qkv" and mode == "fp16"):
+                continue
+            yield f"native_{mode}_{name.replace('-', '_')}", mode, (*base, name)
 
 
 class Native:
@@ -37,6 +53,7 @@ class Native:
         precision="mixed",
         cache_dir=None,
         fuse_silu=False,
+        optimizations=(),
     ):
         cuda, cudnn = libraries()
         self.dll_dirs = []
@@ -57,7 +74,7 @@ class Native:
             self.run.argtypes = [ctypes.c_void_p] * 3
             self.dll.gt_enqueue.argtypes = [ctypes.c_void_p] * 2
             directory = str(bundle.resolve()).encode()
-            if cache_dir or fuse_silu:
+            if cache_dir or fuse_silu or optimizations:
                 create_ex = self.dll.gt_create_ex
                 create_ex.argtypes = [
                     ctypes.c_char_p,
@@ -67,6 +84,7 @@ class Native:
                 ]
                 create_ex.restype = ctypes.c_void_p
                 flags = int(graph) | (2 if fp16 else 0) | (4 if fuse_silu else 0)
+                flags |= sum(KERNEL_OPTIONS[name] for name in set(optimizations))
                 cached = str(cache_dir.resolve()).encode() if cache_dir else None
                 self.handle = create_ex(directory, batch, flags, cached)
             else:
@@ -154,7 +172,7 @@ class Native:
             function.argtypes = [ctypes.c_void_p]
             function.restype = dtype
         statuses = ("disabled", "miss", "hit", "rebuilt", "unavailable")
-        return {
+        result = {
             "stages_ms": dict(
                 zip(
                     ("model", "plans", "allocation_warmup", "capture"),
@@ -167,6 +185,26 @@ class Native:
             "fused_silu_count": self.dll.gt_fused_silu_count(self.handle),
             "fusion_message": self.dll.gt_fusion_message(self.handle).decode(),
         }
+        query = getattr(self.dll, "gt_optimization_stats", None)
+        if query is not None:
+            query.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+            query.restype = None
+            counts = (ctypes.c_int * 5)()
+            query(self.handle, counts)
+            result["optimization"] = dict(
+                zip(
+                    (
+                        "replay_tuned_shapes",
+                        "fused_gate_pool_sites",
+                        "fp16_qkv_projections",
+                        "split_gate_registers",
+                        "fused_gate_registers",
+                    ),
+                    counts,
+                    strict=True,
+                )
+            )
+        return result
 
     def profile(self, schedule):
         self.dll.gt_operation_count.argtypes = [ctypes.c_void_p]
@@ -223,6 +261,7 @@ def quality(args, images):
             "precision": args.precision,
             "cache_dir": args.cache_dir,
             "fuse_silu": args.fuse_silu,
+            "optimizations": enabled_optimizations(args),
         }
         native = Native(args.bundle, 16, **options)
         runners.callback(native.close)
@@ -434,9 +473,15 @@ def speed(args, images, batch, report, save):
     device_half = device_input.half()
     torch.cuda.synchronize()
     with ExitStack() as stack:
+        configured = enabled_optimizations(args)
 
         def native_case(
-            bundle, precision, graph=True, control=False, fuse_silu=args.fuse_silu
+            bundle,
+            precision,
+            graph=True,
+            control=False,
+            fuse_silu=args.fuse_silu,
+            optimizations=configured,
         ):
             instance = Native(
                 bundle,
@@ -445,6 +490,7 @@ def speed(args, images, batch, report, save):
                 precision=precision,
                 cache_dir=None if control else args.cache_dir,
                 fuse_silu=fuse_silu and not control,
+                optimizations=() if control else optimizations,
             )
             stack.callback(instance.close)
             return instance
@@ -463,7 +509,11 @@ def speed(args, images, batch, report, save):
             fp16 = native_case(args.bundle, "fp16")
             cases["native_fp16"] = (fp16.prepare_device(device_input), fp16.host)
             report["setup"]["native_fp16"] = fp16.setup()
-        elif not args.control_bundle and not args.compare_silu:
+        elif (
+            not args.control_bundle
+            and not args.compare_silu
+            and not args.compare_optimization
+        ):
             eager = native_case(args.bundle, args.precision, graph=False)
             cases["native_eager"] = (eager.prepare_device(device_input), eager.host)
         if args.compare_silu:
@@ -472,6 +522,12 @@ def speed(args, images, batch, report, save):
                 label = f"native_{mode}_silu"
                 cases[label] = (candidate.prepare_device(device_input), candidate.host)
                 report["setup"][label] = candidate.setup()
+        candidates = {}
+        for label, mode, optimizations in optimization_candidates(args):
+            candidate = native_case(args.bundle, mode, optimizations=optimizations)
+            cases[label] = (candidate.prepare_device(device_input), candidate.host)
+            report["setup"][label] = candidate.setup()
+            candidates[label] = candidate
         if "torch" in args.baselines:
             eager, _ = load_model(args.model, device="cuda", dtype=torch.float16)
 
@@ -567,6 +623,12 @@ def speed(args, images, batch, report, save):
                     args.bundle / "schedule.bin"
                 )
                 save()
+            if candidates:
+                report["optimization_profiles"] = {
+                    label: candidate.profile(args.bundle / "schedule.bin")
+                    for label, candidate in candidates.items()
+                }
+                save()
         if not args.skip_pages:
             calls = {
                 name: host
@@ -591,21 +653,26 @@ def memory(args, batch):
     values = {}
     sample = torch.zeros((batch, *SHAPE), dtype=torch.float32)
     torch.cuda.init()
-    runners = {"native_graph": (args.bundle, args.precision, args.fuse_silu)}
+    configured = enabled_optimizations(args)
+    runners = {
+        "native_graph": (args.bundle, args.precision, args.fuse_silu, configured)
+    }
     if args.control_bundle:
-        runners["native_control"] = (args.control_bundle, "mixed", False)
+        runners["native_control"] = (args.control_bundle, "mixed", False, ())
     if args.compare_fp16:
-        runners["native_fp16"] = (args.bundle, "fp16", args.fuse_silu)
+        runners["native_fp16"] = (args.bundle, "fp16", args.fuse_silu, configured)
     if args.compare_silu:
         for mode in ("mixed", "fp16") if args.compare_fp16 else (args.precision,):
-            runners[f"native_{mode}_silu"] = (args.bundle, mode, True)
+            runners[f"native_{mode}_silu"] = (args.bundle, mode, True, configured)
+    for label, mode, optimizations in optimization_candidates(args):
+        runners[label] = (args.bundle, mode, args.fuse_silu, optimizations)
 
     def used():
         torch.cuda.synchronize()
         free, total = torch.cuda.mem_get_info()
         return total - free, total
 
-    for label, (bundle, precision, fuse_silu) in runners.items():
+    for label, (bundle, precision, fuse_silu, optimizations) in runners.items():
         torch.cuda.empty_cache()
         before, capacity = used()
         started = time.perf_counter()
@@ -615,6 +682,7 @@ def memory(args, batch):
             precision=precision,
             fuse_silu=fuse_silu,
             cache_dir=None if label == "native_control" else args.cache_dir,
+            optimizations=optimizations,
         )
         initialization_ms = (time.perf_counter() - started) * 1000
         try:
@@ -684,6 +752,25 @@ def main():
         "--compare-silu",
         action="store_true",
         help="Compare split and fused convolution/SiLU",
+    )
+    for option, description in (
+        ("tune-projections", "Use a wider cuBLASLt search timed by CUDA Graph replay"),
+        (
+            "fuse-gate-pool",
+            "Fuse the full-resolution local gate and spatial partial sums",
+        ),
+        (
+            "fp16-qkv",
+            "Use FP16 accumulation for the folded QKV projections in mixed precision",
+        ),
+    ):
+        parser.add_argument(f"--{option}", action="store_true", help=description)
+    parser.add_argument(
+        "--compare-optimization",
+        choices=tuple(KERNEL_OPTIONS),
+        nargs="+",
+        default=(),
+        help="Benchmark each selected optimization independently against the current settings",
     )
     parser.add_argument("--precision", choices=("mixed", "fp16"), default="mixed")
     parser.add_argument(
@@ -764,6 +851,7 @@ def main():
         "bundle_sha256": checked_bundle(args.bundle),
         "precision": args.precision,
         "fuse_silu": args.fuse_silu,
+        "optimizations": enabled_optimizations(args),
     }
     if args.control_bundle:
         report["control_sha256"] = checked_bundle(args.control_bundle)

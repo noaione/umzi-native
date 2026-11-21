@@ -80,12 +80,9 @@ extern "C" __global__ void bias(half* out, const half* b, int channels, int tota
 }
 
 template<int channels, int w>
-__device__ void local_gate(half2* out, const half2* in, const half2* weight,
-                           const half2* bias, int total) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= total) return;
+__device__ __forceinline__ half2 local_gate_value(const half2* in, const half2* weight,
+                                                  const half2* bias, int pixel, int g) {
     constexpr int groups = channels / 2;
-    int g = i % groups, pixel = i / groups;
     int x = pixel % w, y = pixel / w % w;
     float2 a = __half22float2(bias[g]), b = __half22float2(bias[g + groups]);
     #pragma unroll
@@ -107,7 +104,15 @@ __device__ void local_gate(half2* out, const half2* in, const half2* weight,
             b.y = fmaf(right.y, wb1.y, fmaf(right.x, wb0.y, b.y));
         }
     }
-    out[i] = __floats2half2_rn(a.x * b.x, a.y * b.y);
+    return __floats2half2_rn(a.x * b.x, a.y * b.y);
+}
+
+template<int channels, int w>
+__device__ void local_gate(half2* out, const half2* in, const half2* weight,
+                           const half2* bias, int total) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total)
+        out[i] = local_gate_value<channels, w>(in, weight, bias, i / (channels / 2), i % (channels / 2));
 }
 
 extern "C" __global__ void mean_partial(float* out, const half* in, int pixels,
@@ -415,6 +420,62 @@ extern "C" __global__ void shuffle_concat(half2* out, const half2* in, const hal
 }
 
 #include "fp16.cuh"
+
+// Each half warp owns one pixel and all 32 gated channels. The gate is
+// materialized in FP16 because the later channel scaling also reads it.
+template<bool Full>
+__device__ void gate_pool(half2* out, void* partial, const half2* in,
+                           const half2* weights, const half2* bias) {
+    constexpr int groups = 16, pixels_per_step = 16, chunk = 64;
+    int g = threadIdx.x % groups, lane_pixel = threadIdx.x / groups;
+    int base = blockIdx.x * chunk;
+    if constexpr (Full) {
+        __shared__ half2 sums[pixels_per_step][groups];
+        half2 acc = splat16(0);
+        for (int p = lane_pixel; p < chunk; p += pixels_per_step) {
+            int pixel = base + p;
+            half2 value = local16_value<32, 128>(in, weights, bias, pixel, g);
+            out[pixel * groups + g] = value;
+            acc = __hadd2(acc, value);
+        }
+        sums[lane_pixel][g] = __hmul2(acc, splat16(1.0f / chunk));
+        __syncthreads();
+        if (!lane_pixel) {
+            acc = sums[0][g];
+            for (int p = 1; p < pixels_per_step; ++p) acc = __hadd2(acc, sums[p][g]);
+            static_cast<half2*>(partial)[blockIdx.x * groups + g] = acc;
+        }
+    } else {
+        __shared__ float2 sums[pixels_per_step][groups];
+        float2 acc{0.f, 0.f};
+        for (int p = lane_pixel; p < chunk; p += pixels_per_step) {
+            int pixel = base + p;
+            half2 value = local_gate_value<32, 128>(in, weights, bias, pixel, g);
+            out[pixel * groups + g] = value;
+            float2 rounded = __half22float2(value);
+            acc.x += rounded.x;
+            acc.y += rounded.y;
+        }
+        sums[lane_pixel][g] = acc;
+        __syncthreads();
+        if (!lane_pixel) {
+            for (int p = 1; p < pixels_per_step; ++p) {
+                acc.x += sums[p][g].x;
+                acc.y += sums[p][g].y;
+            }
+            static_cast<float2*>(partial)[blockIdx.x * groups + g] = acc;
+        }
+    }
+}
+
+extern "C" __global__ void gate_pool32(half2* y, float2* p, const half2* x,
+                                        const half2* k, const half2* b) {
+    gate_pool<false>(y, p, x, k, b);
+}
+extern "C" __global__ void gate_pool16_32(half2* y, half2* p, const half2* x,
+                                          const half2* k, const half2* b) {
+    gate_pool<true>(y, p, x, k, b);
+}
 
 template<int C, bool Local, bool Full>
 __device__ void residual_norm(half2* residual, half2* normalized, const half2* a,

@@ -19,6 +19,9 @@ typedef enum GtCreateFlags {
     GT_CREATE_GRAPH = 1,
     GT_CREATE_FP16 = 2,
     GT_CREATE_FUSE_SILU = 4,
+    GT_CREATE_TUNE_PROJECTIONS = 8,
+    GT_CREATE_FUSE_GATE_POOL = 16,
+    GT_CREATE_FP16_QKV = 32,
 } GtCreateFlags;
 
 typedef enum GtCacheStatus {
@@ -43,6 +46,9 @@ GT_API const char* gt_cache_message(const GtRunner* runner);
 GT_API void gt_setup_timings(const GtRunner* runner, double milliseconds[4]);
 GT_API int gt_fused_silu_count(const GtRunner* runner);
 GT_API const char* gt_fusion_message(const GtRunner* runner);
+// Replay-tuned shapes on this load, fused gate/pool sites, selective FP16
+// projections, and split/fused gate registers per thread.
+GT_API void gt_optimization_stats(const GtRunner* runner, int values[5]);
 
 // Synchronous host I/O. Both buffers contain batch × 3 × 128 × 128 FP32 values in NCHW order.
 GT_API int gt_run(GtRunner* runner, const float* input, float* output);

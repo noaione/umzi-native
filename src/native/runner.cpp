@@ -29,6 +29,8 @@ constexpr int tile = 128;
 constexpr size_t rgb_elements = 3 * tile * tile;
 constexpr size_t scratch_bytes = 64 * 1024 * 1024;
 constexpr int threads = 256;
+constexpr int gate_pool_chunk = 64;
+constexpr float bad_timing = 1e30f;
 constexpr float one = 1, zero = 0;
 constexpr uint16_t half_one = 0x3c00, half_zero = 0;
 thread_local std::string error_text;
@@ -121,6 +123,7 @@ struct Matmul {
     cublasLtMatrixLayout_t kernel = nullptr, input = nullptr, output = nullptr;
     cublasLtMatmulAlgo_t algorithm{};
     size_t workspace = 0;
+    bool half_compute = false;
 
     ~Matmul() {
         if (desc) cublasLtMatmulDescDestroy(desc);
@@ -154,16 +157,43 @@ struct TuningTimer {
     }
     template<class Launch>
     float measure(CUstream stream, Launch launch) {
-        if (!launch()) return 1e30f;
+        if (!launch()) return bad_timing;
         CHECK(cuEventRecord(start, stream));
         for (int i = 0; i < 5; ++i) {
-            if (!launch()) return 1e30f;
+            if (!launch()) return bad_timing;
         }
         CHECK(cuEventRecord(stop, stream));
         CHECK(cuEventSynchronize(stop));
         float elapsed;
         CHECK(cuEventElapsedTime(&elapsed, start, stop));
         return elapsed;
+    }
+
+    template<class Launch>
+    float measure_replay(CUstream stream, Launch launch) {
+        if (!launch()) return bad_timing;
+        CHECK(cuStreamSynchronize(stream));
+        TimedGraph graph(0);
+        CHECK(cuStreamBeginCapture(stream, CU_STREAM_CAPTURE_MODE_THREAD_LOCAL));
+        constexpr int launches = 8;
+        bool captured = true;
+        for (int i = 0; i < launches && captured; ++i) captured = launch();
+        auto status = cuStreamEndCapture(stream, &graph.graph);
+        if (!captured || status != CUDA_SUCCESS) return bad_timing;
+        if (cuGraphInstantiate(&graph.executable, graph.graph, 0) != CUDA_SUCCESS)
+            return bad_timing;
+        CHECK(cuGraphLaunch(graph.executable, stream));
+        CHECK(cuStreamSynchronize(stream));
+        std::array<float, 3> elapsed{};
+        for (auto& ms : elapsed) {
+            CHECK(cuEventRecord(start, stream));
+            CHECK(cuGraphLaunch(graph.executable, stream));
+            CHECK(cuEventRecord(stop, stream));
+            CHECK(cuEventSynchronize(stop));
+            CHECK(cuEventElapsedTime(&ms, start, stop));
+        }
+        std::sort(elapsed.begin(), elapsed.end());
+        return elapsed[1] / launches;
     }
 };
 
@@ -187,11 +217,15 @@ public:
     int batch = 0;
     bool fp16 = false;
     bool fuse_silu = false;
+    bool tune_projections = false;
+    bool fuse_gate_pool = false;
+    bool fp16_qkv = false;
     size_t io_bytes = 0;
     gt::PlanCache plan_cache;
     std::array<double, 4> setup_ms{};
     int fused_silu_count = 0;
     std::string fusion_diagnostic;
+    std::array<int, 5> optimization_stats{};
 
     void buffer_sizes(uint64_t bytes[4]) const {
         bytes[0] = weight_bytes;
@@ -206,12 +240,17 @@ public:
 
     void initialize(const fs::path& directory, int size, uint32_t flags, const fs::path& cache_dir) {
         if (size != 1 && size != 16) throw std::runtime_error("Supported batches are 1 and 16");
-        if (flags & ~(GT_CREATE_GRAPH | GT_CREATE_FP16 | GT_CREATE_FUSE_SILU))
+        constexpr uint32_t supported = GT_CREATE_GRAPH | GT_CREATE_FP16 | GT_CREATE_FUSE_SILU
+            | GT_CREATE_TUNE_PROJECTIONS | GT_CREATE_FUSE_GATE_POOL | GT_CREATE_FP16_QKV;
+        if (flags & ~supported)
             throw std::runtime_error("Unsupported native runner flags");
         auto stage_start = Clock::now();
         batch = size;
         fp16 = (flags & GT_CREATE_FP16) != 0;
         fuse_silu = (flags & GT_CREATE_FUSE_SILU) != 0;
+        tune_projections = (flags & GT_CREATE_TUNE_PROJECTIONS) != 0;
+        fuse_gate_pool = (flags & GT_CREATE_FUSE_GATE_POOL) != 0;
+        fp16_qkv = !fp16 && (flags & GT_CREATE_FP16_QKV) != 0;
         io_bytes = rgb_elements * (fp16 ? sizeof(uint16_t) : sizeof(float));
         CHECK(cuInit(0));
         CHECK(cuDeviceGet(&device, 0));
@@ -361,6 +400,8 @@ private:
     std::vector<CUfunction> kernel_by_op;
     CUfunction add_bias = nullptr;
     CUfunction mean_project = nullptr;
+    CUfunction gate_pool_kernel = nullptr;
+    std::vector<bool> pool_fused;
     size_t arena_bytes = 0;
     size_t weight_bytes = 0;
     size_t workspace_bytes = 0;
@@ -457,6 +498,8 @@ private:
                 hash.add(staging.data(), staging.size());
                 hash.add(batch);
                 hash.add(fp16);
+                hash.add(tune_projections);
+                hash.add(fp16_qkv);
                 hash.add(scratch_bytes);
                 CUuuid uuid{};
                 CHECK(cuDeviceGetUuid(&uuid, device));
@@ -498,16 +541,21 @@ private:
     cublasStatus_t gemm(const Matmul& p, const Op& op, const cublasLtMatmulAlgo_t& algo,
                         size_t workspace, CUstream target) {
         auto y = pointer(tensor(op.out));
-        return cublasLtMatmul(blas, p.desc, fp16 ? static_cast<const void*>(&half_one) : &one,
+        return cublasLtMatmul(blas, p.desc, p.half_compute ? static_cast<const void*>(&half_one) : &one,
             pointer(weight(op.weight[0])), p.kernel, pointer(tensor(op.input[0]) + 2 * op.y),
-            p.input, fp16 ? static_cast<const void*>(&half_zero) : &zero, y, p.output,
+            p.input, p.half_compute ? static_cast<const void*>(&half_zero) : &zero, y, p.output,
             y, p.output, &algo, workspace ? pointer(scratch) : nullptr, workspace, target);
     }
 
     void prepare_matmul(size_t index, const Tensor& a, const Tensor& out, const Op& op, TuningTimer& timer) {
         auto plan = std::make_unique<Matmul>();
-        CHECK(cublasLtMatmulDescCreate(&plan->desc, fp16 ? CUBLAS_COMPUTE_16F : CUBLAS_COMPUTE_32F,
-                                      fp16 ? CUDA_R_16F : CUDA_R_32F));
+        bool selective = fp16_qkv && a.h == 8 && a.w == 8 && a.c == 512 && out.c == 2560;
+        bool replay = tune_projections && (a.h >= 64 || (a.h == 8 && a.c >= 512));
+        if (selective) ++optimization_stats[2];
+        plan->half_compute = fp16 || selective;
+        CHECK(cublasLtMatmulDescCreate(&plan->desc,
+            plan->half_compute ? CUBLAS_COMPUTE_16F : CUBLAS_COMPUTE_32F,
+            plan->half_compute ? CUDA_R_16F : CUDA_R_32F));
         // NHWC pixels are columns, with channels contiguous within each column.
         // The packed weights have one contiguous row per output channel.
         cublasOperation_t transpose = CUBLAS_OP_T;
@@ -556,25 +604,34 @@ private:
         uint64_t allotted = scratch_bytes;
         CHECK(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
                                                    &allotted, sizeof(allotted)));
-        std::array<cublasLtMatmulHeuristicResult_t, 8> results{};
+        std::array<cublasLtMatmulHeuristicResult_t, 24> results{};
+        constexpr int baseline_candidates = 8;
         int found = 0;
         CHECK(cublasLtMatmulAlgoGetHeuristic(blas, plan->desc, plan->kernel, plan->input,
                                             plan->output, plan->output, pref,
-                                            int(results.size()), results.data(), &found));
-        float best = 1e30f;
-        for (int j = 0; j < found; ++j) {
-            auto& candidate = results[j];
-            if (candidate.state != CUBLAS_STATUS_SUCCESS) continue;
-            float elapsed = timer.measure(stream, [&] {
-                return gemm(*plan, op, candidate.algo, candidate.workspaceSize, stream) == CUBLAS_STATUS_SUCCESS;
-            });
-            if (elapsed < best) {
-                best = elapsed;
-                plan->algorithm = candidate.algo;
-                plan->workspace = candidate.workspaceSize;
+                                            replay ? int(results.size()) : baseline_candidates, results.data(), &found));
+        float best = bad_timing;
+        auto test_candidates = [&](int count, bool graph_replay) {
+            for (int j = 0; j < count; ++j) {
+                auto& candidate = results[j];
+                if (candidate.state != CUBLAS_STATUS_SUCCESS) continue;
+                auto run = [&] {
+                    return gemm(*plan, op, candidate.algo, candidate.workspaceSize, stream) == CUBLAS_STATUS_SUCCESS;
+                };
+                float elapsed = graph_replay ? timer.measure_replay(stream, run) : timer.measure(stream, run);
+                if (elapsed < best) {
+                    best = elapsed;
+                    plan->algorithm = candidate.algo;
+                    plan->workspace = candidate.workspaceSize;
+                }
             }
+        };
+        if (replay) {
+            test_candidates(found, true);
+            if (best != bad_timing) ++optimization_stats[0];
         }
-        if (best == 1e30f) throw std::runtime_error("No working cuBLASLt plan for operation " + std::to_string(index));
+        if (best == bad_timing) test_candidates(std::min(found, baseline_candidates), false);
+        if (best == bad_timing) throw std::runtime_error("No working cuBLASLt plan for operation " + std::to_string(index));
         workspace_bytes = std::max(workspace_bytes, plan->workspace);
         auto selected = GemmChoice{plan->algorithm, plan->workspace};
         gemm_algorithms.emplace(key, selected);
@@ -663,10 +720,12 @@ private:
         conv_by_op.resize(ops.size());
         matmuls.resize(ops.size());
         kernel_by_op.resize(ops.size());
+        pool_fused.resize(ops.size());
         TuningTimer timer;
         timer.initialize();
         add_bias = lookup(fp16 ? "bias16" : "bias");
         mean_project = lookup(fp16 ? "mean_project16" : "mean_project");
+        if (fuse_gate_pool) gate_pool_kernel = lookup(fp16 ? "gate_pool16_32" : "gate_pool32");
         constexpr const char* names[] = {
             "pack", nullptr, nullptr, nullptr, "mean_partial", "local_skip",
             nullptr, "global_skip", "shuffle", "concat", "silu", "span_gate",
@@ -676,10 +735,20 @@ private:
             const auto& op = ops[i];
             const auto& out = tensors[op.out];
             if (op.kind == MeanProject) {
-                const auto pixels = tensors[op.input[0]].pixels();
-                size_t partial_bytes = size_t((pixels + 255) / 256) * batch * out.c
+                const auto& gated = tensors[op.input[0]];
+                const auto pixels = gated.pixels();
+                pool_fused[i] = fuse_gate_pool && i && ops[i - 1].kind == Local
+                    && ops[i - 1].out == op.input[0] && gated.h == tile && gated.w == tile
+                    && gated.c == 32 && out.c == 32;
+                int chunk = pool_fused[i] ? gate_pool_chunk : 256;
+                size_t partial_bytes = size_t((pixels + chunk - 1) / chunk) * batch * out.c
                     * (fp16 ? sizeof(uint16_t) : sizeof(float));
                 workspace_bytes = std::max(workspace_bytes, partial_bytes);
+                if (pool_fused[i]) {
+                    ++optimization_stats[1];
+                    CHECK(cuFuncGetAttribute(&optimization_stats[3], CU_FUNC_ATTRIBUTE_NUM_REGS, kernel_by_op[i - 1]));
+                    CHECK(cuFuncGetAttribute(&optimization_stats[4], CU_FUNC_ATTRIBUTE_NUM_REGS, gate_pool_kernel));
+                }
             }
             if (op.kind == Conv) {
                 const auto& in = tensors[op.input[0]];
@@ -818,11 +887,20 @@ private:
                        y, a, w0, w1, pixels * batch);
                 break;
             }
-            case Local: pairs(y, a, w0, w1); break;
+            case Local:
+                if (i + 1 < ops.size() && pool_fused[i + 1]) {
+                    launch(gate_pool_kernel, target, pixels * batch / gate_pool_chunk, 1,
+                           threads, y, scratch, a, w0, w1);
+                } else {
+                    pairs(y, a, w0, w1);
+                }
+                break;
             case MeanProject: {
-                int chunks = (in.pixels() + 255) / 256;
-                launch(kernel, target, o.c / 32, batch * chunks, threads,
-                       scratch, a, in.pixels(), o.c, chunks);
+                int chunk = pool_fused[i] ? gate_pool_chunk : 256;
+                int chunks = (in.pixels() + chunk - 1) / chunk;
+                if (!pool_fused[i])
+                    launch(kernel, target, o.c / 32, batch * chunks, threads,
+                           scratch, a, in.pixels(), o.c, chunks);
                 launch(mean_project, target, batch, 1, threads, y, scratch, w0, w1, in.pixels(), o.c, chunks);
                 break;
             }
@@ -895,6 +973,9 @@ void gt_setup_timings(const GtRunner* runner, double milliseconds[4]) {
 }
 int gt_fused_silu_count(const GtRunner* runner) { return runner->fused_silu_count; }
 const char* gt_fusion_message(const GtRunner* runner) { return runner->fusion_diagnostic.c_str(); }
+void gt_optimization_stats(const GtRunner* runner, int values[5]) {
+    std::copy(runner->optimization_stats.begin(), runner->optimization_stats.end(), values);
+}
 
 void gt_destroy(GtRunner* runner) { delete runner; }
 uint64_t gt_input(const GtRunner* runner) { return runner->input; }
@@ -938,7 +1019,8 @@ void gt_startup_memory(const GtRunner* runner, uint64_t bytes[4]) {
 int main(int argc, char** argv) {
     if (argc < 5) {
         std::cerr << "Usage: gaterv3 <bundle-directory> <batch: 1|16> <input> <output> "
-                     "[--fp16] [--cache-dir <directory>] [--fuse-silu]\n";
+                     "[--fp16] [--cache-dir <directory>] [--fuse-silu] "
+                     "[--tune-projections] [--fuse-gate-pool] [--fp16-qkv]\n";
         return 2;
     }
     return report_errors([&] {
@@ -948,6 +1030,9 @@ int main(int argc, char** argv) {
             std::string option = argv[i];
             if (option == "--fp16") flags |= GT_CREATE_FP16;
             else if (option == "--fuse-silu") flags |= GT_CREATE_FUSE_SILU;
+            else if (option == "--tune-projections") flags |= GT_CREATE_TUNE_PROJECTIONS;
+            else if (option == "--fuse-gate-pool") flags |= GT_CREATE_FUSE_GATE_POOL;
+            else if (option == "--fp16-qkv") flags |= GT_CREATE_FP16_QKV;
             else if (option == "--cache-dir" && i + 1 < argc) cache_dir = argv[++i];
             else throw std::runtime_error("Invalid option " + option);
         }
