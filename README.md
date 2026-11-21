@@ -7,5 +7,6 @@ Experimental native reimplementation of the GateRV3 model.
 - [Kernel tuning, full-FP16 experiment, and VRAM measurements](docs/gaterv3-native-optimization.md)
 - [Planned optimizations](docs/gaterv3-native-optimization.md#planned-improvements)
 - [Native runtime refactor plan](docs/gaterv3-native-refactor.md)
+- [Multi-kernel runtime and `.ummodel` plan](docs/umzi-native-runtime-plan.md)
 - [Prepared PyTorch and TensorRT-RTX baseline](docs/gaterv3-baseline.md)
 - [Manga page tiling and batch-size benchmark](docs/gaterv3-manga-tiling.md)
