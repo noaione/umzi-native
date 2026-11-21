@@ -251,7 +251,7 @@ def build_linux(output, cuda, cudnn, includes, driver):
 def bundle_wheel(library, directory):
     with tempfile.TemporaryDirectory(prefix="umzi-native-wheel-") as temp:
         staging = Path(temp)
-        for filename in ("pyproject.toml", "setup.py"):
+        for filename in ("pyproject.toml", "hatch_build.py"):
             shutil.copy2(ROOT / filename, staging)
         package = staging / "src" / "umzi_native"
         shutil.copytree(

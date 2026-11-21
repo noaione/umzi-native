@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=77"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
 
 [project]
 name = "umzi-native"
@@ -20,15 +20,16 @@ dev = [
     "nvidia-nvjitlink>=13.4,<13.5",
     "ruff>=0.17",
     "pyrefly>=1.5",
-    "setuptools>=77",
+    "hatchling>=1.27",
 ]
 
-[tool.setuptools]
-package-dir = {"" = "src"}
-packages = ["umzi_native"]
+[tool.hatch.build.targets.wheel]
+packages = ["src/umzi_native"]
+# Include a staged library even when version control ignores it.
+artifacts = ["src/umzi_native/gaterv3.dll", "src/umzi_native/libgaterv3.so"]
 
-[tool.setuptools.package-data]
-umzi_native = ["gaterv3.dll", "libgaterv3.so"]
+# Loads hatch_build.py, which sets the platform tag for native wheels.
+[tool.hatch.build.targets.wheel.hooks.custom]
 
 [tool.ruff]
 line-length = 120

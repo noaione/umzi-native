@@ -18,6 +18,20 @@ Build the platform wheel and the packed model, then install the wheel.
 `--wheel` stages the newly built library in a `py3-none-<platform>` wheel
 under `<output>/wheels`.
 
+The package builds with [Hatchling](https://hatch.pypa.io/latest/config/build/);
+it no longer uses setuptools or `setup.py`. `pyproject.toml` selects the
+`hatchling.build` backend and packages `src/umzi_native`. The library files
+are listed as `artifacts` so a staged, untracked library is still included.
+The `hatch_build.py` hook at the repository root runs for wheel builds. When
+`gaterv3.dll` or `libgaterv3.so` is in the package directory, it marks the
+wheel as non-pure and tags it `py3-none-<platform>`, for example `win_amd64`
+or `linux_x86_64`. The library is loaded through ctypes, so the tag does not
+name a Python version or ABI. A build without a library is a pure
+`py3-none-any` wheel. `build_native.py --wheel` copies `pyproject.toml`,
+`hatch_build.py`, the Python sources, and the newly built library into a
+scratch directory and runs `pip wheel --no-build-isolation` there, so
+Hatchling must already be installed. The `dev` extra includes it.
+
 ```powershell
 $py = 'C:\Python314\python.exe'
 & $py -m pip install ".[dev]"
@@ -134,7 +148,9 @@ a scratch directory. The model was copied to
 
 Both precisions padded the odd batch to 3×3×80×80. All runs loaded the
 library from the installed package directory. The WSL run used Python
-3.12 without PyTorch. [Loader check reports](../output/python-loader-check/)
+3.12 without PyTorch. These results are for the Hatchling-built wheels;
+the setuptools wheels from before the switch had passed the same checks.
+[Loader check reports](../output/python-loader-check/)
 
 The PTX fallback runs when a build embeds no cubin for the device's major
 architecture. An `--arch sm_89` build omits `sm_86`, so the RTX 3050 Laptop
@@ -153,7 +169,9 @@ paths is unchanged.
 [Previous Python session check](../output/python-runtime-validation/python-session-check.json)
 
 Build and check the Linux wheel from WSL with the staged CUDA 13.4 wheels,
-build-time Python packages, and OpenSSL headers:
+build-time Python packages, and OpenSSL headers. Hatchling 1.33.0 and its
+dependencies (`packaging`, `pathspec`, `pluggy`, `trove-classifiers`) are
+installed in the staged `python` directory:
 
 ```bash
 B=/tmp/umzi-native-linux-build
@@ -176,8 +194,8 @@ PYTHONPATH=/tmp/umzi-loader-site:$B/python python3 scripts/check_python_session.
   to an older NVRTC, or require a driver that supports CUDA 13.4.
 - The `sm_89` and `sm_120` cubins have not run on matching hardware.
 - `pip install --dry-run ".[dev]"` resolves on Windows to CUDA runtime,
-  NVRTC and CRT 13.4.92, cuBLAS 13.10, CCCL 13.3.5, cuDNN 9.28.1, Ruff 0.17.6,
-  Pyrefly 1.5.0 and setuptools 84.2.1. A full install into a clean
-  environment has not been run.
+  NVRTC and CRT 13.4.92, cuBLAS 13.10, CCCL 13.3.5, cuDNN 9.28.1,
+  Hatchling 1.33.0, Ruff 0.17.6 and Pyrefly 1.5.0. A full install into a
+  clean environment has not been run.
 - The Linux path has not been checked with CUDA PyTorch imported first,
   because the WSL Python has no PyTorch.

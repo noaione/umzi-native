@@ -1,2 +1,2 @@
-project-includes = ["src", "scripts"]
+project-includes = ["src", "scripts", "hatch_build.py"]
 search-path = ["src", "scripts"]
