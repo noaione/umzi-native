@@ -19,7 +19,6 @@ from ._loader import PathArg, find_session_library, load_cuda_libraries, load_se
 __all__ = ["InferenceSession", "SessionOptions", "TensorInfo"]
 
 _DTYPE = {1: ("tensor(float)", np.dtype("float32")), 2: ("tensor(float16)", np.dtype("float16"))}
-_GATE_OPTIONS = ("fuse_silu", "tune_projections", "fuse_gate_pool", "fp16_qkv")
 
 
 @dataclass
@@ -30,10 +29,6 @@ class SessionOptions:
     device_id: int = 0
     cache_dir: PathArg | None = None
     enable_cuda_graph: bool = True
-    fuse_silu: bool = False
-    tune_projections: bool = False
-    fuse_gate_pool: bool = False
-    fp16_qkv: bool = False
     dll_path: PathArg | None = None
     dll_dirs: Sequence[PathArg] = ()
     kernel_options: Mapping[str, int] = field(default_factory=dict)
@@ -77,11 +72,6 @@ class InferenceSession:
             if not -(2**63) <= number < 2**63:
                 raise ValueError(f"Kernel option {name} exceeds the int64 range")
             kernel_options[name] = number
-        for name in _GATE_OPTIONS:
-            if getattr(options, name):
-                if name in kernel_options and kernel_options[name] != 1:
-                    raise ValueError(f"Conflicting settings for kernel option {name}")
-                kernel_options[name] = 1
         cache = str(Path(options.cache_dir).resolve()).encode("utf-8") if options.cache_dir else None
         self._library = find_session_library(model, options.dll_path)
         self._lock = Lock()
@@ -115,6 +105,17 @@ class InferenceSession:
         with self._lock:
             self._finalize()
 
+    def __repr__(self) -> str:
+        name = type(self).__name__
+        # Construction can fail at any step, so a traceback may format the instance early.
+        if not hasattr(self, "_kernel"):
+            return f"<{name} (unopened)>"
+        state = "closed" if self.closed else "open"
+        return (
+            f"<{name} {state} kernel={self._kernel!r} dtype={self._dtype.name} scale={self._scale_factor} "
+            f"context={self._context} input={self._input.shape} output={self._output.shape}>"
+        )
+
     def __enter__(self) -> Self:
         self._ensure_open()
         return self
@@ -137,6 +138,11 @@ class InferenceSession:
     @property
     def context(self) -> int:
         return self._context
+
+    @property
+    def closed(self) -> bool:
+        """Whether the session has been closed and released its device resources."""
+        return not self._finalize.alive
 
     def get_inputs(self) -> list[TensorInfo]:
         return [self._input]

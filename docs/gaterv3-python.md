@@ -217,11 +217,7 @@ and releases its device resources.
 | `device_id` | CUDA device index. Defaults to 0. |
 | `cache_dir` | Tuned plans use `gaterv3_<hex-key>.umplan` in this directory. Defaults to `None`, which disables disk caching. |
 | `enable_cuda_graph` | Enables replay for the prepared shape. Defaults to `True`. |
-| `fuse_silu` | Tries convolution–SiLU fusion at eligible sites. |
-| `tune_projections` | Runs the wider cuBLASLt candidate search. |
-| `fuse_gate_pool` | Fuses eligible grouped gate and pooling sites. |
-| `fp16_qkv` | Enables FP16 QKV accumulation in mixed precision. |
-| `kernel_options` | Pass family-specific settings as named integer values. GateRV3 accepts its four optimization flags as 0 or 1. |
+| `kernel_options` | Pass family-specific settings as named integer values. GateRV3 accepts `fuse_silu`, `tune_projections`, `fuse_gate_pool` and `fp16_qkv` as 0 or 1. |
 | `dll_path` | Load this Umzi runtime instead of the package or model-directory copy. |
 | `dll_dirs` | Directories passed to `load_cuda_libraries()` before the session library loads. |
 
@@ -232,7 +228,8 @@ or inference raises `MemoryError`, and the same session can accept
 a smaller batch. [Native optimization details](gaterv3-native-refactor.md#session-optimization-options)
 
 The package header dispatches to GateRV3. `session.kernel`,
-`session.scale_factor` and `session.context` expose model metadata.
+`session.scale_factor` and `session.context` expose model metadata, and
+`session.closed` reports whether the session still holds device resources.
 [Runtime and format spec](umzi-native-runtime-plan.md)
 
 ## Historical verification
