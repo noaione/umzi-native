@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+Nothing yet!
+
+## [0.0.2] - 2026-11-22
+
 - Extended the opt-in GateRV3 `fuse_gate_pool` and `fuse_silu` paths to
   eligible 32-channel feature maps at other padded tile sizes, including
   rectangles. Conv/SiLU uses a split fallback when cuDNN cannot fuse the shape.
