@@ -215,6 +215,18 @@ def _run(*args: str, env: dict[str, str] | None = None, cwd: Path | None = None)
 
 def _build_windows(output: Path, toolchain: Toolchain, includes: Sequence[Path], test_kernel: bool) -> Path:
     env = _msvc_environment()
+    # CreateProcess searches the parent PATH for a bare executable name.
+    # Resolve cl.exe through the MSVC environment and use its companion tools.
+    msvc_path = next((value for name, value in env.items() if name.casefold() == "path"), "")
+    compiler = shutil.which("cl.exe", path=msvc_path)
+    if compiler is None:
+        raise RuntimeError("cl.exe was not found in the MSVC environment")
+    cl = Path(compiler).resolve()
+    librarian, linker = cl.with_name("lib.exe"), cl.with_name("link.exe")
+    for tool in (librarian, linker):
+        if not tool.is_file():
+            raise FileNotFoundError(f"MSVC tool not found: {tool}")
+
     # Keep the compiler and linker scratch files in the build directory.
     # Some environments let Python write to %TEMP% but deny it to link.exe.
     scratch = output / "tmp"
@@ -226,7 +238,7 @@ def _build_windows(output: Path, toolchain: Toolchain, includes: Sequence[Path],
         flags += ("/DUMZI_TEST_KERNEL",)
     for cpp in HOST_SOURCES:
         obj = output / "_".join(cpp.relative_to(NATIVE).with_suffix(".obj").parts)
-        _run("cl.exe", *flags, "/c", *(f"/I{path}" for path in includes), f"/Fo{obj}", str(cpp), env=env, cwd=output)
+        _run(str(cl), *flags, "/c", *(f"/I{path}" for path in includes), f"/Fo{obj}", str(cpp), env=env, cwd=output)
         objects.append(str(obj))
     # The development wheels omit the cuBLASLt and cuDNN MSVC import
     # libraries, so generate them from the functions the runtime calls.
@@ -241,9 +253,9 @@ def _build_windows(output: Path, toolchain: Toolchain, includes: Sequence[Path],
         exports = "\n".join(sorted(names))
         definition.write_text(f"LIBRARY {dll}.dll\nEXPORTS\n{exports}\n", encoding="ascii")
         library = output / f"{dll}.lib"
-        _run("lib.exe", "/nologo", "/machine:x64", f"/def:{definition}", f"/out:{library}", env=env, cwd=output)
+        _run(str(librarian), "/nologo", "/machine:x64", f"/def:{definition}", f"/out:{library}", env=env, cwd=output)
         imports.append(str(library))
-    link = ("link.exe", "/nologo", *objects, str(toolchain.cuda / "lib/x64/cuda.lib"), "bcrypt.lib", "version.lib")
+    link = (str(linker), "/nologo", *objects, str(toolchain.cuda / "lib/x64/cuda.lib"), "bcrypt.lib", "version.lib")
     library = output / LIBRARY_NAME
     _run(*link, *imports, "/DLL", f"/OUT:{library}", env=env, cwd=output)
     _run(*link, *imports, f"/OUT:{output / CLI_NAME}", f"/IMPLIB:{output / 'umzi_native-cli.lib'}", env=env, cwd=output)
