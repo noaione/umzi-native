@@ -1,0 +1,16 @@
+*.pth
+*.onnx
+*.safetensors
+
+__pycache__
+.venv
+venv
+
+output/
+*.onnx
+*.pth
+
+samples/
+output/
+
+.ruff_cache
