@@ -1,7 +1,7 @@
 # Built-in model exporter plan
 
-Implemented for the two existing GateRV3 configurations. See the
-[export and inference guide](gaterv3-python.md) for usage and session options.
+Implemented for the two existing GateRV3 configurations.
+[Model export](gaterv3-python.md#gaterv3-checkpoints) · [Inference quickstart](quickstart.md)
 
 Ship a checkpoint exporter in the `umzi-native` wheel. It will use Resselt to
 recognize and construct models from SafeTensors and PyTorch checkpoints, then
