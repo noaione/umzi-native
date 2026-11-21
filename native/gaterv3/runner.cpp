@@ -7,6 +7,7 @@
 #define GATERV3_BUILD
 #include "runner.h"
 #include "model_file.h"
+#include "cuda_images.h"
 
 #include <algorithm>
 #include <array>
@@ -512,7 +513,7 @@ private:
         CUuuid uuid{};
         CHECK(cuDeviceGetUuid(&uuid, device));
         hash.add(uuid);
-        hash.add(gt::driver_file_version());
+        gt::hash_driver_version(hash);
         hash.add(cudnnGetVersion());
         hash.add(cublasLtGetVersion());
     }
@@ -1130,28 +1131,30 @@ struct GtSession {
         if (file.peek() != EOF) throw std::runtime_error("Model changed while it was being read");
         model.parse(bytes);
 
-        // Locate the resource in the EXE or DLL that owns this copy of the runner.
-        static const char module_anchor = 0;
-        HMODULE image = nullptr;
-        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                reinterpret_cast<LPCWSTR>(&module_anchor), &image))
-            throw std::runtime_error("Could not locate the native runtime image");
-        auto resource = FindResourceW(image, MAKEINTRESOURCEW(101), MAKEINTRESOURCEW(10));
-        auto embedded = resource ? LoadResource(image, resource) : nullptr;
-        auto* cubin = embedded ? LockResource(embedded) : nullptr;
-        if (!cubin) throw std::runtime_error("Missing embedded GateRV3 CUDA kernels");
+        CHECK(cuInit(0));
+        CHECK(cuDeviceGet(&device, device_index));
+        int major = 0, minor = 0;
+        CHECK(cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device));
+        CHECK(cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device));
+        int capability = 10 * major + minor;
+        if (capability < gt::embedded_ptx.capability)
+            throw std::runtime_error("GateRV3 requires CUDA compute capability 8.6 or higher");
+        const auto* image = &gt::embedded_ptx;
+        for (const auto& cubin : gt::embedded_cubins) {
+            if (cubin.capability / 10 == major && cubin.capability <= capability
+                && (image == &gt::embedded_ptx || cubin.capability > image->capability))
+                image = &cubin;
+        }
         if (!cache.empty()) {
             gt::Sha256 hash;
             const char build_id[] = __DATE__ " " __TIME__;
             hash.add(build_id);
-            hash.add(cubin, SizeofResource(image, resource));
+            hash.add(image->data, image->size);
             build = hash.finish();
         }
-        CHECK(cuInit(0));
-        CHECK(cuDeviceGet(&device, device_index));
         CHECK(cuDevicePrimaryCtxRetain(&context, device));
         ContextScope scope(context);
-        CHECK(cuModuleLoadData(&module, cubin));
+        CHECK(cuModuleLoadData(&module, image->data));
         allocate(weights, model.weight_bytes, "model weights");
         CHECK(cuMemcpyHtoD(weights, bytes.data() + model.weight_offset, model.weight_bytes));
         CHECK(cuEventCreate(&completed, CU_EVENT_DISABLE_TIMING));
@@ -1534,6 +1537,7 @@ int legacy_cli(int argc, char** argv) {
 }
 } // namespace
 
+#ifdef _WIN32
 int wmain(int argc, wchar_t** wide_argv) {
     std::vector<std::string> arguments;
     for (int i = 0; i < argc; ++i) arguments.push_back(fs::path(wide_argv[i]).u8string());
@@ -1541,3 +1545,9 @@ int wmain(int argc, wchar_t** wide_argv) {
     for (auto& text : arguments) argv.push_back(text.data());
     return argc >= 2 && arguments[1] == "run" ? session_cli(argc, argv.data()) : legacy_cli(argc, argv.data());
 }
+
+#else
+int main(int argc, char** argv) {
+    return argc >= 2 && std::string(argv[1]) == "run" ? session_cli(argc, argv) : legacy_cli(argc, argv);
+}
+#endif

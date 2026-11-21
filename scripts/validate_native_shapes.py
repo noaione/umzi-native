@@ -15,6 +15,8 @@ import torch.nn.functional as F
 from benchmark_native import CHECKPOINT, ROOT, Native, error_metrics, load_model
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+from umzi_native._native import IoABI
+
 CASES = (
     (1, 128, 128),
     (16, 128, 128),
@@ -26,13 +28,6 @@ CASES = (
     (1, 1, 7),
     (1, 128, 128),
 )
-
-
-class IoDescription(ctypes.Structure):
-    _fields_ = [
-        (key, ctypes.c_uint32)
-        for key in ("struct_size", "rgb_type", "batch", "channels", "height", "width")
-    ] + [("input_bytes", ctypes.c_uint64), ("output_bytes", ctypes.c_uint64)]
 
 
 def reference_output(reference, sample):
@@ -52,14 +47,7 @@ def reference_output(reference, sample):
 
 def describe_and_check_buffers(runner, sample, shape):
     dll = runner.dll
-    dll.gt_session_describe.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_uint32,
-        ctypes.c_uint32,
-        ctypes.c_uint32,
-        ctypes.POINTER(IoDescription),
-    ]
-    info = IoDescription()
+    info = IoABI()
     info.struct_size = ctypes.sizeof(info)
     runner.check(dll.gt_session_describe(runner.handle, *shape, ctypes.byref(info)))
     batch, height, width = shape

@@ -2,10 +2,14 @@
 
 #include <stdint.h>
 
-#ifdef GATERV3_BUILD
-#define GT_API __declspec(dllexport)
+#ifdef _WIN32
+#  ifdef GATERV3_BUILD
+#    define GT_API __declspec(dllexport)
+#  else
+#    define GT_API __declspec(dllimport)
+#  endif
 #else
-#define GT_API __declspec(dllimport)
+#  define GT_API __attribute__((visibility("default")))
 #endif
 
 #ifdef __cplusplus

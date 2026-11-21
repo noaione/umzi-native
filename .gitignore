@@ -14,3 +14,7 @@ samples/
 output/
 
 .ruff_cache
+
+/build/
+/dist/
+*.egg-info/

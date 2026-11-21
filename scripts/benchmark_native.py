@@ -31,49 +31,19 @@ from export_native import (
 from PIL import Image
 from rtx_session import create_rtx_session
 
+from umzi_native._native import (
+    CACHE_STATUSES,
+    KERNEL_OPTIONS,
+    OPTIMIZATION_STATS,
+    OptionsABI,
+    load_session_library,
+    read_session_info,
+    session_setup,
+)
+
 CHECKPOINT = ROOT / "models/1x_umzi_digital_decompress_gaterv3_1.pth"
 SHAPE = (3, 128, 128)
 METRIC = Path(r"C:\Tools\imaging\ssimulacra2.exe")
-KERNEL_OPTIONS = {"tune-projections": 8, "fuse-gate-pool": 16, "fp16-qkv": 32}
-CACHE_STATUSES = ("disabled", "miss", "hit", "rebuilt", "unavailable")
-OPTIMIZATION_STATS = (
-    "replay_tuned_shapes",
-    "fused_gate_pool_sites",
-    "fp16_qkv_projections",
-    "split_gate_registers",
-    "fused_gate_registers",
-)
-
-
-class SessionOptions(ctypes.Structure):
-    _fields_ = [
-        ("struct_size", ctypes.c_uint32),
-        ("device", ctypes.c_int32),
-        ("flags", ctypes.c_uint32),
-        ("reserved", ctypes.c_uint32),
-        ("cache_dir", ctypes.c_char_p),
-    ]
-
-
-class SessionInfo(ctypes.Structure):
-    _fields_ = [
-        (name, ctypes.c_uint32)
-        for name in (
-            "struct_size",
-            "cache_status",
-            "batch",
-            "padded_height",
-            "padded_width",
-            "reserved",
-        )
-    ] + [
-        ("buffer_bytes", ctypes.c_uint64 * 4),
-        ("startup_device_used_bytes", ctypes.c_uint64 * 4),
-        ("model_load_ms", ctypes.c_double),
-        ("shape_setup_ms", ctypes.c_double * 4),
-        ("optimization_stats", ctypes.c_int32 * 5),
-        ("fused_silu_count", ctypes.c_int32),
-    ]
 
 
 def packed_schedule(path):
@@ -146,8 +116,7 @@ class Native:
         optimizations=(),
         model_file=None,
     ):
-        cuda, cudnn = libraries()
-        self.dll_dirs = []
+        self.dll_dirs = ExitStack()
         self.handle = None
         self.model_file = model_file
         self.bundle = bundle
@@ -157,13 +126,16 @@ class Native:
         flags |= sum(KERNEL_OPTIONS[name] for name in set(optimizations))
         cached = str(cache_dir.resolve()).encode() if cache_dir else None
         try:
-            for path in (cuda / "bin/x86_64", cudnn / "bin"):
-                self.dll_dirs.append(os.add_dll_directory(str(path)))
-            self.dll = ctypes.CDLL(str((bundle / "gaterv3.dll").resolve()))
-            self.dll.gt_error.restype = ctypes.c_char_p
+            library_path = (bundle / "gaterv3.dll").resolve()
             if model_file is not None:
+                self.dll, self.dll_dirs = load_session_library(library_path)
                 self.open_packed(model_file, batch, flags, cached)
             else:
+                cuda, cudnn = libraries()
+                for path in (cuda / "bin/x86_64", cudnn / "bin"):
+                    self.dll_dirs.enter_context(os.add_dll_directory(str(path)))
+                self.dll = ctypes.CDLL(str(library_path))
+                self.dll.gt_error.restype = ctypes.c_char_p
                 self.open_legacy(bundle, batch, graph, fp16, flags, cached)
             self.host_output = torch.empty((batch, *SHAPE), dtype=self.dtype)
         except BaseException:
@@ -200,30 +172,8 @@ class Native:
         self.device_input = self.dll.gt_input(self.handle)
 
     def open_packed(self, path, batch, flags, cached):
-        dims = [ctypes.c_void_p, *([ctypes.c_uint32] * 3)]
-        sizes = [ctypes.c_void_p, ctypes.c_uint64] * 2
-        self.dll.gt_session_open.argtypes = [
-            ctypes.c_char_p,
-            ctypes.POINTER(SessionOptions),
-        ]
-        self.dll.gt_session_open.restype = ctypes.c_void_p
         self.destroy = self.dll.gt_session_close
-        self.destroy.argtypes = [ctypes.c_void_p]
-        self.destroy.restype = None
-        self.dll.gt_session_prepare.argtypes = dims
-        self.dll.gt_session_run.argtypes = dims + sizes
-        self.dll.gt_session_enqueue.argtypes = (
-            dims + [ctypes.c_uint64] * 4 + [ctypes.c_void_p]
-        )
-        self.dll.gt_session_info.argtypes = [
-            ctypes.c_void_p,
-            ctypes.POINTER(SessionInfo),
-        ]
-        for name in ("gt_session_cache_message", "gt_session_fusion_message"):
-            fn = getattr(self.dll, name)
-            fn.argtypes = [ctypes.c_void_p]
-            fn.restype = ctypes.c_char_p
-        options = SessionOptions(ctypes.sizeof(SessionOptions), 0, flags, 0, cached)
+        options = OptionsABI(ctypes.sizeof(OptionsABI), 0, flags, 0, cached)
         self.handle = self.dll.gt_session_open(
             str(path.resolve()).encode(), ctypes.byref(options)
         )
@@ -232,10 +182,7 @@ class Native:
         self.check(self.dll.gt_session_prepare(self.handle, batch, *SHAPE[1:]))
 
     def session_info(self):
-        info = SessionInfo()
-        info.struct_size = ctypes.sizeof(info)
-        self.check(self.dll.gt_session_info(self.handle, ctypes.byref(info)))
-        return info
+        return read_session_info(self.dll, self.handle)
 
     def check(self, status):
         if status:
@@ -245,8 +192,7 @@ class Native:
         if self.handle:
             self.destroy(self.handle)
             self.handle = None
-        for directory in self.dll_dirs:
-            directory.close()
+        self.dll_dirs.close()
 
     def host(self, x):
         if (
@@ -343,33 +289,7 @@ class Native:
 
     def setup(self):
         if self.model_file is not None:
-            info = self.session_info()
-            return {
-                "stages_ms": dict(
-                    zip(
-                        (
-                            "model",
-                            "shape_allocation",
-                            "plans",
-                            "allocation_warmup",
-                            "capture",
-                        ),
-                        (info.model_load_ms, *info.shape_setup_ms),
-                        strict=True,
-                    )
-                ),
-                "cache_status": CACHE_STATUSES[info.cache_status],
-                "cache_message": self.dll.gt_session_cache_message(
-                    self.handle
-                ).decode(),
-                "fused_silu_count": info.fused_silu_count,
-                "fusion_message": self.dll.gt_session_fusion_message(
-                    self.handle
-                ).decode(),
-                "optimization": dict(
-                    zip(OPTIMIZATION_STATS, info.optimization_stats, strict=True)
-                ),
-            }
+            return session_setup(self.dll, self.handle, self.session_info())
         timing = getattr(self.dll, "gt_setup_timings", None)
         if timing is None:
             return None
@@ -422,6 +342,11 @@ class Native:
             shapes = table[: 4 * (count + 1)].reshape(-1, 4)
             ops = table[4 * (count + 1) :].reshape(-1, 11)
             profile = self.dll.gt_profile
+            profile.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.c_int,
+            ]
         else:
             specs, ops, _ = packed_schedule(self.model_file)
             count = len(ops)
@@ -439,9 +364,12 @@ class Native:
                 ]
             )
             profile = self.dll.gt_session_profile
-        profile.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
         times = np.zeros(count, dtype=np.float32)
-        self.check(profile(self.handle, times.ctypes.data, count))
+        self.check(
+            profile(
+                self.handle, times.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), count
+            )
+        )
         totals = defaultdict(float)
         rows = []
         for entry, ms in zip(ops, times, strict=True):

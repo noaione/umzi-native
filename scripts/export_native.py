@@ -7,18 +7,16 @@ import hashlib
 import json
 import shutil
 import struct
-import sys
 import tempfile
 from enum import IntEnum
 from pathlib import Path
 from typing import NamedTuple
 
 import torch
+from reference.model import load_model
 from torch import Tensor, nn
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
-from model import load_model
 
 MODEL_MAGIC = b"GTR3PCK\0"
 MODEL_FORMAT_VERSION = 1

@@ -17,7 +17,7 @@ from pathlib import Path
 import torch
 from torch import Tensor, nn
 
-from gaterv3 import GateRV3, SampleMods
+from .gaterv3 import GateRV3, SampleMods
 
 
 def _child_count(state_dict: Mapping[str, Tensor], prefix: str) -> int:

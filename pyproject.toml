@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "umzi-native"
+version = "0.1.0"
+description = "Python inference sessions for Umzi CUDA kernels"
+requires-python = ">=3.11"
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+dev = [
+    "nvidia-cuda-runtime>=13.4,<13.5",
+    "nvidia-cuda-nvrtc>=13.4,<13.5",
+    "nvidia-cuda-crt>=13.4,<13.5",
+    "nvidia-cuda-cccl>=13.3,<14",
+    "nvidia-cublas>=13.7,<14",
+    "nvidia-cudnn-cu13>=9.26,<10",
+    "nvidia-nvjitlink>=13.4,<13.5",
+    "ruff>=0.17",
+    "pyrefly>=1.5",
+    "setuptools>=77",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["umzi_native"]
+
+[tool.setuptools.package-data]
+umzi_native = ["gaterv3.dll", "libgaterv3.so"]

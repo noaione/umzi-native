@@ -1,7 +1,6 @@
 #pragma once
 
-#include <windows.h>
-#include <bcrypt.h>
+#include "../common/platform.h"
 
 #include <array>
 #include <cstdint>
@@ -14,65 +13,7 @@
 #include <vector>
 
 namespace gt {
-using Digest = std::array<unsigned char, 32>;
 using ShapeKey = std::array<int, 5>;
-
-class Sha256 {
-    BCRYPT_ALG_HANDLE provider = nullptr;
-    BCRYPT_HASH_HANDLE hash = nullptr;
-
-    static void check(NTSTATUS status) {
-        if (status < 0) throw std::runtime_error("SHA-256 operation failed");
-    }
-
-public:
-    Sha256() {
-        check(BCryptOpenAlgorithmProvider(&provider, BCRYPT_SHA256_ALGORITHM, nullptr, 0));
-        try {
-            check(BCryptCreateHash(provider, &hash, nullptr, 0, nullptr, 0, 0));
-        } catch (...) {
-            BCryptCloseAlgorithmProvider(provider, 0);
-            throw;
-        }
-    }
-    Sha256(const Sha256&) = delete;
-    Sha256& operator=(const Sha256&) = delete;
-    ~Sha256() {
-        BCryptDestroyHash(hash);
-        BCryptCloseAlgorithmProvider(provider, 0);
-    }
-    void add(const void* data, size_t size) {
-        // The model loader bounds its inputs well below the BCrypt length limit.
-        check(BCryptHashData(hash, static_cast<unsigned char*>(const_cast<void*>(data)),
-                            static_cast<ULONG>(size), 0));
-    }
-    template<class T>
-    void add(const T& value) { add(&value, sizeof(value)); }
-
-    Digest finish() {
-        Digest digest{};
-        check(BCryptFinishHash(hash, digest.data(), static_cast<ULONG>(digest.size()), 0));
-        return digest;
-    }
-};
-
-inline std::array<DWORD, 2> driver_file_version() {
-    std::array<wchar_t, 32768> path{};
-    auto module = GetModuleHandleW(L"nvcuda.dll");
-    auto length = GetModuleFileNameW(module, path.data(), static_cast<DWORD>(path.size()));
-    if (!module || !length || length >= path.size()) throw std::runtime_error("Could not identify CUDA driver");
-    DWORD unused = 0;
-    auto size = GetFileVersionInfoSizeW(path.data(), &unused);
-    std::vector<char> version(size);
-    if (!size || !GetFileVersionInfoW(path.data(), 0, size, version.data()))
-        throw std::runtime_error("Could not read CUDA driver version");
-    void* value = nullptr;
-    UINT bytes = 0;
-    if (!VerQueryValueW(version.data(), L"\\", &value, &bytes) || bytes < sizeof(VS_FIXEDFILEINFO))
-        throw std::runtime_error("Could not read CUDA driver version");
-    const auto* info = static_cast<const VS_FIXEDFILEINFO*>(value);
-    return {info->dwFileVersionMS, info->dwFileVersionLS};
-}
 
 struct GemmChoice {
     cublasLtMatmulAlgo_t algorithm{};
@@ -208,17 +149,13 @@ public:
             Sha256 hash;
             hash.add(bytes.data(), bytes.size());
             auto digest = hash.finish();
-            std::array<wchar_t, MAX_PATH> name{};
-            if (!GetTempFileNameW(path.parent_path().c_str(), L"gtp", 0, name.data()))
-                throw std::runtime_error("Could not create a temporary cache file");
-            temp = name.data();
+            temp = temporary_cache_path(path.parent_path());
             std::ofstream file(temp, std::ios::binary | std::ios::trunc);
             file.write(reinterpret_cast<const char*>(digest.data()), digest.size());
             file.write(bytes.data(), bytes.size());
             file.close();
-            if (!file || !MoveFileExW(temp.c_str(), path.c_str(),
-                                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
-                throw std::runtime_error("Could not publish the cache entry");
+            if (!file) throw std::runtime_error("Could not write the cache entry");
+            publish_cache(temp, path);
         } catch (const std::exception& error) {
             std::error_code ignored;
             if (!temp.empty()) std::filesystem::remove(temp, ignored);

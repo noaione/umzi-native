@@ -17,11 +17,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from reference.model import load_model
 from rtx_session import create_rtx_session
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-from model import load_model
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
 
