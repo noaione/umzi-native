@@ -19,7 +19,7 @@ from typing import Any
 import numpy as np
 import torch
 from benchmark import IMAGE_EXTS, ROOT, image_tensor, load_model, patches, tensor_image
-from build_native import libraries
+from build_native import load_build_module
 from export_native import (
     MODEL_FORMAT_VERSION,
     MODEL_HEADER,
@@ -119,8 +119,9 @@ class Native:
                 self.dll = load_session_library(library_path)
                 self.open_packed(model_file, batch, flags, cached)
             else:
-                cuda, cudnn = libraries()
-                for path in (cuda / "bin/x86_64", cudnn / "bin"):
+                native = load_build_module()
+                toolchain = native.find_toolchain(native.BuildSettings())
+                for path in (toolchain.cuda / "bin/x86_64", toolchain.cudnn / "bin"):
                     self.dll_dirs.enter_context(os.add_dll_directory(str(path)))
                 self.dll = ctypes.CDLL(str(library_path))
                 self.dll.gt_error.restype = ctypes.c_char_p

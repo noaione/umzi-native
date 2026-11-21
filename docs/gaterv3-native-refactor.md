@@ -44,7 +44,10 @@ Command-line usage for three tiles, each 192 pixels high and
 gaterv3 run --model .\gaterv3.gtmodel --precision mixed --batch 3 --height 192 --width 160 --input .\tiles.f32 --output .\restored.f32 --cache-dir .\cache\gaterv3
 ```
 
-Build and export from the checkout root using system Python.
+Build and export from the checkout root using system Python. The build
+code lives in `hatch_build.py`, which also compiles the library for every
+Python wheel; `scripts/build_native.py` runs it without packaging.
+[Python install and build hook](gaterv3-python.md#install)
 
 ```powershell
 $py = 'C:\Python314\python.exe'

@@ -18,3 +18,6 @@ output/
 /build/
 /dist/
 *.egg-info/
+
+pip-*
+tmp_*

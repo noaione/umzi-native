@@ -14,31 +14,84 @@ cuBLASLt 13 and cuDNN 9, which the package does not ship. On Windows it
 also needs the MSVC runtime.
 [ONNX Runtime Python API](https://onnxruntime.ai/docs/api/python/api_summary.html#load-and-run-a-model)
 
-Build the platform wheel and the packed model, then install the wheel.
-`--wheel` stages the newly built library in a `py3-none-<platform>` wheel
-under `<output>/wheels`.
+## Install
 
-The package builds with [Hatchling](https://hatch.pypa.io/latest/config/build/);
-it no longer uses setuptools or `setup.py`. `pyproject.toml` selects the
-`hatchling.build` backend and packages `src/umzi_native`. The library files
-are listed as `artifacts` so a staged, untracked library is still included.
-The `hatch_build.py` hook at the repository root runs for wheel builds. When
-`gaterv3.dll` or `libgaterv3.so` is in the package directory, it marks the
-wheel as non-pure and tags it `py3-none-<platform>`, for example `win_amd64`
-or `linux_x86_64`. The library is loaded through ctypes, so the tag does not
-name a Python version or ABI. A build without a library is a pure
-`py3-none-any` wheel. `build_native.py --wheel` copies `pyproject.toml`,
-`hatch_build.py`, the Python sources, and the newly built library into a
-scratch directory and runs `pip wheel --no-build-isolation` there, so
-Hatchling must already be installed. The `dev` extra includes it.
+Installing the package compiles the native library. `pip install .` from
+the checkout, from an sdist, or from a Git URL builds a wheel with
+[Hatchling](https://hatch.pypa.io/latest/config/build/), and Hatchling runs
+the build hook in `hatch_build.py` at the repository root. The hook:
+
+1. Compiles `native/gaterv3/kernels.cu` with NVRTC into `sm_86`, `sm_89`
+   and `sm_120` cubins plus `compute_86` PTX, and embeds them in a generated
+   `cuda_images.h`.
+2. Compiles `native/gaterv3/runner.cpp` and links `gaterv3.dll` with MSVC on
+   Windows, or `libgaterv3.so` with `c++` on Linux.
+3. Adds the library to the wheel as `umzi_native/gaterv3.dll` or
+   `umzi_native/libgaterv3.so`, and tags the wheel `py3-none-<platform>`,
+   such as `win_amd64` or `linux_x86_64`. The library is loaded through
+   ctypes, so the tag names no Python version or ABI.
+
+The package does not use setuptools or `setup.py`. The CUDA 13 headers,
+NVRTC, and the cuBLASLt and cuDNN link targets come from NVIDIA wheels in
+`[build-system] requires`. pip installs them into the isolated build
+environment, and they are not runtime dependencies. Hatchling cannot ask a
+script-defined hook for its dependencies, so `pyproject.toml` repeats
+`BUILD_REQUIREMENTS` from `hatch_build.py`. Keep the two lists in sync.
+
+The build machine needs:
+
+- Windows: Visual Studio with the MSVC x64 tools. The hook finds them
+  with `vswhere`, unless `cl.exe`, `INCLUDE` and `LIB` are already set.
+- Linux: a C++17 compiler (`CXX`, default `c++`), the OpenSSL 3 headers,
+  and `libcrypto.so.3`. A CUDA driver is not required to link; the library
+  references `libcuda.so.1` by name.
 
 ```powershell
 $py = 'C:\Python314\python.exe'
-& $py -m pip install ".[dev]"
-& $py scripts/build_native.py --output output/umzi-native-windows --wheel
+& $py -m pip install .                 # builds the DLL, then installs
+& $py -m pip wheel . --no-deps -w dist  # or keep the platform wheel
 & $py scripts/export_native.py --output output/native-refactor/gaterv3.gtmodel
-& $py -m pip install (Get-ChildItem output/umzi-native-windows/wheels/*.whl)
 ```
+
+On this machine, an isolated `pip wheel .` took about 30 seconds on Windows
+and 95 seconds under WSL, most of it in NVRTC. The sdist contains `src/`,
+`native/`, `hatch_build.py` and `pyproject.toml`, so installing an sdist
+builds the same way. The wheel excludes any `.dll` or `.so` left in
+`src/umzi_native/` and bundles only the library the hook just built.
+
+Wheel builds read these optional environment variables, because build
+frontends pass no command-line arguments to the hook:
+
+| Variable | Effect |
+| --- | --- |
+| `UMZI_CUDA_ARCHES` | Cubin targets separated by spaces or commas, such as `sm_86,sm_120`. Defaults to all three. |
+| `UMZI_CUDA_ROOT`, `UMZI_CUDNN_ROOT` | Use these `nvidia/cu13` and `nvidia/cudnn` trees instead of the build-environment wheels. |
+| `UMZI_CRT_INCLUDE`, `UMZI_CCCL_INCLUDE` | Use these CRT and CCCL header roots. |
+| `UMZI_OPENSSL_INCLUDE` | Linux OpenSSL include directories, separated by `os.pathsep`. |
+| `UMZI_CUDA_DRIVER_LIB` | Linux `libcuda.so.1` to link against. |
+| `UMZI_NATIVE_BUILD_DIR` | Build in this directory and keep it, including the `gaterv3` CLI linked from the same object. |
+| `UMZI_NATIVE_LIBRARY` | Skip compilation and bundle this prebuilt library. |
+
+Editable installs (`pip install -e .`) skip the native build. Build the
+library with `scripts/build_native.py` and pass its path as
+`SessionOptions(dll_path=...)`.
+
+`scripts/build_native.py` runs the same build without packaging, for a
+bundle directory or the benchmarks. It loads `hatch_build.py` and takes the
+overrides as flags. Outside an isolated build it uses the NVIDIA wheels
+installed in its own Python, so install the CUDA build wheels there first:
+
+```powershell
+& $py -m pip install "nvidia-cuda-runtime>=13.4,<13.5" "nvidia-cuda-nvrtc>=13.4,<13.5" `
+  "nvidia-cuda-crt>=13.4,<13.5" "nvidia-cuda-cccl>=13.3,<14" "nvidia-cublas>=13.7,<14" "nvidia-cudnn-cu13>=9.26,<10"
+& $py scripts/build_native.py --output output/umzi-native-windows
+```
+
+Two separate builds of the same sources produce identical cubins and PTX,
+but MSVC produces different host objects, and their outputs can differ in
+the last bits. Compare a library only with the CLI from the same build:
+build the wheel with `UMZI_NATIVE_BUILD_DIR` set, or use the files that
+`build_native.py` writes together.
 
 ### Library loading
 
@@ -134,22 +187,29 @@ of odd tiles, then opens a second session on the same plan cache. Every
 output must be finite and match the native CLI bit for bit. The first
 session must report a cache miss, the second a hit with identical output.
 The report records which GateRV3, cuBLASLt and cuDNN files the process
-loaded. Each wheel was installed with `pip install --no-deps --target` into
-a scratch directory. The model was copied to
-`output/python-loader-check/model dir 日本/`, which has no library beside it.
+loaded. The model was copied to `output/python-loader-check/model dir 日本/`,
+which has no library beside it.
+
+Every wheel below was built by the Hatch hook in an isolated
+`pip wheel . --no-deps`, with `UMZI_NATIVE_BUILD_DIR` set so the CLI for the
+bitwise comparison came from the same build. Each wheel was installed with
+`pip install --no-deps --target` into a scratch directory. A separate check
+ran `pip install --no-cache-dir` on the sdist in a new virtual environment.
+pip built the DLL from source, installed NumPy and the package, and did not
+install any NVIDIA wheels. The session check passed there with `dll_dirs`.
 
 | Platform | CUDA libraries | Result |
 | --- | --- | --- |
 | Windows, `import torch` first | `torch/lib` cuBLASLt and cuDNN | All checks passed |
 | Windows, `dll_dirs` | `nvidia/cu13/bin/x86_64` and `nvidia/cudnn/bin` | All checks passed |
+| Windows, sdist into a new venv, `dll_dirs` | Same as above | Session checks passed; no CLI comparison |
 | Windows, neither | None loaded | `OSError` with both remedies |
 | WSL Ubuntu 24.04, `dll_dirs` | Staged `cu13/lib` and `cudnn/lib` | All checks passed |
 | WSL Ubuntu 24.04, neither | None loaded | `OSError` naming `libcublasLt.so.13` |
 
 Both precisions padded the odd batch to 3×3×80×80. All runs loaded the
 library from the installed package directory. The WSL run used Python
-3.12 without PyTorch. These results are for the Hatchling-built wheels;
-the setuptools wheels from before the switch had passed the same checks.
+3.12 without PyTorch.
 [Loader check reports](../output/python-loader-check/)
 
 The PTX fallback runs when a build embeds no cubin for the device's major
@@ -168,21 +228,18 @@ recovery after a rejected oversized allocation. The session code for those
 paths is unchanged.
 [Previous Python session check](../output/python-runtime-validation/python-session-check.json)
 
-Build and check the Linux wheel from WSL with the staged CUDA 13.4 wheels,
-build-time Python packages, and OpenSSL headers. Hatchling 1.33.0 and its
-dependencies (`packaging`, `pathspec`, `pluggy`, `trove-classifiers`) are
-installed in the staged `python` directory:
+Build and check the Linux wheel from WSL. pip downloads the CUDA build
+wheels into its isolated environment. The OpenSSL headers come from the
+staged `libssl-dev` package, and NumPy from the staged `python` directory:
 
 ```bash
 B=/tmp/umzi-native-linux-build
-PYTHONPATH=$B/python python3 scripts/build_native.py --output output/umzi-native-linux --wheel \
-  --cuda-root $B/cuda/nvidia/cu13 --cudnn-root $B/cuda/nvidia/cudnn \
-  --openssl-include $B/ssl/headers/usr/include \
-  --openssl-include $B/ssl/headers/usr/include/x86_64-linux-gnu \
-  --cuda-driver-lib /usr/lib/wsl/lib/libcuda.so.1
-python3 -m pip install --no-deps --target /tmp/umzi-loader-site output/umzi-native-linux/wheels/*.whl
+export UMZI_OPENSSL_INCLUDE=$B/ssl/headers/usr/include:$B/ssl/headers/usr/include/x86_64-linux-gnu
+export UMZI_NATIVE_BUILD_DIR=$PWD/output/umzi-native-linux-wheel
+python3 -m pip wheel . --no-deps -w output/python-loader-check/wheels-linux
+python3 -m pip install --no-deps --target /tmp/umzi-loader-site output/python-loader-check/wheels-linux/*.whl
 PYTHONPATH=/tmp/umzi-loader-site:$B/python python3 scripts/check_python_session.py \
-  --model output/native-refactor/gaterv3.gtmodel --cli output/umzi-native-linux/gaterv3 \
+  --model output/native-refactor/gaterv3.gtmodel --cli output/umzi-native-linux-wheel/gaterv3 \
   --cuda-dir $B/cuda/nvidia/cu13/lib --cuda-dir $B/cuda/nvidia/cudnn/lib \
   --output output/python-loader-check/linux-explicit.json
 ```
@@ -195,7 +252,10 @@ PYTHONPATH=/tmp/umzi-loader-site:$B/python python3 scripts/check_python_session.
 - The `sm_89` and `sm_120` cubins have not run on matching hardware.
 - `pip install --dry-run ".[dev]"` resolves on Windows to CUDA runtime,
   NVRTC and CRT 13.4.92, cuBLAS 13.10, CCCL 13.3.5, cuDNN 9.28.1,
-  Hatchling 1.33.0, Ruff 0.17.6 and Pyrefly 1.5.0. A full install into a
-  clean environment has not been run.
+  Hatchling 1.33.0, Ruff 0.17.6 and Pyrefly 1.5.0. A full install of the
+  `dev` extra into a clean environment has not been run.
+- The Hatch build has not run on a Windows machine without Visual Studio,
+  or on a Linux distribution other than WSL Ubuntu 24.04. A Linux build
+  without the OpenSSL headers fails at compile time.
 - The Linux path has not been checked with CUDA PyTorch imported first,
   because the WSL Python has no PyTorch.

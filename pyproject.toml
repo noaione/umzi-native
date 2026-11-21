@@ -1,5 +1,16 @@
 [build-system]
-requires = ["hatchling>=1.27"]
+# hatch_build.py compiles the native library during every wheel build, so the
+# CUDA 13 headers, NVRTC and link libraries are build requirements. Keep this
+# list in sync with BUILD_REQUIREMENTS in hatch_build.py.
+requires = [
+    "hatchling>=1.27",
+    "nvidia-cuda-runtime>=13.4,<13.5",
+    "nvidia-cuda-nvrtc>=13.4,<13.5",
+    "nvidia-cuda-crt>=13.4,<13.5",
+    "nvidia-cuda-cccl>=13.3,<14",
+    "nvidia-cublas>=13.7,<14",
+    "nvidia-cudnn-cu13>=9.26,<10",
+]
 build-backend = "hatchling.build"
 
 [project]
@@ -23,12 +34,16 @@ dev = [
     "hatchling>=1.27",
 ]
 
+[tool.hatch.build.targets.sdist]
+include = ["/src", "/native", "/hatch_build.py", "/README.md"]
+exclude = ["*.dll", "*.so", "__pycache__"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/umzi_native"]
-# Include a staged library even when version control ignores it.
-artifacts = ["src/umzi_native/gaterv3.dll", "src/umzi_native/libgaterv3.so"]
+# Only the library built by hatch_build.py is bundled.
+exclude = ["*.dll", "*.so"]
 
-# Loads hatch_build.py, which sets the platform tag for native wheels.
+# Loads hatch_build.py, which compiles the native library for each wheel.
 [tool.hatch.build.targets.wheel.hooks.custom]
 
 [tool.ruff]
