@@ -39,6 +39,11 @@ def main() -> None:
         help="Override the embedded cubin targets. Repeat to include multiple targets.",
     )
     parser.add_argument("--cuda-root", type=Path)
+    parser.add_argument(
+        "--nvrtc-root",
+        type=Path,
+        help="Use CUDA 13.0 NVRTC from this nvidia/cu13 directory.",
+    )
     parser.add_argument("--cudnn-root", type=Path)
     parser.add_argument("--crt-include", type=Path)
     parser.add_argument("--cccl-include", type=Path)
@@ -50,6 +55,7 @@ def main() -> None:
         native.BuildSettings(
             arches=args.arch or native.CUBIN_TARGETS,
             cuda_root=args.cuda_root,
+            nvrtc_root=args.nvrtc_root,
             cudnn_root=args.cudnn_root,
             crt_include=args.crt_include,
             cccl_include=args.cccl_include,

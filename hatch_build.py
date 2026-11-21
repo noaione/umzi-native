@@ -34,7 +34,7 @@ CUDNN = "bin/cudnn64_9.dll" if WINDOWS else "lib/libcudnn.so.9"
 # cuBLASLt and cuDNN are only linked; the wheel does not bundle them.
 BUILD_REQUIREMENTS = (
     "nvidia-cuda-runtime>=13.4,<13.5",
-    "nvidia-cuda-nvrtc>=13.4,<13.5",
+    "nvidia-cuda-nvrtc>=13.0.88,<13.1",
     "nvidia-cuda-crt>=13.4,<13.5",
     "nvidia-cuda-cccl>=13.3,<14",
     "nvidia-cublas>=13.7,<14",
@@ -46,6 +46,7 @@ BUILD_REQUIREMENTS = (
 # registering it in sys.modules, which dataclasses require.
 class Toolchain(NamedTuple):
     cuda: Path
+    nvrtc: Path
     cudnn: Path
     includes: tuple[Path, ...]
 
@@ -55,6 +56,7 @@ class BuildSettings(NamedTuple):
 
     arches: Sequence[str] = CUBIN_TARGETS
     cuda_root: Path | None = None
+    nvrtc_root: Path | None = None
     cudnn_root: Path | None = None
     crt_include: Path | None = None
     cccl_include: Path | None = None
@@ -90,7 +92,8 @@ def _find(supplied: Path | None, relative: str, candidates: Iterable[Path], what
 
 def find_toolchain(settings: BuildSettings) -> Toolchain:
     sites = _nvidia_dirs()
-    cuda = _find(settings.cuda_root, NVRTC, (site / "cu13" for site in sites), "CUDA 13 NVRTC")
+    cuda = _find(settings.cuda_root, "include/cuda.h", (site / "cu13" for site in sites), "CUDA 13 headers")
+    nvrtc = _find(settings.nvrtc_root, NVRTC, (cuda,), "CUDA 13.0 NVRTC") / NVRTC
     cudnn = _find(settings.cudnn_root, CUDNN, (site / "cudnn" for site in sites), "cuDNN 9")
     header = cuda / "include" / "cuda.h"
     if not header.is_file() or not re.search(
@@ -101,19 +104,21 @@ def find_toolchain(settings: BuildSettings) -> Toolchain:
     headers = cuda / "include"
     crt = _find(settings.crt_include, "crt/mma.h", (headers,), "CUDA CRT headers")
     cccl = _find(settings.cccl_include, "nv/target", (headers, headers / "cccl"), "CUDA CCCL headers")
-    return Toolchain(cuda, cudnn, tuple(dict.fromkeys((headers, crt, cccl))))
+    return Toolchain(cuda, nvrtc, cudnn, tuple(dict.fromkeys((headers, crt, cccl))))
 
 
-def _load_nvrtc(cuda: Path) -> ctypes.CDLL:
-    path = cuda / NVRTC
+def _load_nvrtc(path: Path) -> ctypes.CDLL:
     if WINDOWS:
         # NVRTC loads its version-matched builtins DLL by name through the
         # standard search order, which add_dll_directory does not affect.
         os.environ["PATH"] = os.pathsep.join((str(path.parent), os.environ.get("PATH", "")))
     nvrtc = ctypes.CDLL(str(path))
     major, minor = ctypes.c_int(), ctypes.c_int()
-    if nvrtc.nvrtcVersion(ctypes.byref(major), ctypes.byref(minor)) or major.value != 13:
-        raise RuntimeError(f"Expected CUDA 13 NVRTC at {path}")
+    if nvrtc.nvrtcVersion(ctypes.byref(major), ctypes.byref(minor)) or (major.value, minor.value) != (13, 0):
+        raise RuntimeError(
+            f"Expected CUDA 13.0 NVRTC at {path} to generate PTX for the CUDA 13 driver baseline. "
+            "Use pip wheel . or point UMZI_NVRTC_ROOT at the NVIDIA CUDA 13.0 NVRTC wheel."
+        )
     _log(f"CUDA NVRTC {major.value}.{minor.value}")
     return nvrtc
 
@@ -279,7 +284,7 @@ def build(output: Path, settings: BuildSettings | None = None) -> Path:
     toolchain = find_toolchain(settings)
     output = output.resolve()
     output.mkdir(parents=True, exist_ok=True)
-    nvrtc = _load_nvrtc(toolchain.cuda)
+    nvrtc = _load_nvrtc(toolchain.nvrtc)
     cubins = {arch: _compile_kernels(nvrtc, toolchain.includes, arch) for arch in dict.fromkeys(settings.arches)}
     ptx = _compile_kernels(nvrtc, toolchain.includes, PTX_TARGET)
     for arch, image in cubins.items():
@@ -318,6 +323,7 @@ def settings_from_environment() -> BuildSettings:
     return BuildSettings(
         arches=arches or CUBIN_TARGETS,
         cuda_root=path("UMZI_CUDA_ROOT"),
+        nvrtc_root=path("UMZI_NVRTC_ROOT"),
         cudnn_root=path("UMZI_CUDNN_ROOT"),
         crt_include=path("UMZI_CRT_INCLUDE"),
         cccl_include=path("UMZI_CCCL_INCLUDE"),

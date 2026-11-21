@@ -1145,6 +1145,17 @@ struct GtSession {
                 && (image == &gt::embedded_ptx || cubin.capability > image->capability))
                 image = &cubin;
         }
+        CHECK(cuDevicePrimaryCtxRetain(&context, device));
+        ContextScope scope(context);
+        auto status = cuModuleLoadData(&module, image->data);
+        if (status == CUDA_ERROR_NO_BINARY_FOR_GPU && image != &gt::embedded_ptx) {
+            image = &gt::embedded_ptx;
+            status = cuModuleLoadData(&module, image->data);
+        }
+        if (image == &gt::embedded_ptx
+            && (status == CUDA_ERROR_UNSUPPORTED_PTX_VERSION || status == CUDA_ERROR_JIT_COMPILER_NOT_FOUND))
+            check(status, "Could not JIT the GateRV3 PTX fallback; install a CUDA 13-capable NVIDIA driver with PTX JIT support");
+        check(status, "Load GateRV3 CUDA kernels");
         if (!cache.empty()) {
             gt::Sha256 hash;
             const char build_id[] = __DATE__ " " __TIME__;
@@ -1152,9 +1163,6 @@ struct GtSession {
             hash.add(image->data, image->size);
             build = hash.finish();
         }
-        CHECK(cuDevicePrimaryCtxRetain(&context, device));
-        ContextScope scope(context);
-        CHECK(cuModuleLoadData(&module, image->data));
         allocate(weights, model.weight_bytes, "model weights");
         CHECK(cuMemcpyHtoD(weights, bytes.data() + model.weight_offset, model.weight_bytes));
         CHECK(cuEventCreate(&completed, CU_EVENT_DISABLE_TIMING));

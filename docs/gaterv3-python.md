@@ -21,9 +21,10 @@ the checkout, from an sdist, or from a Git URL builds a wheel with
 [Hatchling](https://hatch.pypa.io/latest/config/build/), and Hatchling runs
 the build hook in `hatch_build.py` at the repository root. The hook:
 
-1. Compiles `native/gaterv3/kernels.cu` with NVRTC into `sm_86`, `sm_89`
-   and `sm_120` cubins plus `compute_86` PTX, and embeds them in a generated
-   `cuda_images.h`.
+1. Compiles `native/gaterv3/kernels.cu` with CUDA 13.0 NVRTC into `sm_86`,
+   `sm_89` and `sm_120` cubins plus `compute_86` PTX, and embeds them in a
+   generated `cuda_images.h`. CUDA 13.0 emits PTX ISA 9.0 so the fallback
+   can run on drivers that support the CUDA 13.0 baseline.
 2. Compiles `native/gaterv3/runner.cpp` and links `gaterv3.dll` with MSVC on
    Windows, or `libgaterv3.so` with `c++` on Linux.
 3. Adds the library to the wheel as `umzi_native/gaterv3.dll` or
@@ -66,6 +67,7 @@ frontends pass no command-line arguments to the hook:
 | --- | --- |
 | `UMZI_CUDA_ARCHES` | Cubin targets separated by spaces or commas, such as `sm_86,sm_120`. Defaults to all three. |
 | `UMZI_CUDA_ROOT`, `UMZI_CUDNN_ROOT` | Use these `nvidia/cu13` and `nvidia/cudnn` trees instead of the build-environment wheels. |
+| `UMZI_NVRTC_ROOT` | Use the CUDA 13.0 NVRTC wheel from this separate `nvidia/cu13` tree. |
 | `UMZI_CRT_INCLUDE`, `UMZI_CCCL_INCLUDE` | Use these CRT and CCCL header roots. |
 | `UMZI_OPENSSL_INCLUDE` | Linux OpenSSL include directories, separated by `os.pathsep`. |
 | `UMZI_CUDA_DRIVER_LIB` | Linux `libcuda.so.1` to link against. |
@@ -82,9 +84,17 @@ overrides as flags. Outside an isolated build it uses the NVIDIA wheels
 installed in its own Python, so install the CUDA build wheels there first:
 
 ```powershell
-& $py -m pip install "nvidia-cuda-runtime>=13.4,<13.5" "nvidia-cuda-nvrtc>=13.4,<13.5" `
+& $py -m pip install "nvidia-cuda-runtime>=13.4,<13.5" "nvidia-cuda-nvrtc>=13.0.88,<13.1" `
   "nvidia-cuda-crt>=13.4,<13.5" "nvidia-cuda-cccl>=13.3,<14" "nvidia-cublas>=13.7,<14" "nvidia-cudnn-cu13>=9.26,<10"
 & $py scripts/build_native.py --output output/umzi-native-windows
+```
+
+To keep a newer NVRTC in the system Python, install the CUDA 13.0 NVRTC
+wheel in a separate directory and point the standalone build at it:
+
+```powershell
+& $py -m pip install --no-deps --target output/cuda-13.0-nvrtc "nvidia-cuda-nvrtc>=13.0.88,<13.1"
+& $py scripts/build_native.py --nvrtc-root output/cuda-13.0-nvrtc/nvidia/cu13 --output output/umzi-native-windows
 ```
 
 Two separate builds of the same sources produce identical cubins and PTX,
@@ -135,9 +145,7 @@ import umzi_native as umzi
 options = umzi.SessionOptions(cache_dir=Path("output/cache/gaterv3"))
 tiles = np.zeros((3, 3, 192, 160), dtype=np.float32)
 
-with umzi.InferenceSession(
-    "output/native-refactor/gaterv3.gtmodel", sess_options=options
-) as session:
+with umzi.InferenceSession("output/native-refactor/gaterv3.gtmodel", sess_options=options) as session:
     input_name = session.get_inputs()[0].name
     (restored,) = session.run(None, {input_name: tiles})
     print(restored.shape, restored.dtype)
@@ -212,15 +220,28 @@ library from the installed package directory. The WSL run used Python
 3.12 without PyTorch.
 [Loader check reports](../output/python-loader-check/)
 
-The PTX fallback runs when a build embeds no cubin for the device's major
-architecture. An `--arch sm_89` build omits `sm_86`, so the RTX 3050 Laptop
-loads its `compute_86` PTX. With NVRTC 13.4 that PTX declares ISA 9.4, and
-the installed driver 610.62 (CUDA 13.3) rejected it:
-`the provided PTX was compiled with an unsupported toolchain`. A probe
-built with NVRTC 13.0.88 emitted ISA 9.0. Its PTX path passed every check
-above in both precisions, including the CLI comparison.
-[PTX probe report](../output/python-loader-check/windows-ptx-sm89-nvrtc130.json) ·
-[CUDA minor-version compatibility](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html)
+The session uses the best cubin for the device's compute capability.
+It falls back to `compute_86` PTX on GPUs with compute capability 8.6 or
+higher when a compatible cubin is unavailable. Devices below 8.6 fail
+with a clear error. The fallback requires a CUDA 13-capable driver with
+PTX JIT support. To exercise it on an RTX 3050 Laptop, build with
+`--arch sm_89` so the device has no compatible cubin.
+[CUDA code compatibility](https://docs.nvidia.com/cuda/cuda-programming-guide/01-introduction/cuda-platform.html)
+· [CUDA minor-version compatibility](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html)
+
+On Windows with NVIDIA driver 610.62, the `sm_89`-only build emitted
+PTX ISA 9.0 and passed mixed and FP16 inference through the fallback on
+the RTX 3050 Laptop. Both precisions matched the CLI bit for bit for
+128×128 input and a batch of three odd tiles, and hit the disk cache on
+reopen. The default wheel passed the same checks with its `sm_86` cubin.
+[Forced PTX report](../output/windows-ptx-fix/forced-ptx.json)
+· [Default wheel report](../output/windows-ptx-fix/default-wheel.json)
+
+An alternating batch-16 smoke test on the same GPU compared cubins built
+with NVRTC 13.4 and 13.0 on a single synthetic 128×128 batch. Median CUDA
+Graph replay time was 61.32 ms and 60.98 ms in mixed precision and 58.72 ms
+and 56.23 ms in FP16, respectively.
+[Batch-16 smoke timings](../output/windows-ptx-fix/batch16-smoke.json)
 
 An earlier pass of the previous Windows wrapper also checked strided input
 views, independent output arrays, concurrent calls on one session, and
@@ -246,14 +267,9 @@ PYTHONPATH=/tmp/umzi-loader-site:$B/python python3 scripts/check_python_session.
 
 ## Open items
 
-- The PTX fallback needs a toolchain no newer than the oldest supported
-  driver. NVRTC 13.4 PTX fails on driver 610.62. Either pin the PTX compile
-  to an older NVRTC, or require a driver that supports CUDA 13.4.
 - The `sm_89` and `sm_120` cubins have not run on matching hardware.
-- `pip install --dry-run ".[dev]"` resolves on Windows to CUDA runtime,
-  NVRTC and CRT 13.4.92, cuBLAS 13.10, CCCL 13.3.5, cuDNN 9.28.1,
-  Hatchling 1.33.0, Ruff 0.17.6 and Pyrefly 1.5.0. A full install of the
-  `dev` extra into a clean environment has not been run.
+- A full install of the `dev` extra into a clean environment has not
+  been run.
 - The Hatch build has not run on a Windows machine without Visual Studio,
   or on a Linux distribution other than WSL Ubuntu 24.04. A Linux build
   without the OpenSSL headers fails at compile time.
