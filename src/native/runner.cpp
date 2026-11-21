@@ -1,12 +1,16 @@
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
 #include <cuda.h>
 #include <cublasLt.h>
 #include <cudnn.h>
 
 #define GATERV3_BUILD
 #include "runner.h"
+#include "plan_cache.h"
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -28,6 +32,13 @@ constexpr int threads = 256;
 constexpr float one = 1, zero = 0;
 constexpr uint16_t half_one = 0x3c00, half_zero = 0;
 thread_local std::string error_text;
+using gt::ShapeKey;
+using gt::GemmChoice;
+using Clock = std::chrono::steady_clock;
+
+double milliseconds_since(Clock::time_point started) {
+    return std::chrono::duration<double, std::milli>(Clock::now() - started).count();
+}
 
 void check(CUresult status, const char* operation) {
     if (status == CUDA_SUCCESS) return;
@@ -119,11 +130,6 @@ struct Matmul {
     }
 };
 
-struct GemmChoice {
-    cublasLtMatmulAlgo_t algorithm;
-    size_t workspace;
-};
-
 struct TimedGraph {
     std::vector<CUevent> events;
     CUgraph graph = nullptr;
@@ -163,6 +169,8 @@ struct TuningTimer {
 
 } // namespace
 
+#include "silu_plan.h"
+
 class GtRunner {
 public:
     CUdevice device = 0;
@@ -178,7 +186,12 @@ public:
     cublasLtHandle_t blas = nullptr;
     int batch = 0;
     bool fp16 = false;
+    bool fuse_silu = false;
     size_t io_bytes = 0;
+    gt::PlanCache plan_cache;
+    std::array<double, 4> setup_ms{};
+    int fused_silu_count = 0;
+    std::string fusion_diagnostic;
 
     void buffer_sizes(uint64_t bytes[4]) const {
         bytes[0] = weight_bytes;
@@ -191,10 +204,14 @@ public:
         std::copy(startup_used.begin(), startup_used.end(), bytes);
     }
 
-    void initialize(const fs::path& directory, int size, bool capture, bool half_precision) {
+    void initialize(const fs::path& directory, int size, uint32_t flags, const fs::path& cache_dir) {
         if (size != 1 && size != 16) throw std::runtime_error("Supported batches are 1 and 16");
+        if (flags & ~(GT_CREATE_GRAPH | GT_CREATE_FP16 | GT_CREATE_FUSE_SILU))
+            throw std::runtime_error("Unsupported native runner flags");
+        auto stage_start = Clock::now();
         batch = size;
-        fp16 = half_precision;
+        fp16 = (flags & GT_CREATE_FP16) != 0;
+        fuse_silu = (flags & GT_CREATE_FUSE_SILU) != 0;
         io_bytes = rgb_elements * (fp16 ? sizeof(uint16_t) : sizeof(float));
         CHECK(cuInit(0));
         CHECK(cuDeviceGet(&device, 0));
@@ -202,41 +219,62 @@ public:
         ContextScope scope(context);
         record_memory(0);
         CHECK(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
-        CHECK(cuModuleLoad(&module, (directory / "kernels.cubin").u8string().c_str()));
+        auto module_path = directory / "kernels.cubin";
+        auto module_size = fs::file_size(module_path);
+        if (!module_size || module_size > (16u << 20)) throw std::runtime_error("Invalid CUDA module size");
+        std::vector<char> module_data(static_cast<size_t>(module_size));
+        std::ifstream kernel_file(module_path, std::ios::binary);
+        read(kernel_file, module_data.data(), module_data.size());
+        CHECK(cuModuleLoadData(&module, module_data.data()));
         CHECK(cudnnCreate(&cudnn));
         CHECK(cublasLtCreate(&blas));
         CHECK(cudnnSetStream(cudnn, stream));
-        load(directory);
-        CHECK(cuMemAlloc(&scratch, scratch_bytes));
+        load(directory, !cache_dir.empty(), module_data);
         record_memory(1);
         CHECK(cuMemAllocHost(&host_input, io_bytes * batch));
         CHECK(cuMemAllocHost(&host_output, io_bytes * batch));
-        CHECK(cuMemsetD8Async(arena, 0x28, arena_bytes, stream));
+        setup_ms[0] = milliseconds_since(stage_start);
+        stage_start = Clock::now();
+        if (plan_cache.status != GT_CACHE_UNAVAILABLE) {
+            try {
+                plan_cache.open(cache_dir, plan_key);
+            } catch (const std::exception& error) {
+                plan_cache.unavailable(error);
+            }
+        }
         prepare();
+        if (fuse_silu) prepare_silu();
         CHECK(cuStreamSynchronize(stream));
         record_memory(2);
-        CHECK(cuMemFree(scratch));
-        scratch = 0;
+        setup_ms[1] = milliseconds_since(stage_start);
+        stage_start = Clock::now();
+        if (scratch) {
+            CHECK(cuMemFree(scratch));
+            scratch = 0;
+        }
         CHECK(cuMemAlloc(&scratch, workspace_bytes));
+        if (silu_plan) bind_silu();
         CHECK(cuMemsetD8Async(input, 0, io_bytes * batch, stream));
         forward(stream);
         CHECK(cuStreamSynchronize(stream));
-        if (capture) {
-            CHECK(cuStreamBeginCapture(stream, CU_STREAM_CAPTURE_MODE_THREAD_LOCAL));
+        setup_ms[2] = milliseconds_since(stage_start);
+        stage_start = Clock::now();
+        if (flags & GT_CREATE_GRAPH) {
             try {
-                forward(stream);
-            } catch (...) {
-                cuStreamEndCapture(stream, &graph);
-                throw;
+                capture_graph();
+            } catch (const std::exception& error) {
+                if (!fused_silu_count) throw;
+                if (executable) CHECK(cuGraphExecDestroy(executable));
+                if (graph) CHECK(cuGraphDestroy(graph));
+                executable = nullptr;
+                graph = nullptr;
+                disable_fusion(error.what());
+                capture_graph();
             }
-            CHECK(cuStreamEndCapture(stream, &graph));
-            CHECK(cuGraphInstantiate(&executable, graph, 0));
-            CHECK(cuGraphUpload(executable, stream));
-            CHECK(cuStreamSynchronize(stream));
-            CHECK(cuGraphDestroy(graph));
-            graph = nullptr;
         }
+        setup_ms[3] = milliseconds_since(stage_start);
         record_memory(3);
+        plan_cache.save(plan_key);
     }
 
     ~GtRunner() {
@@ -246,6 +284,8 @@ public:
         if (stream) cuStreamSynchronize(stream);
         if (executable) cuGraphExecDestroy(executable);
         if (graph) cuGraphDestroy(graph);
+        silu_bindings.clear();
+        silu_plan.reset();
         matmuls.clear();
         convolutions.clear();
         if (cudnn) cudnnDestroy(cudnn);
@@ -315,8 +355,8 @@ private:
     std::vector<CUdeviceptr> addresses;
     std::vector<Convolution*> conv_by_op;
     std::vector<std::unique_ptr<Matmul>> matmuls;
-    std::map<std::array<int, 5>, GemmChoice> gemm_algorithms;
-    std::map<std::array<int, 5>, std::unique_ptr<Convolution>> convolutions;
+    std::map<ShapeKey, GemmChoice> gemm_algorithms;
+    std::map<ShapeKey, std::unique_ptr<Convolution>> convolutions;
     std::map<std::string, CUfunction> kernels;
     std::vector<CUfunction> kernel_by_op;
     CUfunction add_bias = nullptr;
@@ -325,6 +365,17 @@ private:
     size_t weight_bytes = 0;
     size_t workspace_bytes = 0;
     std::array<uint64_t, 4> startup_used{};
+    gt::Digest plan_key{};
+    std::unique_ptr<gt::SiluPlan> silu_plan;
+    std::vector<size_t> silu_sites;
+    std::vector<std::unique_ptr<gt::BackendDescriptor>> silu_bindings;
+
+    void ensure_tuning_workspace() {
+        if (scratch) return;
+        CHECK(cuMemAlloc(&scratch, scratch_bytes));
+        CHECK(cuMemsetD8Async(arena, 0x28, arena_bytes, stream));
+        record_memory(1);
+    }
 
     void record_memory(size_t stage) {
         size_t available, total;
@@ -332,7 +383,23 @@ private:
         startup_used[stage] = total - available;
     }
 
-    void load(const fs::path& directory) {
+    void capture_graph() {
+        CHECK(cuStreamBeginCapture(stream, CU_STREAM_CAPTURE_MODE_THREAD_LOCAL));
+        try {
+            forward(stream);
+        } catch (...) {
+            cuStreamEndCapture(stream, &graph);
+            throw;
+        }
+        CHECK(cuStreamEndCapture(stream, &graph));
+        CHECK(cuGraphInstantiate(&executable, graph, 0));
+        CHECK(cuGraphUpload(executable, stream));
+        CHECK(cuStreamSynchronize(stream));
+        CHECK(cuGraphDestroy(graph));
+        graph = nullptr;
+    }
+
+    void load(const fs::path& directory, bool cache_enabled, const std::vector<char>& module_data) {
         std::ifstream schedule(directory / "schedule.bin", std::ios::binary);
         std::array<uint32_t, 4> header{};
         read(schedule, header.data(), sizeof(header));
@@ -374,6 +441,34 @@ private:
         std::ifstream file(directory / "weights.bin", std::ios::binary);
         read(file, staging.data(), staging.size());
         if (file.peek() != EOF) throw std::runtime_error("Unexpected trailing weight data");
+        if (cache_enabled) {
+            try {
+                gt::Sha256 hash;
+                const char build_id[] = __DATE__ " " __TIME__;
+                hash.add(build_id);
+                hash.add(module_data.data(), module_data.size());
+                hash.add(header);
+                for (const auto& t : tensors) {
+                    // All arena placements have the same alignment. Plan geometry
+                    // depends on tensor shapes and strides, independently of offsets.
+                    hash.add(std::array<int, 3>{t.h, t.w, t.c});
+                }
+                hash.add(ops.data(), ops.size() * sizeof(Op));
+                hash.add(staging.data(), staging.size());
+                hash.add(batch);
+                hash.add(fp16);
+                hash.add(scratch_bytes);
+                CUuuid uuid{};
+                CHECK(cuDeviceGetUuid(&uuid, device));
+                hash.add(uuid);
+                hash.add(gt::driver_file_version());
+                hash.add(cudnnGetVersion());
+                hash.add(cublasLtGetVersion());
+                plan_key = hash.finish();
+            } catch (const std::exception& error) {
+                plan_cache.unavailable(error);
+            }
+        }
         CHECK(cuMemAlloc(&weights, staging.size()));
         CHECK(cuMemcpyHtoD(weights, staging.data(), staging.size()));
         CHECK(cuMemAlloc(&input, batch * io_bytes));
@@ -430,13 +525,30 @@ private:
             CHECK(cublasLtMatmulDescSetAttribute(plan->desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER,
                                                 &ptr, sizeof(ptr)));
         }
-        auto key = std::array<int, 5>{cin, out.c, count, a.c, op.weight[1] >= 0};
+        auto key = ShapeKey{cin, out.c, count, a.c, op.weight[1] >= 0};
         if (auto cached = gemm_algorithms.find(key); cached != gemm_algorithms.end()) {
             plan->algorithm = cached->second.algorithm;
             plan->workspace = cached->second.workspace;
             matmuls[index] = std::move(plan);
             return;
         }
+        if (auto saved = plan_cache.gemms.find(key); saved != plan_cache.gemms.end()) {
+            const auto& choice = saved->second;
+            cublasLtMatmulHeuristicResult_t checked{};
+            if (choice.workspace <= scratch_bytes
+                && cublasLtMatmulAlgoCheck(blas, plan->desc, plan->kernel, plan->input, plan->output,
+                                           plan->output, &choice.algorithm, &checked) == CUBLAS_STATUS_SUCCESS
+                && checked.state == CUBLAS_STATUS_SUCCESS && checked.workspaceSize == choice.workspace) {
+                plan->algorithm = choice.algorithm;
+                plan->workspace = choice.workspace;
+                workspace_bytes = std::max(workspace_bytes, plan->workspace);
+                gemm_algorithms.emplace(key, choice);
+                matmuls[index] = std::move(plan);
+                return;
+            }
+        }
+        ensure_tuning_workspace();
+        plan_cache.record_tuning();
         cublasLtMatmulPreference_t pref;
         CHECK(cublasLtMatmulPreferenceCreate(&pref));
         auto preference = std::unique_ptr<std::remove_pointer_t<cublasLtMatmulPreference_t>,
@@ -464,7 +576,9 @@ private:
         }
         if (best == 1e30f) throw std::runtime_error("No working cuBLASLt plan for operation " + std::to_string(index));
         workspace_bytes = std::max(workspace_bytes, plan->workspace);
-        gemm_algorithms.emplace(key, GemmChoice{plan->algorithm, plan->workspace});
+        auto selected = GemmChoice{plan->algorithm, plan->workspace};
+        gemm_algorithms.emplace(key, selected);
+        plan_cache.gemms.insert_or_assign(key, selected);
         matmuls[index] = std::move(plan);
     }
 
@@ -475,7 +589,7 @@ private:
     }
 
     void prepare_conv(size_t index, const Tensor& in, const Tensor& out, const Op& op, TuningTimer& timer) {
-        auto key = std::array<int, 5>{in.h, in.w, in.c, out.c, op.x};
+        auto key = ShapeKey{in.h, in.w, in.c, out.c, op.x};
         auto [it, inserted] = convolutions.try_emplace(key);
         if (inserted) {
             it->second = std::make_unique<Convolution>();
@@ -492,6 +606,26 @@ private:
                                             out.c, in.c, op.x, op.x));
             CHECK(cudnnSetConvolution2dDescriptor(p.conv, op.x / 2, op.x / 2,
                 1, 1, 1, 1, CUDNN_CROSS_CORRELATION, fp16 ? CUDNN_DATA_HALF : CUDNN_DATA_FLOAT));
+            if (auto saved = plan_cache.convolutions.find(key); saved != plan_cache.convolutions.end()) {
+                const auto& choice = saved->second;
+                size_t required = 0;
+                auto algorithm = static_cast<cudnnConvolutionFwdAlgo_t>(choice.algorithm);
+                auto math = static_cast<cudnnMathType_t>(choice.math);
+                if (choice.algorithm < CUDNN_CONVOLUTION_FWD_ALGO_COUNT
+                    && choice.math <= CUDNN_FMA_MATH && choice.workspace <= scratch_bytes
+                    && cudnnSetConvolutionMathType(p.conv, math) == CUDNN_STATUS_SUCCESS
+                    && cudnnGetConvolutionForwardWorkspaceSize(cudnn, p.input, p.weight, p.conv,
+                                                               p.output, algorithm, &required) == CUDNN_STATUS_SUCCESS
+                    && required == choice.workspace) {
+                    p.algorithm = algorithm;
+                    p.workspace = required;
+                    workspace_bytes = std::max(workspace_bytes, p.workspace);
+                    conv_by_op[index] = &p;
+                    return;
+                }
+            }
+            ensure_tuning_workspace();
+            plan_cache.record_tuning();
             CHECK(cudnnSetConvolutionMathType(p.conv, CUDNN_TENSOR_OP_MATH));
             std::array<cudnnConvolutionFwdAlgoPerf_t, 16> results;
             int count = 0;
@@ -519,6 +653,8 @@ private:
             p.workspace = fastest->memory;
             workspace_bytes = std::max(workspace_bytes, p.workspace);
             CHECK(cudnnSetConvolutionMathType(p.conv, fastest->mathType));
+            plan_cache.convolutions.insert_or_assign(
+                key, gt::ConvChoice{uint32_t(fastest->algo), uint32_t(fastest->mathType), p.workspace});
         }
         conv_by_op[index] = it->second.get();
     }
@@ -570,6 +706,62 @@ private:
         }
     }
 
+    void disable_fusion(std::string diagnostic) {
+        silu_bindings.clear();
+        silu_plan.reset();
+        fused_silu_count = 0;
+        fusion_diagnostic = std::move(diagnostic);
+    }
+
+    void prepare_silu() {
+        std::vector<int> uses(tensors.size());
+        for (const auto& op : ops)
+            for (int id : op.input)
+                if (id >= 0) ++uses[id];
+        for (size_t i = 0; i + 1 < ops.size(); ++i) {
+            const auto& conv = ops[i];
+            const auto& silu = ops[i + 1];
+            if (conv.kind != Conv || conv.x != 3 || conv.weight[1] >= 0 || silu.kind != Silu
+                || silu.input[0] != conv.out || uses[conv.out] != 1) continue;
+            const auto& x = tensors[conv.input[0]];
+            const auto& y = tensors[silu.out];
+            if (x.h != tile || x.w != tile || x.c != 32 || y.h != tile || y.w != tile || y.c != 32)
+                continue;
+            const auto x_end = x.offset + x.elements() * 2;
+            const auto y_end = y.offset + y.elements() * 2;
+            if (std::max(x.offset, y.offset) < std::min(x_end, y_end)) continue;
+            silu_sites.push_back(i);
+        }
+        if (silu_sites.empty()) {
+            fusion_diagnostic = "Schedule has no compatible non-aliasing convolution/SiLU sites";
+            return;
+        }
+        try {
+            auto candidate = std::make_unique<gt::SiluPlan>();
+            candidate->initialize(cudnn, batch, fp16, scratch_bytes);
+            workspace_bytes = std::max(workspace_bytes, candidate->workspace);
+            silu_plan = std::move(candidate);
+        } catch (const std::exception& error) {
+            disable_fusion(error.what());
+        }
+    }
+
+    void bind_silu() {
+        try {
+            silu_bindings.resize(ops.size());
+            for (auto i : silu_sites) {
+                const auto& conv = ops[i];
+                silu_bindings[i] = silu_plan->bind(pointer(tensor(conv.input[0])),
+                    pointer(weight(conv.weight[0])), pointer(tensor(ops[i + 1].out)), pointer(scratch));
+            }
+            silu_plan->run(cudnn, *silu_bindings[silu_sites.front()]);
+            CHECK(cuStreamSynchronize(stream));
+            fused_silu_count = static_cast<int>(silu_sites.size());
+        } catch (const std::exception& error) {
+            disable_fusion(error.what());
+        }
+    }
+
     template<class... Args>
     void launch(CUfunction kernel, CUstream target, unsigned grid_x, unsigned grid_y,
                 unsigned block, Args... args) {
@@ -580,6 +772,13 @@ private:
     void forward(CUstream target, const CUevent* timing = nullptr) {
         for (size_t i = 0; i < ops.size(); ++i) {
             if (timing) CHECK(cuEventRecordWithFlags(timing[i], target, CU_EVENT_RECORD_EXTERNAL));
+            if (fused_silu_count) {
+                if (silu_bindings[i]) {
+                    silu_plan->run(cudnn, *silu_bindings[i]);
+                    continue;
+                }
+                if (i && silu_bindings[i - 1]) continue;
+            }
             const auto& op = ops[i];
             const auto& o = tensors[op.out];
             const auto& in = tensors[op.input[0]];
@@ -671,24 +870,31 @@ extern "C" {
 const char* gt_error() { return error_text.c_str(); }
 
 GtRunner* gt_create(const char* directory, int batch, int graph) {
+    return gt_create_ex(directory, batch, graph ? GT_CREATE_GRAPH : 0, nullptr);
+}
+
+GtRunner* gt_create_fp16(const char* directory, int batch, int graph) {
+    return gt_create_ex(directory, batch, GT_CREATE_FP16 | (graph ? GT_CREATE_GRAPH : 0), nullptr);
+}
+
+GtRunner* gt_create_ex(const char* directory, int batch, uint32_t flags, const char* cache_dir) {
     GtRunner* result = nullptr;
     report_errors([&] {
         auto runner = std::make_unique<GtRunner>();
-        runner->initialize(fs::u8path(directory), batch, graph != 0, false);
+        runner->initialize(fs::u8path(directory), batch, flags,
+                           cache_dir ? fs::u8path(cache_dir) : fs::path{});
         result = runner.release();
     });
     return result;
 }
 
-GtRunner* gt_create_fp16(const char* directory, int batch, int graph) {
-    GtRunner* result = nullptr;
-    report_errors([&] {
-        auto runner = std::make_unique<GtRunner>();
-        runner->initialize(fs::u8path(directory), batch, graph != 0, true);
-        result = runner.release();
-    });
-    return result;
+GtCacheStatus gt_cache_status(const GtRunner* runner) { return runner->plan_cache.status; }
+const char* gt_cache_message(const GtRunner* runner) { return runner->plan_cache.diagnostic.c_str(); }
+void gt_setup_timings(const GtRunner* runner, double milliseconds[4]) {
+    std::copy(runner->setup_ms.begin(), runner->setup_ms.end(), milliseconds);
 }
+int gt_fused_silu_count(const GtRunner* runner) { return runner->fused_silu_count; }
+const char* gt_fusion_message(const GtRunner* runner) { return runner->fusion_diagnostic.c_str(); }
 
 void gt_destroy(GtRunner* runner) { delete runner; }
 uint64_t gt_input(const GtRunner* runner) { return runner->input; }
@@ -730,15 +936,30 @@ void gt_startup_memory(const GtRunner* runner, uint64_t bytes[4]) {
 }
 
 int main(int argc, char** argv) {
-    bool fp16 = argc == 6 && std::string(argv[5]) == "--fp16";
-    if (argc != 5 && !fp16) {
-        std::cerr << "Usage: gaterv3 <bundle-directory> <batch: 1|16> <input> <output> [--fp16]\n";
+    if (argc < 5) {
+        std::cerr << "Usage: gaterv3 <bundle-directory> <batch: 1|16> <input> <output> "
+                     "[--fp16] [--cache-dir <directory>] [--fuse-silu]\n";
         return 2;
     }
     return report_errors([&] {
-        auto create = fp16 ? gt_create_fp16 : gt_create;
-        std::unique_ptr<GtRunner> runner(create(argv[1], std::stoi(argv[2]), 1));
+        uint32_t flags = GT_CREATE_GRAPH;
+        const char* cache_dir = nullptr;
+        for (int i = 5; i < argc; ++i) {
+            std::string option = argv[i];
+            if (option == "--fp16") flags |= GT_CREATE_FP16;
+            else if (option == "--fuse-silu") flags |= GT_CREATE_FUSE_SILU;
+            else if (option == "--cache-dir" && i + 1 < argc) cache_dir = argv[++i];
+            else throw std::runtime_error("Invalid option " + option);
+        }
+        std::unique_ptr<GtRunner> runner(gt_create_ex(argv[1], std::stoi(argv[2]), flags, cache_dir));
         if (!runner) throw std::runtime_error(error_text);
+        if (*gt_cache_message(runner.get()))
+            std::cerr << "Plan cache: " << gt_cache_message(runner.get()) << '\n';
+        if (flags & GT_CREATE_FUSE_SILU) {
+            std::cerr << "Convolution/SiLU sites: " << gt_fused_silu_count(runner.get()) << '\n';
+            if (*gt_fusion_message(runner.get()))
+                std::cerr << gt_fusion_message(runner.get()) << '\n';
+        }
         std::vector<char> pixels(runner->batch * runner->io_bytes);
         std::vector<char> restored(pixels.size());
         std::ifstream file(fs::u8path(argv[3]), std::ios::binary);

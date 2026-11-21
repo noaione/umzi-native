@@ -168,11 +168,12 @@ def build(output: Path, arch: str, crt_include: Path | None, cccl_include: Path 
         check=True,
     )
     # The wheels ship these DLLs and headers but omit their MSVC import libraries.
+    host_sources = "\n".join(
+        path.read_text(encoding="utf-8") for path in (cpp, *sorted(SOURCE.glob("*.h")))
+    )
     imports = []
     for dll, symbol in (("cudnn64_9", r"cudnn\w+"), ("cublasLt64_13", r"cublasLt\w+")):
-        names = sorted(
-            set(re.findall(rf"\b({symbol})\(", cpp.read_text(encoding="utf-8")))
-        )
+        names = sorted(set(re.findall(rf"\b({symbol})\(", host_sources)))
         if dll.startswith("cublas"):
             names.append("cublasLtMatmulPreferenceDestroy")
         definition = output / f"{dll}.def"
@@ -193,7 +194,15 @@ def build(output: Path, arch: str, crt_include: Path | None, cccl_include: Path 
             check=True,
         )
         imports.append(str(library))
-    link = ["link.exe", "/nologo", str(obj), str(cuda / "lib/x64/cuda.lib"), *imports]
+    link = [
+        "link.exe",
+        "/nologo",
+        str(obj),
+        str(cuda / "lib/x64/cuda.lib"),
+        "bcrypt.lib",
+        "version.lib",
+        *imports,
+    ]
     subprocess.run(
         [*link, "/DLL", f"/OUT:{output / 'gaterv3.dll'}"],
         env=env,

@@ -198,48 +198,160 @@ optimizations carry over to variable input shapes and the single model file.
 
 ### 1. Repack the activation arena
 
-- [ ] Replace append-order allocation with an offline packing pass that
+- [x] Replace append-order allocation with an offline packing pass that
   places larger tensors first and assigns offsets using their lifetimes.
   Treat fused launches as simultaneous reads and writes of all participating
   tensors, including the two outputs of residual plus RMSNorm.
-- [ ] Validate each offset's alignment and confirm that overlapping lifetimes
+- [x] Validate each offset's alignment and confirm that overlapping lifetimes
   never share memory. Run both precisions against the existing bundle at the
   same shape and precision, with the same kernel plans when checking bitwise
   parity. Remeasure exact runner buffers and warmed device usage separately.
 
-An offline packing of the current schedule reached **8 MiB per tile**.
-That corresponds to **128 MiB at batch 16** versus the current 164 MiB
-arena, a **36 MiB reduction in activation allocation**. This is an offline
-result. GPU output parity and the change in warmed device usage are pending.
+The new exporter reached **8 MiB per tile** and **128 MiB at batch 16**,
+down from 164 MiB. With the same runner build and verified cache hits,
+the original and repacked schedules produced bitwise-identical results
+on all 528 tiles and four stress inputs for each precision and batch size.
+The weights and logical operation list matched.
+
+Compared with the preceding measured bundle, warmed batch-16 device usage
+increased by **210 MiB** for repacked mixed and **204 MiB** for repacked full
+FP16, down from **246 MiB** and **240 MiB** respectively. Exact runner buffer
+totals were 204.44 MiB for mixed and 201.37 MiB for full FP16. Device-wide
+readings include CUDA library and graph overhead.
 
 ### 2. Persist selected kernel plans
 
-- [ ] Add an optional `cache_dir` session setting and `--cache-dir` CLI
+- [x] Add an optional cache directory to `gt_create_ex` and a `--cache-dir` CLI
   flag. Save the selected cuDNN and cuBLASLt choices and workspace
   requirements. Use the compatibility key and miss behavior in the
   [refactor plan](gaterv3-native-refactor.md#configurable-kernel-plan-cache).
-- [ ] Benchmark a first load into an empty cache and a fresh process with
+- [x] Benchmark a first load into an empty cache and a fresh process with
   a populated cache. Record tune time, graph capture time, total time to first
   output, warmed latency and output parity. Include mismatched and corrupt
   cache tests.
 
-Batch-16 setup measured **1.04 s** for mixed and **5.68 s** for full FP16 in
-the isolated setup pass. The cache targets repeat setup time. Measure the
-remaining model load, allocation and graph capture costs on cache hits.
+The two benchmark processes below each started with a fresh CUDA context
+and ran batch 1 followed by batch 16. The first process populated the
+directory. The second loaded and validated the saved plans and avoided
+allocating the temporary 64 MiB tuning workspace on compatible hits.
+
+| Mode | Batch | Initialization empty / populated (ms) | First output empty / populated (ms) |
+| --- | ---: | ---: | ---: |
+| Mixed | 1 | 686 / 472 | 692 / 478 |
+| Full FP16 | 1 | 741 / 211 | 747 / 216 |
+| Mixed | 16 | 1043 / 225 | 1106 / 292 |
+| Full FP16 | 16 | 5688 / 191 | 5741 / 245 |
+
+The compatibility key includes the native build, CUDA module, logical
+schedule, weights, shape, precision, device UUID, driver DLL version,
+backend versions, and workspace cap. The same aligned logical schedule
+can reuse its plans with different arena offsets. The standalone binary
+and DLL accept a caller-specified cache directory. Cache tests covered
+hits with bitwise parity, separate keys for mixed and full FP16, a payload
+from a different key, corruption, an unavailable directory, and concurrent
+standalone writers followed by a fresh reader. Graph instances are captured
+for each session.
 
 ### 3. Prototype convolution and SiLU fusion
 
-- [ ] Start with the repeated 128×128, 32-channel convolutions in the SISR
+- [x] Start with the repeated 128×128, 32-channel convolutions in the SISR
   branch. Prototype a convolution with a SiLU epilogue using a compatible
   cuDNN graph plan on the RTX 3050. Keep the current separate kernels as a
   fallback, and check that fused intermediates preserve the intended rounding
   or meet the same-precision fidelity criteria.
-- [ ] Compare the fused and split paths with batch 1 and 16, both precisions,
+- [x] Compare the fused and split paths with batch 1 and 16, both precisions,
   and identical inputs. Include workspace and startup cost alongside warm
   page throughput. Extend to other shapes after the first candidate is measured.
 
 The batch-16 full-FP16 profile attributed **7.01 ms** to 19 full-resolution
 32-to-32 convolutions and **2.98 ms** to 12 SiLU dispatches. Only the
 convolutions with a following SiLU are fusion candidates. These are
-instrumented operation times. The end-to-end speedup is pending.
+instrumented operation times. The paired measurements below quantify the
+end-to-end difference.
 [cuDNN graph fusion documentation](https://docs.nvidia.com/deeplearning/cudnn/latest/developer/graph-api.html)
+
+The prototype uses the cuDNN convolution–SiLU operation graph at 12 sites
+in mixed precision. The tested cuDNN heuristics returned no compatible
+full-FP16 graph plan on this workstation. The split fallback produced
+bitwise-identical full-FP16 output with and without the fusion flag at
+both batch sizes. The fusion flag is opt-in and the disk cache stores the
+split-path plans.
+
+| Repacked runner | Aggregate raw PSNR vs Torch FP32 (dB) | Mean SSIMULACRA2 | Minimum SSIMULACRA2 |
+| --- | ---: | ---: | ---: |
+| Mixed, separate kernels | 85.5470 | 92.35 | 91.11 |
+| Mixed, convolution–SiLU | 85.5471 | 92.29 | 91.10 |
+| Full FP16, separate kernels | 72.0891 | 91.87 | 90.52 |
+
+All three modes passed finite-output checks on black, white, checkerboard,
+seeded random, and real-image batch-1 inputs. The full set of per-image
+metrics and stress results is under `output/native-next-validation/`.
+
+### Build and exercise this pass
+
+```powershell
+$py = 'C:\Python314\python.exe'
+$bundle = 'output/native-arena'
+$results = 'output/native-next-validation'
+$cache = "$results/cache"
+& $py scripts/build_native.py --output $bundle
+& $py scripts/export_native.py --output $bundle
+& $py scripts/benchmark_native.py --suite memory --bundle $bundle --cache-dir $cache --compare-fp16 --compare-silu --output "$results/memory"
+& $py scripts/benchmark_native.py --suite speed --bundle $bundle --cache-dir $cache --compare-fp16 --compare-silu --rounds 4 --repeats 4 --output "$results/speed"
+```
+
+Use a new cache directory for an empty-cache measurement. Repeat the memory
+command in a fresh process to measure a populated cache. For the standalone
+binary, append `--cache-dir <directory>` after the raw output path. The
+optional `--fuse-silu` flag requests the mixed fusion prototype. C callers
+can use `gt_create_ex` with `GT_CREATE_GRAPH`, optional `GT_CREATE_FP16`
+or `GT_CREATE_FUSE_SILU`, and the UTF-8 cache directory. The existing
+entry points retain their original signatures.
+
+```powershell
+& .\output\native-arena\gaterv3.exe $bundle 16 .\tiles.f16 .\restored.f16 --fp16 --cache-dir $cache
+```
+
+### Measured latency
+
+On the RTX 3050 Laptop GPU, each runner timed all 528 tiles as individual
+synchronized batch-1 calls, alternating runner order every 16 tiles. All
+native cases used the populated disk cache. TensorRT-RTX executed the
+separate batch-1 graph through its profiled RTX provider.
+
+| Runner | Mean tile (ms) | page-001 (ms) | page-005 (ms) | page-009 (ms) | GPU-resident median (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Mixed, separate kernels | 5.422 | 5.417 | 5.476 | 5.374 | 4.656 |
+| Mixed, convolution–SiLU | 5.404 | 5.391 | 5.619 | 5.201 | 4.557 |
+| Full FP16, separate kernels | 5.094 | 5.037 | 5.229 | 5.018 | 4.286 |
+| Full FP16 with fusion requested, split fallback | 5.173 | 5.395 | 5.204 | 4.920 | 4.266 |
+| Torch eager FP16 | 50.589 | 51.733 | 52.294 | 47.740 | 43.839 |
+| TorchInductor FP16 | 18.450 | 18.014 | 19.047 | 18.288 | 16.624 |
+| ORT TensorRT-RTX FP16 | 6.353 | 6.265 | 6.537 | 6.256 | 5.292 |
+
+### Measured batch-16 throughput
+
+Page timings include batch assembly and synchronous host I/O. Each runner
+processed the same three pages in 33 batch-16 calls. ORT profiling confirmed
+RTX placement for the fixed batch-16 graph.
+
+| Runner | Total (s) | MPx/s | page-001 s / MPx/s | page-005 s / MPx/s | page-009 s / MPx/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Mixed, separate kernels | 2.138 | 3.941 | 0.711 / 3.950 | 0.704 / 3.986 | 0.722 / 3.888 |
+| Mixed, convolution–SiLU | 2.129 | 3.957 | 0.717 / 3.917 | 0.719 / 3.907 | 0.694 / 4.048 |
+| Full FP16, separate kernels | 1.816 | 4.638 | 0.608 / 4.621 | 0.598 / 4.696 | 0.611 / 4.596 |
+| Full FP16 with fusion requested, split fallback | 1.802 | 4.674 | 0.598 / 4.696 | 0.603 / 4.654 | 0.601 / 4.671 |
+| Torch eager FP16 | 5.515 | 1.527 | 1.883 / 1.491 | 1.814 / 1.548 | 1.818 / 1.545 |
+| TorchInductor FP16 | 7.424 | 1.135 | 2.489 / 1.128 | 2.440 / 1.151 | 2.495 / 1.126 |
+| ORT TensorRT-RTX FP16 | 2.603 | 3.236 | 0.854 / 3.288 | 0.907 / 3.095 | 0.842 / 3.335 |
+
+The mixed fusion improved the GPU-resident batch-16 median from
+61.319 ms to 60.588 ms, while the repeated host-I/O median went from
+62.764 ms to 65.827 ms. Page throughput differed by 0.4% and the fused
+graph added about 101 ms of initialization in the populated-cache pass.
+Keep fusion opt-in based on these measurements. The full-FP16 fallback
+row times the same split execution path as the regular full-FP16 row.
+
+The combined report is `output/native-next-validation/verified-report.json`.
+It records bundle hashes, output parity, cache cases, VRAM, per-image
+quality, all tile timings, and per-page throughput.

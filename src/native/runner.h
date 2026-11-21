@@ -15,11 +15,34 @@ extern "C" {
 typedef struct GtRunner GtRunner;
 typedef struct CUstream_st* GtStream;
 
+typedef enum GtCreateFlags {
+    GT_CREATE_GRAPH = 1,
+    GT_CREATE_FP16 = 2,
+    GT_CREATE_FUSE_SILU = 4,
+} GtCreateFlags;
+
+typedef enum GtCacheStatus {
+    GT_CACHE_DISABLED,
+    GT_CACHE_MISS,
+    GT_CACHE_HIT,
+    GT_CACHE_REBUILT,
+    GT_CACHE_UNAVAILABLE,
+} GtCacheStatus;
+
 // Uses CUDA device 0. The bundle contains schedule.bin, weights.bin and kernels.cubin.
 GT_API GtRunner* gt_create(const char* utf8_directory, int batch, int graph);
 GT_API GtRunner* gt_create_fp16(const char* utf8_directory, int batch, int graph);
+// An empty or null cache directory disables disk caching.
+GT_API GtRunner* gt_create_ex(const char* utf8_directory, int batch, uint32_t flags,
+                             const char* utf8_cache_directory);
 GT_API void gt_destroy(GtRunner* runner);
 GT_API const char* gt_error(void);
+GT_API GtCacheStatus gt_cache_status(const GtRunner* runner);
+GT_API const char* gt_cache_message(const GtRunner* runner);
+// Model loading, plan lookup/tuning, allocation/warmup and graph capture, in ms.
+GT_API void gt_setup_timings(const GtRunner* runner, double milliseconds[4]);
+GT_API int gt_fused_silu_count(const GtRunner* runner);
+GT_API const char* gt_fusion_message(const GtRunner* runner);
 
 // Synchronous host I/O. Both buffers contain batch × 3 × 128 × 128 FP32 values in NCHW order.
 GT_API int gt_run(GtRunner* runner, const float* input, float* output);

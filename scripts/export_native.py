@@ -10,6 +10,7 @@ import sys
 import tempfile
 from enum import IntEnum
 from pathlib import Path
+from typing import NamedTuple
 
 import torch
 from torch import Tensor, nn
@@ -38,6 +39,48 @@ class Op(IntEnum):
     ADD = 15
     RGB = 16
     SHUFFLE_CONCAT = 17
+
+
+class Activation(NamedTuple):
+    index: int
+    first: int
+    last: int
+    size: int
+
+    def overlaps(self, other: Activation) -> bool:
+        return self.first <= other.last and other.first <= self.last
+
+
+def pack_activations(activations: list[Activation]) -> dict[int, int]:
+    offsets: dict[int, int] = {}
+    placed: list[Activation] = []
+    for tensor in sorted(activations, key=lambda item: (-item.size, item.first)):
+        offset = 0
+        conflicts = sorted(
+            (offsets[other.index], other.size)
+            for other in placed
+            if tensor.overlaps(other)
+        )
+        for start, size in conflicts:
+            if offset + tensor.size <= start:
+                break
+            offset = max(offset, start + size)
+        offsets[tensor.index] = offset
+        placed.append(tensor)
+
+    for i, tensor in enumerate(activations):
+        start = offsets[tensor.index]
+        if start % 256:
+            raise RuntimeError(f"Misaligned arena offset for tensor {tensor.index}")
+        for other in activations[:i]:
+            addr = offsets[other.index]
+            if tensor.overlaps(other) and max(start, addr) < min(
+                start + tensor.size, addr + other.size
+            ):
+                raise RuntimeError(
+                    f"Arena overlap for tensors {tensor.index} and {other.index}"
+                )
+    return offsets
 
 
 class Schedule:
@@ -270,9 +313,23 @@ class Schedule:
         )
 
     def write(self, path: Path):
-        end = 0
-        free: list[tuple[int, int]] = []
-        live: dict[int, tuple[int, int]] = {}
+        last_use = self.last_use.copy()
+        for index, (conv, silu) in enumerate(zip(self.ops, self.ops[1:])):
+            if conv[0] == Op.CONV and conv[9] == 3 and silu[0] == Op.SILU:
+                # An optional fused launch reads the original convolution input
+                # while writing the SiLU result.
+                source = conv[2]
+                last_use[source] = max(last_use[source], index + 1)
+        activations = []
+        for index, (h, w, c) in enumerate(self.shapes[1:-1], start=1):
+            first = index - 1
+            op = self.ops[first]
+            # Residual + RMSNorm emits both outputs in the residual launch.
+            if op[0] == Op.RMS and op[3] >= 0:
+                first -= 1
+            size = (h * w * c * 2 + 255) & ~255
+            activations.append(Activation(index, first, last_use[index], size))
+        offsets = pack_activations(activations)
         with path.open("wb") as file:
             file.write(
                 struct.pack(
@@ -284,43 +341,10 @@ class Schedule:
                 )
             )
             for index, (h, w, c) in enumerate(self.shapes):
-                if index in (0, len(self.shapes) - 1):
-                    file.write(struct.pack("<4i", h, w, c, -1))
-                    continue
-                for i, allocation in list(live.items()):
-                    if self.last_use[i] < index - 1:
-                        free.append(allocation)
-                        del live[i]
-                merged: list[tuple[int, int]] = []
-                for offset, length in sorted(free):
-                    if merged and sum(merged[-1]) == offset:
-                        start, previous = merged.pop()
-                        merged.append((start, previous + length))
-                    else:
-                        merged.append((offset, length))
-                free = merged
-                size = (h * w * c * 2 + 255) & ~255
-                available = min(
-                    (
-                        (length, offset, j)
-                        for j, (offset, length) in enumerate(free)
-                        if length >= size
-                    ),
-                    default=None,
-                )
-                if available is None:
-                    offset = end
-                    end += size
-                else:
-                    length, offset, j = available
-                    free.pop(j)
-                    if length > size:
-                        free.append((offset + size, length - size))
-                live[index] = (offset, size)
-                file.write(struct.pack("<4i", h, w, c, offset))
+                file.write(struct.pack("<4i", h, w, c, offsets.get(index, -1)))
             for op in self.ops:
                 file.write(struct.pack("<11i", *op))
-        return end
+        return max(offsets[tensor.index] + tensor.size for tensor in activations)
 
 
 def main():

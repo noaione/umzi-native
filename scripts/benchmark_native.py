@@ -29,7 +29,15 @@ METRIC = Path(r"C:\Tools\imaging\ssimulacra2.exe")
 
 
 class Native:
-    def __init__(self, bundle, batch, graph=True, precision="mixed"):
+    def __init__(
+        self,
+        bundle,
+        batch,
+        graph=True,
+        precision="mixed",
+        cache_dir=None,
+        fuse_silu=False,
+    ):
         cuda, cudnn = libraries()
         self.dll_dirs = []
         try:
@@ -48,7 +56,21 @@ class Native:
             self.run = self.dll.gt_run_fp16 if fp16 else self.dll.gt_run
             self.run.argtypes = [ctypes.c_void_p] * 3
             self.dll.gt_enqueue.argtypes = [ctypes.c_void_p] * 2
-            self.handle = create(str(bundle.resolve()).encode(), batch, graph)
+            directory = str(bundle.resolve()).encode()
+            if cache_dir or fuse_silu:
+                create_ex = self.dll.gt_create_ex
+                create_ex.argtypes = [
+                    ctypes.c_char_p,
+                    ctypes.c_int,
+                    ctypes.c_uint32,
+                    ctypes.c_char_p,
+                ]
+                create_ex.restype = ctypes.c_void_p
+                flags = int(graph) | (2 if fp16 else 0) | (4 if fuse_silu else 0)
+                cached = str(cache_dir.resolve()).encode() if cache_dir else None
+                self.handle = create_ex(directory, batch, flags, cached)
+            else:
+                self.handle = create(directory, batch, graph)
             if not self.handle:
                 self.check(-1)
         except BaseException:
@@ -114,6 +136,38 @@ class Native:
         query(self.handle, sizes)
         return dict(zip(keys, sizes, strict=True))
 
+    def setup(self):
+        timing = getattr(self.dll, "gt_setup_timings", None)
+        if timing is None:
+            return None
+        timing.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_double)]
+        timing.restype = None
+        values = (ctypes.c_double * 4)()
+        timing(self.handle, values)
+        functions = (
+            (self.dll.gt_cache_status, ctypes.c_int),
+            (self.dll.gt_cache_message, ctypes.c_char_p),
+            (self.dll.gt_fused_silu_count, ctypes.c_int),
+            (self.dll.gt_fusion_message, ctypes.c_char_p),
+        )
+        for function, dtype in functions:
+            function.argtypes = [ctypes.c_void_p]
+            function.restype = dtype
+        statuses = ("disabled", "miss", "hit", "rebuilt", "unavailable")
+        return {
+            "stages_ms": dict(
+                zip(
+                    ("model", "plans", "allocation_warmup", "capture"),
+                    values,
+                    strict=True,
+                )
+            ),
+            "cache_status": statuses[self.dll.gt_cache_status(self.handle)],
+            "cache_message": self.dll.gt_cache_message(self.handle).decode(),
+            "fused_silu_count": self.dll.gt_fused_silu_count(self.handle),
+            "fusion_message": self.dll.gt_fusion_message(self.handle).decode(),
+        }
+
     def profile(self, schedule):
         self.dll.gt_operation_count.argtypes = [ctypes.c_void_p]
         self.dll.gt_profile.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
@@ -165,10 +219,16 @@ def quality(args, images):
     rows = []
     scores = []
     with ExitStack() as runners:
-        native = Native(args.bundle, 16, precision=args.precision)
+        options = {
+            "precision": args.precision,
+            "cache_dir": args.cache_dir,
+            "fuse_silu": args.fuse_silu,
+        }
+        native = Native(args.bundle, 16, **options)
         runners.callback(native.close)
-        single = Native(args.bundle, 1, precision=args.precision)
+        single = Native(args.bundle, 1, **options)
         runners.callback(single.close)
+        setup = {"16": native.setup(), "1": single.setup()}
         for name, image in images:
             result = torch.empty_like(image)
             expected = torch.empty_like(image)
@@ -237,6 +297,7 @@ def quality(args, images):
         if scores
         else None,
         "batch1": stress_rows,
+        "setup": setup,
     }
 
 
@@ -374,15 +435,25 @@ def speed(args, images, batch, report, save):
     torch.cuda.synchronize()
     with ExitStack() as stack:
 
-        def native_case(bundle, precision, graph=True):
-            instance = Native(bundle, batch, graph=graph, precision=precision)
+        def native_case(
+            bundle, precision, graph=True, control=False, fuse_silu=args.fuse_silu
+        ):
+            instance = Native(
+                bundle,
+                batch,
+                graph=graph,
+                precision=precision,
+                cache_dir=None if control else args.cache_dir,
+                fuse_silu=fuse_silu and not control,
+            )
             stack.callback(instance.close)
             return instance
 
         native = native_case(args.bundle, args.precision)
         cases = {"native_graph": (native.prepare_device(device_input), native.host)}
+        report["setup"] = {"native_graph": native.setup()}
         if args.control_bundle:
-            control = native_case(args.control_bundle, "mixed")
+            control = native_case(args.control_bundle, "mixed", control=True)
             cases["native_control"] = (
                 control.prepare_device(device_input),
                 control.host,
@@ -391,9 +462,16 @@ def speed(args, images, batch, report, save):
         if args.compare_fp16:
             fp16 = native_case(args.bundle, "fp16")
             cases["native_fp16"] = (fp16.prepare_device(device_input), fp16.host)
-        elif not args.control_bundle:
+            report["setup"]["native_fp16"] = fp16.setup()
+        elif not args.control_bundle and not args.compare_silu:
             eager = native_case(args.bundle, args.precision, graph=False)
             cases["native_eager"] = (eager.prepare_device(device_input), eager.host)
+        if args.compare_silu:
+            for mode in ("mixed", "fp16") if args.compare_fp16 else (args.precision,):
+                candidate = native_case(args.bundle, mode, fuse_silu=True)
+                label = f"native_{mode}_silu"
+                cases[label] = (candidate.prepare_device(device_input), candidate.host)
+                report["setup"][label] = candidate.setup()
         if "torch" in args.baselines:
             eager, _ = load_model(args.model, device="cuda", dtype=torch.float16)
 
@@ -513,26 +591,40 @@ def memory(args, batch):
     values = {}
     sample = torch.zeros((batch, *SHAPE), dtype=torch.float32)
     torch.cuda.init()
-    runners = {"native_graph": (args.bundle, args.precision)}
+    runners = {"native_graph": (args.bundle, args.precision, args.fuse_silu)}
     if args.control_bundle:
-        runners["native_control"] = (args.control_bundle, "mixed")
+        runners["native_control"] = (args.control_bundle, "mixed", False)
     if args.compare_fp16:
-        runners["native_fp16"] = (args.bundle, "fp16")
+        runners["native_fp16"] = (args.bundle, "fp16", args.fuse_silu)
+    if args.compare_silu:
+        for mode in ("mixed", "fp16") if args.compare_fp16 else (args.precision,):
+            runners[f"native_{mode}_silu"] = (args.bundle, mode, True)
 
     def used():
         torch.cuda.synchronize()
         free, total = torch.cuda.mem_get_info()
         return total - free, total
 
-    for label, (bundle, precision) in runners.items():
+    for label, (bundle, precision, fuse_silu) in runners.items():
         torch.cuda.empty_cache()
         before, capacity = used()
         started = time.perf_counter()
-        native = Native(bundle, batch, precision=precision)
+        native = Native(
+            bundle,
+            batch,
+            precision=precision,
+            fuse_silu=fuse_silu,
+            cache_dir=None if label == "native_control" else args.cache_dir,
+        )
         initialization_ms = (time.perf_counter() - started) * 1000
         try:
             captured, _ = used()
-            for _ in range(8):
+            first_call = time.perf_counter()
+            native.host(sample)
+            time_to_first_output_ms = (
+                initialization_ms + (time.perf_counter() - first_call) * 1000
+            )
+            for _ in range(7):
                 native.host(sample)
             warmed, _ = used()
             buffers = native.memory_values(
@@ -542,11 +634,14 @@ def memory(args, batch):
                 "gt_startup_memory",
                 ("context", "tuning_workspace", "tuned", "captured"),
             )
+            setup = native.setup()
         finally:
             native.close()
         released, _ = used()
         row = {
             "initialization_wall_ms": initialization_ms,
+            "time_to_first_output_ms": time_to_first_output_ms,
+            "setup": setup,
             "device_capacity_bytes": capacity,
             "device_used_before_bytes": before,
             "device_used_captured_bytes": captured,
@@ -579,6 +674,17 @@ def main():
     parser.add_argument("--input", type=Path, default=ROOT / "samples/input")
     parser.add_argument("--bundle", type=Path, default=ROOT / "output/native")
     parser.add_argument("--control-bundle", type=Path)
+    parser.add_argument(
+        "--cache-dir", type=Path, help="Read and write tuned plans in this directory"
+    )
+    parser.add_argument(
+        "--fuse-silu", action="store_true", help="Try the cuDNN convolution/SiLU graph"
+    )
+    parser.add_argument(
+        "--compare-silu",
+        action="store_true",
+        help="Compare split and fused convolution/SiLU",
+    )
     parser.add_argument("--precision", choices=("mixed", "fp16"), default="mixed")
     parser.add_argument(
         "--compare-fp16",
@@ -618,6 +724,8 @@ def main():
         parser.error("Include torch when benchmarking inductor")
     if args.compare_fp16 and args.precision != "mixed":
         parser.error("--compare-fp16 pairs the mixed runner with full FP16")
+    if args.compare_silu and args.fuse_silu:
+        parser.error("--compare-silu uses the split path as its control")
     args.output.mkdir(parents=True, exist_ok=True)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
@@ -655,6 +763,7 @@ def main():
         "checkpoint_sha256": checkpoint_hash,
         "bundle_sha256": checked_bundle(args.bundle),
         "precision": args.precision,
+        "fuse_silu": args.fuse_silu,
     }
     if args.control_bundle:
         report["control_sha256"] = checked_bundle(args.control_bundle)
