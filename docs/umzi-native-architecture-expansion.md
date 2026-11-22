@@ -253,6 +253,7 @@ algorithms. [GateRV2 session options](quickstart.md#gaterv2-kernel-options)
 | 5 | Reuse register weights and columns in the local gate, parallelize pooling by output, and split attention preparation by value slice | About 52 ms per mixed batch-16 forward and 4.3 ms per batch-1 call |
 | 6 | Select one inception branch per eight-channel vector where possible | About 49 ms per mixed batch-16 forward |
 | 7 | Pack only the weight copies each operator uses, release unused tuning workspace, size three work buffers by role, and reuse the consumed skip as decoder state | Mixed VRAM fell from 524 to 232 MiB at batch 16 and from 278 to 92 MiB at batch 1 |
+| 8 | Specialize the 32-channel 128×128 inception gate with four-channel depthwise branch loads | About 56% less GPU time in the specialized gate in both precisions. [Profile and paired validation](handoff-gaterv2.md#32-channel-inception-gate) |
 
 Shared-memory tiling for the local and inception gates and a cheaper Mish
 formula were evaluated in the earlier experiments. The timing details and

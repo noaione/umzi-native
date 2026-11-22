@@ -302,11 +302,11 @@ struct Events {
 constexpr const char* kernel_names[] = {
     "input_conv_f32", "input_conv_f16", "output_conv_f32", "output_conv_f16", "weights_to_half",
     "pixel_norm_0", "pixel_norm_1", "pixel_norm_2", "pixel_norm_3", "local_gate", "pool_project",
-    "inception_gate", "attention_prepare", "attention_reduce", "attention_gate", "shuffle_concat",
+    "inception_gate", "inception_gate32_128", "attention_prepare", "attention_reduce", "attention_gate", "shuffle_concat",
 };
 enum KernelId {
     InputF32, InputF16, OutputF32, OutputF16, WeightsToHalf, NormCopy, NormUnshuffle, NormMish, NormScaled,
-    LocalGate, PoolProject, InceptionGate, AttentionPrepare, AttentionReduce, AttentionGate, ShuffleConcat,
+    LocalGate, PoolProject, InceptionGate, InceptionGate32, AttentionPrepare, AttentionReduce, AttentionGate, ShuffleConcat,
     KernelCount,
 };
 static_assert(std::size(kernel_names) == KernelCount);
@@ -1000,8 +1000,14 @@ public:
                param(m.sca_b), param(m.gamma0), dim, tiles, pixels);
         pixel_norm(NormScaled, x, norm, local, x, multiplier, m.glob_scale, m.glob_offset, dim, pixels, w);
         gemm(expanded, norm, dim, dim, 2 * hidden, rows, m.fc1_w, m.fc1_b);
-        elementwise(InceptionGate, rows * (hidden / 8), local, expanded, param(m.square_w), param(m.square_b),
-                    param(m.row_w), param(m.row_b), param(m.column_w), param(m.column_b), dim, h, w);
+        const int gate_vectors = rows * (hidden / 8);
+        if (dim == 32 && h == 128 && w == 128) {
+            elementwise(InceptionGate32, gate_vectors, local, expanded, param(m.square_w), param(m.square_b),
+                        param(m.row_w), param(m.row_b), param(m.column_w), param(m.column_b));
+        } else {
+            elementwise(InceptionGate, gate_vectors, local, expanded, param(m.square_w), param(m.square_b),
+                        param(m.row_w), param(m.row_b), param(m.column_w), param(m.column_b), dim, h, w);
+        }
         gemm(last, local, hidden, hidden, dim, rows, m.fc2_w, m.fc2_b);
         pixel_norm(NormMish, x, next.present ? norm : 0, last, x, param(m.gamma1), next.scale, next.offset, dim,
                    pixels, w);

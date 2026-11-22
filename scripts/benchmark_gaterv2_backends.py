@@ -1,4 +1,4 @@
-"""Compare packaged GateRV2 and TensorRT-RTX in rotated, paired page runs."""
+"""Compare packaged GateRV2 with TensorRT-RTX or a control DLL in paired page runs."""
 
 from __future__ import annotations
 
@@ -51,14 +51,15 @@ def measure_pages(
     output: Path,
     rounds: int,
 ) -> dict[str, Any]:
-    history: dict[str, list[dict[str, Any]]] = {name: [] for name in BACKENDS}
+    backends = tuple(runners)
+    history: dict[str, list[dict[str, Any]]] = {name: [] for name in backends}
     first_results: dict[tuple[str, str], Tensor] = {}
     images = {path.name: read_image(path) for path in sources}
     for round_index in range(rounds):
-        start = round_index % len(BACKENDS)
-        order = BACKENDS[start:] + BACKENDS[:start]
+        start = round_index % len(backends)
+        order = backends[start:] + backends[:start]
         print(f"Round {round_index + 1}: {', '.join(order)}", flush=True)
-        pages: dict[str, list[dict[str, Any]]] = {name: [] for name in BACKENDS}
+        pages: dict[str, list[dict[str, Any]]] = {name: [] for name in backends}
         for label, image in images.items():
             for name in order:
                 row, candidate = timed_page(image, label, runners[name], FAMILY, FAMILY.batch)
@@ -71,7 +72,7 @@ def measure_pages(
             history[name].append({"round": round_index + 1, "pages": pages[name], "summary": summarize(pages[name])})
 
     report: dict[str, Any] = {}
-    for name in BACKENDS:
+    for name in backends:
         target = output / name
         target.mkdir(parents=True, exist_ok=True)
         quality: list[dict[str, Any]] = []
@@ -84,6 +85,10 @@ def measure_pages(
                 raise RuntimeError(f"{name} produced non-finite output for {label}")
             image_tensor(candidate).save(target / f"{stem}.png")
             row["ssimulacra2"] = ssimulacra2(references / f"{stem}.png", target / f"{stem}.png")
+            if name.startswith("native-"):
+                control = first_results.get((name.replace("native-", "control-", 1), label))
+                if control is not None:
+                    row["bitwise_vs_control"] = torch.equal(candidate, control)
             quality.append(row)
         total_mse = sum(row["mse"] * row["values"] for row in quality) / sum(row["values"] for row in quality)
         trials = history[name]
@@ -108,14 +113,23 @@ def measure_pages(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--library", type=Path, required=True)
+    parser.add_argument("--control-library", type=Path, help="Compare two native DLLs using heuristic plans")
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--reference-report", type=Path, default=BASELINE / "fp32/report.json")
     parser.add_argument("--rtx-report", type=Path, default=BASELINE / "rtx/report.json")
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--rounds", type=int, default=3, help="Run a multiple of three for balanced order")
+    parser.add_argument("--rounds", type=int, help="Run a whole number of backend-order rotations")
     args = parser.parse_args()
-    if args.rounds < 3 or args.rounds % len(BACKENDS):
-        parser.error("--rounds must be a positive multiple of three")
+    libraries = {"native": args.library}
+    backends = BACKENDS
+    kernel_options: dict[str, int] = {}
+    if args.control_library is not None:
+        libraries = {"control": args.control_library, **libraries}
+        backends = tuple(f"{build}-{precision}" for precision in PRECISIONS for build in libraries)
+        kernel_options["tune_plans"] = 0
+    rounds = len(backends) if args.rounds is None else args.rounds
+    if rounds < len(backends) or rounds % len(backends):
+        parser.error(f"--rounds must be a positive multiple of {len(backends)}")
     os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
     torch.set_num_threads(2)
     payload = peek_model(args.model).payload
@@ -131,33 +145,34 @@ def main() -> None:
         "scale": FAMILY.scale,
     }
     read_report(args.reference_report, config, "fp32")
-    rtx = read_report(args.rtx_report, config, "rtx")
+    rtx = read_report(args.rtx_report, config, "rtx") if "rtx" in backends else None
     args.output.mkdir(parents=True, exist_ok=True)
-    setup: dict[str, Any] = {name: {} for name in BACKENDS}
-    runners: dict[str, dict[int, Runner]] = {name: {} for name in BACKENDS}
+    setup: dict[str, Any] = {name: {} for name in backends}
+    runners: dict[str, dict[int, Runner]] = {name: {} for name in backends}
     with ExitStack() as stack:
         for batch in (1, FAMILY.batch):
             shape = (batch, 3, FAMILY.tile, FAMILY.tile)
-            graph_info = rtx["setup"][str(batch)]
-            graph_path = args.rtx_report.parent / graph_info["graph"]
-            if digest(graph_path) != graph_info["graph_sha256"]:
-                raise ValueError(f"Graph hash differs from the RTX report for {graph_path}")
-            graph = onnx.load(graph_path, load_external_data=False)
-            rtx_setup = setup["rtx"][str(batch)] = {"graph_sha256": graph_info["graph_sha256"]}
-            runners["rtx"][batch] = open_rtx_runner(
-                graph_path, graph.graph.input[0].name, batch, FAMILY, rtx_setup, output_dir=args.output
-            )
-            for precision, dtype in PRECISIONS.items():
-                name = f"native-{precision}"
-                session = stack.enter_context(
-                    InferenceSession(args.model, SessionOptions(precision=precision, dll_path=args.library))
+            if rtx is not None:
+                graph_info = rtx["setup"][str(batch)]
+                graph_path = args.rtx_report.parent / graph_info["graph"]
+                if digest(graph_path) != graph_info["graph_sha256"]:
+                    raise ValueError(f"Graph hash differs from the RTX report for {graph_path}")
+                graph = onnx.load(graph_path, load_external_data=False)
+                rtx_setup = setup["rtx"][str(batch)] = {"graph_sha256": graph_info["graph_sha256"]}
+                runners["rtx"][batch] = open_rtx_runner(
+                    graph_path, graph.graph.input[0].name, batch, FAMILY, rtx_setup, output_dir=args.output
                 )
-                session.prepare(shape)
-                runner = Runner(DeviceSession(session), dtype)
-                runner.measure(torch.zeros(shape))
-                runners[name][batch] = runner
-                setup[name][str(batch)] = session.get_session_info()
-        results = measure_pages(sources, runners, args.reference_report.parent, args.output, args.rounds)
+            for build, library in libraries.items():
+                for precision, dtype in PRECISIONS.items():
+                    name = f"{build}-{precision}"
+                    options = SessionOptions(precision=precision, dll_path=library, kernel_options=kernel_options)
+                    session = stack.enter_context(InferenceSession(args.model, options))
+                    session.prepare(shape)
+                    runner = Runner(DeviceSession(session), dtype)
+                    runner.measure(torch.zeros(shape))
+                    runners[name][batch] = runner
+                    setup[name][str(batch)] = session.get_session_info()
+        results = measure_pages(sources, runners, args.reference_report.parent, args.output, rounds)
     report = {
         "config": config,
         "device": torch.cuda.get_device_name(),
@@ -167,6 +182,8 @@ def main() -> None:
         "setup": setup,
         "results": results,
     }
+    if args.control_library is not None:
+        report["control_library_sha256"] = digest(args.control_library)
     path = args.output / "report.json"
     path.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     print(f"Wrote {path}", flush=True)

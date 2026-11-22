@@ -85,6 +85,17 @@ __device__ __forceinline__ void load8(const half* p, float* out) {
     }
 }
 
+__device__ __forceinline__ void load4(const half* p, float* out) {
+    const uint2 raw = *reinterpret_cast<const uint2*>(p);
+    const half2* pairs = reinterpret_cast<const half2*>(&raw);
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const float2 value = __half22float2(pairs[i]);
+        out[2 * i] = value.x;
+        out[2 * i + 1] = value.y;
+    }
+}
+
 __device__ __forceinline__ void store8(half* p, const float* in) {
     uint4 raw;
     half2* pairs = reinterpret_cast<half2*>(&raw);
@@ -502,6 +513,65 @@ extern "C" __global__ void inception_gate(half* out, const half* projected, cons
 #pragma unroll
     for (int k = 0; k < 8; ++k) result[k] = mish(g[k]) * value[k];
     store8(out + size_t(pixel) * hidden + ch, result);
+}
+
+// At C=32 the 48 gated channels are [36 identity | 4 square | 4 row | 4 column].
+// The last two eight-channel vectors can use fixed four-channel branch loads.
+extern "C" __global__ void inception_gate32_128(
+    half* out, const half* projected, const float* square, const float* square_bias,
+    const float* row, const float* row_bias, const float* column, const float* column_bias, int total) {
+    constexpr int side = 128, hidden = 48, stride = 2 * hidden;
+    const int index = grid_index();
+    if (index >= total) return;
+    const int vector = index % (hidden / 8), pixel = index / (hidden / 8);
+    const int ch = vector * 8, x = pixel % side, y = pixel / side % side;
+    const half* here = projected + size_t(pixel) * stride;
+    float gates[8], value[8];
+    load8(here + ch, gates);
+    if (vector < 5) {
+        load8(here + hidden + ch, value);
+        if (vector == 4) {
+#pragma unroll
+            for (int k = 0; k < 4; ++k) value[k + 4] = square_bias[k];
+            const half* center = here + hidden + 36;
+            for (int ky = 0; ky < 3; ++ky) {
+                if (unsigned(y + ky - 1) >= side) continue;
+                for (int kx = 0; kx < 3; ++kx) {
+                    if (unsigned(x + kx - 1) >= side) continue;
+                    float sample[4];
+                    load4(center + ((ky - 1) * side + kx - 1) * stride, sample);
+#pragma unroll
+                    for (int k = 0; k < 4; ++k)
+                        value[k + 4] = fmaf(square[k * 9 + ky * 3 + kx], sample[k], value[k + 4]);
+                }
+            }
+        }
+    } else {
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            value[k] = row_bias[k];
+            value[k + 4] = column_bias[k];
+        }
+        const half* bands = here + hidden + 40;
+        for (int tap = 0; tap < 11; ++tap) {
+            const int offset = tap - 5;
+            if (unsigned(x + offset) < side) {
+                float sample[4];
+                load4(bands + offset * stride, sample);
+#pragma unroll
+                for (int k = 0; k < 4; ++k) value[k] = fmaf(row[k * 11 + tap], sample[k], value[k]);
+            }
+            if (unsigned(y + offset) < side) {
+                float sample[4];
+                load4(bands + offset * side * stride + 4, sample);
+#pragma unroll
+                for (int k = 0; k < 4; ++k) value[k + 4] = fmaf(column[k * 11 + tap], sample[k], value[k + 4]);
+            }
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < 8; ++k) value[k] *= mish(gates[k]);
+    store8(out + size_t(pixel) * hidden + ch, value);
 }
 
 // Linear attention, part one. qkv is FP32 [image, token, 2K + V]. A block
