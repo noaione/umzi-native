@@ -16,6 +16,7 @@
 #define UMZI_BUILD
 #include "gaterv2_images.h"
 #include "../../common/cuda_module.h"
+#include "../../common/cuda_plan_cache.h"
 #include "../../runtime/binary.h"
 #include "../../runtime/kernel.h"
 
@@ -30,17 +31,43 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
-#include <tuple>
 #include <vector>
 
 namespace {
 using umzi::AllocationError;
 using Clock = std::chrono::steady_clock;
 constexpr int threads = 256;
-constexpr size_t scratch_bytes = size_t(64) << 20;
+constexpr uint64_t default_workspace_mib = 64;
+constexpr uint64_t missing = ~uint64_t(0);
 constexpr size_t architecture_words = 16;
 constexpr uint32_t max_levels = 4;
 constexpr float bad_timing = 1e30f;
+// Bump when the host changes plan keys, descriptor semantics, or the choice format.
+constexpr uint32_t plan_schema = 1;
+
+// IEEE binary16 with round-to-nearest-even, matching __float2half_rn.
+uint16_t to_half(float value) {
+    uint32_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const uint32_t sign = (bits >> 16) & 0x8000u;
+    const uint32_t magnitude = bits & 0x7fffffffu;
+    if (magnitude >= 0x7f800000u) return uint16_t(sign | 0x7c00u | (magnitude > 0x7f800000u ? 0x200u : 0));
+    if (magnitude >= 0x477ff000u) return uint16_t(sign | 0x7c00u);  // Rounds to infinity.
+    if (magnitude < 0x38800000u) {  // Subnormal or zero in binary16.
+        if (magnitude < 0x33000000u) return uint16_t(sign);
+        const uint32_t exponent = magnitude >> 23;
+        const uint32_t mantissa = (magnitude & 0x7fffffu) | 0x800000u;
+        const uint32_t shift = 126 - exponent;  // 14 to 24 bits.
+        uint32_t result = mantissa >> shift;
+        const uint32_t rest = mantissa & ((1u << shift) - 1), halfway = 1u << (shift - 1);
+        if (rest > halfway || (rest == halfway && (result & 1))) ++result;
+        return uint16_t(sign | result);
+    }
+    uint32_t result = (magnitude - 0x38000000u) >> 13;
+    const uint32_t rest = magnitude & 0x1fffu;
+    if (rest > 0x1000u || (rest == 0x1000u && (result & 1))) ++result;
+    return uint16_t(sign | result);
+}
 
 double milliseconds_since(Clock::time_point start) {
     return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
@@ -288,8 +315,12 @@ class GateRV2Session final : public umzi::KernelSession {
 public:
     Architecture arch;
     std::unique_ptr<Network> network;
-    std::vector<uint64_t> offsets;
-    size_t weight_bytes = 0;
+    // Packed device offsets of each parameter in the FP32 and FP16 copies, or
+    // missing. Only small parameters keep FP32; projections and filters are FP16.
+    std::vector<uint64_t> offsets32, offsets16;
+    size_t weight_bytes = 0, weight32_bytes = 0, weight16_bytes = 0;
+    bool tune_plans = true;
+    uint64_t workspace_limit = default_workspace_mib << 20;
     bool use_graph = false;
     bool fp16 = false;
     CUdevice device = 0;
@@ -302,14 +333,21 @@ public:
     cudnnHandle_t cudnn = nullptr;
     cublasLtHandle_t blas = nullptr;
     bool pending = false;
+    std::filesystem::path cache_dir;
+    umzi::Digest cache_environment{}, plan_key{};
+    std::string cache_environment_error;
 
     // State for the prepared padded shape.
     Shape prepared{};
-    std::map<std::tuple<int, int, int, int, int>, std::unique_ptr<Convolution>> convolutions;
-    std::map<std::tuple<int, int, int, int, int>, std::unique_ptr<Gemm>> gemms;
-    std::array<CUdeviceptr, 4> work{};
+    umzi::CudaPlanCache<umzi::gaterv2_id, plan_schema> plan_cache;
+    std::map<umzi::PlanShape, std::unique_ptr<Convolution>> convolutions;
+    std::map<umzi::PlanShape, std::unique_ptr<Gemm>> gemms;
+    // work[0]: RMSNorm output; work[1]: expansions, 3x3 outputs and fc2
+    // outputs; work[2]: gated and concatenated features. Sized per role.
+    std::array<CUdeviceptr, 3> work{};
+    std::array<uint64_t, 3> work_elements{};
     std::vector<CUdeviceptr> skips;
-    CUdeviceptr latent_x = 0, decoder_x = 0, qkv = 0, key_sum = 0, value_sum = 0, matrix = 0;
+    CUdeviceptr latent_x = 0, qkv = 0, key_sum = 0, value_sum = 0, matrix = 0;
     CUdeviceptr key_part = 0, value_part = 0, matrix_part = 0, local_part = 0, multiplier = 0;
     CUdeviceptr stage_in = 0, stage_out = 0, scratch = 0;
     size_t activation_bytes = 0, workspace_bytes = 0, io_bytes = 0;
@@ -326,7 +364,7 @@ public:
         if (options.precision != UMZI_MIXED && options.precision != UMZI_FP16)
             throw std::runtime_error("Unsupported GateRV2 session precision");
         fp16 = options.precision == UMZI_FP16;
-        if (options.kernel_option_count) throw std::runtime_error("GateRV2 sessions take no kernel options");
+        parse_options(options);
         use_graph = (options.flags & UMZI_CUDA_GRAPH) != 0;
         arch = parse_architecture(package.section(1));
         network = std::make_unique<Network>(arch);
@@ -345,41 +383,142 @@ public:
             auto stored = reader.number<uint64_t>();
             if (stored != count || offset % 256 || offset < end || offset > data.size()
                 || count > (data.size() - offset) / 4)
-                throw std::runtime_error("Invalid GateRV2 parameter " + std::to_string(offsets.size()));
-            offsets.push_back(offset);
+                throw std::runtime_error("Invalid GateRV2 parameter " + std::to_string(offsets32.size()));
+            offsets32.push_back(offset);
             end = offset + count * 4;
         }
         if (end != data.size()) throw std::runtime_error("Unexpected trailing GateRV2 weight data");
         weight_bytes = data.size();
+        std::vector<uint64_t> package_offsets;
+        package_offsets.swap(offsets32);
 
         CHECK(cuInit(0));
         CHECK(cuDeviceGet(&device, options.device));
         CHECK(cuDevicePrimaryCtxRetain(&context, device));
         ContextScope scope(context);
-        umzi::load_kernel_module(device, module, gaterv2_images::embedded_cubins, gaterv2_images::embedded_ptx);
+        const auto& image = umzi::load_kernel_module(
+            device, module, gaterv2_images::embedded_cubins, gaterv2_images::embedded_ptx);
         for (int i = 0; i < KernelCount; ++i) CHECK(cuModuleGetFunction(&functions[i], module, kernel_names[i]));
         CHECK(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
         CHECK(cuEventCreate(&completed, CU_EVENT_DISABLE_TIMING));
         CHECK(cudnnCreate(&cudnn));
         CHECK(cublasLtCreate(&blas));
-        CHECK(cuMemAlloc(&weights, weight_bytes));
-        CHECK(cuMemcpyHtoD(weights, data.data(), weight_bytes));
-        upload_half_weights(data);
+        upload_weights(data, package_offsets);
+        initialize_cache(options.cache_dir, package.digest, image);
     }
 
-    // The FP16 copy keeps every parameter at half its FP32 byte offset. The 3x3
-    // down and up filters become KRSC for NHWC cuDNN, and the up filter's
-    // outputs are reordered subpixel-major for shuffle_concat.
-    void upload_half_weights(std::string_view data) {
+    void initialize_cache(const char* directory, const umzi::Digest& model, const umzi::KernelImage& image) {
+        if (!directory || !*directory) return;
+        try {
+            cache_dir = std::filesystem::u8path(directory);
+            umzi::Sha256 hash;
+            hash.add(umzi::plan_format_version);
+            hash.add(umzi::gaterv2_id);
+            hash.add(plan_schema);
+            hash.add(sizeof(void*));
+            hash.add(sizeof(cublasLtMatmulAlgo_t));
+            hash.add(model);
+            hash.add(image.data, image.size);
+            hash.add(static_cast<uint32_t>(fp16));
+            hash.add(static_cast<uint32_t>(tune_plans));
+            hash.add(workspace_limit);
+            CUuuid uuid{};
+            CHECK(cuDeviceGetUuid(&uuid, device));
+            hash.add(uuid);
+            umzi::hash_driver_version(hash);
+            hash.add(cudnnGetVersion());
+            hash.add(cublasLtGetVersion());
+            cache_environment = hash.finish();
+        } catch (const std::exception& error) {
+            cache_environment_error = error.what();
+        }
+    }
+
+    void load_plan_cache(Shape shape) {
+        try {
+            if (!cache_environment_error.empty()) throw std::runtime_error(cache_environment_error);
+            if (cache_dir.empty()) return;
+            umzi::Sha256 hash;
+            hash.add(cache_environment);
+            hash.add(std::array<int, 3>{shape.n, shape.h, shape.w});
+            plan_key = hash.finish();
+            plan_cache.open(cache_dir, "gaterv2", plan_key);
+        } catch (const std::exception& error) {
+            plan_cache.unavailable(error);
+        }
+    }
+
+    // Kernel options; each value is validated and duplicates are rejected.
+    //   tune_plans (0 or 1, default 1): time cuBLASLt and cuDNN candidates when a
+    //     shape is prepared, instead of taking the first heuristic choice.
+    //   workspace_mib (0 to 1024, default 64): workspace the candidates may use.
+    //     Prepare allocates it temporarily, then keeps only what the chosen plans need.
+    void parse_options(const UmziSessionOptions& options) {
+        bool seen_tune = false, seen_workspace = false;
+        for (uint32_t i = 0; i < options.kernel_option_count; ++i) {
+            const auto& option = options.kernel_options[i];
+            const std::string name = option.name ? option.name : "";
+            if (name == "tune_plans" && !seen_tune) {
+                if (option.value != 0 && option.value != 1)
+                    throw std::runtime_error("GateRV2 option tune_plans must be 0 or 1");
+                tune_plans = option.value != 0;
+                seen_tune = true;
+            } else if (name == "workspace_mib" && !seen_workspace) {
+                if (option.value < 0 || option.value > 1024)
+                    throw std::runtime_error("GateRV2 option workspace_mib must be between 0 and 1024");
+                workspace_limit = uint64_t(option.value) << 20;
+                seen_workspace = true;
+            } else if (name == "tune_plans" || name == "workspace_mib") {
+                throw std::runtime_error("Duplicate GateRV2 option: " + name);
+            } else {
+                throw std::runtime_error("Unknown GateRV2 option: " + name + " (expected tune_plans or workspace_mib)");
+            }
+        }
+    }
+
+    // Which copies each parameter needs: 1 = FP32 (read by the CUDA kernels),
+    // 2 = FP16 (cuBLASLt projections with their biases, and cuDNN filters).
+    std::vector<uint8_t> parameter_use() const {
+        const auto& net = *network;
+        std::vector<uint8_t> use(net.counts.size(), 0);
+        auto fp32 = [&](std::initializer_list<size_t> items) { for (auto i : items) use[i] |= 1; };
+        auto fp16 = [&](std::initializer_list<size_t> items) { for (auto i : items) use[i] |= 2; };
+        fp32({net.in_w, net.in_b, net.out_w, net.out_b});
+        auto meta = [&](const Meta& m) {
+            fp32({m.norm_scale, m.norm_offset, m.local_w, m.local_b, m.sca_w, m.sca_b, m.gamma0, m.glob_scale,
+                  m.glob_offset, m.square_w, m.square_b, m.row_w, m.row_b, m.column_w, m.column_b, m.gamma1});
+            fp16({m.expand_w, m.expand_b, m.fc1_w, m.fc1_b, m.fc2_w, m.fc2_b});
+        };
+        for (const auto& level : net.encoder) {
+            for (const auto& m : level.blocks) meta(m);
+            fp16({level.scale_w});
+        }
+        for (const auto& block : net.latent) {
+            fp32({block.scale, block.offset, block.qkv_b});
+            fp16({block.fc1_w, block.fc1_b, block.qkv_w, block.fc2_w, block.fc2_b});
+        }
+        for (const auto& level : net.decoder) {
+            fp16({level.scale_w, level.shor_w, level.shor_b});
+            for (const auto& m : level.blocks) meta(m);
+        }
+        return use;
+    }
+
+    // Uploads the FP32 and FP16 parameter copies, each packed at 256-byte
+    // offsets. The 3x3 down and up filters become KRSC for NHWC cuDNN, and the
+    // up filter's outputs are reordered subpixel-major for shuffle_concat.
+    void upload_weights(std::string_view data, const std::vector<uint64_t>& package_offsets) {
+        const auto& counts = network->counts;
         std::vector<float> values(weight_bytes / 4);
         std::memcpy(values.data(), data.data(), weight_bytes);
         auto to_krsc = [&](size_t index, int outputs, int inputs, auto output_row) {
-            float* filter = values.data() + offsets[index] / 4;
-            std::vector<float> original(filter, filter + size_t(outputs) * inputs * 9);
+            float* filter_values = values.data() + package_offsets[index] / 4;
+            std::vector<float> original(filter_values, filter_values + size_t(outputs) * inputs * 9);
             for (int o = 0; o < outputs; ++o)
                 for (int i = 0; i < inputs; ++i)
                     for (int t = 0; t < 9; ++t)
-                        filter[(size_t(output_row(o)) * 9 + t) * inputs + i] = original[(size_t(o) * inputs + i) * 9 + t];
+                        filter_values[(size_t(output_row(o)) * 9 + t) * inputs + i]
+                            = original[(size_t(o) * inputs + i) * 9 + t];
         };
         for (const auto& level : network->encoder)
             to_krsc(level.scale_w, level.dim / 2, level.dim, [](int o) { return o; });
@@ -387,19 +526,30 @@ public:
             const int half = level.dim, dim = 2 * half;
             to_krsc(level.scale_w, 2 * dim, dim, [half](int o) { return (o % 4) * half + o / 4; });
         }
-        CUdeviceptr staging = 0;
-        CHECK(cuMemAlloc(&staging, weight_bytes));
-        try {
-            CHECK(cuMemcpyHtoD(staging, values.data(), weight_bytes));
-            CHECK(cuMemAlloc(&half_weights, weight_bytes / 2));
-            target = stream;
-            elementwise(WeightsToHalf, int(weight_bytes / 4), half_weights, staging);
-            CHECK(cuStreamSynchronize(stream));
-        } catch (...) {
-            cuMemFree(staging);
-            throw;
+        const auto use = parameter_use();
+        offsets32.assign(counts.size(), missing);
+        offsets16.assign(counts.size(), missing);
+        std::vector<float> packed32;
+        std::vector<uint16_t> packed16;
+        for (size_t i = 0; i < counts.size(); ++i) {
+            const float* source = values.data() + package_offsets[i] / 4;
+            if (use[i] & 1) {
+                packed32.resize((packed32.size() + 63) / 64 * 64);
+                offsets32[i] = packed32.size() * 4;
+                packed32.insert(packed32.end(), source, source + counts[i]);
+            }
+            if (use[i] & 2) {
+                packed16.resize((packed16.size() + 127) / 128 * 128);
+                offsets16[i] = packed16.size() * 2;
+                for (uint64_t k = 0; k < counts[i]; ++k) packed16.push_back(to_half(source[k]));
+            }
         }
-        CHECK(cuMemFree(staging));
+        weight32_bytes = packed32.size() * 4;
+        weight16_bytes = packed16.size() * 2;
+        CHECK(cuMemAlloc(&weights, std::max<size_t>(weight32_bytes, 256)));
+        CHECK(cuMemAlloc(&half_weights, std::max<size_t>(weight16_bytes, 256)));
+        CHECK(cuMemcpyHtoD(weights, packed32.data(), weight32_bytes));
+        CHECK(cuMemcpyHtoD(half_weights, packed16.data(), weight16_bytes));
     }
 
     ~GateRV2Session() override {
@@ -419,8 +569,14 @@ public:
         cuDevicePrimaryCtxRelease(device);
     }
 
-    CUdeviceptr param(size_t index) const { return weights + offsets[index]; }
-    CUdeviceptr filter(size_t index) const { return half_weights + offsets[index] / 2; }
+    CUdeviceptr param(size_t index) const {
+        if (offsets32[index] == missing) throw std::runtime_error("GateRV2 parameter has no FP32 copy");
+        return weights + offsets32[index];
+    }
+    CUdeviceptr filter(size_t index) const {
+        if (offsets16[index] == missing) throw std::runtime_error("GateRV2 parameter has no FP16 copy");
+        return half_weights + offsets16[index];
+    }
     uint64_t io_element() const { return fp16 ? 2 : 4; }
 
     // ---- Shapes ----
@@ -443,7 +599,8 @@ public:
         return {shape.n, (shape.h + align - 1) / align * align, (shape.w + align - 1) / align * align};
     }
 
-    // Elements of the largest work buffer: three base widths at full resolution.
+    // Elements of the largest tensor, the full-resolution fc1 output of three
+    // base widths, which bounds the kernels' 32-bit indexing.
     uint64_t total_elements(Shape p) const {
         const uint64_t total = uint64_t(p.n) * uint64_t(p.h) * uint64_t(p.w) * 3 * arch.base;
         if (total > uint64_t(INT_MAX) - 256)
@@ -461,6 +618,7 @@ public:
         graph = nullptr;
         convolutions.clear();
         gemms.clear();
+        plan_cache = {};
         for (auto& buffer : work) {
             if (buffer) cuMemFree(buffer);
             buffer = 0;
@@ -468,13 +626,14 @@ public:
         for (auto buffer : skips)
             if (buffer) cuMemFree(buffer);
         skips.clear();
-        for (auto* buffer : {&latent_x, &decoder_x, &qkv, &key_sum, &value_sum, &matrix, &key_part, &value_part,
+        for (auto* buffer : {&latent_x, &qkv, &key_sum, &value_sum, &matrix, &key_part, &value_part,
                              &matrix_part, &local_part, &multiplier, &stage_in, &stage_out, &scratch}) {
             if (*buffer) cuMemFree(*buffer);
             *buffer = 0;
         }
         prepared = {};
         activation_bytes = workspace_bytes = io_bytes = 0;
+        work_elements = {};
         setup_ms = {};
         timed_plans = 0;
     }
@@ -500,8 +659,24 @@ public:
         try {
             auto start = Clock::now();
             const uint64_t n = uint64_t(p.n), pixels = uint64_t(p.h) * uint64_t(p.w);
-            const uint64_t elements = total_elements(p);
-            for (auto& buffer : work) allocate(buffer, elements * 2);
+            total_elements(p);
+            // Each work buffer holds the largest tensor of its role at any level.
+            work_elements = {};
+            auto need = [&](int slot, uint64_t channels, uint64_t level_pixels) {
+                work_elements[slot] = std::max(work_elements[slot], n * channels * level_pixels);
+            };
+            for (uint32_t level = 0; level < arch.levels; ++level) {
+                const uint64_t dim = uint64_t(arch.dim(level)), level_pixels = pixels >> (2 * level);
+                need(0, dim, level_pixels);
+                need(1, 3 * dim, level_pixels);      // fc1 output; also expansion, 3x3 outputs and fc2.
+                need(2, 2 * dim, level_pixels);      // Decoder concatenation; also the gated features.
+            }
+            const uint64_t latent_tokens = pixels >> (2 * arch.levels), latent_dim = uint64_t(arch.latent_dim());
+            need(0, latent_dim, latent_tokens);
+            need(1, 3 * latent_dim, latent_tokens);
+            need(2, 3 * latent_dim / 2, latent_tokens);
+            need(1, 2 * latent_dim, latent_tokens);  // The first up convolution.
+            for (int i = 0; i < 3; ++i) allocate(work[i], work_elements[i] * 2);
             for (uint32_t level = 0; level < arch.levels; ++level) {
                 skips.push_back(0);
                 allocate(skips.back(), n * uint64_t(arch.dim(level)) * (pixels >> (2 * level)) * 2);
@@ -510,7 +685,6 @@ public:
             const uint64_t l = uint64_t(arch.latent_dim()), k = uint64_t(arch.keys()), t = uint64_t(tokens());
             const uint64_t c = uint64_t(chunks());
             allocate(latent_x, n * t * l * 2);
-            allocate(decoder_x, n * pixels * arch.base * 2);
             allocate(qkv, n * t * (2 * k + l) * 4);
             allocate(key_sum, n * k * 4);
             allocate(value_sum, n * l * 4);
@@ -531,19 +705,26 @@ public:
             io_bytes = n * 3 * pixels * io_element();
             CHECK(cuMemAlloc(&stage_in, io_bytes));
             CHECK(cuMemAlloc(&stage_out, io_bytes));
-            CHECK(cuMemAlloc(&scratch, scratch_bytes));
-            for (auto buffer : work) CHECK(cuMemsetD8Async(buffer, 0, elements * 2, stream));
+            // Candidate plans may use up to the workspace limit while they are timed.
+            if (workspace_limit) CHECK(cuMemAlloc(&scratch, workspace_limit));
+            for (int i = 0; i < 3; ++i) CHECK(cuMemsetD8Async(work[i], 0, work_elements[i] * 2, stream));
             CHECK(cuMemsetD8Async(stage_in, 0, io_bytes, stream));
             request = p;
             setup_ms[0] = milliseconds_since(start);
 
-            // The first pass times and records every cuBLASLt and cuDNN plan.
+            // The first pass verifies cached plans and selects any missing plans.
             start = Clock::now();
+            load_plan_cache(p);
             CHECK(cudnnSetStream(cudnn, stream));
             input_rgb = stage_in;
             output_rgb = stage_out;
             forward(stream);
             CHECK(cuStreamSynchronize(stream));
+            plan_cache.save(plan_key);
+            // Keep only the workspace the chosen plans use.
+            if (scratch) CHECK(cuMemFree(scratch));
+            scratch = 0;
+            if (workspace_bytes) CHECK(cuMemAlloc(&scratch, workspace_bytes));
             setup_ms[1] = milliseconds_since(start);
 
             start = Clock::now();
@@ -610,7 +791,8 @@ public:
     // other projections write FP16 with an FP16 bias.
     void gemm(CUdeviceptr out, CUdeviceptr in, int input_stride, int cin, int cout, int rows, size_t weight,
               size_t bias, bool fp32_output = false) {
-        auto& plan = gemms[std::make_tuple(cin, cout, rows, input_stride, int(fp32_output))];
+        const umzi::PlanShape key{cin, cout, rows, input_stride, int(fp32_output)};
+        auto& plan = gemms[key];
         const CUdeviceptr bias_pointer = fp32_output ? param(bias) : filter(bias);
         if (!plan) {
             plan = std::make_unique<Gemm>();
@@ -628,12 +810,33 @@ public:
             CHECK(cublasLtMatrixLayoutCreate(&p.weight, CUDA_R_16F, cin, cout, cin));
             CHECK(cublasLtMatrixLayoutCreate(&p.input, CUDA_R_16F, cin, rows, input_stride));
             CHECK(cublasLtMatrixLayoutCreate(&p.output, fp32_output ? CUDA_R_32F : CUDA_R_16F, cout, rows, cout));
+            if (auto saved = plan_cache.gemms.find(key); saved != plan_cache.gemms.end()) {
+                const auto& choice = saved->second;
+                CHECK(cublasLtMatmulDescSetAttribute(
+                    p.desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias_pointer, sizeof(bias_pointer)));
+                cublasLtMatmulHeuristicResult_t checked{};
+                if (choice.workspace <= workspace_limit
+                    && cublasLtMatmulAlgoCheck(blas, p.desc, p.weight, p.input, p.output, p.output,
+                                               &choice.algorithm, &checked) == CUBLAS_STATUS_SUCCESS
+                    && checked.state == CUBLAS_STATUS_SUCCESS && checked.workspaceSize == choice.workspace) {
+                    p.algorithm = choice.algorithm;
+                    p.workspace = checked.workspaceSize;
+                    if (run_gemm(p, out, in, weight, bias_pointer) == CUBLAS_STATUS_SUCCESS) {
+                        workspace_bytes = std::max(workspace_bytes, p.workspace);
+                        return;
+                    }
+                }
+                const CUdeviceptr no_bias_pointer = 0;
+                CHECK(cublasLtMatmulDescSetAttribute(
+                    p.desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &no_bias_pointer, sizeof(no_bias_pointer)));
+            }
+            plan_cache.record_tuning();
             cublasLtMatmulPreference_t preference = nullptr;
             CHECK(cublasLtMatmulPreferenceCreate(&preference));
             std::unique_ptr<std::remove_pointer_t<cublasLtMatmulPreference_t>,
                             decltype(&cublasLtMatmulPreferenceDestroy)> owner(preference,
                                                                               cublasLtMatmulPreferenceDestroy);
-            uint64_t limit = scratch_bytes;
+            uint64_t limit = workspace_limit;
             CHECK(cublasLtMatmulPreferenceSetAttribute(preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &limit,
                                                        sizeof(limit)));
             std::array<cublasLtMatmulHeuristicResult_t, 8> results{};
@@ -645,7 +848,11 @@ public:
             float best = bad_timing;
             int chosen = -1;
             for (int i = 0; i < found; ++i) {
-                if (results[i].state != CUBLAS_STATUS_SUCCESS) continue;
+                if (results[i].state != CUBLAS_STATUS_SUCCESS || results[i].workspaceSize > workspace_limit) continue;
+                if (!tune_plans) {
+                    chosen = i;  // The heuristic lists its preferred plan first.
+                    break;
+                }
                 p.algorithm = results[i].algo;
                 p.workspace = results[i].workspaceSize;
                 const float elapsed = events.measure(target, [&] {
@@ -660,7 +867,8 @@ public:
             p.algorithm = results[chosen].algo;
             p.workspace = results[chosen].workspaceSize;
             workspace_bytes = std::max(workspace_bytes, p.workspace);
-            ++timed_plans;
+            plan_cache.gemms.insert_or_assign(key, umzi::GemmChoice{p.algorithm, p.workspace});
+            if (tune_plans) ++timed_plans;
         }
         CHECK(run_gemm(*plan, out, in, weight, bias_pointer));
     }
@@ -682,7 +890,8 @@ public:
 
     // A 3x3 NHWC convolution without bias.
     void conv3x3(CUdeviceptr out, CUdeviceptr in, int cin, int cout, int h, int w, size_t weight) {
-        auto& plan = convolutions[std::make_tuple(cin, cout, h, w, prepared.n)];
+        const umzi::PlanShape key{cin, cout, h, w, prepared.n};
+        auto& plan = convolutions[key];
         const float one = 1, zero = 0;
         auto run = [&](const Convolution& p) {
             return cudnnConvolutionForward(cudnn, &one, p.input, reinterpret_cast<void*>(in), p.filter,
@@ -702,6 +911,26 @@ public:
             CHECK(cudnnSetFilter4dDescriptor(p.filter, CUDNN_DATA_HALF, CUDNN_TENSOR_NHWC, cout, cin, 3, 3));
             CHECK(cudnnSetConvolution2dDescriptor(p.conv, 1, 1, 1, 1, 1, 1, CUDNN_CROSS_CORRELATION,
                                                   fp16 ? CUDNN_DATA_HALF : CUDNN_DATA_FLOAT));
+            if (auto saved = plan_cache.convolutions.find(key); saved != plan_cache.convolutions.end()) {
+                const auto& choice = saved->second;
+                const auto algo = static_cast<cudnnConvolutionFwdAlgo_t>(choice.algorithm);
+                const auto math = static_cast<cudnnMathType_t>(choice.math);
+                size_t required = 0;
+                if (choice.algorithm < CUDNN_CONVOLUTION_FWD_ALGO_COUNT
+                    && choice.math <= CUDNN_FMA_MATH && choice.workspace <= workspace_limit
+                    && cudnnSetConvolutionMathType(p.conv, math) == CUDNN_STATUS_SUCCESS
+                    && cudnnGetConvolutionForwardWorkspaceSize(cudnn, p.input, p.filter, p.conv, p.output,
+                                                               algo, &required) == CUDNN_STATUS_SUCCESS
+                    && required == choice.workspace) {
+                    p.algorithm = algo;
+                    p.workspace = required;
+                    if (run(p) == CUDNN_STATUS_SUCCESS) {
+                        workspace_bytes = std::max(workspace_bytes, p.workspace);
+                        return;
+                    }
+                }
+            }
+            plan_cache.record_tuning();
             CHECK(cudnnSetConvolutionMathType(p.conv, CUDNN_TENSOR_OP_MATH));
             std::array<cudnnConvolutionFwdAlgoPerf_t, CUDNN_CONVOLUTION_FWD_ALGO_COUNT> results{};
             int count = 0;
@@ -712,7 +941,12 @@ public:
             cudnnConvolutionFwdAlgoPerf_t chosen{};
             for (int i = 0; i < count; ++i) {
                 const auto& candidate = results[i];
-                if (candidate.status != CUDNN_STATUS_SUCCESS || candidate.memory > scratch_bytes) continue;
+                if (candidate.status != CUDNN_STATUS_SUCCESS || candidate.memory > workspace_limit) continue;
+                if (!tune_plans) {
+                    chosen = candidate;  // cuDNN orders its heuristic results by expected speed.
+                    best = 0;
+                    break;
+                }
                 CHECK(cudnnSetConvolutionMathType(p.conv, candidate.mathType));
                 p.algorithm = candidate.algo;
                 p.workspace = candidate.memory;
@@ -727,7 +961,9 @@ public:
             p.algorithm = chosen.algo;
             p.workspace = chosen.memory;
             workspace_bytes = std::max(workspace_bytes, p.workspace);
-            ++timed_plans;
+            plan_cache.convolutions.insert_or_assign(
+                key, umzi::ConvChoice{uint32_t(chosen.algo), uint32_t(chosen.mathType), p.workspace});
+            if (tune_plans) ++timed_plans;
         }
         CHECK(run(*plan));
     }
@@ -752,7 +988,9 @@ public:
     // One MetaGated block on x, whose local norm is already in work[0]. It
     // leaves x updated and, when next is present, its norm in work[0].
     void meta(const Meta& m, CUdeviceptr x, int h, int w, Next next) {
-        const auto [norm, expanded, local, last] = work;
+        // fc2 reads the gated features and writes over the consumed fc1 output.
+        const auto [norm, expanded, local] = work;
+        const CUdeviceptr last = expanded;
         const int n = prepared.n, dim = m.dim, pixels = h * w, rows = n * pixels, hidden = 3 * dim / 2;
         gemm(expanded, norm, dim, dim, 2 * dim, rows, m.expand_w, m.expand_b);
         const auto grid = gate_grid(dim, h, w, n);
@@ -770,7 +1008,8 @@ public:
     }
 
     void latent(const Latent& block, Next next) {
-        const auto [norm, projected, gated, last] = work;
+        const auto [norm, projected, gated] = work;
+        const CUdeviceptr last = projected;
         const int n = prepared.n, dim = arch.latent_dim(), keys = arch.keys(), t = tokens();
         const int rows = n * t, hidden = 3 * dim / 2, stride = 2 * keys + dim;
         gemm(projected, norm, dim, dim, 2 * hidden, rows, block.fc1_w, block.fc1_b);
@@ -841,19 +1080,20 @@ public:
         for (uint32_t i = 0; i < arch.levels; ++i) {
             const auto& item = net.decoder[i];
             const int half = item.dim, dim = 2 * half, h = low_h << i, w = low_w << i;
-            const CUdeviceptr source = i ? decoder_x : latent_x;
+            // The decoder state replaces the skip it consumes, which has the same shape.
+            const CUdeviceptr source = i ? skips[arch.levels - i] : latent_x;
+            const CUdeviceptr skip = skips[arch.levels - 1 - i];
             conv3x3(work[1], source, dim, 2 * dim, h, w, item.scale_w);
             const int pixels = 4 * h * w;
-            elementwise(ShuffleConcat, n * pixels * (dim / 8), work[2], work[1], skips[arch.levels - 1 - i], half,
-                        2 * h, 2 * w);
-            gemm(decoder_x, work[2], dim, dim, half, n * pixels, item.shor_w, item.shor_b);
+            elementwise(ShuffleConcat, n * pixels * (dim / 8), work[2], work[1], skip, half, 2 * h, 2 * w);
+            gemm(skip, work[2], dim, dim, half, n * pixels, item.shor_w, item.shor_b);
             const Next first = first_norm(item);
             if (first.present)
-                pixel_norm(NormCopy, CUdeviceptr(0), norm, decoder_x, CUdeviceptr(0), CUdeviceptr(0), first.scale,
+                pixel_norm(NormCopy, CUdeviceptr(0), norm, skip, CUdeviceptr(0), CUdeviceptr(0), first.scale,
                            first.offset, half, pixels, 2 * w);
-            blocks(item, decoder_x, 2 * h, 2 * w, {});
+            blocks(item, skip, 2 * h, 2 * w, {});
         }
-        elementwise(fp16 ? OutputF16 : OutputF32, n * h0 * w0, output_rgb, decoder_x, param(net.out_w),
+        elementwise(fp16 ? OutputF16 : OutputF32, n * h0 * w0, output_rgb, skips[0], param(net.out_w),
                     param(net.out_b), input_rgb, base, h0, w0, height, width);
     }
 
@@ -962,24 +1202,28 @@ public:
     UmziSessionInfo session_info() const override {
         UmziSessionInfo result{};
         result.struct_size = sizeof(result);
-        result.cache_status = UMZI_CACHE_DISABLED;
-        result.buffer_bytes[0] = weight_bytes + weight_bytes / 2;
+        result.cache_status = plan_cache.status;
+        result.buffer_bytes[0] = weight32_bytes + weight16_bytes;
         if (prepared.n) {
             result.prepared_input = {4, {uint32_t(prepared.n), 3, uint32_t(prepared.h), uint32_t(prepared.w)}};
             result.buffer_bytes[1] = activation_bytes;
-            result.buffer_bytes[2] = scratch_bytes;
+            result.buffer_bytes[2] = workspace_bytes;
             result.buffer_bytes[3] = 2 * io_bytes;
             std::copy(setup_ms.begin(), setup_ms.end(), result.shape_setup_ms);
         }
         return result;
     }
 
-    uint32_t diagnostic_count() const override { return 2; }
+    uint32_t diagnostic_count() const override { return 4; }
     UmziDiagnostic diagnostic(uint32_t index) const override {
         if (index == 0) return {sizeof(UmziDiagnostic), "timed_plans", timed_plans};
         if (index == 1) return {sizeof(UmziDiagnostic), "plan_workspace_bytes", int64_t(workspace_bytes)};
+        if (index == 2) return {sizeof(UmziDiagnostic), "fp32_weight_bytes", int64_t(weight32_bytes)};
+        if (index == 3) return {sizeof(UmziDiagnostic), "fp16_weight_bytes", int64_t(weight16_bytes)};
         throw std::runtime_error("Invalid GateRV2 diagnostic index");
     }
+
+    const char* cache_message() const override { return plan_cache.diagnostic.c_str(); }
 
     const char* kernel_message() const override {
         return fp16 ? "GateRV2 FP16 with FP32 attention" : "GateRV2 mixed precision with FP32 attention";

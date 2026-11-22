@@ -1,9 +1,12 @@
 # GateRV2 native integration handoff
 
 Updated 2026-11-22. GateRV2 packages (family `3`, schema `1`) run in the C++
-`KernelSession` in mixed precision and FP16, like GateRV3. There is no FP32
-execution mode. Both modes pass the shipping-path checks on Windows. The
-Linux build matches Windows bitwise. Pick up with the next tuning pass. [Architecture expansion plan](umzi-native-architecture-expansion.md)
+`KernelSession` in mixed precision and FP16. Seven optimization steps took
+the session from an FP32 port to NHWC FP16 with fused kernels, timed plans,
+and compact weights. The compact build used less VRAM in the recorded
+single-session probe and beat RTX in three paired page rounds on this
+workstation. GateRV2 also reuses tuned algorithms across sessions when
+`SessionOptions.cache_dir` is set. [Architecture expansion plan](umzi-native-architecture-expansion.md)
 
 ## What is ready
 
@@ -88,39 +91,122 @@ checkpoint, image hashes, and tiling before running a candidate.
 
 ## Native package and session
 
-- **Payload.** Section 1 holds the architecture as sixteen 32-bit values.
-  Section 2 is a 644-entry table of FP32 parameter offsets and counts.
-  Section 3 holds the parameters in execution order, with Q/K/V
-  concatenated per latent block. Section 4 holds the checkpoint digest. The
+- **Payload.** Family `3`, schema `1`. Section 1: sixteen 32-bit
+  architecture values. Section 2: 644 FP32 parameter offsets and counts.
+  Section 3: FP32 parameters in execution order, Q/K/V concatenated per latent
+  block. Section 4: checkpoint digest. The
   [packer](../src/umzi_native/exporter/_gaterv2.py), the
   [reader](../src/umzi_native/_model.py), and the
-  [session](../native/kernels/gaterv2/runner.cpp) derive the same parameter
-  list. `python -m umzi_native export` and `read` handle GateRV2.
-- **Precision.** Both modes store FP16 NCHW features and run cuDNN
-  convolutions on an FP16 filter copy. Mixed precision uses FP32 RGB I/O and
-  FP32 convolution accumulation. FP16 uses FP16 RGB I/O and FP16
-  convolution arithmetic. Q/K normalization, the contractions, the key sum,
-  and the denominator stay FP32 in both modes, because all-FP16 attention
-  failed on flat tiles. The FP32 parity reference stays in
-  [the private runner](../scripts/reference/gaterv2_native.py).
-- **Session.** It accepts any batch and any valid padded shape, with CUDA
-  Graph or direct execution and host or device I/O. It rejects kernel
-  options and writes no plan cache.
-- **Build.** [The build hook](../hatch_build.py) embeds GateRV2 cubins and
-  PTX, with fast math disabled for GateRV2 only. On Linux, NVRTC 13.0 needs
-  `LD_LIBRARY_PATH` to include its wheel's `lib` directory.
+  [session](../native/kernels/gaterv2/runner.cpp) derive the same list.
+- **Precision.** Mixed (FP32 RGB I/O, FP32 accumulation) and FP16 only, like
+  GateRV3. Features are NHWC FP16 in both. Q/K/V projection output,
+  normalization, contractions, key sum and denominator stay FP32 in both
+  modes; all-FP16 attention failed on flat tiles. The FP32 parity reference
+  stays in [the private runner](../scripts/reference/gaterv2_native.py).
+- **Kernel options:**
+  - `tune_plans` (0/1, default 1): time cuBLASLt and cuDNN candidates at
+    prepare, or take the first heuristic plan.
+  - `workspace_mib` (0–1024, default 64): limit for candidate workspace.
+    Prepare allocates it temporarily and keeps only what the chosen plans use.
 
-| Path | Batch-16 seconds | Input MPx/s | Mean batch-1 tile ms | Raw page PSNR dB | Page SSIMULACRA2 mean / min |
+## Improvements made (in order)
+
+| Step | Change | Effect (RTX 3050 Laptop) |
+| --- | --- | --- |
+| 1 | FP32 C++ port of the private runner (NCHW, cuDNN FMA, no fast math) | Bitwise-class parity: pages 146.8 dB vs eager FP32 |
+| 2 | Mixed and FP16 replace FP32: FP16 NCHW features, FP16 cuDNN filters, FP32 attention | Batch-16 pages 3.63 s / 3.53 s, batch-1 7.7 / 7.8 ms |
+| 3 | Biases fused into consumers, channel-parallel RMSNorm, warp-parallel K·V | Batch-16 forward 114.9 → 89.4 ms |
+| 4 | NHWC rewrite: 1×1 convs as cuBLASLt GEMMs with fused bias; timed cuBLASLt/cuDNN plan selection; RMSNorm fused into residual/Mish/unshuffle; local 3×3 fused with average-pool sums; inception fused with gate; 3-kernel linear attention; input/output convs fused with pad, crop and RGB residual | ~430 → 290 kernels; batch-16 forward 89 → ~59 ms |
+| 5 | local_gate: register weights, 4-row column reuse; pool_project parallel over outputs; attention_prepare split over value slices | Batch-16 ~52 ms, batch-1 ~4.3 ms |
+| 6 | inception_gate: one kernel kind per 8-channel vector, mixed vectors handled per channel | Batch-16 ~49 ms |
+| 7 | VRAM: FP32 copy only for small kernel parameters (3.9 MB), FP16 for projections/filters (59 MB); tuning workspace freed after prepare; work buffers sized per role (3 instead of 4); decoder state reuses the consumed skip buffer | Batch 16: 524 → 232 MiB; batch 1: 278 → 92 MiB; speed unchanged in an interleaved A/B |
+
+Tried and dropped: shared-memory tile for local_gate (slower), shared-memory
+halo for inception_gate (no gain), cheaper Mish formula (no gain).
+
+## Latest measurements
+
+Pages: 128×128 tiles, batch 16, device-resident enqueue, scored against eager
+FP32. The first set of numbers was measured right after step 6; the second
+after step 7 on the same build of step 7. Run-to-run timing on this laptop
+varies by about 10–15% (GPU at 66–69 °C, no throttle flags), so compare
+interleaved runs, not separate sessions.
+
+| Path | Batch-16 s | MPx/s | Batch-1 tile ms | Raw PSNR dB | SSIMULACRA2 mean / min |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Eager FP32, same run | 9.015 | 1.024 | 47.220 | — | — |
-| Native mixed | 3.633 | 2.542 | 7.716 | 74.067 | 90.578 / 90.367 |
-| Native FP16 | 3.525 | 2.619 | 7.849 | 70.431 | 90.450 / 90.111 |
+| TensorRT-RTX FP16 (baseline run) | 2.338 | 3.949 | 4.880 | 69.730 | 90.361 / 90.058 |
+| Native mixed, after step 6 | 1.986 | 4.650 | 4.284 | 77.922 | 90.569 / 90.374 |
+| Native FP16, after step 6 | 1.856 | 4.976 | 4.089 | 73.846 | 90.436 / 90.131 |
+| Native mixed, after step 7 | 2.314 | 3.990 | 4.905 | 77.922 | 90.569 / 90.374 |
+| Native FP16, after step 7 | 2.150 | 4.295 | 4.717 | 73.846 | 90.436 / 90.131 |
 
-Native times are synchronized device-resident enqueue calls. The
-checkerboard scores 44.681 dB in mixed precision and 32.923 dB in FP16. The
-Inductor candidate scores 35.727 dB and RTX 35.072 dB on that case. All
-stress outputs are finite, graph and direct execution match, and cleanup
-returns all device memory. [Validation, profile, and Linux details](umzi-native-architecture-expansion.md#gaterv2-native-package-and-session)
+The step-7 run was slower, but an interleaved A/B of the step-6 commit
+(`555af25`) and step 7 gave the same medians (batch 16: 57.8 vs 57.8 ms
+mixed, 54.0 vs 54.1 ms FP16; batch 1: 5.0 vs 5.0 ms mixed, 4.9 vs 4.8 ms FP16).
+The difference is the machine state, not the VRAM change. TensorRT-RTX was
+re-measured shortly after the step-7 run, in the same slower state
+(`output/gaterv2-session/rtx-rerun/gaterv2/batch-16/rtx/report.json`):
+1.243 s and 1.258 s per page at batch 16 (2.50 s total), and 5.179 and
+5.193 ms per batch-1 tile. Against that rerun, native mixed is about 7%
+faster at batch 16 and 6% at batch 1, and native FP16 about 14% and 9%. The
+margin was confirmed in the rotated runs below.
+
+### Paired step-7 comparison
+
+The three back-to-back rounds rotate backend order on each page. Each
+backend keeps its own warmed batch-16 and batch-1 sessions. The report
+contains every tile latency and the per-page SSIMULACRA2 scores. Both RTX
+graphs were profiled with exclusive TensorRT-RTX placement.
+
+| Backend | Median batch-16 seconds | Input MPx/s | Median mean batch-1 tile ms | Raw page PSNR dB | Page SSIMULACRA2 mean / min |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Native mixed | 2.122 | 4.352 | 4.531 | 77.922 | 90.569 / 90.374 |
+| Native FP16 | 1.992 | 4.636 | 4.334 | 73.846 | 90.436 / 90.131 |
+| TensorRT-RTX FP16 | 2.323 | 3.975 | 4.931 | 69.730 | 90.361 / 90.058 |
+
+Native mixed cut median inference time by 8.7% at batch 16 and 8.1% at
+batch 1. Native FP16 cut it by 14.3% and 12.1%. Both were faster on both
+measures in all three rounds. [Paired benchmark script](../scripts/benchmark_gaterv2_backends.py) · [Local report](../output/gaterv2-session/step7-paired/report.json)
+
+VRAM (device-wide free-memory delta, excluding context and caller I/O):
+
+| Path | Batch 16 | Batch 1 |
+| --- | ---: | ---: |
+| Native mixed, before step 7 | 524 MiB | 278 MiB |
+| Native mixed, after step 7 | 232 MiB | 92 MiB |
+| Native FP16, after step 7 | 237 MiB | 96 MiB |
+| Native mixed, `workspace_mib=0` | 230 MiB | 86 MiB, but batch 16 is ~50% slower |
+| TensorRT-RTX FP16 | 242 MiB | 108 MiB |
+| Eager FP32 | 756 MiB | 188 MiB |
+
+`tune_plans=0` halves prepare at batch 16 (818 → 406 ms) and costs ~3% speed.
+FP16 batch-16 prepare took 3.8 s with timing.
+
+Checks after step 7 (all pass): deterministic export; 11 rejections including
+the three option errors; 14 stress cases finite in both precisions;
+repeated graph and direct runs bitwise stable; direct, graph and batch-1
+paths within 3 dB of the graph run's PSNR against eager FP32 (FP16 flat tiles
+vary 1.3 dB between plans); host equals device enqueue; all three option sets
+above 73 dB on a 65×79 batch; cleanup returns all device memory. ruff,
+ruff format and pyrefly are clean.
+
+## Step-7 verification
+
+- The rebuilt Windows library passed both GateRV3 re-exports and session
+  checks, including byte-identical packages, CLI equality, and plan-cache
+  hits. GateRV2 passed the packaged validator with page metrics and the
+  follow-up assertions for heuristic tuning and zero workspace.
+- The full WSL Ubuntu build embedded sm_86, sm_89, sm_120 and compute_86
+  for both families. On the same 2×3×65×79 input, Windows and Linux
+  scored 80.906 dB against each other in mixed and 75.793 dB in FP16.
+  Outputs were finite, with respective maxima of `5.88e-4` and
+  `7.32e-4` between platforms. Both were within 0.03 dB of each other
+  against the same eager FP32 output. The WSL recipe is in
+  `output/gaterv2-session/step7-build.sh`. The manylinux NVRTC needs
+  `LD_LIBRARY_PATH` to include the wheel's `lib` directory.
+- Scratch scripts in `output/gaterv2-session/`: `smoke.py` (quick parity),
+  `bench.py [dll]`, `profile.py`, `levels.py`, `ab.py` (interleaved A/B,
+  expects `ab/native` from a worktree build), `vram.py <precision> <batch> <json options>`.
 
 ```powershell
 & $py scripts/build_native.py --output output/gaterv2-session/native --arch sm_86 --nvrtc-root output/nvrtc-13.0/nvidia/cu13
@@ -130,18 +216,17 @@ $env:PYTHONPATH = 'src;scripts'
 
 ## Where to pick up
 
-1. **Tune the custom kernels.** The grouped local convolution and gate
-   (19.7% of batch-16 time) and the post-inception gate (9.7%) lead the
-   profile. Try fusing the gate into the fc2 input, writing NHWC directly
-   to avoid cuDNN's layout conversions, and timing cuDNN algorithm choices.
-   A shared-memory tile for the local convolution was slower as written.
-2. **Close the gap to TensorRT-RTX.** RTX FP16 runs 2.338 s and 4.880 ms
-   against native FP16 at 3.525 s and 7.849 ms. Keep page SSIMULACRA2 at or
-   above the RTX scores while tuning.
-3. **Add a plan cache only if algorithm timing pays off.** Reuse the GateRV3
-   `.umplan` format and keying.
-4. **Keep the regression loop.** After native changes, rerun the GateRV2
-   validator, both GateRV3 session checks, and the WSL comparison.
+The [GateRV2 plan-cache checks](umzi-native-architecture-expansion.md#gaterv2-plan-cache)
+record prepare latency, key isolation, and recovery from corrupt or
+unavailable cache files. Graph and direct stress runs use the same cached
+plans so the dispatch comparison excludes differences from tuning.
+
+1. **Next speed work** (batch-16 mixed profile after step 7): inception_gate
+   20.5%, local_gate 19.4%, cuBLASLt GEMMs ~30% combined, pixel_norm_2/3
+   16%. Try fusing the inception gate into the fc2 GEMM prologue or writing
+   local_gate output directly as the norm input.
+2. **Further VRAM:** skips for all levels are kept (about 45 MiB at batch
+   16); a lifetime planner like GateRV3's could share them with work buffers.
 
 After Python edits, run `ruff format scripts src`, `ruff check scripts src`,
 and `pyrefly check` from the repository root.

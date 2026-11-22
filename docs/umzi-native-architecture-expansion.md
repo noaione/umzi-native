@@ -228,109 +228,155 @@ the [package reader](../src/umzi_native/_model.py), and the
 [session](../native/kernels/gaterv2/runner.cpp) derive the same parameter
 list from the architecture and reject any other count, order, or layout.
 
-Like GateRV3, the native session offers only mixed precision and FP16. It
-does not keep an FP32 execution mode. Both modes store NCHW features in
-FP16 and run the convolutions through cuDNN with an FP16 copy of the
-filters. Q/K normalization, the K·V contraction, the key sum, the
-denominator, and the value sum stay in FP32 in both modes, as in the
-corrected Inductor candidate.
+The session stores NHWC FP16 feature maps. Mixed precision keeps FP32 RGB
+input and output and uses FP32 accumulation in cuDNN and the non-attention
+cuBLASLt projections. FP16 uses FP16 RGB input and output and FP16
+accumulation in those paths. In both modes the Q/K/V projections output
+FP32 and the linear attention normalization, contractions and denominator
+run in FP32. This protects the flat-tile denominator. The RGB residual uses
+the original input at its I/O precision. The [private FP32 runner](../scripts/reference/gaterv2_native.py)
+remains available as the network parity control.
 
-| Session precision | RGB input and output | Convolution arithmetic | Other kernels |
-| --- | --- | --- | --- |
-| Mixed (default) | FP32 | FP16 data, FP32 accumulation | FP32 registers, FP16 storage |
-| FP16 | FP16 | FP16 data and accumulation | FP32 registers, FP16 storage |
+The native session supports CUDA Graph and direct execution through host and
+device buffers. It accepts batches and rectangular inputs when the required
+reflection padding is smaller than the corresponding input axis. The
+session uses `SessionOptions.kernel_options` for `tune_plans` and
+`workspace_mib`, and `cache_dir` to reuse selected cuBLASLt and cuDNN
+algorithms. [GateRV2 session options](quickstart.md#gaterv2-kernel-options)
 
-The final crop adds the original RGB input as the residual, so the residual
-keeps the input precision. The [CUDA kernels](../native/kernels/gaterv2/kernels.cu)
-compile without fast math. They implement RMSNorm, the grouped local
-convolution and gate, pooling and channel attention, the inception
-depthwise branches, Mish gating, pixel unshuffle and shuffle, and the
-linear attention. The kernel that consumes each 1×1 projection adds its
-bias. The session supports any batch and any input whose reflection padding
-is valid. It runs with CUDA Graph or direct execution, from host or device
-buffers. It rejects kernel options and writes no plan cache. The FP32
-reference path remains [the private runner](../scripts/reference/gaterv2_native.py).
+| Step | Change | Observed effect on RTX 3050 Laptop |
+| --- | --- | --- |
+| 1 | FP32 C++ port using NCHW and cuDNN FMA | 146.8 dB on the pages against eager FP32 |
+| 2 | Mixed and FP16 paths with FP16 features and FP32 attention | Batch-16 totals 3.633/3.525 s and mean batch-1 calls 7.716/7.849 ms for mixed/FP16 |
+| 3 | Fuse biases into consumers, parallelize RMSNorm across channels, and parallelize K·V across warps | Mixed batch-16 forward 114.9 → 89.4 ms |
+| 4 | NHWC feature maps, biased cuBLASLt GEMMs, timed cuBLASLt and cuDNN plans, and fused custom kernels | About 430 → 290 kernel launches and 89 → 59 ms per mixed batch-16 forward |
+| 5 | Reuse register weights and columns in the local gate, parallelize pooling by output, and split attention preparation by value slice | About 52 ms per mixed batch-16 forward and 4.3 ms per batch-1 call |
+| 6 | Select one inception branch per eight-channel vector where possible | About 49 ms per mixed batch-16 forward |
+| 7 | Pack only the weight copies each operator uses, release unused tuning workspace, size three work buffers by role, and reuse the consumed skip as decoder state | Mixed VRAM fell from 524 to 232 MiB at batch 16 and from 278 to 92 MiB at batch 1 |
 
-[The session validator](../scripts/validate_gaterv2_session.py) exported the
-checkpoint twice with identical bytes. It rejected the wrong schema, the
-GateRV3 family ID, an 8-pixel alignment, a wrong parameter count, a
-truncated parameter table, trailing weights, a kernel option, an 8×9 input,
-and a one-channel input. In both precisions, CUDA Graph and direct execution
-produced identical outputs on all 14 stress and shape cases. Host runs
-matched device enqueue exactly. Three sessions that switched through four
-shapes each returned the device's free memory to its starting value.
-Batched items matched their batch-1 runs at 77.6 dB in mixed precision and
-71.8 dB in FP16. These runs use different cuDNN algorithms, not coupled
-tiles. Every stress output was finite.
+Shared-memory tiling for the local and inception gates and a cheaper Mish
+formula were evaluated in the earlier experiments. The timing details and
+the retained implementations are recorded in the [GateRV2 handoff](handoff-gaterv2.md#improvements-made-in-order).
 
-| Stress case against eager FP32 | Mixed raw PSNR dB | FP16 raw PSNR dB |
+### GateRV2 memory and setup
+
+These are the handoff's device-wide free-memory deltas after preparing a
+single session, excluding CUDA context and caller I/O. The selected cuDNN
+and cuBLASLt algorithms determine retained workspace.
+
+| Backend and options | Batch-16 MiB | Batch-1 MiB |
 | --- | ---: | ---: |
-| Black | 77.808 | 75.115 |
-| Checkerboard | 44.681, SSIMULACRA2 96.819 | 32.923, SSIMULACRA2 93.820 |
-| Noise | 71.328, SSIMULACRA2 97.647 | 68.013, SSIMULACRA2 97.340 |
-| 65×79 | 71.195 | 68.086 |
-| 128×160 | 71.317 | 67.978 |
-| 9×9 | 66.453 | 65.887 |
-| Distinct batch of 16 | 71.458 | 68.024 |
+| Native mixed, before compacting buffers and weights | 524 | 278 |
+| Native mixed, after compacting buffers and weights | 232 | 92 |
+| Native FP16, after compacting buffers and weights | 237 | 96 |
+| Native mixed, with `workspace_mib=0` | 230 | 86 |
+| TensorRT-RTX FP16 | 242 | 108 |
+| Eager CUDA FP32 | 756 | 188 |
 
-The Inductor candidate scored 35.727 dB and 95.891 SSIMULACRA2 on the same
-checkerboard, and TensorRT-RTX FP16 scored 35.072 dB. In both native
-modes, that case's loss comes from FP16 feature storage and convolution
-arithmetic, not attention.
+The packed GPU weights total about 60.2 MiB in either mode. Setting
+`tune_plans=0` uses the first heuristic plan. In the recorded mixed
+batch-16 probe it reduced prepare from 818 to 406 ms with about 3% slower
+inference. The zero-workspace mixed setting reduced batch-16 inference
+speed by about half in that probe. [Setup and VRAM measurements](handoff-gaterv2.md#latest-measurements)
 
-The page benchmark uses the baseline tiling: 128×128 tiles, batch 16, zero
-overlap. Native and eager runs time synchronized device-resident calls.
-Native calls go through `umzi_session_enqueue` on the current Torch stream.
-Batch-1 latency times each of the 630 real tiles in its own synchronized
-call to a separate session prepared once for batch 1. SSIMULACRA2 compares
-each rendered PNG with the matching eager FP32 PNG. Raw PSNR is measured
-before PNG quantization.
+### GateRV2 validation
 
-| Path | Batch-16 inference | Input MPx/s | Mean batch-1 tile ms | Raw page PSNR dB | SSIMULACRA2 mean / min |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Eager FP32, same run | 9.015 s | 1.024 | 47.220 | — | — |
-| Native mixed | 3.633 s | 2.542 | 7.716 | 74.067 | 90.578 / 90.367 |
-| Native FP16 | 3.525 s | 2.619 | 7.849 | 70.431 | 90.450 / 90.111 |
+The Windows session build passed deterministic export, eleven rejection
+checks, fourteen stress and shape cases in both precisions, and host/device
+output equality. The current graph and direct runs were bitwise equal on
+matching plans. Separately prepared batch-1 runs were within the validator's
+3 dB consistency margin against eager FP32. The cleanup run returned free
+GPU memory to its starting value after switching shapes. The Windows build
+also passed the two GateRV3 package and session regressions, including
+deterministic re-export, CLI equality, and cache reuse. [Session validator](../scripts/validate_gaterv2_session.py)
 
-| Native page | Mixed batch-16 | Mixed batch-1 tile ms | Mixed PSNR dB / SSIMULACRA2 | FP16 batch-16 | FP16 batch-1 tile ms | FP16 PSNR dB / SSIMULACRA2 |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| watanare-page-085.jpg | 1.808 s | 7.697 | 73.588 / 90.789 | 1.753 s | 7.838 | 69.971 / 90.789 |
-| watanare-page-086.jpg | 1.825 s | 7.735 | 74.606 / 90.367 | 1.772 s | 7.861 | 70.945 / 90.111 |
+The full WSL build passed with cubins for sm_86, sm_89 and sm_120 and
+compute_86 PTX. On a shared 2×3×65×79 input, Windows and Linux output
+differed by at most `5.88e-4` in mixed precision and `7.32e-4` in FP16.
+Their PSNR against the same eager FP32 output was 75.250 and 75.246 dB
+in mixed and 73.105 and 73.076 dB in FP16, respectively.
 
-Both modes are faster than the Inductor candidate (7.565 s, 21.625 ms) and
-match its page fidelity. TensorRT-RTX FP16 remains faster at 2.338 s and
-4.880 ms.
+### GateRV2 plan cache
 
-A direct-execution profile on this RTX 3050 Laptop measured 89.4 ms per
-mixed batch-16 forward and 6.7 ms per batch-1 forward. The custom kernels
-took the most time in batch 16. The grouped 3×3 local convolution and gate
-took 19.7%, and the gate after the inception mixer 9.7%. The K·V
-contraction took 7.1%, RMSNorm 5.7%, and the inception branches 5.7%. cuDNN
-spent about 6% converting layouts between NCHW and NHWC. Moving the biases
-into their consumers, a channel-parallel RMSNorm, and warp-parallel K·V
-reduced batch 16 from 114.9 ms to 89.4 ms. A shared-memory tile for the
-local convolution was slower, so it was not kept. A cheaper Mish formula
-showed no measurable gain, so the exact form stayed.
+With `SessionOptions(cache_dir=...)`, GateRV2 saves the selected cuBLASLt
+and cuDNN algorithms in `gaterv2_<key>.umplan`. The key covers the model,
+CUDA kernel image, precision, padded batch and shape, tuning and workspace
+options, GPU, driver, cuDNN, and cuBLASLt versions. The session checks
+cached algorithms against their current descriptors and workspace before
+reuse. Invalid plans are selected again. Cache read and write failures
+remain visible through `cache_status` and `cache_message`.
+[Shared cache implementation](../native/common/cuda_plan_cache.h)
+
+Windows measurements cover `session.prepare()` for 128×128 tiles,
+including shape allocation, plan selection or reuse, warm-up, and graph
+capture. Model opening and weight upload are outside the measured interval.
+Each reopened session used zero timed plans and returned bitwise-identical
+output to its cold session.
+
+| Precision | Batch | Cache miss prepare ms | Cache hit prepare ms |
+| --- | ---: | ---: | ---: |
+| Mixed | 1 | 82.3 | 39.5 |
+| Mixed | 16 | 465.1 | 130.6 |
+| FP16 | 1 | 274.6 | 24.5 |
+| FP16 | 16 | 3431.1 | 109.7 |
+
+The validator checked option and shape key isolation, zero-workspace reuse,
+checksum-corruption rebuild, and inference when the cache path is
+unavailable. The 9×9 FP16 output is sensitive to independently timed
+plans on its one latent token. Graph and direct dispatch now share the
+same plan file in the stress test, and their outputs matched bitwise for
+all fourteen cases. The 9×9 shared-plan check scored 69.643 dB against
+eager FP32. [Windows validation report](../output/gaterv2-session/cache-final-verified/report.json)
+
+The rebuilt WSL library also reported a miss followed by a hit for both
+precisions on a 2×3×65×79 input. Reopened outputs were bitwise identical
+and no plans were timed on a hit. [WSL cache validation](../output/gaterv2-session/cache-final-linux-session.json)
+
+Run the validator with a rebuilt library to reproduce the cache checks.
 
 ```powershell
-$py = 'C:\Python314\python.exe'
-& $py scripts/build_native.py --output output/gaterv2-session/native --arch sm_86 --nvrtc-root output/nvrtc-13.0/nvidia/cu13
-$env:PYTHONPATH = 'src;scripts'
-& $py scripts/validate_gaterv2_session.py --library output/gaterv2-session/native/umzi_native.dll --pages
+& 'C:\Python314\python.exe' scripts/validate_gaterv2_session.py `
+  --library output/gaterv2-session/cache-final-win/umzi_native.dll `
+  --output output/gaterv2-session/cache-final-verified --pages
 ```
 
-The report is `output/gaterv2-session/report.json`. The same Windows build
-passed `scripts/check_python_session.py` for both GateRV3 checkpoints in
-mixed precision and FP16. Both matched the CLI bitwise and reused the cache
-on reopen. The GateRV3 packages re-exported byte for byte. Reports are in
-`output/gaterv2-session/gaterv3-regression/`.
+### GateRV2 performance against TensorRT-RTX
 
-The Linux build ran in WSL Ubuntu 24.04 with CUDA 13.0 NVRTC from the
-`nvidia-cuda-nvrtc` 13.0.88 manylinux wheel. It embedded GateRV2 cubins
-for sm_86, sm_89, and sm_120 and the compute_86 PTX. NVRTC needs
-`LD_LIBRARY_PATH` to include the wheel's `lib` directory so it can load
-`libnvrtc-builtins.so.13.0`. The Linux session matched the Windows output
-bitwise on a batch of two 65×79 tiles in both precisions.
+Three rounds rotated the order of the three backends per page. Each
+used a separate warm session for each batch size. Per-tile samples were
+timed in individual synchronized batch-1 calls. The table gives medians
+across rounds and fidelity against the matching eager CUDA FP32 output.
+
+| Backend | Batch-16 seconds | Input MPx/s | Mean batch-1 tile ms | Raw PSNR dB | SSIMULACRA2 mean / min |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Native mixed | 2.122 | 4.352 | 4.531 | 77.922 | 90.569 / 90.374 |
+| Native FP16 | 1.992 | 4.636 | 4.334 | 73.846 | 90.436 / 90.131 |
+| TensorRT-RTX FP16 | 2.323 | 3.975 | 4.931 | 69.730 | 90.361 / 90.058 |
+
+| Backend | 085 batch-16 s | 085 MPx/s | 085 batch-1 ms | 085 PSNR dB / SSIMULACRA2 | 086 batch-16 s | 086 MPx/s | 086 batch-1 ms | 086 PSNR dB / SSIMULACRA2 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Native mixed | 1.046 | 4.414 | 4.580 | 77.571 / 90.764 | 1.065 | 4.337 | 4.532 | 78.303 / 90.374 |
+| Native FP16 | 0.989 | 4.668 | 4.301 | 73.546 / 90.741 | 0.990 | 4.666 | 4.364 | 74.168 / 90.131 |
+| TensorRT-RTX FP16 | 1.164 | 3.967 | 4.766 | 69.262 / 90.665 | 1.161 | 3.976 | 4.772 | 70.254 / 90.058 |
+
+The packaged Windows validator also scored the checkerboard and noise
+renders against FP32. Mixed scored 95.702 and 97.690 SSIMULACRA2,
+respectively, and FP16 scored 94.900 and 97.524. The accompanying raw
+PSNR scores were 35.411 and 75.034 dB in mixed and 34.498 and 73.025 dB
+in FP16.
+
+Run the following after building the DLL and running the GateRV2 validator
+to export the package. The original eager FP32 and RTX baseline reports
+provide the reference images and the two matched RTX graphs. The benchmark
+checks their hashes and profiles each RTX graph again.
+
+```powershell
+& 'C:\Python314\python.exe' scripts/benchmark_gaterv2_backends.py `
+  --library output/gaterv2-session/step7-verified-win/umzi_native.dll `
+  --model output/gaterv2-session/step7-verified/gaterv2.ummodel `
+  --rtx-report output/gaterv2-session/rtx-rerun/gaterv2/batch-16/rtx/report.json `
+  --output output/gaterv2-session/step7-paired
+```
 
 Related design documents are the [runtime and package plan](umzi-native-runtime-plan.md)
 and the [exporter plan](umzi-model-exporter-plan.md).

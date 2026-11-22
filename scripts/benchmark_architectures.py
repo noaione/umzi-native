@@ -413,9 +413,12 @@ def prepare_rtx_graph(checkpoint: Path, directory: Path, batch: int, tile: int, 
     return path, inp.name, normalized_permutations
 
 
-def open_rtx_runner(path: Path, input_name: str, batch: int, family: Family, stage: dict[str, Any]) -> Runner:
+def open_rtx_runner(
+    path: Path, input_name: str, batch: int, family: Family, stage: dict[str, Any], *, output_dir: Path | None = None
+) -> Runner:
     tile, scale = family.tile, family.scale
-    cache = path.parent / f"cache-{batch}"
+    directory = path.parent if output_dir is None else output_dir
+    cache = directory / f"cache-{batch}"
     started = time.perf_counter()
     print(f"Profiling {path.name}", flush=True)
     session, _ = create_rtx_session(
@@ -423,7 +426,7 @@ def open_rtx_runner(path: Path, input_name: str, batch: int, family: Family, sta
         batch,
         tile,
         cache,
-        path.parent / f"placement-b{batch}",
+        directory / f"placement-b{batch}",
         scale=scale,
         input_name=input_name,
         cuda_graph=False,

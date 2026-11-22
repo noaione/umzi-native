@@ -18,6 +18,7 @@ import json
 import os
 import struct
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -108,8 +109,14 @@ def check_rejections(model: Path, library: Path, root: Path) -> dict[str, str]:
     results["trailing_weights"] = rejected(
         package(GATERV2_FAMILY, 1, {3: parts[3] + bytes(256)}), options, "trailing GateRV2 weight"
     )
-    results["kernel_option"] = rejected(
-        model, SessionOptions(dll_path=library, kernel_options={"fuse_silu": 1}), "no kernel options"
+    results["unknown_option"] = rejected(
+        model, SessionOptions(dll_path=library, kernel_options={"fuse_silu": 1}), "Unknown GateRV2 option"
+    )
+    results["tune_plans_value"] = rejected(
+        model, SessionOptions(dll_path=library, kernel_options={"tune_plans": 2}), "tune_plans must be 0 or 1"
+    )
+    results["workspace_value"] = rejected(
+        model, SessionOptions(dll_path=library, kernel_options={"workspace_mib": 2048}), "workspace_mib must be"
     )
     with InferenceSession(model, options) as session:
         for shape, message in (((1, 3, 8, 9), "reflection padding"), ((1, 1, 32, 32), "RGB NCHW")):
@@ -158,8 +165,10 @@ class DeviceSession:
 
 def consistent(candidate: Tensor, expected: Tensor, graph: dict[str, Any], message: str) -> dict[str, Any]:
     row = comparison(candidate.numpy(), expected.numpy())
+    if not row["finite"]:
+        raise AssertionError(f"{message} produced {row['nonfinite_values']} non-finite values")
     psnr, baseline = row["psnr_db"], graph["psnr_db"]
-    if not row["finite"] or (psnr is not None and baseline is not None and psnr < baseline - CONSISTENCY_MARGIN_DB):
+    if psnr is not None and baseline is not None and psnr < baseline - CONSISTENCY_MARGIN_DB:
         raise AssertionError(f"{message} ({psnr} dB against eager FP32; graph run {baseline} dB)")
     return row
 
@@ -169,42 +178,56 @@ def check_stress(
 ) -> dict[str, Any]:
     expected = {label: reference(sample.cuda()).cpu() for label, sample in cases.items()}
     rows: dict[str, Any] = {label: {"input_shape": list(sample.shape)} for label, sample in cases.items()}
-    for precision, dtype in PRECISIONS.items():
-        graph = DeviceSession(InferenceSession(model, SessionOptions(precision=precision, dll_path=library)))
-        direct = DeviceSession(
-            InferenceSession(model, SessionOptions(precision=precision, enable_cuda_graph=False, dll_path=library))
-        )
-        try:
-            for label, sample in cases.items():
-                x = sample.to(device="cuda", dtype=dtype)
-                actual = graph(x).float().cpu()
-                row = comparison(actual.numpy(), expected[label].numpy())
-                if not row["finite"]:
-                    raise AssertionError(f"{precision} {label} produced non-finite output")
-                if not torch.equal(graph(x).float().cpu(), actual):
-                    raise AssertionError(f"{precision} {label}: repeated CUDA Graph runs differ")
-                direct_output = direct(x).float().cpu()
-                if not torch.equal(direct(x).float().cpu(), direct_output):
-                    raise AssertionError(f"{precision} {label}: repeated direct runs differ")
-                row["direct_vs_graph"] = comparison(direct_output.numpy(), actual.numpy())
-                row["direct"] = consistent(direct_output, expected[label], row, f"{precision} {label}: direct run")
-                if label in ("checkerboard", "noise"):
-                    row["ssimulacra2"] = score_stress_render(
-                        output / "stress-renders" / precision, label, expected[label], actual
-                    )
-                if len(sample) > 1:
-                    individual = torch.cat([graph(tile).float().cpu() for tile in x.split(1)])
-                    row["vs_individual"] = comparison(actual.numpy(), individual.numpy())
-                    row["individual"] = consistent(
-                        individual, expected[label], row, f"{precision} {label}: batch-1 runs of the batch"
-                    )
-                rows[label][precision] = row
-                note = f", SSIMULACRA2 {row['ssimulacra2']:.3f}" if "ssimulacra2" in row else ""
-                print(f"{precision} {label}: {row['psnr_db']:.3f} dB, max {row['max_abs']:.3g}{note}", flush=True)
-            rows.setdefault("_session_info", {})[precision] = graph.session.get_session_info()
-        finally:
-            graph.session.close()
-            direct.session.close()
+    # Reuse the same algorithms across graph and direct dispatch. Independently
+    # tuned FP16 plans can differ substantially on the one-token attention case.
+    with tempfile.TemporaryDirectory(prefix="stress-plans-", dir=output) as directory:
+        for precision, dtype in PRECISIONS.items():
+            graph = DeviceSession(
+                InferenceSession(model, SessionOptions(precision=precision, dll_path=library, cache_dir=directory))
+            )
+            direct = DeviceSession(
+                InferenceSession(
+                    model,
+                    SessionOptions(precision=precision, enable_cuda_graph=False, dll_path=library, cache_dir=directory),
+                )
+            )
+            try:
+                for label, sample in cases.items():
+                    x = sample.to(device="cuda", dtype=dtype)
+                    actual = graph(x).float().cpu()
+                    row = comparison(actual.numpy(), expected[label].numpy())
+                    if not row["finite"]:
+                        raise AssertionError(f"{precision} {label} produced non-finite output")
+                    if not torch.equal(graph(x).float().cpu(), actual):
+                        raise AssertionError(f"{precision} {label}: repeated CUDA Graph runs differ")
+                    direct_output = direct(x).float().cpu()
+                    if direct.session.get_session_info()["cache_status"] != "hit":
+                        raise AssertionError(
+                            f"{precision} {label}: direct session did not use the graph session's plans"
+                        )
+                    if not torch.equal(direct_output, actual):
+                        raise AssertionError(f"{precision} {label}: direct and graph differ on matching plans")
+                    if not torch.equal(direct(x).float().cpu(), direct_output):
+                        raise AssertionError(f"{precision} {label}: repeated direct runs differ")
+                    row["direct_vs_graph"] = comparison(direct_output.numpy(), actual.numpy())
+                    row["direct"] = consistent(direct_output, expected[label], row, f"{precision} {label}: direct run")
+                    if label in ("checkerboard", "noise"):
+                        row["ssimulacra2"] = score_stress_render(
+                            output / "stress-renders" / precision, label, expected[label], actual
+                        )
+                    if len(sample) > 1:
+                        individual = torch.cat([graph(tile).float().cpu() for tile in x.split(1)])
+                        row["vs_individual"] = comparison(actual.numpy(), individual.numpy())
+                        row["individual"] = consistent(
+                            individual, expected[label], row, f"{precision} {label}: batch-1 runs of the batch"
+                        )
+                    rows[label][precision] = row
+                    note = f", SSIMULACRA2 {row['ssimulacra2']:.3f}" if "ssimulacra2" in row else ""
+                    print(f"{precision} {label}: {row['psnr_db']:.3f} dB, max {row['max_abs']:.3g}{note}", flush=True)
+                rows.setdefault("_session_info", {})[precision] = graph.session.get_session_info()
+            finally:
+                graph.session.close()
+                direct.session.close()
     return rows
 
 
@@ -220,6 +243,36 @@ def check_host_io(reference: GateRV2, model: Path, library: Path) -> dict[str, A
             if not torch.equal(host, device):
                 raise AssertionError(f"{precision}: host run differs from device enqueue in the same session")
             result[precision] = comparison(host.float().numpy(), reference(sample.cuda()).cpu().numpy())
+    return result
+
+
+def check_options(reference: GateRV2, model: Path, library: Path) -> dict[str, Any]:
+    """Each kernel option keeps the output finite and close to eager FP32."""
+    sample = torch.rand((2, 3, 65, 79), generator=torch.Generator().manual_seed(13))
+    expected = reference(sample.cuda()).cpu()
+    result = {}
+    for label, options in (
+        ("default", {}),
+        ("heuristic_plans", {"tune_plans": 0}),
+        ("no_workspace", {"workspace_mib": 0}),
+    ):
+        for precision, dtype in PRECISIONS.items():
+            with InferenceSession(
+                model, SessionOptions(precision=precision, kernel_options=options, dll_path=library)
+            ) as session:
+                actual = DeviceSession(session)(sample.to(device="cuda", dtype=dtype)).float().cpu()
+                info = session.get_session_info()
+            row = comparison(actual.numpy(), expected.numpy())
+            row["diagnostics"] = info["diagnostics"]
+            row["buffer_bytes"] = info["buffer_bytes"]
+            psnr = row.get("psnr_db")
+            if not row["finite"] or (psnr is not None and psnr < 60):
+                raise AssertionError(f"{precision} with {options}: {row.get('psnr_db')} dB")
+            if "tune_plans" in options and info["diagnostics"]["timed_plans"]:
+                raise AssertionError(f"{precision}: the heuristic-only session timed plans")
+            if "workspace_mib" in options and info["buffer_bytes"]["workspace"]:
+                raise AssertionError(f"{precision}: the zero-workspace session allocated workspace")
+            result[f"{label}-{precision}"] = row
     return result
 
 
@@ -242,6 +295,77 @@ def check_cleanup(library: Path, model: Path) -> dict[str, Any]:
         "device_free_after": free_after,
         "device_free_delta": free_before - free_after,
     }
+
+
+def check_plan_cache(library: Path, model: Path, output: Path) -> dict[str, Any]:
+    """Reopen tuned plans, verify key isolation, and recover from cache failures."""
+    generator = torch.Generator().manual_seed(702)
+    samples = {
+        batch: torch.rand((batch, 3, 128, 128), generator=generator, dtype=torch.float32).cuda()
+        for batch in (1, FAMILY.batch)
+    }
+
+    def run(
+        precision: str, batch: int, cache: Path, expected_status: str, **options: int
+    ) -> tuple[Tensor, dict[str, Any]]:
+        sample = samples[batch].to(PRECISIONS[precision])
+        with InferenceSession(
+            model, SessionOptions(precision=precision, dll_path=library, cache_dir=cache, kernel_options=options)
+        ) as session:
+            torch.cuda.synchronize()
+            started = time.perf_counter()
+            session.prepare(sample.shape)
+            prepare_ms = (time.perf_counter() - started) * 1000
+            prediction = DeviceSession(session)(sample).cpu()
+            info = session.get_session_info()
+        if info["cache_status"] != expected_status:
+            raise AssertionError(
+                f"{precision} batch {batch}: expected cache {expected_status}, got "
+                f"{info['cache_status']} ({info['cache_message']})"
+            )
+        if expected_status == "hit" and info["diagnostics"]["timed_plans"]:
+            raise AssertionError(f"{precision} batch {batch}: retimed a cache hit")
+        if not torch.isfinite(prediction).all():
+            raise AssertionError(f"{precision} batch {batch}: cache validation returned non-finite values")
+        return prediction, {"prepare_ms": prepare_ms, **info}
+
+    results: dict[str, Any] = {}
+    with tempfile.TemporaryDirectory(prefix="cache-check-", dir=output) as temporary:
+        cache = Path(temporary)
+        for precision in PRECISIONS:
+            for batch in samples:
+                first, miss = run(precision, batch, cache, "miss")
+                reopened, hit = run(precision, batch, cache, "hit")
+                if not torch.equal(first, reopened):
+                    raise AssertionError(f"{precision} batch {batch}: plan cache changed the output")
+                results[f"{precision}-b{batch}"] = {"miss": miss, "hit": hit}
+        if len(list(cache.glob("gaterv2_*.umplan"))) != 4:
+            raise AssertionError("GateRV2 cache keys did not separate batch sizes and precisions")
+
+        _, heuristic = run("mixed", 1, cache, "miss", tune_plans=0)
+        first, zero_workspace = run("mixed", 1, cache, "miss", workspace_mib=0)
+        reopened, zero_hit = run("mixed", 1, cache, "hit", workspace_mib=0)
+        if not torch.equal(first, reopened) or zero_hit["buffer_bytes"]["workspace"]:
+            raise AssertionError("The zero-workspace plan cache changed the session")
+        if len(list(cache.glob("gaterv2_*.umplan"))) != 6:
+            raise AssertionError("GateRV2 cache keys did not separate tuning and workspace options")
+        results["option_isolation"] = {"heuristic": heuristic, "zero_workspace": zero_workspace, "hit": zero_hit}
+
+        corrupt_cache = cache / "corrupt"
+        run("mixed", 1, corrupt_cache, "miss")
+        plan = next(corrupt_cache.glob("gaterv2_*.umplan"))
+        data = bytearray(plan.read_bytes())
+        data[-1] ^= 1
+        plan.write_bytes(data)
+        repaired, rebuilt = run("mixed", 1, corrupt_cache, "rebuilt")
+        reopened, hit = run("mixed", 1, corrupt_cache, "hit")
+        if not torch.equal(repaired, reopened):
+            raise AssertionError("The rebuilt GateRV2 cache changed the output")
+        unavailable = cache / "regular-file"
+        unavailable.touch()
+        _, failed = run("mixed", 1, unavailable, "unavailable")
+        results["recovery"] = {"rebuilt": rebuilt, "hit": hit, "unavailable": failed}
+    return results
 
 
 def check_pages(reference: GateRV2, library: Path, model: Path, sources: list[Path], output: Path) -> dict[str, Any]:
@@ -331,6 +455,8 @@ def main() -> None:
     cases["rect-31x47-batch3"] = torch.rand((3, 3, 31, 47), generator=generator)
     report["stress"] = check_stress(reference, model, library, cases, args.output)
     report["host_io"] = check_host_io(reference, model, library)
+    report["options"] = check_options(reference, model, library)
+    report["plan_cache"] = check_plan_cache(library, model, args.output)
     report["cleanup"] = check_cleanup(library, model)
     report_path = args.output / "report.json"
     report_path.write_text(json.dumps(report, indent=2, allow_nan=False), encoding="utf-8")

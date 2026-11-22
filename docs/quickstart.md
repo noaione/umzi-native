@@ -62,7 +62,7 @@ the [manga tiling benchmark](gaterv3-manga-tiling.md).
 | --- | --- | --- |
 | `precision` | `"mixed"` | Mixed precision uses FP32 NumPy input and output and FP32 accumulation in the default convolution and projection paths. `"fp16"` uses FP16 arrays and enables the native FP16 compute path. |
 | `device_id` | `0` | CUDA ordinal for the session. Use the ordinal visible to the process when CUDA devices are masked. |
-| `cache_dir` | `None` | Set a writable directory to reuse tuned algorithms from `gaterv3_<hex-key>.umplan` on compatible opens. The key includes the model, padded shape and batch, precision, relevant options, and CUDA environment. With `None`, every fresh prepare tunes in memory. The CUDA Graph is captured in the process. |
+| `cache_dir` | `None` | Set a writable directory to reuse GateRV2 or GateRV3 algorithms from the family's `.umplan` files. The key includes the model, padded shape and batch, precision, plan options, and CUDA environment. Each process captures its own CUDA Graph. |
 | `enable_cuda_graph` | `True` | Capture and replay a CUDA Graph to reduce launch overhead for the prepared shape. `False` submits the operations directly. It still uses cuBLASLt and cuDNN plans. |
 | `kernel_options` | `{}` | Pass the kernel-specific switches below as a mapping of names to integer values. |
 | `dll_path` | `None` | Override the path to the Umzi DLL or shared library. By default the loader checks the installed package directory and then the model directory. |
@@ -98,7 +98,22 @@ kernel-specific counters in the `diagnostics` dictionary. An out-of-memory error
 or inference raises `MemoryError`, and the same session can accept
 a smaller batch. [Native optimization details](gaterv3-native-refactor.md#session-optimization-options)
 
-The package header dispatches to GateRV3. `session.kernel`,
+The package header selects the kernel family. `session.kernel`,
 `session.scale_factor` and `session.context` expose model metadata, and
 `session.closed` reports whether the session still holds device resources.
 [Runtime and format spec](umzi-native-runtime-plan.md)
+
+### GateRV2 kernel options
+
+| Key | Default | Effect |
+| --- | ---: | --- |
+| `tune_plans` | `1` | Time cuBLASLt and cuDNN candidates when preparing a shape. Set `0` to use the first heuristic plan and shorten prepare. |
+| `workspace_mib` | `64` | Cap the candidate workspace in MiB. Accepts integers from `0` to `1024`. Prepare retains only the workspace needed by the selected plans. |
+
+For example, use `SessionOptions(kernel_options={"tune_plans": 0})` when
+prepare latency matters on a new shape. Set `cache_dir` to keep the chosen
+plans in `gaterv2_<hex-key>.umplan` files. With a compatible cache hit,
+the session reuses those algorithms with `timed_plans == 0`. Inspect
+`timed_plans`, `plan_workspace_bytes`,
+`fp32_weight_bytes`, and `fp16_weight_bytes` in
+`get_session_info()["diagnostics"]`. [GateRV2 measurements](handoff-gaterv2.md)

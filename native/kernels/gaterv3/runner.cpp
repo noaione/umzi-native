@@ -327,9 +327,9 @@ public:
         allocate_host(host_output, io_bytes * batch);
         setup_ms[0] = milliseconds_since(stage_start);
         stage_start = Clock::now();
-        if (plan_cache.status != GT_CACHE_UNAVAILABLE) {
+        if (plan_cache.status != UMZI_CACHE_UNAVAILABLE) {
             try {
-                plan_cache.open(cache_dir, plan_key);
+                plan_cache.open(cache_dir, "gaterv3", plan_key);
             } catch (const std::exception& error) {
                 plan_cache.unavailable(error);
             }
@@ -1356,7 +1356,7 @@ GtRunner* gt_create_ex(const char* directory, int batch, uint32_t flags, const c
     return result;
 }
 
-GtCacheStatus gt_cache_status(const GtRunner* runner) { return runner->plan_cache.status; }
+GtCacheStatus gt_cache_status(const GtRunner* runner) { return static_cast<GtCacheStatus>(runner->plan_cache.status); }
 const char* gt_cache_message(const GtRunner* runner) { return runner->plan_cache.diagnostic.c_str(); }
 void gt_setup_timings(const GtRunner* runner, double milliseconds[4]) {
     std::copy(runner->setup_ms.begin(), runner->setup_ms.end(), milliseconds);
