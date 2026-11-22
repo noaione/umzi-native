@@ -166,7 +166,7 @@ records the current MoESR state and the next steps.
 | --- | --- | --- | --- |
 | GateRV2 | Verified | FP32, RTX FP16, and Inductor FP16 with FP32 attention measured | Package (family 3, schema 1) and C++ session in mixed and FP16 validated on Windows and Linux; first tuning pass done |
 | MoESR | Verified, supplied ONNX validated | FP32, Inductor FP16, and RTX FP16 measured | [Private FP32 parity](#moesr-private-fp32-validation) and [family-4 mixed/FP16 session](#moesr-native-package-and-session) validated on Windows and Linux wheels (Pass 4: 1.84× RTX in FP16, 1.14× RTX in 68.2 dB mixed) |
-| GFISRv2 | Verified, prior handoff reviewed | FP32, eager FP16, and Inductor FP16 measured, flat-tile fidelity failure traced, RTX skipped | [Implementation planned](#gfisrv2-implementation-plan) |
+| GFISRv2 | Verified, prior handoff reviewed | FP32, eager FP16, and Inductor FP16 measured, flat-tile fidelity failure traced, RTX skipped | [Private FP32 parity with cuFFT](#gfisrv2-private-fp32-parity). Package and C++ session pending |
 
 ### GateRV2 private FP32 validation
 
@@ -648,3 +648,54 @@ and 32 input pixels of overlap. Keep per-page and overall batch-2 time
 and throughput, and time individual synchronized batch-1 tiles separately.
 The first implementation milestone is the isolated Fourier validator
 with a trace that identifies the first diverging stage.
+
+### GFISRv2 private FP32 parity
+
+The [staged runner](../scripts/reference/gfisrv2_native.py) reconstructs
+the Fourier unit, the 24 gated blocks with their rotated inception
+branches, and the feature residual and 4× output. It calls
+[cuFFT directly](../scripts/reference/cufft.py) for the FP32 transforms,
+and uses Torch CUDA for convolutions and tensor operations. The
+[validator](../scripts/validate_gfisrv2.py) traces the untouched Resselt
+forward and compares it with the replica using both Torch FFTs and
+direct cuFFT.
+
+- The forward transform uses the last two axes and packs all real
+  channels before the imaginary channels. The inverse interprets adjacent
+  channels as the real and imaginary components of each pair. Pass the
+  original height and width explicitly, including odd widths and width 1.
+- The orthonormal scale is `1 / sqrt(H × W)` for each cuFFT call. RMSNorm
+  multiplies the channel L2 norm by `1 / sqrt(C)` and adds epsilon before
+  division. The inverse receives a copy of the learned spectrum because
+  out-of-place C2R overwrites its input. [cuFFT data layout](https://docs.nvidia.com/cuda/cufft/index.html#data-layout)
+- On the RTX 3050 Laptop GPU, both FFT backends matched all 290 Fourier
+  stage comparisons bit for bit. The cases exercised the first four block
+  rotations plus one full 256×256 tile. Direct cuFFT also matched all 28
+  network stages on each of `1×3×32×40` and `2×3×31×45`. All 18 stress
+  outputs matched bit for bit, including flat gray, checkerboard,
+  one-pixel axes, and distinct batch inputs. The individual calls matched
+  the corresponding batched output. Gray, gray 128/255, checkerboard, and
+  noise each scored 100 SSIMULACRA2.
+
+The three `samples/mscale/` pages matched the saved eager FP32 output bit
+for bit, with zero raw error, infinite PSNR, and 100 SSIMULACRA2 on each
+page. This run used 256×256 tiles, 32 px overlap, and separate warmed
+cuFFT plans for batch 2 and batch 1. The report contains all 72 timed
+batch-1 calls with image, tile index, and coordinates.
+
+| Page | Batch-2 time (s) | Input MPx/s | Mean batch-1 tile (ms) |
+| --- | ---: | ---: | ---: |
+| `lb-page-003.png` | 6.191 | 0.1963 | 254.799 |
+| `lb-page-004.png` | 6.006 | 0.2023 | 242.998 |
+| `lb-page-005.png` | 6.587 | 0.1845 | 268.145 |
+| All three | 18.784 | 0.1940 | 255.314 |
+
+```powershell
+$env:PYTHONPATH = 'src;scripts'
+& 'C:\Python314\python.exe' scripts/validate_gfisrv2.py --pages
+```
+
+The next native integration step is to move the transforms, packing,
+and normalization into the C++ path and rerun the saved FP32 comparison
+before reducing precision.
+[Local validation report](../output/gfisrv2-native-validation/report.json)
