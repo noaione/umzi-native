@@ -72,6 +72,7 @@ Triton 3.9.0.post30, ONNX 1.23.2, ONNX Runtime 1.31.1, and RTX plugin 0.5.0.
 | Family | Backend | Batched seconds | Input MPx/s | Mean batch-1 tile ms | Raw PSNR dB | SSIMULACRA2 mean/min |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
 | GateRV2 | Eager FP32 | 8.929 | 1.034 | 43.658 | — | — |
+| GateRV2 | Inductor FP16 with FP32 attention math | 7.565 | 1.221 | 21.625 | 73.754 | 90.440 / 90.186 |
 | GateRV2 | TensorRT-RTX FP16 | 2.338 | 3.949 | 4.880 | 69.730 | 90.361 / 90.058 |
 | MoESR | Eager FP32 | 76.963 | 0.047 | 565.989 | — | — |
 | MoESR | Inductor FP16 | 18.143 | 0.201 | 258.581 | 67.263 | 87.287 / 87.058 |
@@ -114,6 +115,8 @@ GFISRv2 matched bit for bit. Peak PyTorch allocations were 600, 657, and
 
 | Family | Backend | Source page | Batched seconds | Input MPx/s | Mean batch-1 tile ms | Raw PSNR dB | SSIMULACRA2 |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| GateRV2 | Inductor, FP32 attention math | watanare-page-085.jpg | 3.786 | 1.220 | 21.956 | 73.405 | 90.695 |
+| GateRV2 | Inductor, FP32 attention math | watanare-page-086.jpg | 3.779 | 1.222 | 21.295 | 74.132 | 90.186 |
 | GateRV2 | TensorRT-RTX | watanare-page-085.jpg | 1.173 | 3.935 | 4.801 | 69.262 | 90.665 |
 | GateRV2 | TensorRT-RTX | watanare-page-086.jpg | 1.165 | 3.964 | 4.959 | 70.254 | 90.058 |
 | MoESR | Inductor | lb-page-003.png | 6.053 | 0.201 | 248.920 | 68.596 | 87.615 |
@@ -164,6 +167,29 @@ eager CUDA FP16 calculation gave 0.0625 at all 64 tokens and kept all
 49,152 output values finite. Eager FP16 scored 33.627 dB on the
 checkerboard, close to the RTX score of 35.072 dB. The trace is saved as
 `gaterv2-inductor-nonfinite.json`.
+
+### GateRV2 Inductor with FP32 attention math
+
+The candidate casts the Q, K and V projection outputs to FP32 before
+L2 normalization, contractions, and division. It casts the attention
+result to FP16 before the gated update. The projection convolutions and
+the rest of the network execute in FP16. All four static Inductor graphs
+compiled with `fullgraph=True`. The initial batch-1 and batch-16 calls
+took 43.3 and 42.1 seconds using the existing serial compilation cache.
+The cached rerun's first calls took 8.8 and 8.6 seconds and its steady-state
+times are in the tables.
+
+All 12 stress cases and both pages were finite. The checkerboard had the
+lowest raw PSNR at 35.727 dB and scored 95.891 SSIMULACRA2 against its
+matching FP32 render. The 65×79 and 128×160 rectangles
+scored 72.753 and 72.739 dB, and the distinct batch scored 72.741 dB.
+The maximum raw page error was 0.00330. The report preserves the existing
+FP32 and default Inductor runs under their original backend names.
+
+```powershell
+$env:TORCHINDUCTOR_COMPILE_THREADS = '1'
+& 'C:\Python314\python.exe' scripts/benchmark_architectures.py gaterv2 inductor-attention-fp32
+```
 
 ### Supplied MoESR ONNX validation
 

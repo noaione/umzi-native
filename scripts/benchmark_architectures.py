@@ -24,6 +24,7 @@ import numpy as np
 import torch
 from benchmark import IMAGE_EXTS, ROOT, image_tensor, tensor_image
 from PIL import Image
+from reference.gaterv2 import use_fp32_attention
 from rtx_session import create_rtx_session
 from torch import Tensor
 from torch.nn import functional
@@ -31,7 +32,7 @@ from torch.nn import functional
 from umzi_native.exporter._loader import load_checkpoint
 
 METRIC = Path(r"C:\Tools\imaging\ssimulacra2.exe")
-BACKENDS = ("fp32", "inductor", "rtx", "supplied", "eager-fp16")
+BACKENDS = ("fp32", "inductor", "inductor-attention-fp32", "rtx", "supplied", "eager-fp16")
 RTX_WORKSPACE_BYTES = 512 * 2**20
 
 
@@ -133,6 +134,15 @@ def ssimulacra2(reference: Path, candidate: Path) -> float:
     return float(numbers[-1])
 
 
+def score_stress_render(directory: Path, label: str, reference: Tensor, candidate: Tensor) -> float:
+    directory.mkdir(parents=True, exist_ok=True)
+    reference_png = directory / f"{label}-fp32.png"
+    candidate_png = directory / f"{label}-candidate.png"
+    image_tensor(reference).save(reference_png)
+    image_tensor(candidate).save(candidate_png)
+    return ssimulacra2(reference_png, candidate_png)
+
+
 def profile_placement(path: Path) -> dict[str, list[str]]:
     placement: dict[str, set[str]] = {}
     for event in json.loads(path.read_text(encoding="utf-8")):
@@ -214,7 +224,15 @@ def validate_stress(
                 np.save(path, output)
                 row["finite"] = True
             else:
-                row.update(comparison(output, np.load(path, mmap_mode="r")))
+                expected = np.load(path, mmap_mode="r")
+                row.update(comparison(output, expected))
+                if backend == "inductor-attention-fp32" and label == "checkerboard" and row["finite"]:
+                    row["ssimulacra2"] = score_stress_render(
+                        base / backend / "stress-renders",
+                        label,
+                        torch.from_numpy(expected.copy()),
+                        torch.from_numpy(output),
+                    )
             if count > 1:
                 row["per_sample_vs_individual"] = [
                     comparison(item, runners[1].run(runners[1].prepare(part))[0].float().cpu().numpy())
@@ -303,7 +321,10 @@ def torch_runners(checkpoint: Path, family: Family, batch: int, backend: str, re
     dtype = torch.float32 if backend == "fp32" else torch.float16
     model.eval().to(device="cuda", dtype=dtype)
     run = model
-    if backend == "inductor":
+    if backend == "inductor-attention-fp32":
+        use_fp32_attention(model)
+        report["precision"] = "FP16 except FP32 latent attention normalization, contractions and division"
+    if backend in ("inductor", "inductor-attention-fp32"):
         if os.name == "nt":
             # Windows cannot pass file descriptors to Inductor's compile subprocesses.
             os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
@@ -559,6 +580,8 @@ def main() -> None:
         parser.error("The baseline matrix skips TensorRT-RTX for GFISRv2")
     if args.backend == "supplied" and args.family != "moesr":
         parser.error("Only MoESR has a supplied graph")
+    if args.backend == "inductor-attention-fp32" and args.family != "gaterv2":
+        parser.error("The FP32 attention candidate requires GateRV2")
     os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
     torch.set_num_threads(2)
     torch.backends.cuda.matmul.allow_tf32 = False

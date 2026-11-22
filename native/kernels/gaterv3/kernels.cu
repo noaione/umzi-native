@@ -450,20 +450,7 @@ extern "C" __global__ void shuffle_concat(half2* out, const half2* in, const hal
 
 #include "fp16.cuh"
 
-template<class T, bool Crop>
-__device__ void resize_rgb(T* out, const T* in, int h, int w, int ph, int pw, int total) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= total) return;
-    if constexpr (Crop) {
-        int plane = i / (h * w), y = i / w % h, x = i % w;
-        out[i] = in[(plane * ph + y) * pw + x];
-    } else {
-        int plane = i / (ph * pw), y = i / pw % ph, x = i % pw;
-        if (y >= h) y = ph - h < h ? 2 * h - 2 - y : h - 1;
-        if (x >= w) x = pw - w < w ? 2 * w - 2 - x : w - 1;
-        out[i] = in[(plane * h + y) * w + x];
-    }
-}
+#include "../../common/resize_rgb.cuh"
 
 #define RESIZE_RGB(NAME, T, CROP) \
 extern "C" __global__ void NAME(T* y, const T* x, int h, int w, int ph, int pw, int n) { \

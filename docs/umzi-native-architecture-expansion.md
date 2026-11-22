@@ -161,9 +161,55 @@ record the reference and backend runs.
 
 | Family | CPU checkpoint load | CUDA baselines | Native FP32 parity, export, and session |
 | --- | --- | --- | --- |
-| GateRV2 | Verified | FP32 and RTX measured, default Inductor FP16 produces non-finite output | Pending |
+| GateRV2 | Verified | FP32, RTX FP16, and Inductor FP16 with FP32 attention measured | Private FP32 network validated, package and session pending |
 | MoESR | Verified, supplied ONNX validated | FP32, Inductor FP16, and RTX FP16 measured | Pending |
 | GFISRv2 | Verified, prior handoff reviewed | FP32, eager FP16, and Inductor FP16 measured, flat-tile fidelity failure traced, RTX skipped | Pending |
+
+### GateRV2 private FP32 validation
+
+The private runner loads the same checkpoint as eager FP32 and traces
+padding, encoder skips and downsampling, all 12 latent attention updates,
+decoder merges, the output convolution, and the cropped RGB output.
+GateRV2 shares GateRV3's CUDA RGB padding and crop code. Its new kernels
+normalize Q and K across channels and apply the attention denominator. The private runner
+uses Torch CUDA primitives for the convolutions, contractions, and
+remaining operations. The package and session work follows the private
+parity checks.
+
+The CUDA RGB padding and crop matched exactly on four shapes, including
+65×79 and 9×9. Standalone attention matched within 8.95e-8 max absolute
+error on four batch/token configurations. The first observed rounding
+difference was at the first latent attention update on all five traced
+inputs. The worst stress output was the checkerboard at 117.920 dB,
+6.32e-6 maximum absolute error, and 98.988 SSIMULACRA2. The full output
+checks use `atol=1e-5` and `rtol=5e-5`.
+
+Both Dehalftone pages passed that tolerance. SSIMULACRA2 compares the
+rendered candidate PNGs with their matching Torch FP32 PNGs using
+`C:\Tools\imaging\ssimulacra2.exe`. The report records the paired
+Torch reference timing and the CUDA runner's own timings.
+
+| Source page | Batch-16 inference | Input MPx/s | Mean batch-1 tile ms | Raw PSNR dB | SSIMULACRA2 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| watanare-page-085.jpg | 4.112 s | 1.123 | 38.735 | 148.706 | 93.100 |
+| watanare-page-086.jpg | 4.548 s | 1.015 | 42.256 | 148.964 | 93.167 |
+| Both pages | 8.661 s | 1.066 | 40.495 | 148.833 | 93.133 mean / 93.100 min |
+
+The maximum raw page error was 8.05e-7. The rendered PNGs differed in 60
+and 52 RGB samples respectively, each by one 8-bit code value.
+
+```powershell
+& 'C:\Python314\python.exe' scripts/validate_gaterv2.py --pages --nvrtc-root output/nvrtc-13.0/nvidia/cu13
+```
+
+The private validator uses the local CUDA Python bindings and CUDA 13.0
+NVRTC toolchain. The report is in `output/gaterv2-native-validation/`.
+
+Both GateRV3 checkpoints exported byte for byte against the existing
+packages after extracting the shared CUDA resize code. The rebuilt
+Windows DLL passed the aligned and odd-rectangle session checks in
+mixed precision and FP16. Both checkpoints matched the CLI bit for
+bit and reused the disk cache when reopened.
 
 Related design documents are the [runtime and package plan](umzi-native-runtime-plan.md)
 and the [exporter plan](umzi-model-exporter-plan.md).

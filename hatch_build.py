@@ -132,8 +132,10 @@ def _load_nvrtc(path: Path) -> ctypes.CDLL:
     return nvrtc
 
 
-def _compile_kernels(nvrtc: ctypes.CDLL, includes: Sequence[Path], arch: str, source: Path) -> bytes:
-    _log(f"Compiling GateRV3 kernels for {arch}")
+def _compile_kernels(
+    nvrtc: ctypes.CDLL, includes: Sequence[Path], arch: str, source: Path, *, fast_math: bool = True
+) -> bytes:
+    _log(f"Compiling {source.name} kernels for {arch}")
     prog = ctypes.c_void_p()
 
     def check(status: int) -> None:
@@ -147,8 +149,9 @@ def _compile_kernels(nvrtc: ctypes.CDLL, includes: Sequence[Path], arch: str, so
             f"--gpu-architecture={arch}".encode(),
             *[f"--include-path={path}".encode() for path in (*includes, source)],
             b"--std=c++17",
-            b"--use_fast_math",
         ]
+        if fast_math:
+            options.append(b"--use_fast_math")
         argv = (ctypes.c_char_p * len(options))(*options)
         status = nvrtc.nvrtcCompileProgram(prog, len(options), argv)
         size = ctypes.c_size_t()
