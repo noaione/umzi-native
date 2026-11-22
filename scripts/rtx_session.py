@@ -11,6 +11,11 @@ def create_rtx_session(
     tile: int,
     cache_dir: Path,
     profile_prefix: Path | None = None,
+    *,
+    scale: int | None = None,
+    input_name: str = "input",
+    cuda_graph: bool = True,
+    workspace_bytes: int | None = None,
 ):
     import onnxruntime as ort
     import onnxruntime_ep_nv_tensorrt_rtx as rtx
@@ -25,10 +30,12 @@ def create_rtx_session(
         raise RuntimeError(f"No execution-provider device is available for {ep}")
 
     cache_dir.mkdir(parents=True, exist_ok=True)
-    profile = f"input:{batch}x3x{tile}x{tile}"
+    profile = f"{input_name}:{batch}x3x{tile}x{tile}"
+    if workspace_bytes is None:
+        workspace_bytes = torch.cuda.get_device_properties(0).total_memory * 3 // 4
     config = {
-        "enable_cuda_graph": "1",
-        "nv_max_workspace_size": str(torch.cuda.get_device_properties(0).total_memory * 3 // 4),
+        "enable_cuda_graph": "1" if cuda_graph else "0",
+        "nv_max_workspace_size": str(workspace_bytes),
         "nv_detailed_build_log": "0",
         "nv_runtime_cache_path": str(cache_dir.resolve()),
         "nv_profile_min_shapes": profile,
@@ -46,6 +53,9 @@ def create_rtx_session(
     session = ort.InferenceSession(str(path), sess_options=options, enable_fallback=0)
     if ep not in session.get_providers():
         raise RuntimeError(f"TensorRT-RTX did not activate: {session.get_providers()}")
-    if list(session.get_inputs()[0].shape) != [batch, 3, tile, tile]:
-        raise RuntimeError(f"Unexpected TensorRT-RTX input shape for {path}")
+    inputs, outputs = session.get_inputs(), session.get_outputs()
+    if len(inputs) != 1 or inputs[0].name != input_name or inputs[0].shape != [batch, 3, tile, tile]:
+        raise RuntimeError(f"Unexpected TensorRT-RTX input signature for {path}: {inputs}")
+    if scale is not None and (len(outputs) != 1 or outputs[0].shape != [batch, 3, tile * scale, tile * scale]):
+        raise RuntimeError(f"Unexpected TensorRT-RTX output signature for {path}: {outputs}")
     return session, config
