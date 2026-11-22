@@ -2,7 +2,48 @@
 
 ## Unreleased
 
-Nothing yet!
+### Added
+
+- Native CUDA support (exporter, `peek_model()`, CUDA Graph session, and
+  `.umplan` plan cache) for three new model families:
+  - **GateRV2** (`mixed`/`fp16`): fused NHWC kernels, FP32 linear
+    attention, shared activation arena, `tune_plans` / `workspace_mib` options.
+  - **MoESR** (`mixed`/`fp16`): custom tensor-core fused expand/project and
+    tiled depthwise kernels with 0 B retained cuDNN workspace, `fused_gate` /
+    `workspace_mib` options.
+  - **GFISRv2** (`fp32`/`mixed`/`fp16`): dynamic cuFFT 12 loading (no cuFFT
+    dependency for other families), bit-exact FP32 path, fused NHWC
+    tensor-core/spectral reduced-precision path with 0 B retained cuDNN
+    workspace, `fused_conv` / `workspace_mib` / `unexact_erf` options.
+- Linux x64 (`manylinux_2_34_x86_64`) wheel and native SDK CI builds with ELF
+  ABI/dependency verification, GPU-less `libcuda.so.1` stub linking in
+  `hatch_build.py`, and multi-platform tag publishing.
+- Quickstart, export guide, and consolidated final timing/fidelity tables in
+  `docs/`.
+
+### Changed
+
+- Consolidated shared CUDA/cuDNN helpers, backend conv plans, and Ampere+ PTX
+  tensor-core primitives into `native/common/`.
+- Moved the `umzi_native` CLI into standalone `native/runtime/cli.cpp` (linked
+  into the CLI binary only) with generic `--option name=value` kernel options.
+- Aligned `startup_device_used_bytes`, common plan diagnostics (`timed_plans`,
+  `plan_workspace_bytes`, `peak_plan_workspace_bytes`), and `kernel_message()`
+  reporting across all four kernel families.
+
+### Removed
+
+- Removed `native/kernels/gaterv3/runner.h`, all 20 legacy `gt_*` DLL exports
+  (leaving only the 17 base `umzi_*` ABI exports), the legacy fixed-bundle
+  loader, and `legacy_cli`.
+
+### Fixed
+
+- Fixed missing/incomplete `startup_device_used_bytes` reporting in GateRV2,
+  MoESR, and GFISRv2, and missing index bounds checking in MoESR's
+  `umzi_session_diagnostic()`.
+- Fixed GFISRv2 `mixed` TF32 drift on the spectral 1×1 projection by using a
+  deterministic FP32 FMA kernel.
 
 ## [0.0.2] - 2026-11-22
 

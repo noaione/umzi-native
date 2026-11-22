@@ -132,5 +132,12 @@ with umzi.InferenceSession("model.ummodel", sess_options=options) as session:
 ## Links
 
 - [umzi](https://github.com/umzi2)
-- [GateRV3](https://github.com/umzi2/GaterV3)
+  - [GateRV2](https://github.com/umzi2/GateRv2)
+  - [GateRV3](https://github.com/umzi2/GaterV3)
+  - [GFISRv2](https://github.com/umzi2/gfisrv2)
+  - [MoESR](https://github.com/umzi2/MoESR)
 - [Resselt](https://github.com/rewaifu/resselt)
+
+## License
+
+MPL-2.0

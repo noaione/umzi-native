@@ -16,9 +16,49 @@ build-backend = "hatchling.build"
 [project]
 name = "umzi-native"
 version = "0.0.2"
-description = "Faster inference for umzi models/kernels on CUDA"
+description = "Native CUDA inference runtime for Umzi image restoration and upscaling models"
+readme = "README.md"
+license = "MPL-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
+authors = [{ name = "noaione", email = "hi@n4o.xyz" }]
+keywords = [
+    "cuda",
+    "cudnn",
+    "cublaslt",
+    "image-restoration",
+    "super-resolution",
+    "upscaling",
+    "gaterv3",
+    "gaterv2",
+    "moesr",
+    "gfisrv2",
+    "umzi",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Intended Audience :: Developers",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Multimedia :: Graphics",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
 dependencies = ["numpy>=2.5"]
+
+[project.scripts]
+umzi-native = "umzi_native.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/noaione/umzi-native"
+Repository = "https://github.com/noaione/umzi-native"
+Issues = "https://github.com/noaione/umzi-native/issues"
+Changelog = "https://github.com/noaione/umzi-native/blob/master/CHANGELOG.md"
 
 [project.optional-dependencies]
 exporter = ["resselt>=1.4.1"]
@@ -37,7 +77,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.sdist]
-include = ["/src", "/native", "/hatch_build.py", "/README.md"]
+include = ["/src", "/native", "/hatch_build.py", "/README.md", "/LICENSE", "/CHANGELOG.md"]
 exclude = ["*.dll", "*.so", "__pycache__"]
 
 [tool.hatch.build.targets.wheel]
