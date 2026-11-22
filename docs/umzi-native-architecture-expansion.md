@@ -939,10 +939,27 @@ same timing scope, tiling, and grayscale scoring when judging the target.
 · [Timing harness](../../umzi-bench/scripts/evaluate_umzi_unified_matrix.py)
 
 The 256×256 batch-2 MangaScale results above report synchronized model
-calls and serve as the native tuning baseline. Run the matched 128×128
-full-page comparison to determine whether a candidate beats 4.8052 s/page.
-Record the memory and fidelity alongside the matched timings.
+calls with 32 px overlap. Fresh optimization baselines at both the matched
+128×128 full-page workload (32 px overlap, `lb-page-003.png`, 4 paired rounds,
+NVML VRAM, 150 individual batch-1 tiles) and the 256×256 batch-2 64 px overlap
+tuning workload (all three pages, 105 real tiles) were recorded on the pickup
+build (`658fcc9`, `scripts/benchmark_gfisrv2_page.py`, `scripts/profile_gfisrv2.py`):
 
-The next tuning pass can profile the half cuDNN convolutions and evaluate
-workspace choices against these baselines. Replicate padding remains a
-separate model-behavior experiment for panel edges, halftones and tile overlaps.
+| Workload & Runner | Time (s) | Input MPx/s | Mean batch-1 tile (ms) | VRAM (MiB) | Raw PSNR (dB) | SSIMULACRA2 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Matched 128×128, Historical ORT TRT 10 FP16 | **4.8052** | 0.2529 | — | 292.49 (NVML steady) | 60.4422 | 87.2950 (gray) |
+| Matched 128×128, Native FP16 baseline | 6.3540 | 0.1912 | 40.655 dev / 43.239 host | 128.49 (NVML steady) | 64.4828 | 87.3532 (gray) |
+| Matched 128×128, Native Mixed baseline | 6.7572 | 0.1798 | 36.953 dev / 38.030 host | 148.49 (NVML steady) | 67.4726 | 87.4351 (gray) |
+| Matched 128×128, Native FP32 baseline | 8.6323 | 0.1408 | 48.172 dev / 49.346 host | 144.49 (NVML steady) | ∞ | 100.000 (gray) |
+| 256×256 b2 ov64 (3 pages), Native FP16 baseline | 16.388 | 0.2224 | 153.243 | 270 (warmed b2 delta) | 60.716 | 86.425 mean |
+| 256×256 b2 ov64 (3 pages), Native Mixed baseline | 17.221 | 0.2117 | 161.076 | 342 (warmed b2 delta) | 63.993 | 86.581 mean |
+| 256×256 b2 ov64 (3 pages), Native FP32 baseline | 22.734 | 0.1603 | 212.987 | 362 (warmed b2 delta) | ∞ | 100.000 mean |
+
+CUPTI profiling (`output/gfisrv2-session/baseline-profile-{128,256}.json`)
+shows the unoptimized NCHW runner spends ~57% of GPU kernel time in cuDNN
+(including 12.2–12.7% pure NCHW↔NHWC reformat kernels and FP32-accumulated
+expand/project convolutions), ~34.5% in unfused custom kernels (led by
+`add_bias_half` at 14.6–15.6%, `gate_half` at 7.1%, `rms_norm_half` at 4%,
+`residual_half` at 3.2%, and `depthwise_half` at 2.4%), and only ~6–8% in
+cuFFT itself. Replicate padding remains a separate model-behavior experiment
+for panel edges, halftones and tile overlaps.

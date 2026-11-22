@@ -7,6 +7,7 @@ import json
 import os
 from contextlib import ExitStack
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -16,6 +17,7 @@ import torch
 from benchmark import image_tensor
 from benchmark_architectures import (
     ROOT,
+    Family,
     Runner,
     digest,
     read_image,
@@ -168,8 +170,9 @@ def check_dispatch(
         with TemporaryDirectory(dir=output) as directory:
             temporary = Path(directory)
             switches = ("--unexact-erf",) if unexact else ()
+            plans = Path(settings.cache_dir) if settings.cache_dir is not None else temporary / "plans"
             reference = cli_output(
-                cli, model, settings.precision, temporary / "plans", sample.numpy(), temporary, host.shape, switches
+                cli, model, settings.precision, plans, sample.numpy(), temporary, host.shape, switches
             )
         if not np.array_equal(host, reference):
             raise AssertionError("GFISRv2 CLI and Python outputs differ")
@@ -185,15 +188,16 @@ def check_pages(
     output: Path,
     check_fp32_parity: bool,
     eager_half_reference: Path | None,
+    family: Family,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     rows, setup = [], {}
     torch.cuda.empty_cache()
     with ExitStack() as stack:
         runners = {}
-        for batch in (1, FAMILY.batch):
+        for batch in (1, family.batch):
             free_before = torch.cuda.mem_get_info()[0]
             session = stack.enter_context(InferenceSession(package, settings))
-            shape = (batch, 3, FAMILY.tile, FAMILY.tile)
+            shape = (batch, 3, family.tile, family.tile)
             session.prepare(shape)
             device_runner = DeviceSession(session)
             runner = Runner(device_runner, device_runner.dtype)
@@ -203,7 +207,7 @@ def check_pages(
             torch.cuda.empty_cache()
             setup[str(batch)]["warmed_device_vram_delta_bytes"] = free_before - torch.cuda.mem_get_info()[0]
         for path in sources:
-            row, actual = timed_page(read_image(path), path.name, runners, FAMILY, FAMILY.batch)
+            row, actual = timed_page(read_image(path), path.name, runners, family, family.batch)
             expected = np.load(reference / f"{path.stem}.npy", mmap_mode="r")
             if check_fp32_parity:
                 np.testing.assert_allclose(actual.numpy(), expected, err_msg=path.name, **CUFFT_TOLERANCE)
@@ -232,25 +236,29 @@ def main() -> None:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--reference-report", type=Path, default=BASELINE / "report.json")
     parser.add_argument("--pages", action="store_true")
+    parser.add_argument("--overlap", type=int, default=FAMILY.overlap, help="Tile overlap in input pixels")
     parser.add_argument("--precision", choices=("fp32", "fp16", "mixed"), default="fp32")
     parser.add_argument(
         "--unexact-erf", action="store_true", help="Measure CUDA erff without asserting reference parity"
     )
     args = parser.parse_args()
+    if args.overlap < 0 or args.overlap >= FAMILY.tile:
+        parser.error(f"--overlap must satisfy 0 <= overlap < {FAMILY.tile}")
+    family = replace(FAMILY, overlap=args.overlap)
     os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
     torch.set_num_threads(2)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     torch.backends.cudnn.benchmark = False
-    checkpoint = ROOT / "models" / FAMILY.checkpoint
-    sources = sorted((ROOT / "samples" / FAMILY.samples).glob("*.png"))
+    checkpoint = ROOT / "models" / family.checkpoint
+    sources = sorted((ROOT / "samples" / family.samples).glob("*.png"))
     config = {
         "checkpoint_sha256": digest(checkpoint),
         "images": {path.name: digest(path) for path in sources},
-        "tile": FAMILY.tile,
-        "batch": FAMILY.batch,
-        "overlap": FAMILY.overlap,
-        "scale": FAMILY.scale,
+        "tile": family.tile,
+        "batch": family.batch,
+        "overlap": family.overlap,
+        "scale": family.scale,
     }
     eager_half_reference = None
     if args.pages:
@@ -297,9 +305,16 @@ def main() -> None:
     eager_half = deepcopy(eager).half() if args.precision == "fp16" else None
     check_fp32_parity = args.precision == "fp32" and not args.unexact_erf
     options = {"unexact_erf": 1} if args.unexact_erf else {}
-    settings = SessionOptions(precision=args.precision, dll_path=args.library, kernel_options=options)
+    plan_cache = args.output / "plans" / args.precision if args.precision != "fp32" else None
+    settings = SessionOptions(
+        precision=args.precision, dll_path=args.library, cache_dir=plan_cache, kernel_options=options
+    )
     direct_settings = SessionOptions(
-        precision=args.precision, dll_path=args.library, enable_cuda_graph=False, kernel_options=options
+        precision=args.precision,
+        dll_path=args.library,
+        cache_dir=plan_cache,
+        enable_cuda_graph=False,
+        kernel_options=options,
     )
     with InferenceSession(package, settings) as graph, InferenceSession(package, direct_settings) as direct:
         report["stress"] = check_stress(graph, direct, eager, eager_half, sources, args.output, settings)
@@ -316,6 +331,7 @@ def main() -> None:
             args.output,
             check_fp32_parity,
             eager_half_reference,
+            family,
         )
         report.update(pages=pages, setup=setup, summary=summarize(pages))
         path.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")

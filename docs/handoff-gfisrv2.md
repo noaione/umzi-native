@@ -33,16 +33,88 @@ Use each overlap's own eager FP32 render for precision comparisons. If
 the wider overlap gives no visible seam benefit, 32 px is the cheaper
 candidate to revisit.
 
-### Archived 256×256 results
+### Archived 256×256 results (32 px overlap)
 
-The table uses batch 2 and **32 px overlap**. The 64 px native tuning
-baseline and the matched TRT comparison are pending.
+The table below uses batch 2 and **32 px overlap** (archived prior to the 64 px
+tuning baseline and matched 128×128 full-page baseline).
 
 | Native precision | Batch-2 time, all 3 pages (s) | Input MPx/s | Mean batch-1 tile (ms) | Warmed batch-2 VRAM delta (MiB) | Raw PSNR (dB) | Mean SSIMULACRA2 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | FP32 | 14.364 | 0.2538 | 202.595 | 362 | ∞ | 100.000 |
 | FP16 | 10.785 | 0.3380 | 148.899 | 270 | 60.166 | 86.385 |
 | Mixed | 10.950 | 0.3329 | 151.537 | 342 | 63.667 | 86.633 |
+
+### Optimization baselines (2026-11-22, pickup build `658fcc9`)
+
+Rebuilt cleanly into `output/gfisrv2-session/pickup-win/` (`umzi_native.dll`
+SHA-256 `b7b4c132499a9d50415af4eb4cd65736bfb7f49c8166f4bea3d8d82d6cbd4fb4`,
+package SHA-256 `36e829d2f1e4e334a48bc4295ee14a26283b929d46c841c9446761fc5a74bae1`).
+All three smoke validations (`fp32`, `fp16`, `mixed`) passed before timing.
+
+#### Matched 128×128 full-page baseline (`lb-page-003.png`, batch 1, 32 px overlap, 150 tiles)
+
+Four paired forward/reverse rounds in fresh isolated workers with CUDA Graph
+replay, NVML 5 ms VRAM sampling in separate workers, and 150 individually timed
+synchronized batch-1 tiles. Fresh untouched eager CUDA FP32 reference at the
+same tiling (`output/gfisrv2-session/matched-128-ref/`). Reports:
+`output/gfisrv2-session/baseline-matched-128/summary.json`.
+
+| Runner | Median s/page | Range (s/page) | Input MPx/s | Mean batch-1 dev / host (ms/tile) | NVML steady peak above idle (MiB) | Buffers / warmed delta (MiB) | Raw PSNR vs FP32 (dB) | Gray / RGB16 SSIMULACRA2 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Historical ORT TRT 10 FP16 (target) | **4.8052** | 4.7665–4.9099 | 0.2529 | — | 292.49 | — | 60.4422 | 87.2950 / — |
+| Native FP16 (baseline) | 6.3540 | 5.6458–6.4009 | 0.1912 | 40.655 / 43.239 | **128.49** | 39.7 / 66.0 | 64.4828 | 87.3532 / 87.1839 |
+| Native Mixed (baseline) | 6.7572 | 5.9912–6.7869 | 0.1798 | 36.953 / 38.030 | 148.49 | 62.3 / 86.0 | 67.4726 | 87.4351 / 87.3302 |
+| Native FP32 (baseline) | 8.6323 | 8.6229–9.1936 | 0.1408 | 48.172 / 49.346 | 144.49 | 59.2 / 82.0 | ∞ | 100.000 / 100.000 |
+
+All three native modes matched CUDA Graph vs direct bit-for-bit on the full
+page. Native FP16 uses 2.28× less steady VRAM than the historical TRT 10 runner
+(128.49 vs 292.49 MiB) and +4.04 dB higher PSNR, but trails by 32.2% in median
+page time (6.3540 vs 4.8052 s/page).
+
+#### 256×256 batch-2 native tuning baseline (64 px overlap, all 3 pages, 105 real tiles)
+
+Fresh eager FP32 reference generated with `--overlap 64` at
+`output/architecture-baselines-ov64/gfisrv2/batch-2/fp32/report.json`. Reports:
+`output/gfisrv2-session/baseline-ov64-{fp32,fp16,mixed}/report.json`.
+
+| Native precision | Batch-2 time, all 3 pages (s) | Input MPx/s | Mean batch-1 tile (ms) | Batch-1 / Batch-2 buffers (MiB) | Batch-1 / Batch-2 warmed delta (MiB) | Raw PSNR (dB) | Mean / Min SSIMULACRA2 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| FP32 | 22.734 | 0.1603 | 212.987 | 184.7 / 352.1 | 186 / 362 | ∞ | 100.000 / 100.000 |
+| FP16 | 16.388 | 0.2224 | 153.243 | 133.8 / 259.2 | 138 / 270 | 60.716 | 86.425 / 85.534 |
+| Mixed | 17.221 | 0.2117 | 161.076 | 175.8 / 327.2 | 182 / 342 | 63.993 | 86.581 / 85.658 |
+
+#### Baseline kernel profile (`scripts/profile_gfisrv2.py`)
+
+Measured separately with `enable_cuda_graph=False` via CUPTI (`output/gfisrv2-session/baseline-profile-{128,256}.json`):
+
+- **128×128 batch-1 FP16 (50.84 ms GPU kernels; host page 6.99 s = 6.53 s runner + 0.45 s CPU stitch/tile):**
+  - cuDNN/GEMM: **29.05 ms (57.2%)** — `expand 48→256` (24×, FP32 acc) 12.80 ms, `project 128→48` (25×, FP32 acc) 7.35 ms, NCHW↔NHWC layout reformat kernels (153×) **6.18 ms**, Fourier 60-ch grouped 3×3 1.91 ms, Fourier 60→60 1×1 0.49 ms.
+  - Custom kernels: **17.53 ms (34.5%)** — `add_bias_half` (100×) **7.92 ms**, `gate_half` (24×) 3.59 ms, `rms_norm_half` (72×) 2.12 ms, `residual_half` (24×) 1.63 ms, `depthwise_half` (72×) 1.24 ms, `copy_channels_to_float` 0.49 ms, `add_half_residual` 0.42 ms.
+  - cuFFT + pack/unpack/scale: **4.23 ms (8.3%)** — actual FFT kernels ~2.97 ms.
+- **128×128 batch-1 Mixed (45.41 ms GPU kernels; host page 6.02 s = 5.71 s runner + 0.31 s CPU):**
+  - Same bottleneck hierarchy: `expand` 10.23 ms, `add_bias_half` 5.98 ms, `project` 5.79 ms, NCHW↔NHWC reformat 5.14 ms, `gate_mixed` 2.77 ms, `rms_norm*` 2.99 ms, `residual_mixed` 1.83 ms, Fourier FP32 1×1 1.32 ms, Fourier depthwise 1.23 ms, cuFFT ~3.53 ms.
+- **256×256 batch-2 FP16 (284.23 ms GPU kernels):**
+  - `expand` 68.23 ms (24.0%), `add_bias_half` 41.44 ms (14.6%), `project` 40.56 ms (14.3%), NCHW↔NHWC reformat **36.23 ms (12.7%)**, `gate_half` 20.11 ms (7.1%), `rms_norm_half` 11.08 ms (3.9%), Fourier grouped 3×3 8.94 ms, `residual_half` 8.86 ms, `depthwise_half` 6.92 ms, cuFFT ~16 ms.
+
+### Optimization pass 1 (2026-11-22)
+
+Build: `output/gfisrv2-session/p1-win` (`--arch sm_86` iteration build).
+Switched reduced-precision (`fp16` and `mixed`) to NHWC with canonical block
+channel permutation at session open, cuDNN backend timed plans
+(`native/kernels/gfisrv2/conv_plan.h`, `CudaPlanCache`, `workspace_mib`, FP16
+accumulation in FP16 mode), fused bias/RMSNorm/residual/gate/pack/unpack
+kernels, and shared-memory tiled spatial and spectral depthwise kernels. Kept
+`precision="fp32"` on its untouched bit-exact NCHW path.
+
+- Same-process alternating A/B probe (`scripts/ab_moesr_builds.py`, random tiles):
+  - **128×128 batch 1**: FP16 `42.3 → 22.5 ms/tile` (**1.88×**), Mixed `42.9 → 28.0 ms/tile` (**1.53×**).
+  - **256×256 batch 2**: FP16 `273.4 → 150.2 ms` (`75.1 ms/tile`, **1.82×**), Mixed `323.1 → 204.1 ms` (`102.1 ms/tile`, **1.58×**).
+- Matched 128×128 full-page (`output/gfisrv2-session/p1-matched-128/summary.json`, 4 rounds):
+  - **Pass 1 FP16**: **3.1374 s/page median** (range `3.1302–3.1850 s`, **0.3873 MPx/s**, **19.242 ms/tile** dev / `19.042 ms/tile` host, **116.49 MiB** NVML steady peak VRAM above idle, **59.3372 dB** raw PSNR, **87.1869** gray / `86.9820` RGB16 SSIMULACRA2, graph == direct bit-exact). Already **2.03× faster** than baseline and **1.53× faster** than the 4.8052 s/page TRT 10 target at 2.51× lower VRAM.
+- Note caught in Pass 1 smoke check: cuDNN backend selected a TF32 engine (`s1688gemm`) for Mixed's FP32 1×1 spectral projection when Python imported Torch before setting `NVIDIA_TF32_OVERRIDE=0`, causing a Python-vs-CLI mismatch on `mixed`. Pass 2 replaces the spectral 1×1 conv with custom deterministic kernels in both modes.
+- Pass 1 CUPTI profile (`output/gfisrv2-session/p1-profile-128.json`, 20.04 ms FP16 / 27.44 ms Mixed):
+  - Remaining FP16 bottlenecks: `expand 48→256` 5.43 ms + `gate_plain` 1.13 ms, `project 128→48` 2.88 ms + `residual_rms` 2.82 ms, stride-256 `branch_dw_gate` 1.65 ms, unvectorized `spectral_dw_res` 1.15 ms, cuFFT ~2.21 ms.
+  - Remaining Mixed bottlenecks: `expand` (`indexed_wo_smem`) 9.34 ms, `project` 4.30 ms + `residual_rms` 2.86 ms, `spectral_dw_res` 2.05 ms, `gate_plain` 1.68 ms, `branch_dw_gate` 1.41 ms.
 
 - FP32 matched all three untouched eager FP32 pages bit for bit.
 - FP16 matched eager FP16 on all 72 raw batch-2 page tiles and all three

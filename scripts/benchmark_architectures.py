@@ -14,7 +14,7 @@ import subprocess
 import time
 import traceback
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from hashlib import file_digest
 from importlib.metadata import version
 from pathlib import Path
@@ -572,10 +572,15 @@ def main() -> None:
     parser.add_argument("family", choices=FAMILIES)
     parser.add_argument("backend", choices=BACKENDS)
     parser.add_argument("--batch", type=int, help="Override the family's planned throughput batch")
+    parser.add_argument("--overlap", type=int, help="Override the family's default tile overlap in input pixels")
     parser.add_argument("--input", type=Path, help="Override the family's default sample directory")
     parser.add_argument("--output", type=Path, default=ROOT / "output/architecture-baselines")
     args = parser.parse_args()
     family = FAMILIES[args.family]
+    if args.overlap is not None:
+        if args.overlap < 0 or args.overlap >= family.tile:
+            parser.error(f"--overlap must satisfy 0 <= overlap < {family.tile}")
+        family = replace(family, overlap=args.overlap)
     batch = family.batch if args.batch is None else args.batch
     if batch < 1:
         parser.error("--batch must be positive")

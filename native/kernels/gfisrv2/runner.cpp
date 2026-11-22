@@ -4,8 +4,10 @@
 #include <cudnn.h>
 
 #include "gfisrv2_images.h"
+#include "conv_plan.h"
 #include "cufft_api.h"
 #include "../../common/cuda_module.h"
+#include "../../common/cuda_plan_cache.h"
 #include "../../runtime/binary.h"
 #include "../../runtime/kernel.h"
 
@@ -14,13 +16,22 @@
 #include <chrono>
 #include <climits>
 #include <cmath>
+#include <cstring>
+#include <filesystem>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <memory>
+#include <string>
 #include <string_view>
+#include <vector>
 
 namespace {
 constexpr int channels = 48, blocks = 24, scale = 4, hidden = 128, fourier = 30, band = 6, threads = 256;
+constexpr int rgb_lanes = 8, freq_lanes = 64;
+constexpr uint64_t default_workspace_mib = 512, max_workspace_mib = 4096;
+constexpr uint32_t plan_schema = 1;
+constexpr uint32_t saved_plan_marker = 0x4742;
 constexpr std::array<uint32_t, 7> configuration{3, 3, scale, channels, blocks, hidden, fourier};
 constexpr int r2c = 0x2a, c2r = 0x2c;
 using Clock = std::chrono::steady_clock;
@@ -67,6 +78,35 @@ Shape checked(const UmziShape& shape) {
     return {int(n), int(h), int(w)};
 }
 
+uint16_t float_to_half(float value) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const uint32_t sign = (bits >> 16) & 0x8000u;
+    const int exp = int((bits >> 23) & 0xffu) - 127;
+    uint32_t mant = bits & 0x7fffffu;
+    if (exp == 128) return uint16_t(sign | 0x7c00u | (mant ? 0x0200u | (mant >> 13) : 0u));
+    if (exp > 15) return uint16_t(sign | 0x7c00u);
+    if (exp >= -14) {
+        const uint32_t round_bit = 0x1000u;
+        const uint32_t sticky = mant & 0xfffu;
+        if ((mant & round_bit) && (sticky || (mant & 0x2000u))) mant += round_bit;
+        if (mant & 0x800000u) {
+            if (exp == 15) return uint16_t(sign | 0x7c00u);
+            return uint16_t(sign | (uint32_t(exp + 16) << 10));
+        }
+        return uint16_t(sign | (uint32_t(exp + 15) << 10) | (mant >> 13));
+    }
+    if (exp < -25) return uint16_t(sign);
+    mant |= 0x800000u;
+    const int shift = -14 - exp + 13;
+    const uint32_t half_ulp = 1u << (shift - 1);
+    const uint32_t mask = (1u << shift) - 1u;
+    const uint32_t rem = mant & mask;
+    uint32_t sub = mant >> shift;
+    if (rem > half_ulp || (rem == half_ulp && (sub & 1u))) ++sub;
+    return uint16_t(sign | sub);
+}
+
 struct Norm { size_t scale, offset; };
 struct Filter { size_t weight, bias; };
 struct Fourier { Norm pre; Filter position, project; Norm post; };
@@ -102,18 +142,184 @@ struct Network {
     Filter conv(int cin, int cout, int taps = 9) { return {take(size_t(cin) * cout * taps), take(cout)}; }
 };
 
-struct Convolution {
+// Device NHWC weight layout for reduced precision (FP16 / Mixed).
+// Dense spatial filters are FP16 KRSC; spectral 1x1 projection is FP16 KRSC in
+// FP16 mode and FP32 KRSC in Mixed mode (padded 60 -> 64). All biases, norms,
+// depthwise filters, and residual gammas stay FP32.
+struct DeviceNetwork {
+    size_t bytes = 0;
+    Filter first, tail_expand, tail_project, last;
+    std::array<Block, blocks> body{};
+
+    explicit DeviceNetwork(bool spectral_half) {
+        first = dense_half(rgb_lanes, channels, 9);
+        for (auto& block : body) {
+            block.norm = norm(channels);
+            block.expand = dense_half(channels, 2 * hidden, 9);
+            block.fft = {
+                norm(2 * fourier),
+                {take_bytes(size_t(2 * fourier) * 9 * 4), take_bytes(size_t(2 * fourier) * 4)},
+                spectral_half ? dense_half(freq_lanes, freq_lanes, 1) : dense_float(freq_lanes, freq_lanes, 1),
+                norm(fourier),
+            };
+            block.bands = {{
+                Filter{take_bytes(size_t(band) * 9 * 4), take_bytes(size_t(band) * 4)},
+                Filter{take_bytes(size_t(band) * 11 * 4), take_bytes(size_t(band) * 4)},
+                Filter{take_bytes(size_t(band) * 11 * 4), take_bytes(size_t(band) * 4)},
+            }};
+            block.project = dense_half(hidden, channels, 9);
+            block.gamma = take_bytes(size_t(channels) * 4);
+        }
+        tail_expand = dense_half(channels, 2 * channels, 9);
+        tail_project = dense_half(2 * channels, channels, 9);
+        last = dense_half(channels, 3 * scale * scale, 9);
+    }
+
+    size_t take_bytes(size_t count) {
+        const size_t offset = (bytes + 255) & ~size_t(255);
+        bytes = offset + count;
+        return offset;
+    }
+    Norm norm(int c) { return {take_bytes(size_t(c) * 4), take_bytes(size_t(c) * 4)}; }
+    Filter dense_half(int cin, int cout, int taps) {
+        return {take_bytes(size_t(cin) * cout * taps * 2), take_bytes(size_t(cout) * 4)};
+    }
+    Filter dense_float(int cin, int cout, int taps) {
+        return {take_bytes(size_t(cin) * cout * taps * 4), take_bytes(size_t(cout) * 4)};
+    }
+};
+
+// Map original hidden channel k (0..127) in block `block_index` to canonical
+// hidden slot: 0..79 plain, 80..109 Fourier, 110..115 square, 116..121 row, 122..127 col.
+std::array<int, hidden> block_canon(int block_index) {
+    std::array<int, hidden> map{};
+    for (int k = 0; k < hidden - channels; ++k) map[k] = k;
+    int offset = 0;
+    for (int slot = 0; slot < 4; ++slot) {
+        const int kind = (slot + block_index) % 4;
+        if (kind == 0) {
+            for (int c = 0; c < fourier; ++c) map[80 + offset + c] = 80 + c;
+            offset += fourier;
+        } else {
+            const int base = 80 + fourier + (kind - 1) * band;
+            for (int c = 0; c < band; ++c) map[80 + offset + c] = base + c;
+            offset += band;
+        }
+    }
+    return map;
+}
+
+template<class OutSlot, class InSlot>
+void pack_oihw_to_krsc_half(std::vector<char>& out, const char* in, Filter to, Filter from, int cin, int cout,
+                            int to_cin, int taps, OutSlot out_slot, InSlot in_slot) {
+    const auto* src_w = reinterpret_cast<const float*>(in + from.weight);
+    const auto* src_b = reinterpret_cast<const float*>(in + from.bias);
+    auto* dst_w = reinterpret_cast<uint16_t*>(out.data() + to.weight);
+    auto* dst_b = reinterpret_cast<float*>(out.data() + to.bias);
+    for (int o = 0; o < cout; ++o) {
+        const int target_o = out_slot(o);
+        dst_b[target_o] = src_b[o];
+        for (int i = 0; i < cin; ++i) {
+            const int target_i = in_slot(i);
+            for (int tap = 0; tap < taps; ++tap) {
+                const float w = src_w[(size_t(o) * cin + i) * taps + tap];
+                dst_w[(size_t(target_o) * taps + tap) * to_cin + target_i] = float_to_half(w);
+            }
+        }
+    }
+}
+
+void pack_oihw_to_krsc_float(std::vector<char>& out, const char* in, Filter to, Filter from, int cin, int cout,
+                             int to_cin, int taps) {
+    const auto* src_w = reinterpret_cast<const float*>(in + from.weight);
+    const auto* src_b = reinterpret_cast<const float*>(in + from.bias);
+    auto* dst_w = reinterpret_cast<float*>(out.data() + to.weight);
+    auto* dst_b = reinterpret_cast<float*>(out.data() + to.bias);
+    for (int o = 0; o < cout; ++o) {
+        dst_b[o] = src_b[o];
+        for (int i = 0; i < cin; ++i) {
+            for (int tap = 0; tap < taps; ++tap) {
+                dst_w[(size_t(o) * taps + tap) * to_cin + i] = src_w[(size_t(o) * cin + i) * taps + tap];
+            }
+        }
+    }
+}
+
+std::vector<char> build_device_weights(const Network& from, const DeviceNetwork& to, const char* in,
+                                       bool spectral_half) {
+    std::vector<char> out(to.bytes, 0);
+    const auto copy_raw = [&](size_t dst, size_t src, size_t bytes) {
+        std::memcpy(out.data() + dst, in + src, bytes);
+    };
+    const auto id = [](int c) { return c; };
+
+    pack_oihw_to_krsc_half(out, in, to.first, from.first, 3, channels, rgb_lanes, 9, id, id);
+    for (int i = 0; i < blocks; ++i) {
+        const auto& src = from.body[i];
+        const auto& dst = to.body[i];
+        const auto canon = block_canon(i);
+        copy_raw(dst.norm.scale, src.norm.scale, channels * 4);
+        copy_raw(dst.norm.offset, src.norm.offset, channels * 4);
+
+        const auto expand_slot = [&](int o) {
+            const bool is_value = o >= hidden;
+            const int k = is_value ? o - hidden : o;
+            const int c = canon[k];
+            if (c < 80) return 8 * (c / 4) + (is_value ? 4 : 0) + (c % 4);
+            return (is_value ? 208 : 160) + (c - 80);
+        };
+        pack_oihw_to_krsc_half(out, in, dst.expand, src.expand, channels, 2 * hidden, channels, 9, expand_slot, id);
+
+        copy_raw(dst.fft.pre.scale, src.fft.pre.scale, 2 * fourier * 4);
+        copy_raw(dst.fft.pre.offset, src.fft.pre.offset, 2 * fourier * 4);
+        copy_raw(dst.fft.position.weight, src.fft.position.weight, size_t(2 * fourier) * 9 * 4);
+        copy_raw(dst.fft.position.bias, src.fft.position.bias, size_t(2 * fourier) * 4);
+        if (spectral_half) {
+            pack_oihw_to_krsc_half(out, in, dst.fft.project, src.fft.project, 2 * fourier, 2 * fourier, freq_lanes, 1,
+                                   id, id);
+        } else {
+            pack_oihw_to_krsc_float(out, in, dst.fft.project, src.fft.project, 2 * fourier, 2 * fourier, freq_lanes, 1);
+        }
+        copy_raw(dst.fft.post.scale, src.fft.post.scale, fourier * 4);
+        copy_raw(dst.fft.post.offset, src.fft.post.offset, fourier * 4);
+
+        for (int b = 0; b < 3; ++b) {
+            const int taps = b == 0 ? 9 : 11;
+            copy_raw(dst.bands[b].weight, src.bands[b].weight, size_t(band) * taps * 4);
+            copy_raw(dst.bands[b].bias, src.bands[b].bias, size_t(band) * 4);
+        }
+
+        pack_oihw_to_krsc_half(out, in, dst.project, src.project, hidden, channels, hidden, 9, id,
+                               [&](int k) { return canon[k]; });
+        copy_raw(dst.gamma, src.gamma, channels * 4);
+    }
+    pack_oihw_to_krsc_half(out, in, to.tail_expand, from.tail_expand, channels, 2 * channels, channels, 9, id, id);
+    pack_oihw_to_krsc_half(out, in, to.tail_project, from.tail_project, 2 * channels, channels, 2 * channels, 9, id,
+                           id);
+    pack_oihw_to_krsc_half(out, in, to.last, from.last, channels, 3 * scale * scale, channels, 9, id, id);
+    return out;
+}
+
+// Legacy NCHW convolution plan (retained exclusively for bit-exact FP32 mode).
+struct LegacyConvolution {
     cudnnTensorDescriptor_t input = nullptr, output = nullptr;
     cudnnFilterDescriptor_t filter = nullptr;
     cudnnConvolutionDescriptor_t convolution = nullptr;
     cudnnConvolutionFwdAlgo_t algorithm{};
     size_t workspace = 0;
-    ~Convolution() {
+    ~LegacyConvolution() {
         if (convolution) cudnnDestroyConvolutionDescriptor(convolution);
         if (filter) cudnnDestroyFilterDescriptor(filter);
         if (output) cudnnDestroyTensorDescriptor(output);
         if (input) cudnnDestroyTensorDescriptor(input);
     }
+};
+
+// Backend NHWC convolution plan (used for FP16 and Mixed modes).
+struct BackendConvolution {
+    std::unique_ptr<gfi::ConvGraph> graph;
+    std::unique_ptr<gfi::Descriptor> plan;
+    size_t workspace = 0;
 };
 
 struct FftPlan {
@@ -142,49 +348,83 @@ struct FftPlan {
 };
 
 constexpr const char* kernel_names[] = {
+    // Legacy NCHW FP32 kernels (unchanged for bit-exact FP32).
     "rms_norm", "depthwise", "copy_channels", "pack_fft", "unpack_fft", "scale_fft", "add_bias",
     "gate", "residual", "apply_silu", "add_features", "shuffle_rgb",
-    "rms_norm_half", "rms_norm_to_half", "depthwise_half", "copy_channels_to_float", "pack_fft_half",
-    "unpack_fft_half", "scale_fft_to_half", "add_bias_half", "gate_half", "gate_mixed", "residual_half",
-    "residual_mixed", "apply_silu_half", "add_features_half", "add_features_mixed", "cast_to_half",
-    "cast_to_float", "add_half_residual", "shuffle_rgb_half", "shuffle_rgb_mixed",
+    // Optimized NHWC kernels (FP16 and Mixed).
+    "pack_rgb_nhwc_f16", "pack_rgb_nhwc_f32",
+    "input_bias_rms_nhwc_f16", "input_bias_rms_nhwc_mixed",
+    "residual_rms_nhwc_f16", "residual_nhwc_f16",
+    "residual_rms_nhwc_mixed", "residual_to_half_nhwc_mixed",
+    "gate_plain_nhwc", "extract_fourier_nhwc", "branch_dw_gate_nhwc",
+    "pack_rms_fft_nhwc_f16", "pack_rms_fft_nhwc_f32",
+    "spectral_dw_res_nhwc_f16", "spectral_dw_res_nhwc_f32",
+    "unpack_bias_gelu_nhwc_f16", "unpack_bias_gelu_nhwc_f32",
+    "scale_post_rms_gate_nhwc",
+    "bias_silu_nhwc_96", "tail_add_nhwc_f16", "tail_add_nhwc_mixed",
+    "bias_shuffle_rgb_nhwc_f16", "bias_shuffle_rgb_nhwc_f32",
+    "fill_noise_f16", "fill_noise_f32",
 };
 enum Kernel {
     Rms, Depthwise, CopyChannels, Pack, Unpack, ScaleFft, Bias, Gate, Residual, Silu, Add, Shuffle,
-    RmsHalf, RmsToHalf, DepthwiseHalf, CopyChannelsToFloat, PackHalf, UnpackHalf, ScaleFftToHalf,
-    BiasHalf, GateHalf, GateMixed, ResidualHalf, ResidualMixed, SiluHalf, AddHalf, AddMixed,
-    ToHalf, ToFloat, AddHalfResidual, ShuffleHalf, ShuffleMixed, KernelCount
+    PackRgbF16, PackRgbF32,
+    InputBiasRmsF16, InputBiasRmsMixed,
+    ResidualRmsF16, ResidualF16,
+    ResidualRmsMixed, ResidualToHalfMixed,
+    GatePlainNhwc, ExtractFourierNhwc, BranchDwGateNhwc,
+    PackRmsFftF16, PackRmsFftF32,
+    SpectralDwResF16, SpectralDwResF32,
+    UnpackBiasGeluF16, UnpackBiasGeluF32,
+    ScalePostRmsGateNhwc,
+    BiasSilu96, TailAddF16, TailAddMixed,
+    BiasShuffleRgbF16, BiasShuffleRgbF32,
+    FillNoiseF16, FillNoiseF32,
+    KernelCount
 };
 static_assert(std::size(kernel_names) == KernelCount);
 
 class Session final : public umzi::KernelSession {
     Network model;
+    DeviceNetwork dev_model{false};
     bool graph_enabled = false, pending = false, unexact_erf = false;
     uint32_t precision = UMZI_FP32;
+    uint64_t workspace_limit = default_workspace_mib << 20;
     CUdevice device = 0;
     CUcontext context = nullptr;
     CUmodule module = nullptr;
     CUstream stream = nullptr;
     CUevent complete = nullptr;
+    std::array<CUevent, 2> timing{};
     cudnnHandle_t cudnn = nullptr;
     std::unique_ptr<gfi::CufftApi> fft;
     int fft_version = 0;
     std::array<CUfunction, KernelCount> functions{};
-    CUdeviceptr weights = 0, weights_half = 0;
+    CUdeviceptr weights = 0;
+    size_t weight_bytes = 0;
 
     Shape shape{};
     int bins = 0;
     float fft_scale = 0;
     CUdeviceptr stage_in = 0, stage_out = 0, cudnn_scratch = 0;
     CUdeviceptr initial = 0, state = 0, norm = 0, projected = 0, gated = 0;
-    CUdeviceptr spectrum = 0, packed = 0, spectral_out = 0;
+    CUdeviceptr fft_buf = 0, spectrum = 0, freq_a = 0, freq_b = 0;
     CUgraph graph = nullptr;
     CUgraphExec executable = nullptr;
     FftPlan forward_fft, inverse_fft;
-    using Key = std::array<int, 5>;
-    std::map<Key, std::unique_ptr<Convolution>> plans;
-    size_t activation_bytes = 0, cudnn_workspace = 0;
+
+    using LegacyKey = std::array<int, 5>;
+    std::map<LegacyKey, std::unique_ptr<LegacyConvolution>> legacy_plans;
+    std::map<umzi::PlanShape, std::unique_ptr<BackendConvolution>> backend_plans;
+    std::map<std::array<CUdeviceptr, 4>, std::unique_ptr<gfi::Descriptor>> variants;
+    umzi::CudaPlanCache<umzi::gfisrv2_id, plan_schema> plan_cache;
+    std::filesystem::path cache_dir;
+    umzi::Digest cache_environment{}, plan_key{};
+    std::string cache_environment_error;
+
+    size_t activation_bytes = 0, cudnn_workspace = 0, scratch_bytes = 0;
+    int timed_plans = 0;
     std::array<double, 4> setup_ms{};
+    std::array<uint64_t, 4> device_used{};
 
 public:
     void open(const umzi::ModelPackage& package, const UmziSessionOptions& options) {
@@ -198,43 +438,65 @@ public:
         if (!package.section(2).empty() || data.size() != model.bytes)
             throw std::runtime_error("Invalid GFISRv2 weight layout");
         precision = options.precision;
+        bool seen_erf = false, seen_ws = false;
         for (uint32_t i = 0; i < options.kernel_option_count; ++i) {
             const auto& option = options.kernel_options[i];
             const std::string_view name = option.name ? option.name : "";
-            if (name != "unexact_erf")
+            if (name == "unexact_erf") {
+                if (seen_erf) throw std::runtime_error("Duplicate GFISRv2 option: unexact_erf");
+                if (option.value != 0 && option.value != 1)
+                    throw std::runtime_error("GFISRv2 unexact_erf must be 0 or 1");
+                unexact_erf = option.value == 1;
+                seen_erf = true;
+            } else if (name == "workspace_mib") {
+                if (seen_ws) throw std::runtime_error("Duplicate GFISRv2 option: workspace_mib");
+                if (option.value < 0 || uint64_t(option.value) > max_workspace_mib)
+                    throw std::runtime_error("GFISRv2 workspace_mib must be between 0 and 4096");
+                workspace_limit = uint64_t(option.value) << 20;
+                seen_ws = true;
+            } else {
                 throw std::runtime_error("Unknown GFISRv2 option: " + std::string(name));
-            if (option.value != 0 && option.value != 1)
-                throw std::runtime_error("GFISRv2 unexact_erf must be 0 or 1");
-            unexact_erf = option.value == 1;
+            }
         }
         graph_enabled = (options.flags & UMZI_CUDA_GRAPH) != 0;
+        if (options.cache_dir && *options.cache_dir) cache_dir = std::filesystem::path(options.cache_dir);
+        dev_model = DeviceNetwork(half_io());
+
         fft = std::make_unique<gfi::CufftApi>();
         FFT_CHECK(fft->version(&fft_version));
         CHECK(cuInit(0));
         CHECK(cuDeviceGet(&device, options.device));
         CHECK(cuDevicePrimaryCtxRetain(&context, device));
         ContextScope scope(context);
-        umzi::load_kernel_module(device, module, gfisrv2_images::embedded_cubins, gfisrv2_images::embedded_ptx);
+        record_memory(0);
+
+        const auto& image =
+            umzi::load_kernel_module(device, module, gfisrv2_images::embedded_cubins, gfisrv2_images::embedded_ptx);
         for (int i = 0; i < KernelCount; ++i) {
             const char* name = kernel_names[i];
             if (unexact_erf && i == Unpack) name = "unpack_fft_unexact";
-            if (unexact_erf && i == UnpackHalf) name = "unpack_fft_half_unexact";
+            if (unexact_erf && i == UnpackBiasGeluF16) name = "unpack_bias_gelu_nhwc_f16_unexact";
+            if (unexact_erf && i == UnpackBiasGeluF32) name = "unpack_bias_gelu_nhwc_f32_unexact";
             CHECK(cuModuleGetFunction(&functions[i], module, name));
         }
         CHECK(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
         CHECK(cuEventCreate(&complete, CU_EVENT_DISABLE_TIMING));
+        CHECK(cuEventCreate(&timing[0], CU_EVENT_DEFAULT));
+        CHECK(cuEventCreate(&timing[1], CU_EVENT_DEFAULT));
         CHECK(cudnnCreate(&cudnn));
-        CHECK(cuMemAlloc(&weights, data.size()));
-        CHECK(cuMemcpyHtoD(weights, data.data(), data.size()));
-        if (reduced()) {
-            CHECK(cuMemAlloc(&weights_half, data.size() / 2));
-            launch(stream, ToHalf, int(data.size() / sizeof(float)), weights_half, weights);
-            CHECK(cuStreamSynchronize(stream));
-            if (half_io()) {
-                CHECK(cuMemFree(weights));
-                weights = 0;
-            }
+
+        if (!reduced()) {
+            weight_bytes = data.size();
+            CHECK(cuMemAlloc(&weights, weight_bytes));
+            CHECK(cuMemcpyHtoD(weights, data.data(), weight_bytes));
+        } else {
+            const auto packed = build_device_weights(model, dev_model, data.data(), half_io());
+            weight_bytes = packed.size();
+            CHECK(cuMemAlloc(&weights, weight_bytes));
+            CHECK(cuMemcpyHtoD(weights, packed.data(), weight_bytes));
+            init_cache_environment(options.cache_dir, package.digest, image);
         }
+        record_memory(1);
     }
 
     ~Session() override {
@@ -244,10 +506,11 @@ public:
             if (stream) cuStreamSynchronize(stream);
             release_shape();
             if (cudnn) cudnnDestroy(cudnn);
+            for (auto& ev : timing)
+                if (ev) cuEventDestroy(ev);
             if (complete) cuEventDestroy(complete);
             if (stream) cuStreamDestroy(stream);
             if (weights) cuMemFree(weights);
-            if (weights_half) cuMemFree(weights_half);
             if (module) cuModuleUnload(module);
             CUcontext previous;
             cuCtxPopCurrent(&previous);
@@ -260,12 +523,51 @@ private:
     bool mixed() const { return precision == UMZI_MIXED; }
     bool reduced() const { return precision != UMZI_FP32; }
     size_t element(bool half) const { return half ? sizeof(uint16_t) : sizeof(float); }
-    CUdeviceptr weight(size_t offset, bool half) const {
-        return half ? weights_half + offset / 2 : weights + offset;
+    CUdeviceptr dev_ptr(size_t offset) const { return weights + offset; }
+
+    void record_memory(int stage) {
+        size_t free_bytes = 0, total_bytes = 0;
+        if (cuMemGetInfo(&free_bytes, &total_bytes) == CUDA_SUCCESS) device_used[stage] = total_bytes - free_bytes;
     }
-    bool grouped_half_spectral_conv() const {
-        // Match the eager FP16 depthwise backend for a stride-1 3x3 filter.
-        return half_io() && (shape.h == 1 || shape.w / 2 + 1 >= 7);
+
+    void init_cache_environment(const char* directory, const umzi::Digest& model_digest,
+                                const umzi::KernelImage& image) {
+        if (!directory || !*directory) return;
+        try {
+            cache_dir = std::filesystem::u8path(directory);
+            umzi::Sha256 hash;
+            hash.add(umzi::plan_format_version);
+            hash.add(umzi::gfisrv2_id);
+            hash.add(plan_schema);
+            hash.add(sizeof(void*));
+            hash.add(model_digest);
+            hash.add(image.data, image.size);
+            hash.add(precision);
+            hash.add(workspace_limit);
+            hash.add(static_cast<uint32_t>(unexact_erf));
+            CUuuid uuid{};
+            CHECK(cuDeviceGetUuid(&uuid, device));
+            hash.add(uuid);
+            umzi::hash_driver_version(hash);
+            hash.add(cudnnGetVersion());
+            cache_environment = hash.finish();
+        } catch (const std::exception& error) {
+            cache_environment_error = error.what();
+        }
+    }
+
+    void load_plan_cache() {
+        try {
+            if (!cache_environment_error.empty()) throw std::runtime_error(cache_environment_error);
+            if (cache_dir.empty()) return;
+            umzi::Sha256 hash;
+            hash.add(cache_environment);
+            hash.add(std::array<int, 3>{shape.n, shape.h, shape.w});
+            plan_key = hash.finish();
+            plan_cache.open(cache_dir, "gfisrv2", plan_key);
+        } catch (const std::exception& error) {
+            plan_cache.unavailable(error);
+        }
     }
 
     void release_shape() {
@@ -275,14 +577,18 @@ private:
         graph = nullptr;
         forward_fft.release(*fft);
         inverse_fft.release(*fft);
-        plans.clear();
-        for (auto* buffer : {&stage_in, &stage_out, &cudnn_scratch, &initial, &state, &norm, &projected,
-                             &gated, &spectrum, &packed, &spectral_out}) {
+        variants.clear();
+        backend_plans.clear();
+        legacy_plans.clear();
+        plan_cache = {};
+        for (auto* buffer : {&stage_in, &stage_out, &cudnn_scratch, &initial, &state, &norm, &projected, &gated,
+                             &fft_buf, &spectrum, &freq_a, &freq_b}) {
             if (*buffer) cuMemFree(*buffer);
             *buffer = 0;
         }
         shape = {};
-        activation_bytes = cudnn_workspace = 0;
+        activation_bytes = cudnn_workspace = scratch_bytes = 0;
+        timed_plans = 0;
         setup_ms = {};
     }
 
@@ -292,31 +598,43 @@ private:
         pending = false;
     }
 
-    void activation(CUdeviceptr& buffer, size_t count, bool half = false) {
-        const auto bytes = count * element(half);
+    void activation(CUdeviceptr& buffer, size_t bytes) {
         CHECK(cuMemAlloc(&buffer, bytes));
         activation_bytes += bytes;
     }
 
-    void make_conv(int h, int w, int cin, int cout, int k, bool half, int groups = 1) {
-        auto plan = std::make_unique<Convolution>();
+    bool ensure_scratch(size_t bytes) {
+        if (bytes <= scratch_bytes) return true;
+        CHECK(cuStreamSynchronize(stream));
+        if (cudnn_scratch) CHECK(cuMemFree(cudnn_scratch));
+        cudnn_scratch = 0;
+        scratch_bytes = 0;
+        const auto status = cuMemAlloc(&cudnn_scratch, bytes);
+        if (status == CUDA_ERROR_OUT_OF_MEMORY) {
+            cudnn_scratch = 0;
+            return false;
+        }
+        CHECK(status);
+        scratch_bytes = bytes;
+        return true;
+    }
+
+    // Legacy FP32 plan setup (bit-exact NCHW path).
+    void make_legacy_conv(int h, int w, int cin, int cout, int k) {
+        auto plan = std::make_unique<LegacyConvolution>();
         auto& p = *plan;
         CHECK(cudnnCreateTensorDescriptor(&p.input));
         CHECK(cudnnCreateTensorDescriptor(&p.output));
         CHECK(cudnnCreateFilterDescriptor(&p.filter));
         CHECK(cudnnCreateConvolutionDescriptor(&p.convolution));
-        const auto dtype = half ? CUDNN_DATA_HALF : CUDNN_DATA_FLOAT;
-        CHECK(cudnnSetTensor4dDescriptor(p.input, CUDNN_TENSOR_NCHW, dtype, shape.n, cin, h, w));
-        CHECK(cudnnSetTensor4dDescriptor(p.output, CUDNN_TENSOR_NCHW, dtype, shape.n, cout, h, w));
-        CHECK(cudnnSetFilter4dDescriptor(p.filter, dtype, CUDNN_TENSOR_NCHW, cout, cin / groups, k, k));
+        CHECK(cudnnSetTensor4dDescriptor(p.input, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, shape.n, cin, h, w));
+        CHECK(cudnnSetTensor4dDescriptor(p.output, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, shape.n, cout, h, w));
+        CHECK(cudnnSetFilter4dDescriptor(p.filter, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, cout, cin, k, k));
         CHECK(cudnnSetConvolution2dDescriptor(p.convolution, k / 2, k / 2, 1, 1, 1, 1, CUDNN_CROSS_CORRELATION,
                                              CUDNN_DATA_FLOAT));
-        if (groups != 1) CHECK(cudnnSetConvolutionGroupCount(p.convolution, groups));
-        CHECK(cudnnSetConvolutionMathType(p.convolution, half ? CUDNN_TENSOR_OP_MATH : CUDNN_FMA_MATH));
-        // The reference uses implicit GEMM for RGB and spectral projection,
-        // and Winograd for the wider spatial convolutions on the target GPU.
-        const auto preferred = half ? CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM
-            : k == 1 || cin == 3 ? CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM : CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD;
+        CHECK(cudnnSetConvolutionMathType(p.convolution, CUDNN_FMA_MATH));
+        const auto preferred = k == 1 || cin == 3 ? CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM
+                                                  : CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD;
         const auto status = cudnnGetConvolutionForwardWorkspaceSize(
             cudnn, p.input, p.filter, p.convolution, p.output, preferred, &p.workspace);
         p.algorithm = preferred;
@@ -327,7 +645,81 @@ private:
                 cudnn, p.input, p.filter, p.convolution, p.output, p.algorithm, &p.workspace));
         }
         cudnn_workspace = std::max(cudnn_workspace, p.workspace);
-        plans.emplace(Key{h, w, cin, cout, k}, std::move(plan));
+        legacy_plans.emplace(LegacyKey{h, w, cin, cout, k}, std::move(plan));
+    }
+
+    float time_backend_plan(const BackendConvolution& p, CUdeviceptr in_buf, CUdeviceptr out_buf, float best) {
+        if (!ensure_scratch(p.workspace)) return std::numeric_limits<float>::infinity();
+        const auto variant = gfi::bind(reinterpret_cast<void*>(in_buf), reinterpret_cast<void*>(weights),
+                                       reinterpret_cast<void*>(out_buf), reinterpret_cast<void*>(cudnn_scratch));
+        const auto run = [&] { return cudnnBackendExecute(cudnn, p.plan->get(), variant->get()) == CUDNN_STATUS_SUCCESS; };
+        const auto measure = [&](int repeats) {
+            CHECK(cuEventRecord(timing[0], stream));
+            for (int i = 0; i < repeats; ++i)
+                if (!run()) {
+                    CHECK(cuStreamSynchronize(stream));
+                    return std::numeric_limits<float>::infinity();
+                }
+            CHECK(cuEventRecord(timing[1], stream));
+            CHECK(cuEventSynchronize(timing[1]));
+            float elapsed = 0;
+            CHECK(cuEventElapsedTime(&elapsed, timing[0], timing[1]));
+            return elapsed / repeats;
+        };
+        if (!run()) {
+            CHECK(cuStreamSynchronize(stream));
+            return std::numeric_limits<float>::infinity();
+        }
+        const float first = measure(1);
+        if (!(first < 2.f * best)) return first;
+        return measure(5);
+    }
+
+    void make_backend_plan(int h, int w, int cin, int cout, int k, cudnnDataType_t io_type, bool fp16_compute,
+                           CUdeviceptr in_buf, CUdeviceptr out_buf) {
+        auto plan = std::make_unique<BackendConvolution>();
+        auto& p = *plan;
+        p.graph = std::make_unique<gfi::ConvGraph>(cudnn, shape.n, h, w, cin, cout, k, io_type, fp16_compute);
+        auto candidates = p.graph->candidates(cudnn, workspace_limit);
+        const umzi::PlanShape key{shape.n, h, w, cin, cout};
+        if (auto saved = plan_cache.convolutions.find(key); saved != plan_cache.convolutions.end()) {
+            const auto& choice = saved->second;
+            if (choice.math == saved_plan_marker && choice.algorithm < candidates.size()
+                && uint64_t(candidates[choice.algorithm].workspace) == choice.workspace) {
+                auto& candidate = candidates[choice.algorithm];
+                p.plan = std::move(candidate.plan);
+                p.workspace = size_t(candidate.workspace);
+                if (time_backend_plan(p, in_buf, out_buf, 0.f) < std::numeric_limits<float>::infinity()) {
+                    cudnn_workspace = std::max(cudnn_workspace, p.workspace);
+                    backend_plans.emplace(key, std::move(plan));
+                    return;
+                }
+                p.plan.reset();
+            }
+        }
+        plan_cache.record_tuning();
+        float best = std::numeric_limits<float>::infinity();
+        size_t fastest = candidates.size();
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            p.plan = std::move(candidates[i].plan);
+            p.workspace = size_t(candidates[i].workspace);
+            const float elapsed = time_backend_plan(p, in_buf, out_buf, best);
+            candidates[i].plan = std::move(p.plan);
+            if (elapsed < best) {
+                best = elapsed;
+                fastest = i;
+            }
+        }
+        if (fastest == candidates.size())
+            throw std::runtime_error("No cuDNN convolution for GFISRv2 " + std::to_string(cin) + " to "
+                                     + std::to_string(cout) + " channels within the workspace limit");
+        p.plan = std::move(candidates[fastest].plan);
+        p.workspace = size_t(candidates[fastest].workspace);
+        cudnn_workspace = std::max(cudnn_workspace, p.workspace);
+        ++timed_plans;
+        plan_cache.convolutions.insert_or_assign(key,
+                                                 umzi::ConvChoice{uint32_t(fastest), saved_plan_marker, p.workspace});
+        backend_plans.emplace(key, std::move(plan));
     }
 
     static double elapsed(Clock::time_point start) {
@@ -350,34 +742,78 @@ private:
             const size_t pixels = size_t(shape.n) * shape.pixels();
             bins = shape.h * (shape.w / 2 + 1);
             fft_scale = float(1.0 / std::sqrt(double(shape.pixels())));
-            activation(initial, pixels * channels, half_io());
-            activation(state, pixels * channels, half_io());
-            activation(norm, pixels * channels, reduced());
-            activation(projected, pixels * 2 * hidden, reduced());
-            activation(gated, pixels * hidden, reduced());
-            const size_t frequency_size = size_t(shape.n) * bins * 2 * fourier;
-            activation(spectrum, frequency_size);
-            activation(packed, frequency_size, half_io());
-            activation(spectral_out, frequency_size, half_io());
+
+            if (!reduced()) {
+                // Exact FP32 NCHW layout.
+                activation(initial, pixels * channels * sizeof(float));
+                activation(state, pixels * channels * sizeof(float));
+                activation(norm, pixels * channels * sizeof(float));
+                activation(projected, pixels * 2 * hidden * sizeof(float));
+                activation(gated, pixels * hidden * sizeof(float));
+                const size_t frequency_bytes = size_t(shape.n) * bins * 2 * fourier * sizeof(float);
+                activation(spectrum, frequency_bytes);
+                activation(freq_a, frequency_bytes);
+                activation(freq_b, frequency_bytes);
+            } else {
+                // Optimized NHWC layout for FP16 and Mixed.
+                const size_t state_elem = element(half_io());
+                activation(initial, pixels * channels * state_elem);
+                activation(state, pixels * channels * state_elem);
+                activation(norm, pixels * channels * sizeof(uint16_t));
+                activation(projected, pixels * 2 * hidden * sizeof(uint16_t));
+                activation(gated, pixels * hidden * sizeof(uint16_t));
+                activation(fft_buf, pixels * fourier * sizeof(float));
+                activation(spectrum, size_t(shape.n) * bins * 2 * fourier * sizeof(float));
+                const size_t freq_elem = element(half_io());
+                const size_t freq_bytes = size_t(shape.n) * bins * freq_lanes * freq_elem;
+                activation(freq_a, freq_bytes);
+                activation(freq_b, freq_bytes);
+            }
             CHECK(cuMemAlloc(&stage_in, shape.rgb_bytes(element(half_io()))));
             CHECK(cuMemAlloc(&stage_out, shape.rgb_bytes(element(half_io())) * scale * scale));
             setup_ms[0] = elapsed(start);
 
             start = Clock::now();
-            const int h = shape.h, w = shape.w;
-            make_conv(h, w, 3, channels, 3, reduced());
-            make_conv(h, w, channels, 2 * hidden, 3, reduced());
-            make_conv(h, w, hidden, channels, 3, reduced());
-            make_conv(h, w, channels, 2 * channels, 3, reduced());
-            make_conv(h, w, 2 * channels, channels, 3, reduced());
-            make_conv(h, w, channels, 3 * scale * scale, 3, reduced());
-            make_conv(h, w / 2 + 1, 2 * fourier, 2 * fourier, 1, half_io());
-            if (grouped_half_spectral_conv())
-                make_conv(h, w / 2 + 1, 2 * fourier, 2 * fourier, 3, true, 2 * fourier);
-            if (cudnn_workspace) CHECK(cuMemAlloc(&cudnn_scratch, cudnn_workspace));
+            const int h = shape.h, w = shape.w, w_freq = w / 2 + 1;
             forward_fft.setup(*fft, shape, r2c);
             inverse_fft.setup(*fft, shape, c2r);
             bind_stream(stream);
+
+            if (!reduced()) {
+                make_legacy_conv(h, w, 3, channels, 3);
+                make_legacy_conv(h, w, channels, 2 * hidden, 3);
+                make_legacy_conv(h, w, hidden, channels, 3);
+                make_legacy_conv(h, w, channels, 2 * channels, 3);
+                make_legacy_conv(h, w, 2 * channels, channels, 3);
+                make_legacy_conv(h, w, channels, 3 * scale * scale, 3);
+                make_legacy_conv(h, w_freq, 2 * fourier, 2 * fourier, 1);
+                if (cudnn_workspace) {
+                    if (!ensure_scratch(cudnn_workspace)) CHECK(CUDA_ERROR_OUT_OF_MEMORY);
+                }
+            } else {
+                // Fill activation buffers with deterministic pseudo-random data for accurate plan timing.
+                launch(stream, FillNoiseF16, int(pixels * hidden), gated);
+                if (half_io()) launch(stream, FillNoiseF16, int(size_t(shape.n) * bins * freq_lanes), freq_b);
+                else launch(stream, FillNoiseF32, int(size_t(shape.n) * bins * freq_lanes), freq_b);
+                load_plan_cache();
+                const bool fp16_acc = half_io();
+                make_backend_plan(h, w, rgb_lanes, channels, 3, CUDNN_DATA_HALF, fp16_acc, gated, projected);
+                make_backend_plan(h, w, channels, 2 * hidden, 3, CUDNN_DATA_HALF, fp16_acc, gated, projected);
+                make_backend_plan(h, w, hidden, channels, 3, CUDNN_DATA_HALF, fp16_acc, gated, projected);
+                make_backend_plan(h, w, channels, 2 * channels, 3, CUDNN_DATA_HALF, fp16_acc, gated, projected);
+                make_backend_plan(h, w, 2 * channels, channels, 3, CUDNN_DATA_HALF, fp16_acc, gated, projected);
+                make_backend_plan(h, w, channels, 3 * scale * scale, 3, CUDNN_DATA_HALF, fp16_acc, gated, projected);
+                make_backend_plan(h, w_freq, freq_lanes, freq_lanes, 1,
+                                  half_io() ? CUDNN_DATA_HALF : CUDNN_DATA_FLOAT, fp16_acc, freq_b, freq_a);
+                CHECK(cuStreamSynchronize(stream));
+                if (cudnn_scratch) CHECK(cuMemFree(cudnn_scratch));
+                cudnn_scratch = 0;
+                scratch_bytes = 0;
+                if (cudnn_workspace) {
+                    if (!ensure_scratch(cudnn_workspace)) CHECK(CUDA_ERROR_OUT_OF_MEMORY);
+                }
+                plan_cache.save(plan_key);
+            }
             setup_ms[1] = elapsed(start);
 
             start = Clock::now();
@@ -385,6 +821,7 @@ private:
             forward(stage_in, stage_out, stream);
             CHECK(cuStreamSynchronize(stream));
             setup_ms[2] = elapsed(start);
+            record_memory(2);
 
             if (graph_enabled) {
                 start = Clock::now();
@@ -400,6 +837,7 @@ private:
                 CHECK(cuGraphUpload(executable, stream));
                 CHECK(cuStreamSynchronize(stream));
                 setup_ms[3] = elapsed(start);
+                record_memory(3);
             }
         } catch (...) {
             cuStreamSynchronize(stream);
@@ -411,116 +849,182 @@ private:
     template<class... Args>
     void launch(CUstream target, Kernel id, int count, Args... args) {
         void* params[] = {&args..., &count};
-        CHECK(cuLaunchKernel(functions[id], (count + threads - 1) / threads, 1, 1, threads, 1, 1, 0,
-                             target, params, nullptr));
+        CHECK(cuLaunchKernel(functions[id], (count + threads - 1) / threads, 1, 1, threads, 1, 1, 0, target, params,
+                             nullptr));
     }
 
-    CUdeviceptr channel_offset(CUdeviceptr base, int channel) const {
-        return base + uint64_t(channel) * shape.pixels() * element(reduced());
+    template<class... Args>
+    void launch_grid(CUstream target, Kernel id, int grid_x, int block_x, Args... args) {
+        void* params[] = {&args...};
+        CHECK(cuLaunchKernel(functions[id], grid_x, 1, 1, block_x, 1, 1, 0, target, params, nullptr));
     }
 
-    void conv(CUstream target, CUdeviceptr out, CUdeviceptr in, int h, int w, int cin, int cout, int k, Filter filter,
-              bool half) {
-        const auto& p = *plans.at(Key{h, w, cin, cout, k});
+    // Legacy FP32 helpers (untouched path).
+    CUdeviceptr channel_offset_fp32(CUdeviceptr base, int channel) const {
+        return base + uint64_t(channel) * shape.pixels() * sizeof(float);
+    }
+
+    void conv_fp32(CUstream target, CUdeviceptr out, CUdeviceptr in, int h, int w, int cin, int cout, int k,
+                   Filter filter) {
+        const auto& p = *legacy_plans.at(LegacyKey{h, w, cin, cout, k});
         const float one = 1.f, zero = 0.f;
         CHECK(cudnnConvolutionForward(cudnn, &one, p.input, reinterpret_cast<void*>(in), p.filter,
-            reinterpret_cast<void*>(weight(filter.weight, half)), p.convolution, p.algorithm,
+            reinterpret_cast<void*>(weights + filter.weight), p.convolution, p.algorithm,
             reinterpret_cast<void*>(cudnn_scratch), p.workspace, &zero, p.output, reinterpret_cast<void*>(out)));
-        launch(target, half ? BiasHalf : Bias, shape.n * h * w * cout, out, weight(filter.bias, half), cout, h * w);
+        launch(target, Bias, shape.n * h * w * cout, out, weights + filter.bias, cout, h * w);
     }
 
-    void rms(CUstream target, Kernel kernel, CUdeviceptr out, CUdeviceptr in, Norm params,
-             int c, int pixels, int out_stride) {
-        const bool half = kernel == RmsHalf;
-        launch(target, kernel, shape.n * pixels, out, in, weight(params.scale, half), weight(params.offset, half),
+    void rms_fp32(CUstream target, CUdeviceptr out, CUdeviceptr in, Norm params, int c, int pixels, int out_stride) {
+        launch(target, Rms, shape.n * pixels, out, in, weights + params.scale, weights + params.offset,
                c, c, out_stride, pixels, float(1.0 / std::sqrt(double(c))));
     }
 
-    void fourier_unit(CUstream target, const Fourier& params, CUdeviceptr in, CUdeviceptr out) {
+    void fourier_unit_fp32(CUstream target, const Fourier& params, CUdeviceptr in, CUdeviceptr out) {
         const int pixels = shape.pixels(), spatial = shape.n * fourier * pixels, frequency = shape.n * fourier * bins;
         const int spectral_channels = 2 * fourier, width = shape.w / 2 + 1;
-        // Reuse the gate buffer until the spatial gate runs. It can hold
-        // 30 FP32 channels even in reduced precision (128 FP16 channels).
-        static_assert(fourier * sizeof(float) <= hidden * sizeof(uint16_t));
-        launch(target, reduced() ? CopyChannelsToFloat : CopyChannels, spatial, gated, in, fourier, 2 * hidden, pixels);
+        launch(target, CopyChannels, spatial, gated, in, fourier, 2 * hidden, pixels);
         FFT_CHECK(fft->r2c(forward_fft.handle, reinterpret_cast<void*>(gated), reinterpret_cast<void*>(spectrum)));
-        launch(target, half_io() ? PackHalf : Pack, frequency, packed, spectrum, fourier, bins, fft_scale);
-        rms(target, half_io() ? RmsHalf : Rms, spectral_out, packed, params.pre, spectral_channels, bins, spectral_channels);
-        if (half_io()) {
-            // Eager uses grouped cuDNN here. Materialize its rounded convolution,
-            // bias addition and positional residual before the learned projection.
-            if (grouped_half_spectral_conv()) {
-                conv(target, packed, spectral_out, shape.h, width, spectral_channels, spectral_channels, 3, params.position, true);
-            } else {
-                launch(target, DepthwiseHalf, frequency * 2, packed, spectral_out, weight(params.position.weight, true),
-                       weight(params.position.bias, true), spectral_channels, spectral_channels, spectral_channels,
-                       shape.h, width, 3, 3, 0);
-            }
-            launch(target, AddHalfResidual, frequency * 2, packed, spectral_out);
-        } else {
-            launch(target, Depthwise, frequency * 2, packed, spectral_out, weight(params.position.weight, false),
-                   weight(params.position.bias, false), spectral_channels, spectral_channels, spectral_channels,
-                   shape.h, width, 3, 3, 1);
-        }
-        conv(target, spectral_out, packed, shape.h, width, spectral_channels, spectral_channels, 1, params.project, half_io());
-        launch(target, half_io() ? UnpackHalf : Unpack, frequency, spectrum, spectral_out, bins);
+        launch(target, Pack, frequency, freq_a, spectrum, fourier, bins, fft_scale);
+        rms_fp32(target, freq_b, freq_a, params.pre, spectral_channels, bins, spectral_channels);
+        launch(target, Depthwise, frequency * 2, freq_a, freq_b, weights + params.position.weight,
+               weights + params.position.bias, spectral_channels, spectral_channels, spectral_channels,
+               shape.h, width, 3, 3, 1);
+        conv_fp32(target, freq_b, freq_a, shape.h, width, spectral_channels, spectral_channels, 1, params.project);
+        launch(target, Unpack, frequency, spectrum, freq_b, bins);
         FFT_CHECK(fft->c2r(inverse_fft.handle, reinterpret_cast<void*>(spectrum), reinterpret_cast<void*>(gated)));
-        if (half_io()) {
-            launch(target, ScaleFftToHalf, spatial, packed, gated, fft_scale);
-            rms(target, RmsHalf, out, packed, params.post, fourier, pixels, channels);
-        } else {
-            launch(target, ScaleFft, spatial, gated, fft_scale);
-            rms(target, mixed() ? RmsToHalf : Rms, out, gated, params.post, fourier, pixels, channels);
-        }
+        launch(target, ScaleFft, spatial, gated, fft_scale);
+        rms_fp32(target, out, gated, params.post, fourier, pixels, channels);
     }
 
-    void forward(CUdeviceptr input, CUdeviceptr output, CUstream target) {
+    void forward_fp32(CUdeviceptr input, CUdeviceptr output, CUstream target) {
         const int pixels = shape.pixels(), area = shape.n * pixels, h = shape.h, w = shape.w;
-        const bool half = reduced();
-        if (mixed()) {
-            launch(target, ToHalf, area * 3, gated, input);
-            conv(target, projected, gated, h, w, 3, channels, 3, model.first, true);
-            launch(target, ToFloat, area * channels, initial, projected);
-        } else {
-            conv(target, initial, input, h, w, 3, channels, 3, model.first, half);
-        }
-        CHECK(cuMemcpyDtoDAsync(state, initial, uint64_t(area) * channels * element(half_io()), target));
-        const Kernel spatial_norm = mixed() ? RmsToHalf : half_io() ? RmsHalf : Rms;
-        const Kernel spatial_gate = mixed() ? GateMixed : half_io() ? GateHalf : Gate;
-        const Kernel spatial_residual = mixed() ? ResidualMixed : half_io() ? ResidualHalf : Residual;
+        conv_fp32(target, initial, input, h, w, 3, channels, 3, model.first);
+        CHECK(cuMemcpyDtoDAsync(state, initial, uint64_t(area) * channels * sizeof(float), target));
         for (int i = 0; i < blocks; ++i) {
             const auto& block = model.body[i];
-            rms(target, spatial_norm, norm, state, block.norm, channels, pixels, channels);
-            conv(target, projected, norm, h, w, channels, 2 * hidden, 3, block.expand, half);
+            rms_fp32(target, norm, state, block.norm, channels, pixels, channels);
+            conv_fp32(target, projected, norm, h, w, channels, 2 * hidden, 3, block.expand);
             int offset = 0;
             for (int slot = 0; slot < 4; ++slot) {
                 const int kind = (slot + i) % 4;
-                const auto in = channel_offset(projected, 2 * hidden - channels + offset);
-                const auto out = channel_offset(norm, offset);
+                const auto in = channel_offset_fp32(projected, 2 * hidden - channels + offset);
+                const auto out = channel_offset_fp32(norm, offset);
                 if (!kind) {
-                    fourier_unit(target, block.fft, in, out);
+                    fourier_unit_fp32(target, block.fft, in, out);
                     offset += fourier;
                 } else {
                     const auto& filter = block.bands[kind - 1];
                     const int kh = kind == 1 ? 3 : kind == 2 ? 1 : 11;
                     const int kw = kind == 1 ? 3 : kind == 2 ? 11 : 1;
-                    launch(target, half ? DepthwiseHalf : Depthwise, area * band, out, in, weight(filter.weight, half),
-                           weight(filter.bias, half), band, 2 * hidden, channels, h, w, kh, kw, 0);
+                    launch(target, Depthwise, area * band, out, in, weights + filter.weight,
+                           weights + filter.bias, band, 2 * hidden, channels, h, w, kh, kw, 0);
                     offset += band;
                 }
             }
-            launch(target, spatial_gate, area * hidden, gated, projected, norm, hidden, channels, pixels);
-            conv(target, projected, gated, h, w, hidden, channels, 3, block.project, half);
-            launch(target, spatial_residual, area * channels, state, projected, weight(block.gamma, half_io()), channels, pixels);
+            launch(target, Gate, area * hidden, gated, projected, norm, hidden, channels, pixels);
+            conv_fp32(target, projected, gated, h, w, hidden, channels, 3, block.project);
+            launch(target, Residual, area * channels, state, projected, weights + block.gamma, channels, pixels);
         }
-        if (mixed()) launch(target, ToHalf, area * channels, gated, state);
-        conv(target, projected, mixed() ? gated : state, h, w, channels, 2 * channels, 3, model.tail_expand, half);
-        launch(target, half ? SiluHalf : Silu, area * 2 * channels, projected);
-        conv(target, norm, projected, h, w, 2 * channels, channels, 3, model.tail_project, half);
-        launch(target, mixed() ? AddMixed : half ? AddHalf : Add, area * channels, state, norm, initial);
-        if (mixed()) launch(target, ToHalf, area * channels, gated, state);
-        conv(target, projected, mixed() ? gated : state, h, w, channels, 3 * scale * scale, 3, model.last, half);
-        launch(target, mixed() ? ShuffleMixed : half ? ShuffleHalf : Shuffle, area * 3 * scale * scale, output, projected, h, w);
+        conv_fp32(target, projected, state, h, w, channels, 2 * channels, 3, model.tail_expand);
+        launch(target, Silu, area * 2 * channels, projected);
+        conv_fp32(target, norm, projected, h, w, 2 * channels, channels, 3, model.tail_project);
+        launch(target, Add, area * channels, state, norm, initial);
+        conv_fp32(target, projected, state, h, w, channels, 3 * scale * scale, 3, model.last);
+        launch(target, Shuffle, area * 3 * scale * scale, output, projected, h, w);
+    }
+
+    // Optimized NHWC forward path (FP16 and Mixed).
+    void conv_nhwc(CUdeviceptr out, CUdeviceptr in, int h, int w, int cin, int cout, Filter filter) {
+        const auto& p = *backend_plans.at(umzi::PlanShape{shape.n, h, w, cin, cout});
+        const CUdeviceptr wptr = dev_ptr(filter.weight);
+        auto& variant = variants[std::array<CUdeviceptr, 4>{out, in, wptr, cudnn_scratch}];
+        if (!variant)
+            variant = gfi::bind(reinterpret_cast<void*>(in), reinterpret_cast<void*>(wptr),
+                                reinterpret_cast<void*>(out), reinterpret_cast<void*>(cudnn_scratch));
+        CHECK(cudnnBackendExecute(cudnn, p.plan->get(), variant->get()));
+    }
+
+    void forward_nhwc(CUdeviceptr input, CUdeviceptr output, CUstream target) {
+        const int h = shape.h, w = shape.w, w_freq = w / 2 + 1;
+        const int pixels_per_image = shape.pixels(), total_pixels = shape.n * pixels_per_image;
+        const int pix_tiles_per_image = (pixels_per_image + 31) / 32;
+        const int bin_tiles_per_image = (bins + 31) / 32;
+        const int branch_tx = (w + 15) / 16, branch_ty = (h + 15) / 16;
+        const int spec_tx = (w_freq + 7) / 8, spec_ty = (h + 7) / 8;
+        const int rms48_blocks = (total_pixels * 8 + threads - 1) / threads;
+
+        // Pack RGB NCHW -> NHWC 8-ch half into `gated`, then first 8->48 into `projected`,
+        // then fuse first.bias + initial/state copy + block-0 RMSNorm into `norm`.
+        launch(target, half_io() ? PackRgbF16 : PackRgbF32, total_pixels, gated, input, h, w);
+        conv_nhwc(projected, gated, h, w, rgb_lanes, channels, dev_model.first);
+        launch_grid(target, half_io() ? InputBiasRmsF16 : InputBiasRmsMixed, rms48_blocks, threads,
+                    state, initial, norm, projected, dev_ptr(dev_model.first.bias),
+                    dev_ptr(dev_model.body[0].norm.scale), dev_ptr(dev_model.body[0].norm.offset), total_pixels);
+
+        for (int i = 0; i < blocks; ++i) {
+            const auto& block = dev_model.body[i];
+            conv_nhwc(projected, norm, h, w, channels, 2 * hidden, block.expand);
+
+            // Plain 80-ch gate -> gated[0..79].
+            launch(target, GatePlainNhwc, total_pixels * 20, gated, projected, dev_ptr(block.expand.bias));
+
+            // Unified 16x16 tiled spatial depthwise (3x3, 1x11, 11x1) + SiLU gate -> gated[110..127].
+            launch_grid(target, BranchDwGateNhwc, shape.n * branch_tx * branch_ty, threads,
+                        gated, projected, dev_ptr(block.expand.bias),
+                        dev_ptr(block.bands[0].weight), dev_ptr(block.bands[0].bias),
+                        dev_ptr(block.bands[1].weight), dev_ptr(block.bands[1].bias),
+                        dev_ptr(block.bands[2].weight), dev_ptr(block.bands[2].bias),
+                        h, w, branch_tx, branch_ty);
+
+            // Fourier unit: extract 30 ch -> cuFFT R2C -> fused pack+preRMS -> tiled 3x3 dw+res
+            // -> 1x1 spectral conv -> fused bias+GELU+unpack -> cuFFT C2R -> fused scale+postRMS+gate.
+            launch_grid(target, ExtractFourierNhwc, shape.n * pix_tiles_per_image, threads,
+                        fft_buf, projected, dev_ptr(block.expand.bias), pixels_per_image, pix_tiles_per_image);
+            FFT_CHECK(fft->r2c(forward_fft.handle, reinterpret_cast<void*>(fft_buf), reinterpret_cast<void*>(spectrum)));
+            launch_grid(target, half_io() ? PackRmsFftF16 : PackRmsFftF32, shape.n * bin_tiles_per_image, threads,
+                        freq_a, spectrum, dev_ptr(block.fft.pre.scale), dev_ptr(block.fft.pre.offset),
+                        bins, bin_tiles_per_image, fft_scale);
+            launch_grid(target, half_io() ? SpectralDwResF16 : SpectralDwResF32, shape.n * spec_tx * spec_ty, threads,
+                        freq_b, freq_a, dev_ptr(block.fft.position.weight), dev_ptr(block.fft.position.bias),
+                        h, w_freq, spec_tx, spec_ty);
+            conv_nhwc(freq_a, freq_b, h, w_freq, freq_lanes, freq_lanes, block.fft.project);
+            launch_grid(target, half_io() ? UnpackBiasGeluF16 : UnpackBiasGeluF32, shape.n * bin_tiles_per_image,
+                        threads, spectrum, freq_a, dev_ptr(block.fft.project.bias), bins, bin_tiles_per_image);
+            FFT_CHECK(fft->c2r(inverse_fft.handle, reinterpret_cast<void*>(spectrum), reinterpret_cast<void*>(fft_buf)));
+            launch_grid(target, ScalePostRmsGateNhwc, shape.n * pix_tiles_per_image, threads,
+                        gated, fft_buf, projected, dev_ptr(block.expand.bias),
+                        dev_ptr(block.fft.post.scale), dev_ptr(block.fft.post.offset),
+                        pixels_per_image, pix_tiles_per_image, fft_scale);
+
+            // Project 128 -> 48 + fused bias + SiLU + gamma residual (+ next block RMSNorm).
+            conv_nhwc(projected, gated, h, w, hidden, channels, block.project);
+            if (i + 1 < blocks) {
+                const auto& next_norm = dev_model.body[i + 1].norm;
+                launch_grid(target, half_io() ? ResidualRmsF16 : ResidualRmsMixed, rms48_blocks, threads,
+                            state, norm, projected, dev_ptr(block.project.bias), dev_ptr(block.gamma),
+                            dev_ptr(next_norm.scale), dev_ptr(next_norm.offset), total_pixels);
+            } else {
+                const CUdeviceptr null_ptr = 0;
+                launch_grid(target, half_io() ? ResidualF16 : ResidualToHalfMixed, rms48_blocks, threads,
+                            state, norm, projected, dev_ptr(block.project.bias), dev_ptr(block.gamma),
+                            null_ptr, null_ptr, total_pixels);
+            }
+        }
+
+        // Tail: 48->96 + bias + SiLU -> 96->48 + bias + initial -> 48->48 + bias + 4x shuffle.
+        conv_nhwc(projected, half_io() ? state : norm, h, w, channels, 2 * channels, dev_model.tail_expand);
+        launch(target, BiasSilu96, total_pixels * 12, projected, dev_ptr(dev_model.tail_expand.bias));
+        conv_nhwc(norm, projected, h, w, 2 * channels, channels, dev_model.tail_project);
+        launch(target, half_io() ? TailAddF16 : TailAddMixed, total_pixels * 6,
+               gated, norm, dev_ptr(dev_model.tail_project.bias), initial);
+        conv_nhwc(projected, gated, h, w, channels, 3 * scale * scale, dev_model.last);
+        launch(target, half_io() ? BiasShuffleRgbF16 : BiasShuffleRgbF32, total_pixels * 3 * scale * scale,
+               output, projected, dev_ptr(dev_model.last.bias), h, w);
+    }
+
+    void forward(CUdeviceptr input, CUdeviceptr output, CUstream target) {
+        if (!reduced()) forward_fp32(input, output, target);
+        else forward_nhwc(input, output, target);
     }
 
     void execute(CUdeviceptr input, CUdeviceptr output, CUstream target) {
@@ -589,29 +1093,34 @@ public:
     UmziSessionInfo session_info() const override {
         UmziSessionInfo info{};
         info.struct_size = sizeof(info);
-        info.cache_status = UMZI_CACHE_DISABLED;
-        info.buffer_bytes[0] = (weights ? model.bytes : 0) + (weights_half ? model.bytes / 2 : 0);
+        info.cache_status = reduced() ? plan_cache.status : UMZI_CACHE_DISABLED;
+        info.buffer_bytes[0] = weight_bytes;
         if (shape.n) {
             info.prepared_input = shape.nchw();
             info.buffer_bytes[1] = activation_bytes;
             info.buffer_bytes[2] = cudnn_workspace + forward_fft.bytes + inverse_fft.bytes;
             info.buffer_bytes[3] = shape.rgb_bytes(element(half_io())) * (1 + scale * scale);
             std::copy(setup_ms.begin(), setup_ms.end(), info.shape_setup_ms);
+            std::copy(device_used.begin(), device_used.end(), info.startup_device_used_bytes);
         }
         return info;
     }
 
-    uint32_t diagnostic_count() const override { return 3; }
+    const char* cache_message() const override { return plan_cache.diagnostic.c_str(); }
+
+    uint32_t diagnostic_count() const override { return 5; }
     UmziDiagnostic diagnostic(uint32_t index) const override {
         if (index == 0) return {sizeof(UmziDiagnostic), "cufft_version", fft_version};
         if (index == 1)
             return {sizeof(UmziDiagnostic), "cufft_workspace_bytes", int64_t(forward_fft.bytes + inverse_fft.bytes)};
         if (index == 2) return {sizeof(UmziDiagnostic), "unexact_erf", unexact_erf};
+        if (index == 3) return {sizeof(UmziDiagnostic), "timed_plans", timed_plans};
+        if (index == 4) return {sizeof(UmziDiagnostic), "plan_workspace_bytes", int64_t(cudnn_workspace)};
         throw std::runtime_error("Invalid GFISRv2 diagnostic index");
     }
     const char* kernel_message() const override {
-        if (mixed()) return "GFISRv2 mixed precision with FP32 Fourier and residuals";
-        if (half_io()) return "GFISRv2 FP16 with FP32 cuFFT";
+        if (mixed()) return "GFISRv2 NHWC mixed precision with FP32 Fourier and residuals";
+        if (half_io()) return "GFISRv2 NHWC FP16 with FP32 cuFFT";
         return "GFISRv2 FP32 with cuFFT";
     }
 };
