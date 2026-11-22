@@ -4,23 +4,19 @@
 #include <cublasLt.h>
 #include <cudnn.h>
 
-#define GATERV3_BUILD
 #define UMZI_BUILD
-#include "runner.h"
 #include "model_file.h"
 #include "gaterv3_images.h"
+#include "silu_plan.h"
+#include "../../common/cuda_helpers.h"
 #include "../../common/cuda_module.h"
 #include "../../runtime/kernel.h"
 
 #include <algorithm>
 #include <array>
-#include <charconv>
-#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
-#include <iostream>
 #include <map>
 #include <memory>
 #include <stdexcept>
@@ -37,77 +33,48 @@ constexpr int gate_pool_chunk = 64;
 constexpr float bad_timing = 1e30f;
 constexpr float one = 1, zero = 0;
 constexpr uint16_t half_one = 0x3c00, half_zero = 0;
-thread_local std::string error_text;
 using gt::ShapeKey;
 using gt::GemmChoice;
-using Clock = std::chrono::steady_clock;
-
-double milliseconds_since(Clock::time_point started) {
-    return std::chrono::duration<double, std::milli>(Clock::now() - started).count();
-}
-
 using umzi::AllocationError;
+using umzi::Clock;
+using umzi::ContextScope;
 
-void check(CUresult status, const char* operation) {
-    if (status == CUDA_SUCCESS) return;
-    const char* detail = nullptr;
-    cuGetErrorString(status, &detail);
-    std::string message = std::string(operation) + ": " + (detail ? detail : "CUDA error");
-    if (status == CUDA_ERROR_OUT_OF_MEMORY) throw AllocationError(message);
-    throw std::runtime_error(message);
-}
+enum GateFlags : uint32_t {
+    GT_CREATE_GRAPH = 1,
+    GT_CREATE_FP16 = 2,
+    GT_CREATE_FUSE_SILU = 4,
+    GT_CREATE_TUNE_PROJECTIONS = 8,
+    GT_CREATE_FUSE_GATE_POOL = 16,
+    GT_CREATE_FP16_QKV = 32,
+};
 
-void check(cudnnStatus_t status, const char* operation) {
-    if (status != CUDNN_STATUS_SUCCESS)
-        throw std::runtime_error(std::string(operation) + ": " + cudnnGetErrorString(status));
-}
+enum GateStat {
+    GT_OPT_REPLAY_TUNED_SHAPES,
+    GT_OPT_FUSED_GATE_POOL_SITES,
+    GT_OPT_FP16_QKV_PROJECTIONS,
+    GT_OPT_SPLIT_GATE_REGISTERS,
+    GT_OPT_FUSED_GATE_REGISTERS,
+    GT_OPT_STAT_COUNT,
+};
 
-void check(cublasStatus_t status, const char* operation) {
-    if (status != CUBLAS_STATUS_SUCCESS)
-        throw std::runtime_error(std::string(operation) + ": cuBLAS status " + std::to_string(status));
-}
-
-#define CHECK(expr) check((expr), #expr)
+#define CHECK(expr) umzi::check((expr), #expr)
 
 void allocate(CUdeviceptr& pointer, size_t bytes, const char* name) {
     auto status = cuMemAlloc(&pointer, bytes);
     if (status == CUDA_ERROR_OUT_OF_MEMORY)
         throw AllocationError(std::string("Could not allocate ") + std::to_string(bytes)
             + " bytes for " + name + "; try a smaller tile or batch");
-    check(status, name);
+    umzi::check(status, name);
 }
 
 void allocate_host(void*& pointer, size_t bytes) {
     auto status = cuMemAllocHost(&pointer, bytes);
     if (status == CUDA_ERROR_OUT_OF_MEMORY)
         throw AllocationError("Could not allocate " + std::to_string(bytes) + " bytes for pinned RGB staging");
-    check(status, "Allocate pinned RGB staging");
+    umzi::check(status, "Allocate pinned RGB staging");
 }
-
-struct ContextScope {
-    bool pushed = false;
-    explicit ContextScope(CUcontext context) {
-        CUcontext current;
-        CHECK(cuCtxGetCurrent(&current));
-        if (current != context) {
-            CHECK(cuCtxPushCurrent(context));
-            pushed = true;
-        }
-    }
-    ~ContextScope() {
-        if (pushed) {
-            CUcontext previous;
-            cuCtxPopCurrent(&previous);
-        }
-    }
-};
 
 using namespace gt;
-
-void read(std::ifstream& file, void* target, size_t bytes) {
-    if (!file.read(static_cast<char*>(target), bytes))
-        throw std::runtime_error("Could not read native artifact");
-}
 
 struct Convolution {
     cudnnTensorDescriptor_t input = nullptr, output = nullptr;
@@ -205,15 +172,12 @@ struct TuningTimer {
 
 } // namespace
 
-#include "silu_plan.h"
-
 class GtRunner {
 public:
     CUdevice device = 0;
     CUcontext context = nullptr;
     CUstream stream = nullptr;
     CUmodule module = nullptr;
-    CUgraph graph = nullptr;
     CUgraphExec executable = nullptr;
     CUdeviceptr input = 0, output = 0, weights = 0, arena = 0, scratch = 0;
     void* host_input = nullptr;
@@ -230,6 +194,8 @@ public:
     gt::PlanCache plan_cache;
     std::array<double, 4> setup_ms{};
     int fused_silu_count = 0;
+    int timed_plans = 0;
+    size_t peak_workspace_bytes = 0;
     std::string fusion_diagnostic;
     std::array<int, GT_OPT_STAT_COUNT> optimization_stats{};
 
@@ -239,6 +205,8 @@ public:
         bytes[2] = workspace_bytes;
         bytes[3] = 2 * io_bytes * batch;
     }
+
+    size_t retained_workspace_bytes() const { return workspace_bytes; }
 
     void startup_memory(uint64_t bytes[4]) const {
         std::copy(startup_used.begin(), startup_used.end(), bytes);
@@ -259,34 +227,12 @@ public:
         io_bytes = (shape.rgb_bytes(fp16) / shape.n);
     }
 
-    void initialize(const fs::path& directory, int size, uint32_t flags, const fs::path& cache_dir) {
-        if (size != 1 && size != 16) throw std::runtime_error("Supported batches are 1 and 16");
-        auto stage_start = Clock::now();
-        configure({size, tile, tile}, flags);
-        CHECK(cuInit(0));
-        CHECK(cuDeviceGet(&device, 0));
-        CHECK(cuDevicePrimaryCtxRetain(&context, device));
-        ContextScope scope(context);
-        record_memory(0);
-        auto module_path = directory / "kernels.cubin";
-        auto module_size = fs::file_size(module_path);
-        if (!module_size || module_size > (16u << 20)) throw std::runtime_error("Invalid CUDA module size");
-        std::vector<char> module_data(static_cast<size_t>(module_size));
-        std::ifstream kernel_file(module_path, std::ios::binary);
-        read(kernel_file, module_data.data(), module_data.size());
-        CHECK(cuModuleLoadData(&module, module_data.data()));
-        create_handles();
-        load(directory, !cache_dir.empty(), module_data);
-        finish_setup(flags, cache_dir, stage_start);
-    }
-
     void initialize_shape(Shape shape, uint32_t flags, const fs::path& cache_dir,
                           CUdevice selected_device, CUcontext shared_context, CUmodule shared_module,
                           CUdeviceptr shared_weights, const gt::Digest& build,
                           const gt::ModelFile& model, gt::ResolvedModel resolved) {
         auto stage_start = Clock::now();
         configure(shape, flags);
-        borrowed_resources = true;
         device = selected_device;
         context = shared_context;
         module = shared_module;
@@ -325,7 +271,7 @@ public:
         record_memory(1);
         allocate_host(host_input, io_bytes * batch);
         allocate_host(host_output, io_bytes * batch);
-        setup_ms[0] = milliseconds_since(stage_start);
+        setup_ms[0] = umzi::elapsed_ms(stage_start);
         stage_start = Clock::now();
         if (plan_cache.status != UMZI_CACHE_UNAVAILABLE) {
             try {
@@ -338,18 +284,21 @@ public:
         if (fuse_silu) prepare_silu();
         CHECK(cuStreamSynchronize(stream));
         record_memory(2);
-        setup_ms[1] = milliseconds_since(stage_start);
+        setup_ms[1] = umzi::elapsed_ms(stage_start);
         stage_start = Clock::now();
         if (scratch) {
             CHECK(cuMemFree(scratch));
             scratch = 0;
         }
-        if (workspace_bytes) allocate(scratch, workspace_bytes, "inference workspace");
+        if (workspace_bytes) {
+            allocate(scratch, workspace_bytes, "inference workspace");
+            peak_workspace_bytes = std::max(peak_workspace_bytes, workspace_bytes);
+        }
         if (silu_plan) bind_silu();
         CHECK(cuMemsetD8Async(input, 0, io_bytes * batch, stream));
         forward(stream);
         CHECK(cuStreamSynchronize(stream));
-        setup_ms[2] = milliseconds_since(stage_start);
+        setup_ms[2] = umzi::elapsed_ms(stage_start);
         stage_start = Clock::now();
         if (flags & GT_CREATE_GRAPH) {
             try {
@@ -357,14 +306,12 @@ public:
             } catch (const std::exception& error) {
                 if (!fused_silu_count) throw;
                 if (executable) CHECK(cuGraphExecDestroy(executable));
-                if (graph) CHECK(cuGraphDestroy(graph));
                 executable = nullptr;
-                graph = nullptr;
                 disable_fusion(error.what());
                 capture_graph();
             }
         }
-        setup_ms[3] = milliseconds_since(stage_start);
+        setup_ms[3] = umzi::elapsed_ms(stage_start);
         record_memory(3);
         plan_cache.save(plan_key);
     }
@@ -375,24 +322,18 @@ public:
         if (cuCtxPushCurrent(context) != CUDA_SUCCESS) return;
         if (stream) cuStreamSynchronize(stream);
         if (executable) cuGraphExecDestroy(executable);
-        if (graph) cuGraphDestroy(graph);
         silu_bindings.clear();
         silu_plan.reset();
         matmuls.clear();
         convolutions.clear();
         if (cudnn) cudnnDestroy(cudnn);
         if (blas) cublasLtDestroy(blas);
-        if (!borrowed_resources) {
-            if (module) cuModuleUnload(module);
-            if (weights) cuMemFree(weights);
-        }
         for (auto ptr : {arena, scratch, input, output}) if (ptr) cuMemFree(ptr);
         if (host_input) cuMemFreeHost(host_input);
         if (host_output) cuMemFreeHost(host_output);
         if (stream) cuStreamDestroy(stream);
         CUcontext previous;
         cuCtxPopCurrent(&previous);
-        if (!borrowed_resources) cuDevicePrimaryCtxRelease(device);
     }
 
     void enqueue(CUstream target) {
@@ -485,7 +426,6 @@ public:
     }
 
 private:
-    bool borrowed_resources = false;
     CUfunction dynamic_mean_project = nullptr;
 
     template<class T>
@@ -530,15 +470,13 @@ private:
     }
 
     void allocate_shape() {
-        if (borrowed_resources) {
-            size_t free_bytes, capacity;
-            CHECK(cuMemGetInfo(&free_bytes, &capacity));
-            size_t required = arena_bytes + 2 * batch * io_bytes;
-            if (required > free_bytes)
-                throw AllocationError("Shape buffers require " + std::to_string(required)
-                    + " bytes with " + std::to_string(free_bytes)
-                    + " bytes available; try a smaller tile or batch");
-        }
+        size_t free_bytes, capacity;
+        CHECK(cuMemGetInfo(&free_bytes, &capacity));
+        size_t required = arena_bytes + 2 * batch * io_bytes;
+        if (required > free_bytes)
+            throw AllocationError("Shape buffers require " + std::to_string(required)
+                + " bytes with " + std::to_string(free_bytes)
+                + " bytes available; try a smaller tile or batch");
         allocate(input, batch * io_bytes, "device RGB input");
         allocate(output, batch * io_bytes, "device RGB output");
         allocate(arena, arena_bytes, "activation arena");
@@ -581,99 +519,17 @@ private:
     void ensure_tuning_workspace() {
         if (scratch) return;
         allocate(scratch, scratch_bytes, "tuning workspace");
+        peak_workspace_bytes = std::max(peak_workspace_bytes, scratch_bytes);
         CHECK(cuMemsetD8Async(arena, 0x28, arena_bytes, stream));
         record_memory(1);
     }
 
     void record_memory(size_t stage) {
-        size_t available, total;
-        CHECK(cuMemGetInfo(&available, &total));
-        startup_used[stage] = total - available;
+        startup_used[stage] = umzi::device_used_bytes();
     }
 
     void capture_graph() {
-        CHECK(cuStreamBeginCapture(stream, CU_STREAM_CAPTURE_MODE_THREAD_LOCAL));
-        try {
-            forward(stream);
-        } catch (...) {
-            cuStreamEndCapture(stream, &graph);
-            throw;
-        }
-        CHECK(cuStreamEndCapture(stream, &graph));
-        CHECK(cuGraphInstantiate(&executable, graph, 0));
-        CHECK(cuGraphUpload(executable, stream));
-        CHECK(cuStreamSynchronize(stream));
-        CHECK(cuGraphDestroy(graph));
-        graph = nullptr;
-    }
-
-    void load(const fs::path& directory, bool cache_enabled, const std::vector<char>& module_data) {
-        std::ifstream schedule(directory / "schedule.bin", std::ios::binary);
-        std::array<uint32_t, 4> header{};
-        read(schedule, header.data(), sizeof(header));
-        bool legacy = header[0] == 0x32525447;
-        if ((!legacy && header[0] != 0x33525447) || (legacy && fp16) || header[1] != header[2] + 1
-            || header[2] < 2 || header[2] > 2000 || header[3] > (256u << 20))
-            throw std::runtime_error("Invalid GateRV3 schedule header");
-        tensors.resize(header[1]);
-        ops.resize(header[2]);
-        read(schedule, tensors.data(), tensors.size() * sizeof(Tensor));
-        read(schedule, ops.data(), ops.size() * sizeof(Op));
-        if (tensors.front().offset != -1 || tensors.back().offset != -1
-            || tensors.front().elements() != 3 * tile * tile
-            || tensors.back().elements() != 3 * tile * tile)
-            throw std::runtime_error("Invalid native input or output shape");
-        size_t extent = 0;
-        for (size_t i = 1; i + 1 < tensors.size(); ++i) {
-            const auto& t = tensors[i];
-            if (t.h < 1 || t.h > tile || t.w < 1 || t.w > tile
-                || t.c < 1 || t.c > 2560 || t.offset < 0 || t.offset % 256)
-                throw std::runtime_error("Invalid native tensor");
-            extent = std::max(extent, size_t(t.offset) + t.elements() * 2);
-        }
-        for (size_t i = 0; i < ops.size(); ++i) {
-            const auto& op = ops[i];
-            if (op.kind < Pack || op.kind > (legacy ? Rgb : ShuffleConcat) || op.out != i + 1
-                || op.input[0] < 0
-                || std::any_of(op.input.begin(), op.input.end(), [i](int id) { return id < -1 || id > int(i); })
-                || std::any_of(op.weight.begin(), op.weight.end(), [&](int id) {
-                    return id < -1 || (id >= 0 && (id % 256 || uint32_t(id) >= header[3]));
-                }))
-                throw std::runtime_error("Invalid native operation");
-        }
-        if (extent > (32u << 20) || ops.front().kind != Pack || ops.back().kind != Rgb
-            || (fp16 && ops.back().weight[1] < 0))
-            throw std::runtime_error("Invalid native schedule");
-        std::vector<char> staging(header[3]);
-        weight_bytes = staging.size();
-        std::ifstream file(directory / "weights.bin", std::ios::binary);
-        read(file, staging.data(), staging.size());
-        if (file.peek() != EOF) throw std::runtime_error("Unexpected trailing weight data");
-        if (cache_enabled) {
-            try {
-                gt::Sha256 hash;
-                const char build_id[] = __DATE__ " " __TIME__;
-                hash.add(build_id);
-                hash.add(module_data.data(), module_data.size());
-                hash.add(header);
-                for (const auto& t : tensors) {
-                    // All arena placements have the same alignment. Plan geometry
-                    // depends on tensor shapes and strides, independently of offsets.
-                    hash.add(std::array<int, 3>{t.h, t.w, t.c});
-                }
-                hash.add(ops.data(), ops.size() * sizeof(Op));
-                hash.add(staging.data(), staging.size());
-                hash.add(batch);
-                add_plan_environment(hash);
-                plan_key = hash.finish();
-            } catch (const std::exception& error) {
-                plan_cache.unavailable(error);
-            }
-        }
-        allocate(weights, staging.size(), "model weights");
-        CHECK(cuMemcpyHtoD(weights, staging.data(), staging.size()));
-        arena_bytes = extent * batch;
-        allocate_shape();
+        umzi::capture_cuda_graph(stream, executable, [&] { forward(stream); });
     }
 
     CUfunction lookup(std::string name) {
@@ -784,6 +640,7 @@ private:
         if (best == bad_timing) test_candidates(std::min(found, baseline_candidates), false);
         if (best == bad_timing) throw std::runtime_error("No working cuBLASLt plan for operation " + std::to_string(index));
         workspace_bytes = std::max(workspace_bytes, plan->workspace);
+        ++timed_plans;
         auto selected = GemmChoice{plan->algorithm, plan->workspace};
         gemm_algorithms.emplace(key, selected);
         plan_cache.gemms.insert_or_assign(key, selected);
@@ -860,6 +717,7 @@ private:
             p.algorithm = fastest->algo;
             p.workspace = fastest->memory;
             workspace_bytes = std::max(workspace_bytes, p.workspace);
+            ++timed_plans;
             CHECK(cudnnSetConvolutionMathType(p.conv, fastest->mathType));
             plan_cache.convolutions.insert_or_assign(
                 key, gt::ConvChoice{uint32_t(fastest->algo), uint32_t(fastest->mathType), p.workspace});
@@ -1130,8 +988,9 @@ constexpr std::pair<const char*, uint32_t> gate_options[] = {
 constexpr const char* gate_stats[] = {
     "replay_tuned_shapes", "fused_gate_pool_sites", "fp16_qkv_projections",
     "split_gate_registers", "fused_gate_registers", "fused_silu_count",
+    "timed_plans", "plan_workspace_bytes", "peak_plan_workspace_bytes",
 };
-static_assert(std::size(gate_stats) == GT_OPT_STAT_COUNT + 1);
+static_assert(std::size(gate_stats) == GT_OPT_STAT_COUNT + 4);
 
 class GateSession final : public umzi::KernelSession {
 public:
@@ -1296,7 +1155,13 @@ public:
     UmziDiagnostic diagnostic(uint32_t index) const override {
         if (index >= diagnostic_count()) throw std::runtime_error("Invalid GateRV3 diagnostic index");
         int64_t value = 0;
-        if (active) value = index == GT_OPT_STAT_COUNT ? active->fused_silu_count : active->optimization_stats[index];
+        if (active) {
+            if (index < GT_OPT_STAT_COUNT) value = active->optimization_stats[index];
+            else if (index == GT_OPT_STAT_COUNT) value = active->fused_silu_count;
+            else if (index == GT_OPT_STAT_COUNT + 1) value = active->timed_plans;
+            else if (index == GT_OPT_STAT_COUNT + 2) value = static_cast<int64_t>(active->retained_workspace_bytes());
+            else value = static_cast<int64_t>(active->peak_workspace_bytes);
+        }
         return {sizeof(UmziDiagnostic), gate_stats[index], value};
     }
 
@@ -1311,20 +1176,6 @@ public:
     }
 
 };
-
-template<class F>
-int report_errors(F action) noexcept {
-    try {
-        action();
-        return 0;
-    } catch (const AllocationError& error) {
-        error_text = error.what();
-        return GT_STATUS_OUT_OF_MEMORY;
-    } catch (const std::exception& error) {
-        error_text = error.what();
-        return GT_STATUS_ERROR;
-    }
-}
 } // namespace
 
 std::unique_ptr<umzi::KernelSession> umzi::make_gaterv3(const ModelPackage& package,
@@ -1335,234 +1186,3 @@ std::unique_ptr<umzi::KernelSession> umzi::make_gaterv3(const ModelPackage& pack
     session->open(package, options);
     return session;
 }
-
-extern "C" {
-const char* gt_error() { return error_text.c_str(); }
-
-GtRunner* gt_create(const char* directory, int batch, int graph) {
-    return gt_create_ex(directory, batch, graph ? GT_CREATE_GRAPH : 0, nullptr);
-}
-
-GtRunner* gt_create_fp16(const char* directory, int batch, int graph) {
-    return gt_create_ex(directory, batch, GT_CREATE_FP16 | (graph ? GT_CREATE_GRAPH : 0), nullptr);
-}
-
-GtRunner* gt_create_ex(const char* directory, int batch, uint32_t flags, const char* cache_dir) {
-    GtRunner* result = nullptr;
-    report_errors([&] {
-        auto runner = std::make_unique<GtRunner>();
-        runner->initialize(fs::u8path(directory), batch, flags,
-                           cache_dir ? fs::u8path(cache_dir) : fs::path{});
-        result = runner.release();
-    });
-    return result;
-}
-
-GtCacheStatus gt_cache_status(const GtRunner* runner) { return static_cast<GtCacheStatus>(runner->plan_cache.status); }
-const char* gt_cache_message(const GtRunner* runner) { return runner->plan_cache.diagnostic.c_str(); }
-void gt_setup_timings(const GtRunner* runner, double milliseconds[4]) {
-    std::copy(runner->setup_ms.begin(), runner->setup_ms.end(), milliseconds);
-}
-int gt_fused_silu_count(const GtRunner* runner) { return runner->fused_silu_count; }
-const char* gt_fusion_message(const GtRunner* runner) { return runner->fusion_diagnostic.c_str(); }
-void gt_optimization_stats(const GtRunner* runner, int values[GT_OPT_STAT_COUNT]) {
-    std::copy(runner->optimization_stats.begin(), runner->optimization_stats.end(), values);
-}
-
-void gt_destroy(GtRunner* runner) { delete runner; }
-uint64_t gt_input(const GtRunner* runner) { return runner->input; }
-uint64_t gt_output(const GtRunner* runner) { return runner->output; }
-int gt_operation_count(const GtRunner* runner) { return runner->operation_count(); }
-
-int gt_profile(GtRunner* runner, float* milliseconds, int count) {
-    return report_errors([&] { runner->profile(milliseconds, count); });
-}
-
-int gt_enqueue(GtRunner* runner, GtStream stream) {
-    return report_errors([&] {
-        ContextScope scope(runner->context);
-        runner->enqueue(stream);
-    });
-}
-
-int gt_run(GtRunner* runner, const float* input, float* output) {
-    return report_errors([&] {
-        if (runner->fp16) throw std::runtime_error("Use gt_run_fp16 for a full-FP16 runner");
-        runner->run_host(input, output);
-    });
-}
-
-int gt_run_fp16(GtRunner* runner, const uint16_t* input, uint16_t* output) {
-    return report_errors([&] {
-        if (!runner->fp16) throw std::runtime_error("Use gt_run for a mixed-precision runner");
-        runner->run_host(input, output);
-    });
-}
-
-void gt_buffer_sizes(const GtRunner* runner, uint64_t bytes[4]) {
-    runner->buffer_sizes(bytes);
-}
-
-void gt_startup_memory(const GtRunner* runner, uint64_t bytes[4]) {
-    runner->startup_memory(bytes);
-}
-}
-
-namespace {
-uint32_t cli_switch(const std::string& name) {
-    if (name == "--fuse-silu") return GT_CREATE_FUSE_SILU;
-    if (name == "--tune-projections") return GT_CREATE_TUNE_PROJECTIONS;
-    if (name == "--fuse-gate-pool") return GT_CREATE_FUSE_GATE_POOL;
-    if (name == "--fp16-qkv") return GT_CREATE_FP16_QKV;
-    return 0;
-}
-
-uint32_t cli_int(const std::string& value, const std::string& name) {
-    uint32_t number{};
-    const auto* end = value.data() + value.size();
-    auto parsed = std::from_chars(value.data(), end, number);
-    if (parsed.ec != std::errc{} || parsed.ptr != end)
-        throw std::runtime_error("Invalid number for " + name);
-    return number;
-}
-
-int session_cli(int argc, char** argv) {
-    if (argc == 2 || (argc == 3 && std::string(argv[2]) == "--help")) {
-        std::cout
-            << "Usage: umzi_native run --model file --batch N --height H --width W --input raw --output raw\n"
-            << "  --precision mixed|fp16|fp32   Select a precision supported by the model (default: mixed)\n"
-            << "  --device index           Select a CUDA device (default: 0)\n"
-            << "  --cache-dir path         Read and write tuned plans in this directory\n"
-            << "  --direct                 Dispatch inference without capturing a CUDA Graph\n"
-            << "  --fuse-silu              Try cuDNN convolution/SiLU fusion at eligible sites\n"
-            << "  --tune-projections       Time a wider cuBLASLt candidate search under CUDA Graph replay\n"
-            << "  --fuse-gate-pool         Fuse eligible 128x128 grouped gate/pooling sites\n"
-            << "  --fp16-qkv               Use FP16 accumulation for QKV in mixed precision\n"
-            << "  --unexact-erf            Use CUDA erff for GFISRv2 Fourier GELU\n";
-        return argc == 2 ? 2 : 0;
-    }
-    return report_errors([&] {
-        UmziSessionOptions options{sizeof(UmziSessionOptions), 0, UMZI_MIXED, UMZI_CUDA_GRAPH};
-        uint32_t gate_flags = 0;
-        bool unexact_erf = false;
-        std::string model, input, output;
-        uint32_t batch = 0, height = 0, width = 0;
-        for (int i = 2; i < argc; ++i) {
-            std::string name = argv[i];
-            if (auto flag = cli_switch(name)) {
-                gate_flags |= flag;
-                continue;
-            }
-            if (name == "--direct") {
-                options.flags &= ~UMZI_CUDA_GRAPH;
-                continue;
-            }
-            if (name == "--unexact-erf") {
-                unexact_erf = true;
-                continue;
-            }
-            if (++i >= argc) throw std::runtime_error("Missing value for " + name);
-            if (name == "--model") model = argv[i];
-            else if (name == "--input") input = argv[i];
-            else if (name == "--output") output = argv[i];
-            else if (name == "--cache-dir") options.cache_dir = argv[i];
-            else if (name == "--batch") batch = cli_int(argv[i], name);
-            else if (name == "--height") height = cli_int(argv[i], name);
-            else if (name == "--width") width = cli_int(argv[i], name);
-            else if (name == "--device") {
-                auto device = cli_int(argv[i], name);
-                if (device > INT_MAX) throw std::runtime_error("Invalid CUDA device index");
-                options.device = static_cast<int32_t>(device);
-            } else if (name == "--precision") {
-                std::string mode = argv[i];
-                if (mode == "fp16") options.precision = UMZI_FP16;
-                else if (mode == "mixed") options.precision = UMZI_MIXED;
-                else if (mode == "fp32") options.precision = UMZI_FP32;
-                else throw std::runtime_error("Precision must be mixed, fp16, or fp32");
-            } else throw std::runtime_error("Invalid option " + name);
-        }
-        if (model.empty() || input.empty() || output.empty())
-            throw std::runtime_error("--model, --input and --output are required");
-        std::vector<UmziOption> flags;
-        for (const auto& flag : gate_options)
-            if (gate_flags & flag.second) flags.push_back({flag.first, 1});
-        if (unexact_erf) flags.push_back({"unexact_erf", 1});
-        options.kernel_options = flags.data();
-        options.kernel_option_count = static_cast<uint32_t>(flags.size());
-        std::unique_ptr<UmziSession, decltype(&umzi_session_close)> session(
-            umzi_session_open(model.c_str(), &options), umzi_session_close);
-        if (!session) throw std::runtime_error(umzi_error());
-        UmziShape shape{4, {batch, 3, height, width}};
-        UmziIo io{};
-        io.struct_size = sizeof(io);
-        if (umzi_session_describe(session.get(), &shape, &io)) throw std::runtime_error(umzi_error());
-        if (fs::file_size(fs::u8path(input)) != io.input.bytes)
-            throw std::runtime_error("Raw input must contain exactly " + std::to_string(io.input.bytes) + " bytes");
-        std::vector<char> pixels(static_cast<size_t>(io.input.bytes));
-        std::vector<char> restored(static_cast<size_t>(io.output.bytes));
-        std::ifstream file(fs::u8path(input), std::ios::binary);
-        read(file, pixels.data(), pixels.size());
-        if (umzi_session_run(session.get(), &shape, pixels.data(), pixels.size(), restored.data(), restored.size()))
-            throw std::runtime_error(umzi_error());
-        std::ofstream out(fs::u8path(output), std::ios::binary);
-        if (!out.write(restored.data(), restored.size()))
-            throw std::runtime_error("Could not write restored RGB output");
-        if (*umzi_session_cache_message(session.get()))
-            std::cerr << "Plan cache: " << umzi_session_cache_message(session.get()) << '\n';
-    }) == 0 ? 0 : (std::cerr << error_text << '\n', 1);
-}
-
-int legacy_cli(int argc, char** argv) {
-    if (argc < 5) {
-        std::cerr << "For packed models, see umzi_native run --help.\n"
-                     "Legacy usage: gaterv3 <bundle-directory> <batch: 1|16> <input> <output> "
-                     "[--fp16] [--cache-dir <directory>] [--fuse-silu] "
-                     "[--tune-projections] [--fuse-gate-pool] [--fp16-qkv]\n";
-        return 2;
-    }
-    return report_errors([&] {
-        uint32_t flags = GT_CREATE_GRAPH;
-        const char* cache_dir = nullptr;
-        for (int i = 5; i < argc; ++i) {
-            std::string option = argv[i];
-            if (option == "--fp16") flags |= GT_CREATE_FP16;
-            else if (auto flag = cli_switch(option)) flags |= flag;
-            else if (option == "--cache-dir" && i + 1 < argc) cache_dir = argv[++i];
-            else throw std::runtime_error("Invalid option " + option);
-        }
-        std::unique_ptr<GtRunner> runner(gt_create_ex(argv[1], std::stoi(argv[2]), flags, cache_dir));
-        if (!runner) throw std::runtime_error(error_text);
-        if (*gt_cache_message(runner.get()))
-            std::cerr << "Plan cache: " << gt_cache_message(runner.get()) << '\n';
-        if (flags & GT_CREATE_FUSE_SILU) {
-            std::cerr << "Convolution/SiLU sites: " << gt_fused_silu_count(runner.get()) << '\n';
-            if (*gt_fusion_message(runner.get()))
-                std::cerr << gt_fusion_message(runner.get()) << '\n';
-        }
-        std::vector<char> pixels(runner->batch * runner->io_bytes);
-        std::vector<char> restored(pixels.size());
-        std::ifstream file(fs::u8path(argv[3]), std::ios::binary);
-        read(file, pixels.data(), pixels.size());
-        if (file.peek() != EOF) throw std::runtime_error("Input has extra data");
-        runner->run_host(pixels.data(), restored.data());
-        std::ofstream out(fs::u8path(argv[4]), std::ios::binary);
-        if (!out.write(restored.data(), restored.size()))
-            throw std::runtime_error("Could not write restored RGB output");
-    }) == 0 ? 0 : (std::cerr << error_text << '\n', 1);
-}
-} // namespace
-
-#ifdef _WIN32
-int wmain(int argc, wchar_t** wide_argv) {
-    std::vector<std::string> arguments;
-    for (int i = 0; i < argc; ++i) arguments.push_back(fs::path(wide_argv[i]).u8string());
-    std::vector<char*> argv;
-    for (auto& text : arguments) argv.push_back(text.data());
-    return argc >= 2 && arguments[1] == "run" ? session_cli(argc, argv.data()) : legacy_cli(argc, argv.data());
-}
-
-#else
-int main(int argc, char** argv) {
-    return argc >= 2 && std::string(argv[1]) == "run" ? session_cli(argc, argv) : legacy_cli(argc, argv);
-}
-#endif

@@ -76,12 +76,18 @@ where they can serve any registered kernel family.
 
 ```text
 native/
-  include/umzi_native.h              Public C ABI
+  include/umzi_native.h              Public C ABI (17 base umzi_* exports)
   common/
     platform.h                       OS services, SHA-256, atomic cache writes
     cuda_module.h                    Cubin selection and PTX fallback
+    cuda_helpers.h                   Shared CUDA/cuDNN/cuBLASLt checks, ContextScope, graph capture, FP16 packing
+    cuda_plan_cache.h                Shared CUDA .umplan record serialization
+    cudnn_conv_plan.h                Shared cuDNN backend graph descriptor, candidate search & timing
+    resize_rgb.cuh                   Shared reflection pad/crop device helper
+    tensor_core.cuh                  Shared Ampere+ PTX cp.async / ldmatrix / mma helpers
   runtime/
     api.cpp                          C entry points, dispatch, lifecycle and validation
+    cli.cpp                          Standalone kernel-agnostic umzi_native CLI (linked into CLI only)
     kernel.h                         Internal kernel contract
     registry.cpp                     Compiled kernel factories and stable IDs
     model_package.h / .cpp           Container parsing and validation
@@ -89,11 +95,21 @@ native/
   kernels/
     gaterv3/
       model_file.h                   GateRV3 payload decoder and validator
-      runner.h / .cpp                 GateRV3 adapter, execution, shape plans and graphs
+      runner.cpp                     GateRV3 adapter, execution, shape plans and graphs
       kernels.cu
       fp16.cuh
       plan_cache.h
       silu_plan.h
+    gaterv2/
+      runner.cpp
+      kernels.cu
+    moesr/
+      runner.cpp
+      kernels.cu
+    gfisrv2/
+      cufft_api.h
+      runner.cpp
+      kernels.cu
 src/umzi_native/
   __init__.py                        Public Python imports
   _loader.py                         Platform library discovery and opt-in CUDA loading

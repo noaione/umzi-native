@@ -1,5 +1,6 @@
 #include <cuda_fp16.h>
 #include "../../common/resize_rgb.cuh"
+#include "../../common/tensor_core.cuh"
 
 extern "C" __global__ void pad_rgb(float* out, const float* in, int h, int w, int ph, int pw, int total) {
     resize_rgb<float, false>(out, in, h, w, ph, pw, total);
@@ -273,69 +274,6 @@ extern "C" __global__ void gate_reduced_nhwc(GATE_ARGS) { gate_groups<24, 96>(GA
 // (see pack_expand_weights in runner.cpp) so cp.async loads are contiguous.
 // 8 warps (256 threads) per block, <= 47.6 KB shared memory -> 2 active blocks
 // per SM on sm_86 with zero local spills.
-
-__device__ __forceinline__ unsigned shared_address(const void* pointer) {
-    return static_cast<unsigned>(__cvta_generic_to_shared(pointer));
-}
-
-// 16-byte async copy; src_bytes 0 fills the destination with zeros.
-__device__ __forceinline__ void copy_async(half* target, const half* source, bool valid) {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(shared_address(target)), "l"(source),
-                 "r"(valid ? 16 : 0));
-}
-
-__device__ __forceinline__ void copy_async_always(half* target, const half* source) {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(shared_address(target)), "l"(source));
-}
-
-__device__ __forceinline__ int swizzle64(int row, int chunk) { return (row * 8 + (chunk ^ (row & 7))) * 8; }
-__device__ __forceinline__ int swizzle32(int row, int chunk) { return (row * 4 + (chunk ^ ((row >> 1) & 3))) * 8; }
-
-__device__ __forceinline__ void load_matrix_x4(unsigned (&r)[4], const half* pointer) {
-    asm("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-        : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-        : "r"(shared_address(pointer)));
-}
-
-__device__ __forceinline__ void load_matrix_x2(unsigned (&r)[2], const half* pointer) {
-    asm("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
-        : "=r"(r[0]), "=r"(r[1])
-        : "r"(shared_address(pointer)));
-}
-
-template<bool HalfAccumulate> struct Accumulator;
-
-template<> struct Accumulator<false> {
-    float c[4] = {0.f, 0.f, 0.f, 0.f};
-    __device__ __forceinline__ void mma(const unsigned (&a)[4], unsigned b0, unsigned b1) {
-        asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, "
-            "{%8, %9}, {%0, %1, %2, %3};\n"
-            : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-            : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-    }
-    __device__ __forceinline__ float2 pair(int half_row) const {
-        return make_float2(c[2 * half_row], c[2 * half_row + 1]);
-    }
-    __device__ __forceinline__ unsigned packed_half2(int half_row) const {
-        const half2 h = __floats2half2_rn(c[2 * half_row], c[2 * half_row + 1]);
-        return *reinterpret_cast<const unsigned*>(&h);
-    }
-};
-
-template<> struct Accumulator<true> {
-    unsigned c[2] = {0u, 0u};
-    __device__ __forceinline__ void mma(const unsigned (&a)[4], unsigned b0, unsigned b1) {
-        asm("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0, %1}, {%2, %3, %4, %5}, {%6, %7}, "
-            "{%0, %1};\n"
-            : "+r"(c[0]), "+r"(c[1])
-            : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-    }
-    __device__ __forceinline__ float2 pair(int half_row) const {
-        const unsigned value = c[half_row];
-        return __half22float2(*reinterpret_cast<const half2*>(&value));
-    }
-    __device__ __forceinline__ unsigned packed_half2(int half_row) const { return c[half_row]; }
-};
 
 // Epilogue shared by all four expand_gate_* kernels. Every lane in a warp
 // shares the same y, so `if (y >= h) continue;` is warp-uniform; `x < w` is
@@ -908,14 +846,6 @@ extern "C" __global__ void gate_branch_tiled_reduced(BRANCH_TILED_ARGS) {
 // channels of its rows, the 4 lanes holding a pixel compute LayerNorm with two
 // quad-wide warp shuffles and no extra global round-trip.
 
-__device__ __forceinline__ int swizzle16(int row, int chunk) { return (row * 2 + (chunk ^ ((row >> 2) & 1))) * 8; }
-
-__device__ __forceinline__ float quad_sum(float value) {
-    value += __shfl_xor_sync(0xffffffff, value, 1);
-    value += __shfl_xor_sync(0xffffffff, value, 2);
-    return value;
-}
-
 template<bool HalfAccumulate, bool DoNorm, int Cin>
 __device__ void project_k16_3tap(half* state, half* normalized, const half* in, const half* weight, const float* bias,
                                  const float* gamma, const float* norm_w, const float* norm_b, int h, int w,
@@ -1118,12 +1048,7 @@ extern "C" __global__ void residual_norm_nhwc(half* state, half* normalized, con
 // plan timing sees realistic switching activity rather than zeros.
 extern "C" __global__ void fill_noise(half* out, int total) {
     const int index = thread_index();
-    if (index >= total) return;
-    unsigned x = unsigned(index) * 2654435761u + 0x9e3779b9u;
-    x ^= x >> 15;
-    x *= 0x2c1b3c6du;
-    x ^= x >> 12;
-    out[index] = __float2half_rn(float(x & 0xffff) / 32768.f - 1.f);
+    if (index < total) out[index] = __float2half_rn(hash_noise_float(index));
 }
 extern "C" __global__ void input_bias_norm(half* state, half* initial, half* normalized, const half* projected,
                                            const float* bias, const float* weight, const float* norm_bias, int pixels) {

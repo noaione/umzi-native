@@ -141,7 +141,9 @@ key or value outside `{0, 1}` is rejected.
 
 Changing `fuse_silu` or `fuse_gate_pool` reuses existing cached plans in
 `cache_dir`; changing `tune_projections` or `fp16_qkv` uses a separate cache
-key.
+key. Diagnostics in `get_session_info()["diagnostics"]` also include the common
+plan metrics `timed_plans`, `plan_workspace_bytes`, and
+`peak_plan_workspace_bytes`.
 
 ```python
 options = umzi.SessionOptions(
@@ -184,7 +186,7 @@ MoESR requires `H >= 2` and `W >= 2` (for reflection padding).
 
 Both options are part of the `moesr_<key>.umplan` cache key. Diagnostics in
 `get_session_info()["diagnostics"]`: `timed_plans`, `plan_workspace_bytes`,
-and `fused_gate`.
+`fused_gate`, and `peak_plan_workspace_bytes`.
 
 ```python
 # Default MoESR FP16 (fused_gate=1 is already on by default)
@@ -218,7 +220,15 @@ loads cuFFT when it opens.
 
 | Option | Default | Valid values | What it does |
 | --- | ---: | --- | --- |
-| `unexact_erf` | `0` | `0` or `1` | `0` uses the PyTorch reference's erf rounding for Fourier GELU. `1` uses the build toolchain's CUDA `erff`. The native CLI enables this via `--unexact-erf`. |
+| `fused_conv` | `1` | `0` or `1` | `1` (recommended) runs custom tensor-core fused NHWC expansion and projection kernels in `"fp16"` and `"mixed"` modes. Set `0` to fall back to separate cuDNN backend convolutions. Ignored in `"fp32"`. |
+| `workspace_mib` | `512` | `0` to `4096` | Maximum temporary cuDNN workspace (MiB) plan candidates may use during tuning in `"fp16"` and `"mixed"` modes. Prepare retains only what the selected plans need. |
+| `unexact_erf` | `0` | `0` or `1` | `0` uses the PyTorch reference's erf rounding for Fourier GELU. `1` uses the build toolchain's CUDA `erff`. Pass via `--option unexact_erf=1` on the native CLI. |
+
+`fused_conv`, `workspace_mib`, and `unexact_erf` are part of the
+`gfisrv2_<key>.umplan` cache key in `"fp16"` and `"mixed"` modes. Diagnostics in
+`get_session_info()["diagnostics"]`: `cufft_version`, `cufft_workspace_bytes`,
+`unexact_erf`, `timed_plans`, `plan_workspace_bytes`, `fused_conv`, and
+`peak_plan_workspace_bytes`.
 
 ```python
 options = umzi.SessionOptions(precision="fp32", kernel_options={"unexact_erf": 1})

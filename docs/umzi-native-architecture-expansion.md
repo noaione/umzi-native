@@ -1015,3 +1015,22 @@ batch-2 overlap-64 results (`output/gfisrv2-session/opt-final-ov64-*/report.json
 Full pass logs, per-page tables, and dead ends are recorded in the
 [GFISRv2 tuning handoff](handoff-gfisrv2.md). Replicate padding remains a
 separate model-behavior experiment for panel edges, halftones and tile overlaps.
+
+### Native runtime consolidation and reporting alignment (2026-11-22)
+
+A cross-family audit consolidated duplicated native code, stripped legacy
+non-base DLL exports and CLI code, and aligned session reporting across all four
+kernel families (`gaterv3`, `gaterv2`, `moesr`, `gfisrv2`):
+
+- **Shared headers (`native/common/`):**
+  - `cuda_helpers.h`: shared `Clock`/`elapsed_ms`, `check(CUresult / cudnnStatus_t / cublasStatus_t)`, `ContextScope`, `device_used_bytes()`, `float_to_half()` (exact IEEE binary16 RNE), `capture_cuda_graph()`, and `hash_plan_environment()`.
+  - `cudnn_conv_plan.h`: unified cuDNN backend graph wrapper (`CudnnDescriptor`, `CudnnCandidate`, `CudnnConvGraph`, `CudnnBackendPlan`, `bind_conv_variant`, `ensure_device_scratch`, `time_cudnn_backend_plan`) replacing the near-identical `moesr/conv_plan.h` and `gfisrv2/conv_plan.h` copies and `gt::BackendDescriptor` in `gaterv3/silu_plan.h`. Updated `hatch_build.py` to scan `native/common/*.h` when generating Windows `cudnn64_9.def` / `cublasLt64_13.def`.
+  - `tensor_core.cuh`: shared Ampere+ PTX helpers (`shared_address`, `copy_async`, `copy_async_always`, `swizzle16/32/64`, `load_matrix_x2/x4`, `Accumulator<bool>`, `quad_sum`, `hash_noise_float`) used by both `moesr/kernels.cu` and `gfisrv2/kernels.cu`.
+- **Base-only DLL exports & standalone CLI:**
+  - Deleted `native/kernels/gaterv3/runner.h`, all 20 legacy `gt_*` C DLL exports, the legacy `schedule.bin`/`weights.bin`/`kernels.cubin` bundle loader, and `legacy_cli` from `native/kernels/gaterv3/runner.cpp` (and removed legacy `kernels.cubin` emission in `hatch_build.py` and `--legacy` paths in `scripts/benchmark_native.py`, `scripts/validate_native_shapes.py`, and `scripts/export_native.py`).
+  - Extracted the generic CLI into `native/runtime/cli.cpp`, linked exclusively into `umzi_native.exe` / `umzi_native` (never into `umzi_native.dll` / `libumzi_native.so`), replacing kernel-specific CLI flags (`--fuse-silu`, `--unexact-erf`, etc.) with repeatable `--option name=value`.
+  - Verified the PE export table of `output/refactor-win/umzi_native.dll` exports **only the 17 base `umzi_*` symbols** declared in `native/include/umzi_native.h`.
+- **Consistent session reporting across all four families:**
+  - `startup_device_used_bytes[4]` (`context`, `tuning_workspace`, `tuned`, `captured`): implemented for `gaterv2` (previously all zeros), aligned `moesr` and `gfisrv2` to record the same four lifecycle checkpoints as `gaterv3` (including recording `captured` unconditionally when `enable_cuda_graph=False` and resetting on shape release).
+  - `diagnostics`: added common plan counters (`timed_plans`, `plan_workspace_bytes`, `peak_plan_workspace_bytes`) across all four families, added `fused_conv` to `gfisrv2`, and fixed the missing out-of-range index check in `moesr`'s `diagnostic()`.
+  - `kernel_message()`: added an override for `moesr` matching `gaterv2` and `gfisrv2`.

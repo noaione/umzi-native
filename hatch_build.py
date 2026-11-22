@@ -32,6 +32,7 @@ HOST_SOURCES = (
     NATIVE / "runtime" / "model_package.cpp",
     NATIVE / "runtime" / "plan_cache_file.cpp",
 )
+CLI_SOURCE = NATIVE / "runtime" / "cli.cpp"
 WINDOWS = sys.platform == "win32"
 LIBRARY_NAME = "umzi_native.dll" if WINDOWS else "libumzi_native.so"
 CLI_NAME = "umzi_native.exe" if WINDOWS else "umzi_native"
@@ -244,9 +245,23 @@ def _build_windows(output: Path, toolchain: Toolchain, includes: Sequence[Path],
         obj = output / "_".join(cpp.relative_to(NATIVE).with_suffix(".obj").parts)
         _run(str(cl), *flags, "/c", *(f"/I{path}" for path in includes), f"/Fo{obj}", str(cpp), env=env, cwd=output)
         objects.append(str(obj))
+    cli_obj = output / "_".join(CLI_SOURCE.relative_to(NATIVE).with_suffix(".obj").parts)
+    _run(
+        str(cl),
+        *flags,
+        "/c",
+        *(f"/I{path}" for path in includes),
+        f"/Fo{cli_obj}",
+        str(CLI_SOURCE),
+        env=env,
+        cwd=output,
+    )
     # The development wheels omit the cuBLASLt and cuDNN MSVC import
     # libraries, so generate them from the functions the runtime calls.
-    headers = (path for source in KERNEL_SOURCES.values() for path in sorted(source.glob("*.h")))
+    headers = (
+        *(path for source in KERNEL_SOURCES.values() for path in sorted(source.glob("*.h"))),
+        *sorted((NATIVE / "common").glob("*.h")),
+    )
     sources = "\n".join(path.read_text(encoding="utf-8") for path in (*HOST_SOURCES, *headers))
     imports = []
     for dll, symbol in (("cudnn64_9", r"cudnn\w+"), ("cublasLt64_13", r"cublasLt\w+")):
@@ -262,7 +277,20 @@ def _build_windows(output: Path, toolchain: Toolchain, includes: Sequence[Path],
     link = (str(linker), "/nologo", *objects, str(toolchain.cuda / "lib/x64/cuda.lib"), "bcrypt.lib", "version.lib")
     library = output / LIBRARY_NAME
     _run(*link, *imports, "/DLL", f"/OUT:{library}", env=env, cwd=output)
-    _run(*link, *imports, f"/OUT:{output / CLI_NAME}", f"/IMPLIB:{output / 'umzi_native-cli.lib'}", env=env, cwd=output)
+    _run(
+        str(linker),
+        "/nologo",
+        *objects,
+        str(cli_obj),
+        str(toolchain.cuda / "lib/x64/cuda.lib"),
+        "bcrypt.lib",
+        "version.lib",
+        *imports,
+        f"/OUT:{output / CLI_NAME}",
+        f"/IMPLIB:{output / 'umzi_native-cli.lib'}",
+        env=env,
+        cwd=output,
+    )
     return library
 
 
@@ -282,15 +310,21 @@ def _build_linux(
             *("-o", str(obj), str(cpp)),
         )
         objects.append(str(obj))
+    cli_obj = output / "_".join(CLI_SOURCE.relative_to(NATIVE).with_suffix(".o").parts)
+    _run(
+        compiler,
+        *("-std=c++17", "-O3", "-fPIC", "-fvisibility=hidden", "-Wno-deprecated-declarations", "-c"),
+        *extra_flags,
+        *(f"-I{path}" for path in includes),
+        *("-o", str(cli_obj), str(CLI_SOURCE)),
+    )
     if driver is None:
         # The driver is linked by soname; any copy of libcuda.so.1 will do.
         driver = next(
             (path for path in (Path("/usr/lib/wsl/lib/libcuda.so.1"),) if path.is_file()),
             None,
         )
-    link = [
-        compiler,
-        *objects,
+    link_tail = [
         "-Wl,-z,defs",
         "-Wl,-rpath,$ORIGIN",
         str(driver) if driver else "-l:libcuda.so.1",
@@ -302,8 +336,8 @@ def _build_linux(
         "-ldl",
     ]
     library = output / LIBRARY_NAME
-    _run(*link, "-shared", "-o", str(library))
-    _run(*link, "-o", str(output / CLI_NAME))
+    _run(compiler, *objects, *link_tail, "-shared", "-o", str(library))
+    _run(compiler, *objects, str(cli_obj), *link_tail, "-o", str(output / CLI_NAME))
     return library
 
 
@@ -329,9 +363,6 @@ def build(output: Path, settings: BuildSettings | None = None) -> Path:
         for arch, image in cubins.items():
             (output / f"{family}-{arch}.cubin").write_bytes(image)
         (output / f"{family}-{PTX_TARGET}.ptx").write_bytes(ptx)
-        if family == "gaterv3":
-            # The legacy fixed-bundle runner takes a cubin from its bundle directory.
-            (output / "kernels.cubin").write_bytes(next(iter(cubins.values())))
         _embed_images(output, cubins, ptx, family)
     includes = (*toolchain.includes, toolchain.cudnn / "include", NATIVE / "common", output)
     if WINDOWS:

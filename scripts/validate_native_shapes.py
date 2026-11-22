@@ -128,7 +128,6 @@ def check_cache_recovery(bundle, model_file):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bundle", type=Path, default=ROOT / "output/native")
-    parser.add_argument("--legacy-bundle", type=Path, help="Compare with a fixed bundle built from the same checkpoint")
     parser.add_argument("--checkpoint", type=Path, default=CHECKPOINT)
     parser.add_argument("--model-file", type=Path, help="Packed model path, defaults to gaterv3.ummodel in --bundle")
     parser.add_argument("--output", type=Path, default=ROOT / "output/native-refactor-validation")
@@ -141,13 +140,6 @@ def main():
     checkpoint_hash = digest(args.checkpoint)
     if packed_schedule(model_file)[2] != checkpoint_hash:
         parser.error("Packed model does not match the reference checkpoint")
-    legacy_bundle = args.legacy_bundle
-    if legacy_bundle is None and args.checkpoint.resolve() == CHECKPOINT.resolve():
-        legacy_bundle = ROOT / "output/native-projections"
-    if legacy_bundle is not None:
-        manifest = json.loads((legacy_bundle / "checkpoint.json").read_text(encoding="utf-8"))
-        if manifest["checkpoint_sha256"] != checkpoint_hash:
-            parser.error("Legacy bundle does not match the reference checkpoint")
     reference, _ = load_model(args.checkpoint, device="cuda")
     result: dict[str, Any] = {}
     with tempfile.TemporaryDirectory(dir=args.output) as directory:
@@ -210,12 +202,6 @@ def main():
                         first = output
                     if index == len(CASES) - 1:
                         assert first is not None and torch.equal(first, output) and setup["cache_status"] == "hit"
-                    if legacy_bundle is not None and height == width == 128 and batch in (1, 16) and index < 2:
-                        old = Native(legacy_bundle, batch, precision=mode, cache_dir=cache)
-                        try:
-                            row["old_fixed_comparison"] = error_metrics(old.host(x), output)
-                        finally:
-                            old.close()
                     print(mode, row, flush=True)
                     rows.append(row)
                 assert rows[3]["shape_allocation_ms"] == rows[4]["shape_allocation_ms"]

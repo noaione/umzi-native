@@ -4,16 +4,16 @@
 #include <cudnn.h>
 
 #include "gfisrv2_images.h"
-#include "conv_plan.h"
 #include "cufft_api.h"
+#include "../../common/cuda_helpers.h"
 #include "../../common/cuda_module.h"
 #include "../../common/cuda_plan_cache.h"
+#include "../../common/cudnn_conv_plan.h"
 #include "../../runtime/binary.h"
 #include "../../runtime/kernel.h"
 
 #include <algorithm>
 #include <array>
-#include <chrono>
 #include <climits>
 #include <cmath>
 #include <cstring>
@@ -36,32 +36,16 @@ constexpr uint32_t plan_schema = 4;
 constexpr uint32_t saved_plan_marker = 0x4742;
 constexpr std::array<uint32_t, 7> configuration{3, 3, scale, channels, blocks, hidden, fourier};
 constexpr int r2c = 0x2a, c2r = 0x2c;
-using Clock = std::chrono::steady_clock;
+using umzi::Clock;
+using umzi::ContextScope;
 
-void check(CUresult status, const char* operation) {
-    if (status == CUDA_ERROR_OUT_OF_MEMORY)
-        throw umzi::AllocationError(std::string(operation) + ": out of memory; try a smaller tile or batch");
-    umzi::check_cuda(status, operation);
-}
-void check(cudnnStatus_t status, const char* operation) {
-    if (status != CUDNN_STATUS_SUCCESS)
-        throw std::runtime_error(std::string(operation) + ": " + cudnnGetErrorString(status));
-}
 void fft_check(int status, const char* operation) {
     if (status == 2)
         throw umzi::AllocationError(std::string(operation) + ": cuFFT allocation failed; try a smaller tile or batch");
     if (status) throw std::runtime_error(std::string(operation) + ": cuFFT status " + std::to_string(status));
 }
-#define CHECK(expr) check((expr), #expr)
+#define CHECK(expr) umzi::check((expr), #expr)
 #define FFT_CHECK(expr) fft_check((expr), #expr)
-
-struct ContextScope {
-    explicit ContextScope(CUcontext context) { CHECK(cuCtxPushCurrent(context)); }
-    ~ContextScope() {
-        CUcontext previous;
-        cuCtxPopCurrent(&previous);
-    }
-};
 
 struct Shape {
     int n = 0, h = 0, w = 0;
@@ -78,35 +62,6 @@ Shape checked(const UmziShape& shape) {
     if (uint64_t(n) * h * w * 2 * hidden > INT_MAX - threads)
         throw std::runtime_error("Requested GFISRv2 shape exceeds native tensor indexing limits");
     return {int(n), int(h), int(w)};
-}
-
-uint16_t float_to_half(float value) {
-    uint32_t bits = 0;
-    std::memcpy(&bits, &value, sizeof(bits));
-    const uint32_t sign = (bits >> 16) & 0x8000u;
-    const int exp = int((bits >> 23) & 0xffu) - 127;
-    uint32_t mant = bits & 0x7fffffu;
-    if (exp == 128) return uint16_t(sign | 0x7c00u | (mant ? 0x0200u | (mant >> 13) : 0u));
-    if (exp > 15) return uint16_t(sign | 0x7c00u);
-    if (exp >= -14) {
-        const uint32_t round_bit = 0x1000u;
-        const uint32_t sticky = mant & 0xfffu;
-        if ((mant & round_bit) && (sticky || (mant & 0x2000u))) mant += round_bit;
-        if (mant & 0x800000u) {
-            if (exp == 15) return uint16_t(sign | 0x7c00u);
-            return uint16_t(sign | (uint32_t(exp + 16) << 10));
-        }
-        return uint16_t(sign | (uint32_t(exp + 15) << 10) | (mant >> 13));
-    }
-    if (exp < -25) return uint16_t(sign);
-    mant |= 0x800000u;
-    const int shift = -14 - exp + 13;
-    const uint32_t half_ulp = 1u << (shift - 1);
-    const uint32_t mask = (1u << shift) - 1u;
-    const uint32_t rem = mant & mask;
-    uint32_t sub = mant >> shift;
-    if (rem > half_ulp || (rem == half_ulp && (sub & 1u))) ++sub;
-    return uint16_t(sign | sub);
 }
 
 struct Norm { size_t scale, offset; };
@@ -217,7 +172,7 @@ void pack_oihw_to_krsc_half(uint16_t* dst_w, float* dst_b, const char* in, Filte
             const int target_i = in_slot(i);
             for (int tap = 0; tap < taps; ++tap) {
                 const float w = src_w[(size_t(o) * cin + i) * taps + tap];
-                dst_w[(size_t(target_o) * taps + tap) * to_cin + target_i] = float_to_half(w);
+                dst_w[(size_t(target_o) * taps + tap) * to_cin + target_i] = umzi::float_to_half(w);
             }
         }
     }
@@ -404,12 +359,6 @@ struct LegacyConvolution {
     }
 };
 
-struct BackendConvolution {
-    std::unique_ptr<gfi::ConvGraph> graph;
-    std::unique_ptr<gfi::Descriptor> plan;
-    size_t workspace = 0;
-};
-
 struct FftPlan {
     int handle = 0;
     bool created = false;
@@ -505,20 +454,19 @@ class Session final : public umzi::KernelSession {
     CUdeviceptr stage_in = 0, stage_out = 0, cudnn_scratch = 0;
     CUdeviceptr initial = 0, state = 0, norm = 0, projected = 0, gated = 0;
     CUdeviceptr fft_buf = 0, spectrum = 0, freq_a = 0, freq_b = 0;
-    CUgraph graph = nullptr;
     CUgraphExec executable = nullptr;
     FftPlan forward_fft, inverse_fft;
 
     using LegacyKey = std::array<int, 5>;
     std::map<LegacyKey, std::unique_ptr<LegacyConvolution>> legacy_plans;
-    std::map<umzi::PlanShape, std::unique_ptr<BackendConvolution>> backend_plans;
-    std::map<std::array<CUdeviceptr, 4>, std::unique_ptr<gfi::Descriptor>> variants;
+    std::map<umzi::PlanShape, std::unique_ptr<umzi::CudnnBackendPlan>> backend_plans;
+    std::map<std::array<CUdeviceptr, 4>, std::unique_ptr<umzi::CudnnDescriptor>> variants;
     umzi::CudaPlanCache<umzi::gfisrv2_id, plan_schema> plan_cache;
     std::filesystem::path cache_dir;
     umzi::Digest cache_environment{}, plan_key{};
     std::string cache_environment_error;
 
-    size_t activation_bytes = 0, cudnn_workspace = 0, scratch_bytes = 0;
+    size_t activation_bytes = 0, cudnn_workspace = 0, scratch_bytes = 0, peak_workspace_bytes = 0;
     int timed_plans = 0;
     std::array<double, 4> setup_ms{};
     std::array<uint64_t, 4> device_used{};
@@ -570,7 +518,6 @@ public:
         CHECK(cuDeviceGet(&device, options.device));
         CHECK(cuDevicePrimaryCtxRetain(&context, device));
         ContextScope scope(context);
-        record_memory(0);
 
         const auto& image =
             umzi::load_kernel_module(device, module, gfisrv2_images::embedded_cubins, gfisrv2_images::embedded_ptx);
@@ -606,7 +553,6 @@ public:
             CHECK(cuMemcpyHtoD(weights, packed.data(), weight_bytes));
             init_cache_environment(options.cache_dir, package.digest, image);
         }
-        record_memory(1);
     }
 
     ~Session() override {
@@ -635,32 +581,17 @@ private:
     size_t element(bool half) const { return half ? sizeof(uint16_t) : sizeof(float); }
     CUdeviceptr dev_ptr(size_t offset) const { return weights + offset; }
 
-    void record_memory(int stage) {
-        size_t free_bytes = 0, total_bytes = 0;
-        if (cuMemGetInfo(&free_bytes, &total_bytes) == CUDA_SUCCESS) device_used[stage] = total_bytes - free_bytes;
-    }
-
     void init_cache_environment(const char* directory, const umzi::Digest& model_digest,
                                 const umzi::KernelImage& image) {
         if (!directory || !*directory) return;
         try {
             cache_dir = std::filesystem::u8path(directory);
             umzi::Sha256 hash;
-            hash.add(umzi::plan_format_version);
-            hash.add(umzi::gfisrv2_id);
-            hash.add(plan_schema);
-            hash.add(sizeof(void*));
-            hash.add(model_digest);
-            hash.add(image.data, image.size);
+            umzi::hash_plan_environment(hash, umzi::gfisrv2_id, plan_schema, model_digest, image, device);
             hash.add(precision);
             hash.add(workspace_limit);
             hash.add(static_cast<uint32_t>(unexact_erf));
             hash.add(static_cast<uint32_t>(fused_conv));
-            CUuuid uuid{};
-            CHECK(cuDeviceGetUuid(&uuid, device));
-            hash.add(uuid);
-            umzi::hash_driver_version(hash);
-            hash.add(cudnnGetVersion());
             cache_environment = hash.finish();
         } catch (const std::exception& error) {
             cache_environment_error = error.what();
@@ -683,9 +614,7 @@ private:
 
     void release_shape() {
         if (executable) cuGraphExecDestroy(executable);
-        if (graph) cuGraphDestroy(graph);
         executable = nullptr;
-        graph = nullptr;
         forward_fft.release(*fft);
         inverse_fft.release(*fft);
         variants.clear();
@@ -698,9 +627,10 @@ private:
             *buffer = 0;
         }
         shape = {};
-        activation_bytes = cudnn_workspace = scratch_bytes = 0;
+        activation_bytes = cudnn_workspace = scratch_bytes = peak_workspace_bytes = 0;
         timed_plans = 0;
         setup_ms = {};
+        device_used = {};
     }
 
     void wait() {
@@ -712,22 +642,6 @@ private:
     void activation(CUdeviceptr& buffer, size_t bytes) {
         CHECK(cuMemAlloc(&buffer, bytes));
         activation_bytes += bytes;
-    }
-
-    bool ensure_scratch(size_t bytes) {
-        if (bytes <= scratch_bytes) return true;
-        CHECK(cuStreamSynchronize(stream));
-        if (cudnn_scratch) CHECK(cuMemFree(cudnn_scratch));
-        cudnn_scratch = 0;
-        scratch_bytes = 0;
-        const auto status = cuMemAlloc(&cudnn_scratch, bytes);
-        if (status == CUDA_ERROR_OUT_OF_MEMORY) {
-            cudnn_scratch = 0;
-            return false;
-        }
-        CHECK(status);
-        scratch_bytes = bytes;
-        return true;
     }
 
     void make_legacy_conv(int h, int w, int cin, int cout, int k) {
@@ -758,40 +672,17 @@ private:
         legacy_plans.emplace(LegacyKey{h, w, cin, cout, k}, std::move(plan));
     }
 
-    float time_backend_plan(const BackendConvolution& p, CUdeviceptr in_buf, CUdeviceptr out_buf, float best) {
-        if (!ensure_scratch(p.workspace)) return std::numeric_limits<float>::infinity();
-        const auto variant = gfi::bind(reinterpret_cast<void*>(in_buf), reinterpret_cast<void*>(weights),
-                                       reinterpret_cast<void*>(out_buf), reinterpret_cast<void*>(cudnn_scratch));
-        const auto run = [&] { return cudnnBackendExecute(cudnn, p.plan->get(), variant->get()) == CUDNN_STATUS_SUCCESS; };
-        const auto measure = [&](int repeats) {
-            CHECK(cuEventRecord(timing[0], stream));
-            for (int i = 0; i < repeats; ++i)
-                if (!run()) {
-                    CHECK(cuStreamSynchronize(stream));
-                    return std::numeric_limits<float>::infinity();
-                }
-            CHECK(cuEventRecord(timing[1], stream));
-            CHECK(cuEventSynchronize(timing[1]));
-            float elapsed = 0;
-            CHECK(cuEventElapsedTime(&elapsed, timing[0], timing[1]));
-            return elapsed / repeats;
-        };
-        if (!run()) {
-            CHECK(cuStreamSynchronize(stream));
-            return std::numeric_limits<float>::infinity();
-        }
-        const float first = measure(1);
-        if (!(first < 2.f * best)) return first;
-        return measure(5);
-    }
-
     void make_backend_plan(int h, int w, int cin, int cout, int k, cudnnDataType_t io_type, bool fp16_compute,
                            CUdeviceptr in_buf, CUdeviceptr out_buf) {
-        auto plan = std::make_unique<BackendConvolution>();
+        auto plan = std::make_unique<umzi::CudnnBackendPlan>();
         auto& p = *plan;
-        p.graph = std::make_unique<gfi::ConvGraph>(cudnn, shape.n, h, w, cin, cout, k, io_type, fp16_compute);
+        p.graph = std::make_unique<umzi::CudnnConvGraph>(cudnn, shape.n, h, w, cin, cout, k, io_type, fp16_compute);
         auto candidates = p.graph->candidates(cudnn, workspace_limit);
         const umzi::PlanShape key{shape.n, h, w, cin, cout};
+        auto time_candidate = [&](float best) {
+            return umzi::time_cudnn_backend_plan(cudnn, stream, timing, p, in_buf, weights, out_buf, cudnn_scratch,
+                                                 scratch_bytes, best, &peak_workspace_bytes, &device_used[1]);
+        };
         if (auto saved = plan_cache.convolutions.find(key); saved != plan_cache.convolutions.end()) {
             const auto& choice = saved->second;
             if (choice.math == saved_plan_marker && choice.algorithm < candidates.size()
@@ -799,7 +690,7 @@ private:
                 auto& candidate = candidates[choice.algorithm];
                 p.plan = std::move(candidate.plan);
                 p.workspace = size_t(candidate.workspace);
-                if (time_backend_plan(p, in_buf, out_buf, 0.f) < std::numeric_limits<float>::infinity()) {
+                if (time_candidate(0.f) < std::numeric_limits<float>::infinity()) {
                     cudnn_workspace = std::max(cudnn_workspace, p.workspace);
                     backend_plans.emplace(key, std::move(plan));
                     return;
@@ -813,7 +704,7 @@ private:
         for (size_t i = 0; i < candidates.size(); ++i) {
             p.plan = std::move(candidates[i].plan);
             p.workspace = size_t(candidates[i].workspace);
-            const float elapsed = time_backend_plan(p, in_buf, out_buf, best);
+            const float elapsed = time_candidate(best);
             candidates[i].plan = std::move(p.plan);
             if (elapsed < best) {
                 best = elapsed;
@@ -832,10 +723,6 @@ private:
         backend_plans.emplace(key, std::move(plan));
     }
 
-    static double elapsed(Clock::time_point start) {
-        return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
-    }
-
     void bind_stream(CUstream target) {
         CHECK(cudnnSetStream(cudnn, target));
         FFT_CHECK(fft->set_stream(forward_fft.handle, reinterpret_cast<void*>(target)));
@@ -848,6 +735,7 @@ private:
         release_shape();
         try {
             auto start = Clock::now();
+            device_used[0] = umzi::device_used_bytes();
             shape = requested;
             const size_t pixels = size_t(shape.n) * shape.pixels();
             bins = shape.h * (shape.w / 2 + 1);
@@ -882,7 +770,8 @@ private:
             }
             CHECK(cuMemAlloc(&stage_in, shape.rgb_bytes(element(half_io()))));
             CHECK(cuMemAlloc(&stage_out, shape.rgb_bytes(element(half_io())) * scale * scale));
-            setup_ms[0] = elapsed(start);
+            device_used[1] = umzi::device_used_bytes();
+            setup_ms[0] = umzi::elapsed_ms(start);
 
             start = Clock::now();
             const int h = shape.h, w = shape.w, w_freq = w / 2 + 1;
@@ -899,8 +788,12 @@ private:
                 make_legacy_conv(h, w, channels, 3 * scale * scale, 3);
                 make_legacy_conv(h, w_freq, 2 * fourier, 2 * fourier, 1);
                 if (cudnn_workspace) {
-                    if (!ensure_scratch(cudnn_workspace)) CHECK(CUDA_ERROR_OUT_OF_MEMORY);
+                    if (!umzi::ensure_device_scratch(stream, cudnn_scratch, scratch_bytes, cudnn_workspace,
+                                                     &peak_workspace_bytes))
+                        CHECK(CUDA_ERROR_OUT_OF_MEMORY);
+                    device_used[1] = std::max(device_used[1], umzi::device_used_bytes());
                 }
+                device_used[2] = umzi::device_used_bytes();
             } else {
                 launch(stream, FillNoiseF16, int(pixels * hidden), gated);
                 load_plan_cache();
@@ -914,39 +807,30 @@ private:
                 make_backend_plan(h, w, 2 * channels, channels, 3, CUDNN_DATA_HALF, fp16_acc, gated, projected);
                 make_backend_plan(h, w, channels, 3 * scale * scale, 3, CUDNN_DATA_HALF, fp16_acc, gated, projected);
                 CHECK(cuStreamSynchronize(stream));
+                device_used[2] = umzi::device_used_bytes();
                 if (cudnn_scratch) CHECK(cuMemFree(cudnn_scratch));
                 cudnn_scratch = 0;
                 scratch_bytes = 0;
                 if (cudnn_workspace) {
-                    if (!ensure_scratch(cudnn_workspace)) CHECK(CUDA_ERROR_OUT_OF_MEMORY);
+                    if (!umzi::ensure_device_scratch(stream, cudnn_scratch, scratch_bytes, cudnn_workspace,
+                                                     &peak_workspace_bytes))
+                        CHECK(CUDA_ERROR_OUT_OF_MEMORY);
                 }
                 plan_cache.save(plan_key);
             }
-            setup_ms[1] = elapsed(start);
+            setup_ms[1] = umzi::elapsed_ms(start);
 
             start = Clock::now();
             CHECK(cuMemsetD8Async(stage_in, 0, shape.rgb_bytes(element(half_io())), stream));
             forward(stage_in, stage_out, stream);
             CHECK(cuStreamSynchronize(stream));
-            setup_ms[2] = elapsed(start);
-            record_memory(2);
+            setup_ms[2] = umzi::elapsed_ms(start);
 
-            if (graph_enabled) {
-                start = Clock::now();
-                CHECK(cuStreamBeginCapture(stream, CU_STREAM_CAPTURE_MODE_THREAD_LOCAL));
-                try {
-                    forward(stage_in, stage_out, stream);
-                } catch (...) {
-                    cuStreamEndCapture(stream, &graph);
-                    throw;
-                }
-                CHECK(cuStreamEndCapture(stream, &graph));
-                CHECK(cuGraphInstantiate(&executable, graph, 0));
-                CHECK(cuGraphUpload(executable, stream));
-                CHECK(cuStreamSynchronize(stream));
-                setup_ms[3] = elapsed(start);
-                record_memory(3);
-            }
+            start = Clock::now();
+            if (graph_enabled)
+                umzi::capture_cuda_graph(stream, executable, [&] { forward(stage_in, stage_out, stream); });
+            setup_ms[3] = umzi::elapsed_ms(start);
+            device_used[3] = umzi::device_used_bytes();
         } catch (...) {
             cuStreamSynchronize(stream);
             release_shape();
@@ -1045,8 +929,8 @@ private:
         const CUdeviceptr wptr = dev_ptr(filter.weight);
         auto& variant = variants[std::array<CUdeviceptr, 4>{out, in, wptr, cudnn_scratch}];
         if (!variant)
-            variant = gfi::bind(reinterpret_cast<void*>(in), reinterpret_cast<void*>(wptr),
-                                reinterpret_cast<void*>(out), reinterpret_cast<void*>(cudnn_scratch));
+            variant = umzi::bind_conv_variant(reinterpret_cast<void*>(in), reinterpret_cast<void*>(wptr),
+                                              reinterpret_cast<void*>(out), reinterpret_cast<void*>(cudnn_scratch));
         CHECK(cudnnBackendExecute(cudnn, p.plan->get(), variant->get()));
     }
 
@@ -1253,7 +1137,7 @@ public:
 
     const char* cache_message() const override { return plan_cache.diagnostic.c_str(); }
 
-    uint32_t diagnostic_count() const override { return 5; }
+    uint32_t diagnostic_count() const override { return 7; }
     UmziDiagnostic diagnostic(uint32_t index) const override {
         if (index == 0) return {sizeof(UmziDiagnostic), "cufft_version", fft_version};
         if (index == 1)
@@ -1261,6 +1145,8 @@ public:
         if (index == 2) return {sizeof(UmziDiagnostic), "unexact_erf", unexact_erf};
         if (index == 3) return {sizeof(UmziDiagnostic), "timed_plans", timed_plans};
         if (index == 4) return {sizeof(UmziDiagnostic), "plan_workspace_bytes", int64_t(cudnn_workspace)};
+        if (index == 5) return {sizeof(UmziDiagnostic), "fused_conv", int64_t(fused_conv)};
+        if (index == 6) return {sizeof(UmziDiagnostic), "peak_plan_workspace_bytes", int64_t(peak_workspace_bytes)};
         throw std::runtime_error("Invalid GFISRv2 diagnostic index");
     }
     const char* kernel_message() const override {

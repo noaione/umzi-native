@@ -171,7 +171,7 @@ def check_dispatch(
     if cli is not None:
         with TemporaryDirectory(dir=output) as directory:
             temporary = Path(directory)
-            switches = ("--unexact-erf",) if unexact else ()
+            switches = ("--option", "unexact_erf=1") if unexact else ()
             plans = Path(settings.cache_dir) if settings.cache_dir is not None else temporary / "plans"
             reference = cli_output(
                 cli, model, settings.precision, plans, sample.numpy(), temporary, host.shape, switches

@@ -1,28 +1,9 @@
 #pragma once
 
+#include "../../common/cudnn_conv_plan.h"
+
 namespace gt {
-class BackendDescriptor {
-    cudnnBackendDescriptor_t handle = nullptr;
-
-public:
-    explicit BackendDescriptor(cudnnBackendDescriptorType_t type) {
-        CHECK(cudnnBackendCreateDescriptor(type, &handle));
-    }
-    BackendDescriptor(const BackendDescriptor&) = delete;
-    BackendDescriptor& operator=(const BackendDescriptor&) = delete;
-    ~BackendDescriptor() { cudnnBackendDestroyDescriptor(handle); }
-
-    cudnnBackendDescriptor_t get() const { return handle; }
-    void set(cudnnBackendAttributeName_t name, cudnnBackendAttributeType_t type,
-             const void* values, int64_t count = 1) {
-        CHECK(cudnnBackendSetAttribute(handle, name, type, count, values));
-    }
-    void ref(cudnnBackendAttributeName_t name, const BackendDescriptor& value) {
-        auto descriptor = value.get();
-        set(name, CUDNN_TYPE_BACKEND_DESCRIPTOR, &descriptor);
-    }
-    void finalize() { CHECK(cudnnBackendFinalize(handle)); }
-};
+using BackendDescriptor = umzi::CudnnDescriptor;
 
 // Fuses bias-free C32 convolutions that feed SiLU at the prepared tile size.
 class SiluPlan {
@@ -103,26 +84,29 @@ public:
             auto& heuristic = descriptor(CUDNN_BACKEND_ENGINEHEUR_DESCRIPTOR);
             heuristic.set(CUDNN_ATTR_ENGINEHEUR_MODE, CUDNN_TYPE_HEUR_MODE, &heur_mode);
             heuristic.ref(CUDNN_ATTR_ENGINEHEUR_OPERATION_GRAPH, graph);
-            if (cudnnBackendFinalize(heuristic.get()) != CUDNN_STATUS_SUCCESS) continue;
+            if (heuristic.try_finalize() != CUDNN_STATUS_SUCCESS) continue;
             constexpr int64_t candidates = 12;
             std::array<cudnnBackendDescriptor_t, candidates> configs{};
             int64_t found = 0;
-            CHECK(cudnnBackendGetAttribute(heuristic.get(), CUDNN_ATTR_ENGINEHEUR_RESULTS,
-                                          CUDNN_TYPE_BACKEND_DESCRIPTOR, 0, &found, nullptr));
+            umzi::check(cudnnBackendGetAttribute(heuristic.get(), CUDNN_ATTR_ENGINEHEUR_RESULTS,
+                                                 CUDNN_TYPE_BACKEND_DESCRIPTOR, 0, &found, nullptr),
+                        "cudnnBackendGetAttribute");
             if (found <= 0) continue;
             found = std::min(found, candidates);
             for (int64_t i = 0; i < found; ++i)
                 configs[i] = descriptor(CUDNN_BACKEND_ENGINECFG_DESCRIPTOR).get();
-            CHECK(cudnnBackendGetAttribute(heuristic.get(), CUDNN_ATTR_ENGINEHEUR_RESULTS,
-                                          CUDNN_TYPE_BACKEND_DESCRIPTOR, found, &found, configs.data()));
+            umzi::check(cudnnBackendGetAttribute(heuristic.get(), CUDNN_ATTR_ENGINEHEUR_RESULTS,
+                                                 CUDNN_TYPE_BACKEND_DESCRIPTOR, found, &found, configs.data()),
+                        "cudnnBackendGetAttribute");
             for (int64_t i = 0; i < found; ++i) {
                 auto candidate = std::make_unique<BackendDescriptor>(CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR);
                 candidate->set(CUDNN_ATTR_EXECUTION_PLAN_HANDLE, CUDNN_TYPE_HANDLE, &handle);
                 candidate->set(CUDNN_ATTR_EXECUTION_PLAN_ENGINE_CONFIG, CUDNN_TYPE_BACKEND_DESCRIPTOR, &configs[i]);
-                if (cudnnBackendFinalize(candidate->get()) != CUDNN_STATUS_SUCCESS) continue;
+                if (candidate->try_finalize() != CUDNN_STATUS_SUCCESS) continue;
                 int64_t bytes = 0, count = 0;
-                CHECK(cudnnBackendGetAttribute(candidate->get(), CUDNN_ATTR_EXECUTION_PLAN_WORKSPACE_SIZE,
-                                               CUDNN_TYPE_INT64, 1, &count, &bytes));
+                umzi::check(cudnnBackendGetAttribute(candidate->get(), CUDNN_ATTR_EXECUTION_PLAN_WORKSPACE_SIZE,
+                                                     CUDNN_TYPE_INT64, 1, &count, &bytes),
+                            "cudnnBackendGetAttribute");
                 if (bytes < 0 || static_cast<size_t>(bytes) > limit) continue;
                 workspace = static_cast<size_t>(bytes);
                 plan = std::move(candidate);
@@ -144,7 +128,7 @@ public:
     }
 
     void run(cudnnHandle_t handle, const BackendDescriptor& bindings) const {
-        CHECK(cudnnBackendExecute(handle, plan->get(), bindings.get()));
+        umzi::check(cudnnBackendExecute(handle, plan->get(), bindings.get()), "cudnnBackendExecute");
     }
 };
 } // namespace gt
