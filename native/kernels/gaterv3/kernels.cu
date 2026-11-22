@@ -647,3 +647,75 @@ FUSED_NORM(128)
 FUSED_NORM(256)
 RESIDUAL_NORM(global_norm, 512, false, false)
 RESIDUAL_NORM(global_norm16_, 512, false, true)
+
+// One block owns a head. NHWC Q/K/V are transposed into [head_channel, HW].
+extern "C" __global__ void attention_channels(half* out, const half* in, const float* temperatures) {
+    using namespace nvcuda::wmma;
+    constexpr int C = 32, P = 64, LD = P + 8;
+    __shared__ __align__(32) half q[C][LD], k[C][LD], v[C][LD], probabilities[C][C];
+    __shared__ __align__(32) float result[C][P];
+    const int head = blockIdx.x % 16, batch = blockIdx.x / 16;
+    const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
+    in += batch * P * 1536 + head * C;
+    out += batch * P * 512 + head * C;
+    for (int i = tid; i < C * P; i += 256) {
+        const int c = i % C, p = i / C, at = p * 1536 + c;
+        q[c][p] = in[at];
+        k[c][p] = in[at + 512];
+        v[c][p] = in[at + 1024];
+    }
+    __syncthreads();
+
+    for (int c = warp; c < C; c += 8) {
+        const float qa = __half2float(q[c][lane]), qb = __half2float(q[c][lane+32]);
+        const float ka = __half2float(k[c][lane]), kb = __half2float(k[c][lane+32]);
+        const float qn = fmaxf(sqrtf(warp_sum(qa*qa + qb*qb)), 1e-12f);
+        const float kn = fmaxf(sqrtf(warp_sum(ka*ka + kb*kb)), 1e-12f);
+        q[c][lane] = __float2half_rn(qa / qn);
+        q[c][lane+32] = __float2half_rn(qb / qn);
+        k[c][lane] = __float2half_rn(ka / kn);
+        k[c][lane+32] = __float2half_rn(kb / kn);
+    }
+    __syncthreads();
+
+    if (warp < 4) {
+        const int row = warp / 2 * 16, col = warp % 2 * 16;
+        fragment<matrix_a, 16, 16, 16, half, row_major> a;
+        fragment<matrix_b, 16, 16, 16, half, col_major> b;
+        fragment<accumulator, 16, 16, 16, float> acc;
+        fill_fragment(acc, 0.0f);
+        #pragma unroll
+        for (int s = 0; s < P; s += 16) {
+            load_matrix_sync(a, &q[row][s], LD);
+            load_matrix_sync(b, &k[col][s], LD);
+            mma_sync(acc, a, b, acc);
+        }
+        store_matrix_sync(&result[row][col], acc, P, mem_row_major);
+    }
+    __syncthreads();
+
+    for (int c = warp; c < C; c += 8) {
+        float x = result[c][lane] * temperatures[head];
+        float max_score = x;
+        for (int d = 16; d; d /= 2) max_score = fmaxf(max_score, __shfl_xor_sync(0xffffffff, max_score, d));
+        x = expf(x - max_score);
+        probabilities[c][lane] = __float2half_rn(x / warp_sum(x));
+    }
+    __syncthreads();
+
+    const int row = warp / 4 * 16, col = warp % 4 * 16;
+    fragment<matrix_a, 16, 16, 16, half, row_major> a;
+    fragment<matrix_b, 16, 16, 16, half, row_major> b;
+    fragment<accumulator, 16, 16, 16, float> acc;
+    fill_fragment(acc, 0.0f);
+    #pragma unroll
+    for (int s = 0; s < C; s += 16) {
+        load_matrix_sync(a, &probabilities[row][s], C);
+        load_matrix_sync(b, &v[s][col], LD);
+        mma_sync(acc, a, b, acc);
+    }
+    store_matrix_sync(&result[row][col], acc, P, mem_row_major);
+    __syncthreads();
+    for (int i = tid; i < C * P; i += 256)
+        out[i / C * 512 + i % C] = __float2half_rn(result[i % C][i / C]);
+}

@@ -158,7 +158,9 @@ class Schedule:
                     self.weight(spatial.bias),
                 ),
             )
-            attended = self.op(Op.ATTENTION, (h, w, c), qkv)
+            attended = self.op(
+                Op.ATTENTION, (h, w, c), qkv, weights=(self.weight(mixed.temperature, dtype=torch.float32),)
+            )
             attended = self.conv(attended, mixed.project_out)
             gated = self.op(Op.GATE, (h, w, 3 * c // 2), projected, attended)
         else:

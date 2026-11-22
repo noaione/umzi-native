@@ -169,6 +169,7 @@ class ModelFile {
                 break;
             case Attention:
                 require(count == 1 && spatial(a, y) && a.c == 1536 && y.c == 512);
+                weight(0, 16 * sizeof(float), true);
                 break;
             case Gate:
                 require(count == 2 && spatial(a, y) && spatial(b, y) && a.c == 2560 && b.c == 512 && y.c == 768);

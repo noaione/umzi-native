@@ -769,6 +769,9 @@ private:
                 const auto& in = tensors[op.input[0]];
                 if (op.x == 1) prepare_matmul(i, in, out, op, timer);
                 else prepare_conv(i, in, out, op, timer);
+            } else if (op.kind == Attention && op.weight[0] >= 0) {
+                if (out.pixels() != 64) throw std::runtime_error("Channel attention prototype needs 64 latent positions");
+                kernel_by_op[i] = lookup("attention_channels");
             } else if (op.kind == Rms) {
                 std::string name = fp16 ? "rms16_" : "rms";
                 if (fused_norm(i)) {
@@ -961,7 +964,8 @@ private:
                 else run(y, a, w0, w1, in.c, o.h, o.w, total);
                 break;
             case Attention:
-                if (pixels == 64) launch(kernel, target, batch * 16, 1, threads, y, a);
+                if (w0) launch(kernel, target, batch * 16, 1, 256, y, a, w0);
+                else if (pixels == 64) launch(kernel, target, batch * 16, 1, threads, y, a);
                 else launch(kernel, target, batch * 16 * ((pixels + 3) / 4), 1, 128, y, a, pixels);
                 break;
             case Gate: run(y, a, b, in.c, total); break;
