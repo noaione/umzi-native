@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+Nothing yet!
+
+## [0.0.3] - 2026-11-22
+
 ### Added
 
 - Native CUDA support (exporter, `peek_model()`, CUDA Graph session, and
