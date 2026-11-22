@@ -30,8 +30,8 @@ not execute a model forward pass. [Resselt](https://github.com/rewaifu/resselt)
 2. **MoESR second.** Reproduce the full-resolution gated blocks, each
    multiscale down/up branch and its residual, the outer feature residual, and
    the 4× output. Match normalization and Mish, and test pixel shuffle and
-   unshuffle order with channel-distinct inputs. Match the 2-pixel reflection
-   padding and crop to `4H × 4W` on odd input sizes.
+   unshuffle order with channel-distinct inputs. Reflect-pad the right or
+   bottom by one pixel for each odd axis and crop to `4H × 4W`.
 3. **GFISRv2 third.** Reproduce one Fourier unit before assembling the 24-block
    body. Check forward and inverse transforms with orthonormal scaling, exact
    packed real/imaginary channel order, the learned frequency-space layers,
@@ -164,7 +164,7 @@ the remaining package and session work.
 | Family | CPU checkpoint load | CUDA baselines | Native FP32 parity, export, and session |
 | --- | --- | --- | --- |
 | GateRV2 | Verified | FP32, RTX FP16, and Inductor FP16 with FP32 attention measured | Package (family 3, schema 1) and C++ session in mixed and FP16 validated on Windows and Linux; first tuning pass done |
-| MoESR | Verified, supplied ONNX validated | FP32, Inductor FP16, and RTX FP16 measured | Pending |
+| MoESR | Verified, supplied ONNX validated | FP32, Inductor FP16, and RTX FP16 measured | [Private FP32 parity](#moesr-private-fp32-validation), family-4 package and C++ session pending |
 | GFISRv2 | Verified, prior handoff reviewed | FP32, eager FP16, and Inductor FP16 measured, flat-tile fidelity failure traced, RTX skipped | Pending |
 
 ### GateRV2 private FP32 validation
@@ -384,3 +384,73 @@ checks their hashes and profiles each RTX graph again.
 
 Related design documents are the [runtime and package plan](umzi-native-runtime-plan.md)
 and the [exporter plan](umzi-model-exporter-plan.md).
+
+### MoESR private FP32 validation
+
+The current MoESR checkpoint uses nine groups. Each group has four
+full-resolution gated blocks and a branch with three gated blocks at half
+the spatial resolution. The full-resolution projection splits into
+`[170 gate, 106 identity, 64 inception]`. The reduced-resolution split is
+`[96 gate, 32 identity, 64 inception]`. The inception channels split into
+`[40 direct, 8 square, 8 row, 8 column]` in both cases. Each gated block
+uses channel LayerNorm with centered population variance and epsilon
+inside the square root. The multiscale branch adds to the output of its
+four full-resolution blocks. The outer feature residual is applied before
+the final convolution and 4× RGB shuffle.
+
+The [private runner](../scripts/reference/moesr_native.py) uses CUDA
+kernels for padding, LayerNorm, the Mish gate and residual, 2× unshuffle
+and shuffle, and 4× shuffle with crop. Torch CUDA still supplies the
+checkpoint convolutions. NVRTC compiles the
+[private kernels](../native/kernels/moesr/kernels.cu) with fast math
+disabled. The untouched Resselt model remains the FP32 reference.
+
+Channel-distinct layout primitives matched exactly. The
+[validator](../scripts/validate_moesr.py) compared 149 stages each for
+`1×3×32×48` and `2×3×33×47`. It also checked 16 finite stress inputs,
+including individual-versus-batched tiles. The `1×1`, `1×2`, and `2×1`
+shapes hit the same reflection-padding limit as eager FP32. Valid tiny
+inputs included `2×2`, `3×5`, and `8×9`.
+
+| Stress input | Raw PSNR dB | SSIMULACRA2 |
+| --- | ---: | ---: |
+| Gray 0.5 | 148.920 | 100.000 |
+| Gray 128/255 | 148.929 | 96.785 |
+| Checkerboard | 143.547 | 95.348 |
+| Noise | 138.640 | 98.230 |
+
+The lowest stress PSNR was 137.128 dB on the center tile from
+`lb-page-005.png`. The largest stress error was `3.815e-6` on the center
+tile from `lb-page-003.png`. The checkpoint SHA-256 is
+`d43df68fbd6543c47e41b6dc5ca95da82794521b26108269f75ce533d100ee65`.
+
+The RTX 3050 Laptop GPU run used 256×256 tiles, batch 2, and zero overlap
+on the three `samples/mscale/` pages. Each page used 12 synchronized
+batch-2 calls. Batch-1 latency came from 24 independent, synchronized
+tile calls per page.
+
+| Page | Batch-2 time (s) | Input MPx/s | Mean batch-1 tile (ms) | Raw PSNR dB | SSIMULACRA2 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `lb-page-003.png` | 23.704 | 0.0513 | 460.898 | 141.971 | 90.050 |
+| `lb-page-004.png` | 22.264 | 0.0546 | 444.685 | 139.927 | 89.593 |
+| `lb-page-005.png` | 22.309 | 0.0545 | 444.204 | 141.347 | 89.563 |
+| All three | 68.277 | 0.0534 | 449.929 | 140.996 | 89.735 mean / 89.563 min |
+
+The maximum raw page error was `4.888e-6`. The compared PNGs differed
+in 304, 471, and 205 of 58,320,000 channel values per page, each by one
+8-bit code value. The report stores all 72 individual tile latencies with
+page name, tile index, and coordinates.
+[Local validation report](../output/moesr-native-validation/report.json)
+
+```powershell
+$py = 'C:\Python314\python.exe'
+$env:PYTHONPATH = 'src;scripts'
+& $py scripts/validate_moesr.py --nvrtc-root output/nvrtc-13.0/nvidia/cu13 --pages
+```
+
+Page validation uses the saved eager FP32 arrays and PNGs after checking
+the checkpoint digest, sample digests, tile size, submitted batch size,
+overlap, and scale in the baseline report. The next integration step is
+the family-4 packer and C++ session with independent input and 4× output
+buffer sizes. Rerun these checks against that session in FP32 before
+changing accumulation precision.

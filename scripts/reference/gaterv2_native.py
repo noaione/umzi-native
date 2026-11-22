@@ -2,95 +2,21 @@
 
 from __future__ import annotations
 
-import ctypes
-from collections.abc import Callable
 from pathlib import Path
-from typing import Any, cast
+from typing import cast
 
 import torch
-from build_native import load_build_module
-from cuda.bindings import driver
 from resselt.archs.gaterv2.arch import Attention, Block, GatedCNNBlock, GateRV2, MetaGated
 from torch import Tensor
 
+from reference.native_stages import NativeKernels, Trace
+
 KERNELS = ("pad_rgb", "crop_rgb", "normalize_qk", "finish_attention")
-THREADS = 128
-Trace = Callable[[str, Tensor], None]
 
 
-def check_cuda(result: tuple[Any, ...]) -> Any:
-    status, *values = result
-    if status != driver.CUresult.CUDA_SUCCESS:
-        raise RuntimeError(f"CUDA driver error: {status}")
-    return values[0] if values else None
-
-
-class NativeStages:
+class NativeStages(NativeKernels):
     def __init__(self, nvrtc_root: Path | None):
-        torch.empty(0, device="cuda")
-        major, minor = torch.cuda.get_device_capability()
-        build = load_build_module()
-        toolchain = build.find_toolchain(build.BuildSettings(nvrtc_root=nvrtc_root))
-        image = build._compile_kernels(
-            build._load_nvrtc(toolchain.nvrtc),
-            toolchain.includes,
-            f"sm_{major}{minor}",
-            build.NATIVE / "kernels/gaterv2",
-            fast_math=False,
-        )
-        self.module = check_cuda(driver.cuModuleLoadData(image))
-        try:
-            self.functions = {
-                name: check_cuda(driver.cuModuleGetFunction(self.module, name.encode())) for name in KERNELS
-            }
-        except Exception:
-            check_cuda(driver.cuModuleUnload(self.module))
-            raise
-
-    def __enter__(self) -> NativeStages:
-        return self
-
-    def __exit__(self, *_args: object) -> None:
-        try:
-            torch.cuda.synchronize()
-        finally:
-            check_cuda(driver.cuModuleUnload(self.module))
-
-    def launch(self, name: str, total: int, tensors: tuple[Tensor, ...], *sizes: int) -> None:
-        args = (*(tensor.data_ptr() for tensor in tensors), *sizes, total)
-        if total > 2**31 - 1 or any(size > 2**31 - 1 for size in sizes):
-            raise ValueError("The validation kernel requires 32-bit tensor dimensions")
-        types = (ctypes.c_uint64,) * len(tensors) + (ctypes.c_int,) * (len(sizes) + 1)
-        stream = driver.CUstream(torch.cuda.current_stream().cuda_stream)
-        check_cuda(
-            driver.cuLaunchKernel(
-                self.functions[name],
-                (total + THREADS - 1) // THREADS,
-                1,
-                1,
-                THREADS,
-                1,
-                1,
-                0,
-                stream,
-                (args, types),
-                0,
-            )
-        )
-
-    def pad(self, source: Tensor, align: int) -> Tensor:
-        batch, channels, height, width = source.shape
-        if min(height, width) < 1:
-            raise ValueError("GateRV2 needs positive spatial dimensions")
-        pad_height, pad_width = (-height) % align, (-width) % align
-        if pad_height >= height or pad_width >= width:
-            raise ValueError(f"GateRV2 reflection padding is invalid for {height}x{width}")
-        if not (pad_height or pad_width):
-            return source
-        padded_height, padded_width = height + pad_height, width + pad_width
-        target = source.new_empty((batch, channels, padded_height, padded_width))
-        self.launch("pad_rgb", target.numel(), (target, source), height, width, padded_height, padded_width)
-        return target
+        super().__init__("GateRV2", KERNELS, nvrtc_root)
 
     def crop(self, source: Tensor, height: int, width: int) -> Tensor:
         batch, channels, padded_height, padded_width = source.shape

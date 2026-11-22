@@ -770,3 +770,25 @@ On IDC, gate/pool improved FP16 throughput at 65×79 from 4.16 to
 4.52 MPx/s. Its mean raw PSNR changed from 65.65 to 65.61 dB and mean
 SSIMULACRA2 from 98.50 to 96.40. At 128×160, IDC's mixed Conv/SiLU throughput
 rose from 4.77 to 5.10 MPx/s and its mean SSIMULACRA2 from 96.39 to 96.42.
+
+## Deferred VRAM work
+
+- **Cold prepare.** A compatible plan-cache hit already avoids the temporary
+  64 MiB allocation. On a miss, the first uncached library operation reserves
+  the full cap before candidate timing. Apply GateRV2's on-demand workspace
+  sizing before each candidate is timed, outside replay capture. Keep the
+  tuning input initialization independent so zero-workspace candidates still
+  get initialized inputs. Account for fused cuDNN and gate/pool scratch in
+  the retained workspace. Measure explicit workspace, device-wide startup
+  VRAM, and warm VRAM separately on misses and hits.
+  [GateRV3 runner](../native/kernels/gaterv3/runner.cpp)
+  · [GateRV2 measurements](handoff-gaterv2.md#vram-and-workspace)
+- **Warmed activations.** The digital and IDC package schedules at batch 16
+  with 128×128 tiles both have a 128 MiB arena and a 128 MiB lower bound from
+  simultaneously live tensors. Further savings at this shape require a
+  schedule change. Investigate the SISR concatenation of four full-resolution
+  32-channel inputs into a 128-channel tensor before the 1×1 projection.
+  Prototype avoiding that temporary and measure the resulting peak across
+  the whole graph. Check raw PSNR and SSIMULACRA2 against eager FP32, along
+  with batch-16 throughput and measured batch-1 latency in both precisions.
+  [Lifetime planner](../native/kernels/gaterv3/model_file.h)
