@@ -86,7 +86,7 @@ model-specific kernel switches.
 
 | Field | Default | What it does |
 | --- | --- | --- |
-| `precision` | `"mixed"` | GateRV3, GateRV2, and MoESR support mixed precision with FP32 NumPy I/O and FP16 precision with FP16 NumPy I/O. GFISRv2 runs in FP32 with either `"fp32"` or the default `"mixed"` selector. |
+| `precision` | `"mixed"` | All four families support mixed precision with FP32 NumPy I/O and FP16 precision with FP16 NumPy I/O. GFISRv2 also supports `"fp32"` for the FP32 reference path. |
 | `device_id` | `0` | CUDA GPU index to run on (respects `CUDA_VISIBLE_DEVICES`). |
 | `cache_dir` | `None` | Writable directory for saving and reusing tuned GPU algorithm choices (`<family>_<key>.umplan`). **Strongly recommended:** first run tunes and writes the file; later runs skip tuning. Keys include the model, padded shape, precision, relevant options, GPU, driver, and CUDA/cuDNN versions. CUDA Graphs are still captured per process. |
 | `enable_cuda_graph` | `True` | Captures the forward pass into a CUDA Graph and replays it to cut CPU launch overhead. Set `False` to submit kernels directly (still uses tuned cuBLASLt/cuDNN plans). |
@@ -209,6 +209,12 @@ GFISRv2 returns a 4× RGB result and requires cuFFT 12. If you load the
 dependencies with `dll_dirs`, include the directory containing
 `cufft64_12.dll` on Windows or `libcufft.so.12` on Linux. The GFISRv2 session
 loads cuFFT when it opens.
+
+- `"fp32"` uses FP32 throughout.
+- `"fp16"` follows the eager FP16 arithmetic with half storage and FP32
+  cuFFT transforms. Both NumPy tensors use `np.float16`.
+- `"mixed"` uses half spatial convolutions with FP32 accumulation. The
+  Fourier unit, residual stream, and NumPy input and output use FP32.
 
 | Option | Default | Valid values | What it does |
 | --- | ---: | --- | --- |

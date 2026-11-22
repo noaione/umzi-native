@@ -705,8 +705,7 @@ and biases, and the checkpoint SHA-256. Two exports produced the same
 and weight sections. The runtime allocates input and 4× output independently.
 The DLL loads cuFFT 12 when opening GFISRv2 and creates forward and inverse
 FP32 plans with reusable work areas before capturing the graph. Convolutions
-use cuDNN FP32 FMA math. Use `precision="fp32"` to select this path
-explicitly. The default `mixed` selector currently uses the same FP32 path.
+use cuDNN FP32 FMA math. Use `precision="fp32"` to select this path.
 
 The first native build diverged from eager FP32 on flat gray. The first
 different tensor in the trace was the learned spectrum after exact GELU
@@ -752,8 +751,9 @@ $build = 'output/gfisrv2-session/validated-win'
 GateRV2, both GateRV3 packages, and MoESR passed the mixed and FP16 Windows
 session checks, including CLI parity and plan-cache reopen. Those processes
 ran without PyTorch and loaded no cuFFT module. The GFISRv2 smoke check
-verified both erf settings with standalone CUDA libraries. The default mixed
-selector matched explicit FP32 with `unexact_erf=0` bit for bit on flat gray.
+verified both erf settings with standalone CUDA libraries. Before the mixed
+path was implemented, the default mixed selector used the same path as
+explicit FP32 and matched it bit for bit on flat gray.
 [Session regression reports](../output/gfisrv2-session/regression/)
 
 #### Optional CUDA erf
@@ -836,21 +836,107 @@ The same first-GELU change moved the final output by at most 2.21e-5 on
 random input. [Probe source](../output/gfisrv2-session/diagnose-gray/diagnose.py)
 · [Diagnostic report](../output/gfisrv2-session/diagnose-gray/report.json)
 
-#### Next GFISRv2 milestone
+#### Native FP16 and mixed precision
 
-1. Implement a native FP16 control with the original zero padding. Keep the
-   cuFFT transforms in FP32 and reproduce eager FP16's rounding boundaries
-   around the Fourier layers. Compare against eager FP16 for implementation
-   parity and against untouched FP32 for numeric fidelity.
-2. Establish mixed precision with FP32 RGB I/O. Start by keeping the
-   Fourier unit and residual additions in FP32 while testing narrower
-   spatial weights and activations. Change one precision boundary at a time.
-3. Compare both candidates on the three MangaScale pages using 256×256
-   tiles, batch 2 and 32 px overlap. Record raw PSNR, SSIMULACRA2, VRAM,
-   batch-2 throughput and actual synchronized batch-1 tile latency. Include
-   flat gray and checkerboard, and inspect the gray renders for blob and
-   texture changes. Tune kernels after these controls are established.
+Both modes load the same family-2/schema-1 package and retain zero padding.
+`precision="fp16"` uses half RGB tensors, weights, activations, and residuals.
+The Fourier transforms use FP32 cuFFT. Norm reductions and convolutions
+accumulate in FP32 and preserve the eager FP16 rounding points, including
+the casts at the FFT and inverse FFT boundaries. The 60-channel Fourier
+depthwise projection uses the same width-dependent backend selection as
+eager on the tested CUDA stack. [PyTorch depthwise dispatch](https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/Convolution.cpp)
 
-Replicate padding remains a model-behavior experiment. A follow-up would
-compare it on actual MangaScale pages, especially panel edges, halftones
-and tile overlaps.
+`precision="mixed"` uses FP32 RGB I/O, Fourier processing, and residual
+additions. Spatial convolutions use half storage and FP32 accumulation.
+Spatial RMSNorm takes the FP32 residual stream and casts its result to
+half for convolution. The FFT work reuses the spatial gate buffer in each
+mode. Explicit `precision="fp32"` selects the original parity path.
+
+FP16 matched eager FP16 bit for bit on 15 of 18 stress cases, including
+both flat-gray tiles, checkerboard, noise, MangaScale crops, and the
+distinct batch input. The other three cases were 1×7, 2×2, and 3×5. Their
+worst absolute difference against eager FP16 was 0.00977. All 72 raw
+batch-2 page tiles matched eager FP16 bit for bit before stitching. All
+three page PNGs also matched the archived eager FP16 renders pixel for
+pixel. The graph/direct, host/device, alternate stream, and CLI checks
+passed for all three precision modes.
+[Raw FP16 tile parity](../output/gfisrv2-session/precision-final-fp16/eager-fp16-page-tiles.json)
+
+Page timing used 256×256 input tiles, 32 px overlap and 24 real tiles per
+page on the RTX 3050 Laptop GPU. PSNR and SSIMULACRA2 compare with the saved
+untouched eager FP32 pages. Each report includes all 72 individually timed
+and synchronized batch-1 tile calls with their coordinates.
+
+| Precision | Page | Batch-2 time (s) | Input MPx/s | Mean batch-1 tile (ms) | Raw PSNR (dB) | SSIMULACRA2 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| FP32 | `lb-page-003.png` | 4.790 | 0.2537 | 200.435 | ∞ | 100.000 |
+| FP32 | `lb-page-004.png` | 4.807 | 0.2528 | 206.377 | ∞ | 100.000 |
+| FP32 | `lb-page-005.png` | 4.767 | 0.2549 | 200.973 | ∞ | 100.000 |
+| FP32 | All three | 14.364 | 0.2538 | 202.595 | ∞ | 100.000 |
+| FP16 | `lb-page-003.png` | 3.691 | 0.3291 | 150.399 | 64.067 | 87.086 |
+| FP16 | `lb-page-004.png` | 3.674 | 0.3307 | 151.036 | 58.069 | 86.574 |
+| FP16 | `lb-page-005.png` | 3.420 | 0.3553 | 145.261 | 60.288 | 85.496 |
+| FP16 | All three | 10.785 | 0.3380 | 148.899 | 60.166 | 86.385 |
+| Mixed | `lb-page-003.png` | 3.656 | 0.3323 | 152.317 | 67.433 | 87.420 |
+| Mixed | `lb-page-004.png` | 3.602 | 0.3373 | 151.463 | 62.916 | 86.781 |
+| Mixed | `lb-page-005.png` | 3.692 | 0.3291 | 150.831 | 62.234 | 85.699 |
+| Mixed | All three | 10.950 | 0.3329 | 151.537 | 63.667 | 86.633 |
+
+| Precision | Batch-1 buffers (MiB) | Batch-1 warmed device delta (MiB) | Batch-2 buffers (MiB) | Batch-2 warmed device delta (MiB) |
+| --- | ---: | ---: | ---: | ---: |
+| FP32 | 184.7 | 186 | 352.1 | 362 |
+| FP16 | 133.8 | 138 | 259.2 | 270 |
+| Mixed | 175.8 | 182 | 327.2 | 342 |
+
+Buffer totals come from the session's allocation counters. Warmed deltas
+come from the change in device free memory for each newly prepared session.
+Both reduced modes used 76.2 MiB of batch-2 workspace. Mixed improved page
+PSNR by 3.50 dB at similar throughput, while peak raw page error fell from
+0.07545 to 0.03987. Both gray renders retained a strong pattern and lacked
+the two large blobs visible in FP32 at 0.5. Flat-gray PSNR against FP32 was
+5.556 dB for FP16 and 5.913 dB for mixed.
+[FP16 gray](../output/gfisrv2-session/precision-final-fp16/stress-renders/gray-candidate.png)
+· [Mixed gray](../output/gfisrv2-session/precision-final-mixed/stress-renders/gray-candidate.png)
+
+```powershell
+$py = 'C:\Python314\python.exe'
+$build = 'output/gfisrv2-session/precision-final-win'
+& $py scripts/build_native.py --output $build --nvrtc-root output/nvrtc-13.0/nvidia/cu13
+foreach ($mode in 'fp16', 'mixed', 'fp32') {
+    & $py scripts/validate_gfisrv2_session.py --library "$build/umzi_native.dll" --cli "$build/umzi_native.exe" --precision $mode --pages --output "output/gfisrv2-session/precision-final-$mode"
+}
+```
+
+[FP16 report](../output/gfisrv2-session/precision-final-fp16/report.json)
+· [Mixed report](../output/gfisrv2-session/precision-final-mixed/report.json)
+· [FP32 regression report](../output/gfisrv2-session/precision-final-fp32/report.json)
+
+#### GFISRv2 performance target
+
+Beat **4.8052 s/page median** on a matched full-page benchmark. The target
+is the captured portable ONNX Runtime TensorRT 10 runner from the
+`umzi-bench` four-round matrix. Its preferred preset uses strict NHWC8
+and native depthwise convolutions.
+
+| Runner to beat | Median s/page | Range (s/page) | Steady peak MiB above idle | Raw page PSNR vs FP32 (dB) | Grayscale SSIMULACRA2 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Preferred portable ORT TRT 10, captured | **4.8052** | 4.7665–4.9099 | 292.49 | 60.4422 | 87.2950 |
+
+The source run used the 900×1350 Love Bullet page 003, batch 1,
+128×128 input tiles, and 32 px overlap. The input matches
+`samples/mscale/lb-page-003.png` by SHA-256. Each timing includes tiling,
+transfers, inference, and CPU stitching. The four rounds reverse runner
+order on alternating rounds, with setup and one full-page warmup per
+worker excluded. Steady peak VRAM uses isolated NVML sampling. Keep the
+same timing scope, tiling, and grayscale scoring when judging the target.
+[Source matrix](../../umzi-bench/docs/gfisrv2-trt-experiments.md#four-round-matrix-results)
+· [Timing harness](../../umzi-bench/scripts/evaluate_umzi_unified_matrix.py)
+
+The 256×256 batch-2 MangaScale results above report synchronized model
+calls and serve as the native tuning baseline. Run the matched 128×128
+full-page comparison to determine whether a candidate beats 4.8052 s/page.
+Record the memory and fidelity alongside the matched timings.
+
+The next tuning pass can profile the half cuDNN convolutions and evaluate
+workspace choices against these baselines. Replicate padding remains a
+separate model-behavior experiment for panel edges, halftones and tile overlaps.

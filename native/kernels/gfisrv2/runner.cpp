@@ -54,7 +54,7 @@ struct Shape {
     int n = 0, h = 0, w = 0;
     bool operator==(Shape other) const { return n == other.n && h == other.h && w == other.w; }
     int pixels() const { return h * w; }
-    uint64_t rgb_bytes() const { return uint64_t(n) * pixels() * 3 * sizeof(float); }
+    uint64_t rgb_bytes(size_t element) const { return uint64_t(n) * pixels() * 3 * element; }
     UmziShape nchw() const { return {4, {uint32_t(n), 3, uint32_t(h), uint32_t(w)}}; }
 };
 
@@ -144,13 +144,23 @@ struct FftPlan {
 constexpr const char* kernel_names[] = {
     "rms_norm", "depthwise", "copy_channels", "pack_fft", "unpack_fft", "scale_fft", "add_bias",
     "gate", "residual", "apply_silu", "add_features", "shuffle_rgb",
+    "rms_norm_half", "rms_norm_to_half", "depthwise_half", "copy_channels_to_float", "pack_fft_half",
+    "unpack_fft_half", "scale_fft_to_half", "add_bias_half", "gate_half", "gate_mixed", "residual_half",
+    "residual_mixed", "apply_silu_half", "add_features_half", "add_features_mixed", "cast_to_half",
+    "cast_to_float", "add_half_residual", "shuffle_rgb_half", "shuffle_rgb_mixed",
 };
-enum Kernel { Rms, Depthwise, CopyChannels, Pack, Unpack, ScaleFft, Bias, Gate, Residual, Silu, Add, Shuffle, KernelCount };
+enum Kernel {
+    Rms, Depthwise, CopyChannels, Pack, Unpack, ScaleFft, Bias, Gate, Residual, Silu, Add, Shuffle,
+    RmsHalf, RmsToHalf, DepthwiseHalf, CopyChannelsToFloat, PackHalf, UnpackHalf, ScaleFftToHalf,
+    BiasHalf, GateHalf, GateMixed, ResidualHalf, ResidualMixed, SiluHalf, AddHalf, AddMixed,
+    ToHalf, ToFloat, AddHalfResidual, ShuffleHalf, ShuffleMixed, KernelCount
+};
 static_assert(std::size(kernel_names) == KernelCount);
 
 class Session final : public umzi::KernelSession {
     Network model;
     bool graph_enabled = false, pending = false, unexact_erf = false;
+    uint32_t precision = UMZI_FP32;
     CUdevice device = 0;
     CUcontext context = nullptr;
     CUmodule module = nullptr;
@@ -160,7 +170,7 @@ class Session final : public umzi::KernelSession {
     std::unique_ptr<gfi::CufftApi> fft;
     int fft_version = 0;
     std::array<CUfunction, KernelCount> functions{};
-    CUdeviceptr weights = 0;
+    CUdeviceptr weights = 0, weights_half = 0;
 
     Shape shape{};
     int bins = 0;
@@ -187,8 +197,7 @@ public:
         const auto data = package.section(3);
         if (!package.section(2).empty() || data.size() != model.bytes)
             throw std::runtime_error("Invalid GFISRv2 weight layout");
-        if (options.precision != UMZI_FP32 && options.precision != UMZI_MIXED)
-            throw std::runtime_error("GFISRv2 currently requires FP32 precision");
+        precision = options.precision;
         for (uint32_t i = 0; i < options.kernel_option_count; ++i) {
             const auto& option = options.kernel_options[i];
             const std::string_view name = option.name ? option.name : "";
@@ -207,7 +216,9 @@ public:
         ContextScope scope(context);
         umzi::load_kernel_module(device, module, gfisrv2_images::embedded_cubins, gfisrv2_images::embedded_ptx);
         for (int i = 0; i < KernelCount; ++i) {
-            const char* name = i == Unpack && unexact_erf ? "unpack_fft_unexact" : kernel_names[i];
+            const char* name = kernel_names[i];
+            if (unexact_erf && i == Unpack) name = "unpack_fft_unexact";
+            if (unexact_erf && i == UnpackHalf) name = "unpack_fft_half_unexact";
             CHECK(cuModuleGetFunction(&functions[i], module, name));
         }
         CHECK(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
@@ -215,6 +226,15 @@ public:
         CHECK(cudnnCreate(&cudnn));
         CHECK(cuMemAlloc(&weights, data.size()));
         CHECK(cuMemcpyHtoD(weights, data.data(), data.size()));
+        if (reduced()) {
+            CHECK(cuMemAlloc(&weights_half, data.size() / 2));
+            launch(stream, ToHalf, int(data.size() / sizeof(float)), weights_half, weights);
+            CHECK(cuStreamSynchronize(stream));
+            if (half_io()) {
+                CHECK(cuMemFree(weights));
+                weights = 0;
+            }
+        }
     }
 
     ~Session() override {
@@ -227,6 +247,7 @@ public:
             if (complete) cuEventDestroy(complete);
             if (stream) cuStreamDestroy(stream);
             if (weights) cuMemFree(weights);
+            if (weights_half) cuMemFree(weights_half);
             if (module) cuModuleUnload(module);
             CUcontext previous;
             cuCtxPopCurrent(&previous);
@@ -235,6 +256,18 @@ public:
     }
 
 private:
+    bool half_io() const { return precision == UMZI_FP16; }
+    bool mixed() const { return precision == UMZI_MIXED; }
+    bool reduced() const { return precision != UMZI_FP32; }
+    size_t element(bool half) const { return half ? sizeof(uint16_t) : sizeof(float); }
+    CUdeviceptr weight(size_t offset, bool half) const {
+        return half ? weights_half + offset / 2 : weights + offset;
+    }
+    bool grouped_half_spectral_conv() const {
+        // Match the eager FP16 depthwise backend for a stride-1 3x3 filter.
+        return half_io() && (shape.h == 1 || shape.w / 2 + 1 >= 7);
+    }
+
     void release_shape() {
         if (executable) cuGraphExecDestroy(executable);
         if (graph) cuGraphDestroy(graph);
@@ -259,29 +292,31 @@ private:
         pending = false;
     }
 
-    void activation(CUdeviceptr& buffer, size_t count) {
-        const auto bytes = count * sizeof(float);
+    void activation(CUdeviceptr& buffer, size_t count, bool half = false) {
+        const auto bytes = count * element(half);
         CHECK(cuMemAlloc(&buffer, bytes));
         activation_bytes += bytes;
     }
 
-    void make_conv(int h, int w, int cin, int cout, int k) {
+    void make_conv(int h, int w, int cin, int cout, int k, bool half, int groups = 1) {
         auto plan = std::make_unique<Convolution>();
         auto& p = *plan;
         CHECK(cudnnCreateTensorDescriptor(&p.input));
         CHECK(cudnnCreateTensorDescriptor(&p.output));
         CHECK(cudnnCreateFilterDescriptor(&p.filter));
         CHECK(cudnnCreateConvolutionDescriptor(&p.convolution));
-        CHECK(cudnnSetTensor4dDescriptor(p.input, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, shape.n, cin, h, w));
-        CHECK(cudnnSetTensor4dDescriptor(p.output, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, shape.n, cout, h, w));
-        CHECK(cudnnSetFilter4dDescriptor(p.filter, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, cout, cin, k, k));
+        const auto dtype = half ? CUDNN_DATA_HALF : CUDNN_DATA_FLOAT;
+        CHECK(cudnnSetTensor4dDescriptor(p.input, CUDNN_TENSOR_NCHW, dtype, shape.n, cin, h, w));
+        CHECK(cudnnSetTensor4dDescriptor(p.output, CUDNN_TENSOR_NCHW, dtype, shape.n, cout, h, w));
+        CHECK(cudnnSetFilter4dDescriptor(p.filter, dtype, CUDNN_TENSOR_NCHW, cout, cin / groups, k, k));
         CHECK(cudnnSetConvolution2dDescriptor(p.convolution, k / 2, k / 2, 1, 1, 1, 1, CUDNN_CROSS_CORRELATION,
                                              CUDNN_DATA_FLOAT));
-        CHECK(cudnnSetConvolutionMathType(p.convolution, CUDNN_FMA_MATH));
+        if (groups != 1) CHECK(cudnnSetConvolutionGroupCount(p.convolution, groups));
+        CHECK(cudnnSetConvolutionMathType(p.convolution, half ? CUDNN_TENSOR_OP_MATH : CUDNN_FMA_MATH));
         // The reference uses implicit GEMM for RGB and spectral projection,
         // and Winograd for the wider spatial convolutions on the target GPU.
-        const auto preferred = k == 1 || cin == 3 ? CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM
-                                                  : CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD;
+        const auto preferred = half ? CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM
+            : k == 1 || cin == 3 ? CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM : CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD;
         const auto status = cudnnGetConvolutionForwardWorkspaceSize(
             cudnn, p.input, p.filter, p.convolution, p.output, preferred, &p.workspace);
         p.algorithm = preferred;
@@ -315,28 +350,30 @@ private:
             const size_t pixels = size_t(shape.n) * shape.pixels();
             bins = shape.h * (shape.w / 2 + 1);
             fft_scale = float(1.0 / std::sqrt(double(shape.pixels())));
-            activation(initial, pixels * channels);
-            activation(state, pixels * channels);
-            activation(norm, pixels * channels);
-            activation(projected, pixels * 2 * hidden);
-            activation(gated, pixels * hidden);
+            activation(initial, pixels * channels, half_io());
+            activation(state, pixels * channels, half_io());
+            activation(norm, pixels * channels, reduced());
+            activation(projected, pixels * 2 * hidden, reduced());
+            activation(gated, pixels * hidden, reduced());
             const size_t frequency_size = size_t(shape.n) * bins * 2 * fourier;
             activation(spectrum, frequency_size);
-            activation(packed, frequency_size);
-            activation(spectral_out, frequency_size);
-            CHECK(cuMemAlloc(&stage_in, shape.rgb_bytes()));
-            CHECK(cuMemAlloc(&stage_out, shape.rgb_bytes() * scale * scale));
+            activation(packed, frequency_size, half_io());
+            activation(spectral_out, frequency_size, half_io());
+            CHECK(cuMemAlloc(&stage_in, shape.rgb_bytes(element(half_io()))));
+            CHECK(cuMemAlloc(&stage_out, shape.rgb_bytes(element(half_io())) * scale * scale));
             setup_ms[0] = elapsed(start);
 
             start = Clock::now();
             const int h = shape.h, w = shape.w;
-            make_conv(h, w, 3, channels, 3);
-            make_conv(h, w, channels, 2 * hidden, 3);
-            make_conv(h, w, hidden, channels, 3);
-            make_conv(h, w, channels, 2 * channels, 3);
-            make_conv(h, w, 2 * channels, channels, 3);
-            make_conv(h, w, channels, 3 * scale * scale, 3);
-            make_conv(h, w / 2 + 1, 2 * fourier, 2 * fourier, 1);
+            make_conv(h, w, 3, channels, 3, reduced());
+            make_conv(h, w, channels, 2 * hidden, 3, reduced());
+            make_conv(h, w, hidden, channels, 3, reduced());
+            make_conv(h, w, channels, 2 * channels, 3, reduced());
+            make_conv(h, w, 2 * channels, channels, 3, reduced());
+            make_conv(h, w, channels, 3 * scale * scale, 3, reduced());
+            make_conv(h, w / 2 + 1, 2 * fourier, 2 * fourier, 1, half_io());
+            if (grouped_half_spectral_conv())
+                make_conv(h, w / 2 + 1, 2 * fourier, 2 * fourier, 3, true, 2 * fourier);
             if (cudnn_workspace) CHECK(cuMemAlloc(&cudnn_scratch, cudnn_workspace));
             forward_fft.setup(*fft, shape, r2c);
             inverse_fft.setup(*fft, shape, c2r);
@@ -344,7 +381,7 @@ private:
             setup_ms[1] = elapsed(start);
 
             start = Clock::now();
-            CHECK(cuMemsetD8Async(stage_in, 0, shape.rgb_bytes(), stream));
+            CHECK(cuMemsetD8Async(stage_in, 0, shape.rgb_bytes(element(half_io())), stream));
             forward(stage_in, stage_out, stream);
             CHECK(cuStreamSynchronize(stream));
             setup_ms[2] = elapsed(start);
@@ -379,47 +416,82 @@ private:
     }
 
     CUdeviceptr channel_offset(CUdeviceptr base, int channel) const {
-        return base + uint64_t(channel) * shape.pixels() * sizeof(float);
+        return base + uint64_t(channel) * shape.pixels() * element(reduced());
     }
 
-    void conv(CUstream target, CUdeviceptr out, CUdeviceptr in, int h, int w, int cin, int cout, int k, Filter filter) {
+    void conv(CUstream target, CUdeviceptr out, CUdeviceptr in, int h, int w, int cin, int cout, int k, Filter filter,
+              bool half) {
         const auto& p = *plans.at(Key{h, w, cin, cout, k});
         const float one = 1.f, zero = 0.f;
         CHECK(cudnnConvolutionForward(cudnn, &one, p.input, reinterpret_cast<void*>(in), p.filter,
-            reinterpret_cast<void*>(weights + filter.weight), p.convolution, p.algorithm,
+            reinterpret_cast<void*>(weight(filter.weight, half)), p.convolution, p.algorithm,
             reinterpret_cast<void*>(cudnn_scratch), p.workspace, &zero, p.output, reinterpret_cast<void*>(out)));
-        launch(target, Bias, shape.n * h * w * cout, out, weights + filter.bias, cout, h * w);
+        launch(target, half ? BiasHalf : Bias, shape.n * h * w * cout, out, weight(filter.bias, half), cout, h * w);
     }
 
-    void rms(CUstream target, CUdeviceptr out, CUdeviceptr in, Norm params, int c, int pixels, int out_stride) {
-        launch(target, Rms, shape.n * pixels, out, in, weights + params.scale, weights + params.offset,
+    void rms(CUstream target, Kernel kernel, CUdeviceptr out, CUdeviceptr in, Norm params,
+             int c, int pixels, int out_stride) {
+        const bool half = kernel == RmsHalf;
+        launch(target, kernel, shape.n * pixels, out, in, weight(params.scale, half), weight(params.offset, half),
                c, c, out_stride, pixels, float(1.0 / std::sqrt(double(c))));
     }
 
     void fourier_unit(CUstream target, const Fourier& params, CUdeviceptr in, CUdeviceptr out) {
-        const int pixels = shape.pixels(), frequency = shape.n * fourier * bins;
-        launch(target, CopyChannels, shape.n * fourier * pixels, gated, in, fourier, 2 * hidden, pixels);
+        const int pixels = shape.pixels(), spatial = shape.n * fourier * pixels, frequency = shape.n * fourier * bins;
+        const int spectral_channels = 2 * fourier, width = shape.w / 2 + 1;
+        // Reuse the gate buffer until the spatial gate runs. It can hold
+        // 30 FP32 channels even in reduced precision (128 FP16 channels).
+        static_assert(fourier * sizeof(float) <= hidden * sizeof(uint16_t));
+        launch(target, reduced() ? CopyChannelsToFloat : CopyChannels, spatial, gated, in, fourier, 2 * hidden, pixels);
         FFT_CHECK(fft->r2c(forward_fft.handle, reinterpret_cast<void*>(gated), reinterpret_cast<void*>(spectrum)));
-        launch(target, Pack, frequency, packed, spectrum, fourier, bins, fft_scale);
-        rms(target, spectral_out, packed, params.pre, 2 * fourier, bins, 2 * fourier);
-        launch(target, Depthwise, frequency * 2, packed, spectral_out, weights + params.position.weight,
-               weights + params.position.bias, 2 * fourier, 2 * fourier, 2 * fourier, shape.h, shape.w / 2 + 1,
-               3, 3, 1);
-        conv(target, spectral_out, packed, shape.h, shape.w / 2 + 1, 2 * fourier, 2 * fourier, 1, params.project);
-        launch(target, Unpack, frequency, spectrum, spectral_out, bins);
+        launch(target, half_io() ? PackHalf : Pack, frequency, packed, spectrum, fourier, bins, fft_scale);
+        rms(target, half_io() ? RmsHalf : Rms, spectral_out, packed, params.pre, spectral_channels, bins, spectral_channels);
+        if (half_io()) {
+            // Eager uses grouped cuDNN here. Materialize its rounded convolution,
+            // bias addition and positional residual before the learned projection.
+            if (grouped_half_spectral_conv()) {
+                conv(target, packed, spectral_out, shape.h, width, spectral_channels, spectral_channels, 3, params.position, true);
+            } else {
+                launch(target, DepthwiseHalf, frequency * 2, packed, spectral_out, weight(params.position.weight, true),
+                       weight(params.position.bias, true), spectral_channels, spectral_channels, spectral_channels,
+                       shape.h, width, 3, 3, 0);
+            }
+            launch(target, AddHalfResidual, frequency * 2, packed, spectral_out);
+        } else {
+            launch(target, Depthwise, frequency * 2, packed, spectral_out, weight(params.position.weight, false),
+                   weight(params.position.bias, false), spectral_channels, spectral_channels, spectral_channels,
+                   shape.h, width, 3, 3, 1);
+        }
+        conv(target, spectral_out, packed, shape.h, width, spectral_channels, spectral_channels, 1, params.project, half_io());
+        launch(target, half_io() ? UnpackHalf : Unpack, frequency, spectrum, spectral_out, bins);
         FFT_CHECK(fft->c2r(inverse_fft.handle, reinterpret_cast<void*>(spectrum), reinterpret_cast<void*>(gated)));
-        launch(target, ScaleFft, shape.n * fourier * pixels, gated, fft_scale);
-        rms(target, out, gated, params.post, fourier, pixels, channels);
+        if (half_io()) {
+            launch(target, ScaleFftToHalf, spatial, packed, gated, fft_scale);
+            rms(target, RmsHalf, out, packed, params.post, fourier, pixels, channels);
+        } else {
+            launch(target, ScaleFft, spatial, gated, fft_scale);
+            rms(target, mixed() ? RmsToHalf : Rms, out, gated, params.post, fourier, pixels, channels);
+        }
     }
 
     void forward(CUdeviceptr input, CUdeviceptr output, CUstream target) {
         const int pixels = shape.pixels(), area = shape.n * pixels, h = shape.h, w = shape.w;
-        conv(target, initial, input, h, w, 3, channels, 3, model.first);
-        CHECK(cuMemcpyDtoDAsync(state, initial, uint64_t(area) * channels * sizeof(float), target));
+        const bool half = reduced();
+        if (mixed()) {
+            launch(target, ToHalf, area * 3, gated, input);
+            conv(target, projected, gated, h, w, 3, channels, 3, model.first, true);
+            launch(target, ToFloat, area * channels, initial, projected);
+        } else {
+            conv(target, initial, input, h, w, 3, channels, 3, model.first, half);
+        }
+        CHECK(cuMemcpyDtoDAsync(state, initial, uint64_t(area) * channels * element(half_io()), target));
+        const Kernel spatial_norm = mixed() ? RmsToHalf : half_io() ? RmsHalf : Rms;
+        const Kernel spatial_gate = mixed() ? GateMixed : half_io() ? GateHalf : Gate;
+        const Kernel spatial_residual = mixed() ? ResidualMixed : half_io() ? ResidualHalf : Residual;
         for (int i = 0; i < blocks; ++i) {
             const auto& block = model.body[i];
-            rms(target, norm, state, block.norm, channels, pixels, channels);
-            conv(target, projected, norm, h, w, channels, 2 * hidden, 3, block.expand);
+            rms(target, spatial_norm, norm, state, block.norm, channels, pixels, channels);
+            conv(target, projected, norm, h, w, channels, 2 * hidden, 3, block.expand, half);
             int offset = 0;
             for (int slot = 0; slot < 4; ++slot) {
                 const int kind = (slot + i) % 4;
@@ -432,21 +504,23 @@ private:
                     const auto& filter = block.bands[kind - 1];
                     const int kh = kind == 1 ? 3 : kind == 2 ? 1 : 11;
                     const int kw = kind == 1 ? 3 : kind == 2 ? 11 : 1;
-                    launch(target, Depthwise, area * band, out, in, weights + filter.weight, weights + filter.bias,
-                           band, 2 * hidden, channels, h, w, kh, kw, 0);
+                    launch(target, half ? DepthwiseHalf : Depthwise, area * band, out, in, weight(filter.weight, half),
+                           weight(filter.bias, half), band, 2 * hidden, channels, h, w, kh, kw, 0);
                     offset += band;
                 }
             }
-            launch(target, Gate, area * hidden, gated, projected, norm, hidden, channels, pixels);
-            conv(target, projected, gated, h, w, hidden, channels, 3, block.project);
-            launch(target, Residual, area * channels, state, projected, weights + block.gamma, channels, pixels);
+            launch(target, spatial_gate, area * hidden, gated, projected, norm, hidden, channels, pixels);
+            conv(target, projected, gated, h, w, hidden, channels, 3, block.project, half);
+            launch(target, spatial_residual, area * channels, state, projected, weight(block.gamma, half_io()), channels, pixels);
         }
-        conv(target, projected, state, h, w, channels, 2 * channels, 3, model.tail_expand);
-        launch(target, Silu, area * 2 * channels, projected);
-        conv(target, norm, projected, h, w, 2 * channels, channels, 3, model.tail_project);
-        launch(target, Add, area * channels, state, norm, initial);
-        conv(target, projected, state, h, w, channels, 3 * scale * scale, 3, model.last);
-        launch(target, Shuffle, area * 3 * scale * scale, output, projected, h, w);
+        if (mixed()) launch(target, ToHalf, area * channels, gated, state);
+        conv(target, projected, mixed() ? gated : state, h, w, channels, 2 * channels, 3, model.tail_expand, half);
+        launch(target, half ? SiluHalf : Silu, area * 2 * channels, projected);
+        conv(target, norm, projected, h, w, 2 * channels, channels, 3, model.tail_project, half);
+        launch(target, mixed() ? AddMixed : half ? AddHalf : Add, area * channels, state, norm, initial);
+        if (mixed()) launch(target, ToHalf, area * channels, gated, state);
+        conv(target, projected, mixed() ? gated : state, h, w, channels, 3 * scale * scale, 3, model.last, half);
+        launch(target, mixed() ? ShuffleMixed : half ? ShuffleHalf : Shuffle, area * 3 * scale * scale, output, projected, h, w);
     }
 
     void execute(CUdeviceptr input, CUdeviceptr output, CUstream target) {
@@ -455,7 +529,7 @@ private:
             forward(input, output, target);
             return;
         }
-        const auto bytes = shape.rgb_bytes();
+        const auto bytes = shape.rgb_bytes(element(half_io()));
         if (input != stage_in) CHECK(cuMemcpyDtoDAsync(stage_in, input, bytes, target));
         CHECK(cuGraphLaunch(executable, target));
         if (output != stage_out) CHECK(cuMemcpyDtoDAsync(output, stage_out, bytes * scale * scale, target));
@@ -464,15 +538,16 @@ private:
 public:
     UmziModelInfo model_info() const override { return {sizeof(UmziModelInfo), "gfisrv2", scale, 0}; }
     UmziIo tensors() const override {
-        return {sizeof(UmziIo), {"input", {4, {0, 3, 0, 0}}, UMZI_FLOAT32, 0},
-                                {"output", {4, {0, 3, 0, 0}}, UMZI_FLOAT32, 0}};
+        const uint32_t dtype = half_io() ? UMZI_FLOAT16 : UMZI_FLOAT32;
+        return {sizeof(UmziIo), {"input", {4, {0, 3, 0, 0}}, dtype, 0},
+                                {"output", {4, {0, 3, 0, 0}}, dtype, 0}};
     }
 
     UmziIo describe(const UmziShape& request) const override {
         const auto concrete = checked(request);
         auto io = tensors();
         io.input.shape = request;
-        io.input.bytes = concrete.rgb_bytes();
+        io.input.bytes = concrete.rgb_bytes(element(half_io()));
         io.output.shape = Shape{concrete.n, scale * concrete.h, scale * concrete.w}.nchw();
         io.output.bytes = io.input.bytes * scale * scale;
         return io;
@@ -486,7 +561,7 @@ public:
     void run_host(const UmziShape& request, const void* input, void* output) override {
         ContextScope scope(context);
         prepare(checked(request));
-        const auto bytes = shape.rgb_bytes();
+        const auto bytes = shape.rgb_bytes(element(half_io()));
         try {
             CHECK(cuMemcpyHtoDAsync(stage_in, input, bytes, stream));
             execute(stage_in, stage_out, stream);
@@ -515,12 +590,12 @@ public:
         UmziSessionInfo info{};
         info.struct_size = sizeof(info);
         info.cache_status = UMZI_CACHE_DISABLED;
-        info.buffer_bytes[0] = model.bytes;
+        info.buffer_bytes[0] = (weights ? model.bytes : 0) + (weights_half ? model.bytes / 2 : 0);
         if (shape.n) {
             info.prepared_input = shape.nchw();
             info.buffer_bytes[1] = activation_bytes;
             info.buffer_bytes[2] = cudnn_workspace + forward_fft.bytes + inverse_fft.bytes;
-            info.buffer_bytes[3] = shape.rgb_bytes() * (1 + scale * scale);
+            info.buffer_bytes[3] = shape.rgb_bytes(element(half_io())) * (1 + scale * scale);
             std::copy(setup_ms.begin(), setup_ms.end(), info.shape_setup_ms);
         }
         return info;
@@ -534,7 +609,11 @@ public:
         if (index == 2) return {sizeof(UmziDiagnostic), "unexact_erf", unexact_erf};
         throw std::runtime_error("Invalid GFISRv2 diagnostic index");
     }
-    const char* kernel_message() const override { return "GFISRv2 FP32 with cuFFT"; }
+    const char* kernel_message() const override {
+        if (mixed()) return "GFISRv2 mixed precision with FP32 Fourier and residuals";
+        if (half_io()) return "GFISRv2 FP16 with FP32 cuFFT";
+        return "GFISRv2 FP32 with cuFFT";
+    }
 };
 } // namespace
 
