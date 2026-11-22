@@ -1,23 +1,23 @@
 """Validate the packaged GateRV2 session against the untouched eager FP32 model.
 
-The check exports the checkpoint twice, rejects malformed GateRV2 payloads, runs
-the stress and odd-shape cases through CUDA Graph and direct execution, checks
-device enqueue and cleanup, and measures both benchmark pages with batch-16
-throughput and individual batch-1 tile latency.
+The native session runs in mixed precision (FP32 RGB I/O and convolution
+accumulation) or FP16. Both keep FP16 features and FP32 attention. The check
+exports the checkpoint twice, rejects malformed GateRV2 payloads, runs the
+stress and odd-shape cases through CUDA Graph and direct execution in both
+precisions, checks batch consistency and cleanup, and measures both pages with
+device-resident batch-16 throughput and individual batch-1 tile latency.
 """
 
 from __future__ import annotations
 
 import argparse
-import copy
+import ctypes
 import gc
 import hashlib
 import json
 import os
 import struct
-import sys
 import tempfile
-import time
 from pathlib import Path
 from typing import Any
 
@@ -42,18 +42,17 @@ from resselt.archs.gaterv2.arch import GateRV2
 from torch import Tensor
 
 from umzi_native import GateRV2Model, InferenceSession, SessionOptions, peek_model
+from umzi_native._abi import IoABI, ShapeABI, check_status
 from umzi_native._model import GATERV2_ARCHITECTURE, GATERV2_FAMILY, GATERV3_FAMILY, HEADER_SIZE, SECTION
 from umzi_native.exporter import export_model
 from umzi_native.exporter._loader import load_checkpoint
 from umzi_native.exporter._package import write_package
 
 FAMILY = FAMILIES["gaterv2"]
-NETWORK_TOLERANCE = {"atol": 1e-5, "rtol": 5e-5}
-# Flat and periodic tiles drive the linear-attention denominator close to zero,
-# which amplifies FP32 rounding in any implementation. When a case misses the
-# eager tolerance, compare both FP32 paths with an FP64 run of the same model
-# and require the session to stay within this factor of eager FP32's error.
-FP64_ERROR_RATIO = 1.5
+PRECISIONS = {"mixed": torch.float32, "fp16": torch.float16}
+# Separate tiles must not see each other inside a batch. Allow only the
+# variation that batch-dependent cuDNN algorithms may introduce.
+BATCH_CONSISTENCY_PSNR_DB = 60.0
 
 
 def file_digest(path: Path) -> str:
@@ -92,6 +91,8 @@ def check_rejections(model: Path, library: Path, root: Path) -> dict[str, str]:
         return broken
 
     results["schema"] = rejected(package(GATERV2_FAMILY, 2, {}), options, "Unsupported GateRV2 model payload version")
+    if peek_model(broken).problems != ("Unsupported GateRV2 model payload version",):
+        raise RuntimeError(f"Unexpected reader problems: {peek_model(broken).problems}")
     results["wrong_family"] = rejected(package(GATERV3_FAMILY, 1, {}), options, "GateRV3")
     architecture = list(GATERV2_ARCHITECTURE.unpack(parts[1]))
     architecture[3] = 8
@@ -105,11 +106,6 @@ def check_rejections(model: Path, library: Path, root: Path) -> dict[str, str]:
     results["trailing_weights"] = rejected(
         package(GATERV2_FAMILY, 1, {3: parts[3] + bytes(256)}), options, "trailing GateRV2 weight"
     )
-    for label, info in (("peek_schema", package(GATERV2_FAMILY, 2, {})),):
-        problems = peek_model(info).problems
-        if problems != ("Unsupported GateRV2 model payload version",):
-            raise RuntimeError(f"Unexpected {label} problems: {problems}")
-    results["precision"] = rejected(model, SessionOptions(dll_path=library, precision="fp16"), "FP32 only")
     results["kernel_option"] = rejected(
         model, SessionOptions(dll_path=library, kernel_options={"fuse_silu": 1}), "no kernel options"
     )
@@ -127,94 +123,100 @@ def check_rejections(model: Path, library: Path, root: Path) -> dict[str, str]:
     return results
 
 
-def run_session(session: InferenceSession, sample: Tensor) -> Tensor:
-    return torch.from_numpy(session.run(None, {"input": sample.numpy()})[0])
+class DeviceSession:
+    """Enqueue CUDA tensors on the current Torch stream through the session ABI."""
 
+    def __init__(self, session: InferenceSession):
+        self.session = session
+        self.dtype = torch.float16 if session.get_inputs()[0].type == "tensor(float16)" else torch.float32
 
-def within_tolerance(actual: Tensor, expected: Tensor) -> bool:
-    return bool(torch.isclose(actual, expected, **NETWORK_TOLERANCE).all())
-
-
-def fp64_check(reference64: GateRV2, sample: Tensor, expected: Tensor, actual: Tensor, label: str) -> dict[str, Any]:
-    exact = reference64(sample.cuda().double()).cpu()
-    eager_error = float((expected.double() - exact).abs().max())
-    session_error = float((actual.double() - exact).abs().max())
-    row = {
-        "eager_fp32_max_abs_vs_fp64": eager_error,
-        "session_max_abs_vs_fp64": session_error,
-        "allowed_ratio": FP64_ERROR_RATIO,
-        "eager_tolerance_violations": int((~torch.isclose(actual, expected, **NETWORK_TOLERANCE)).sum()),
-    }
-    if not session_error <= FP64_ERROR_RATIO * eager_error:
-        raise AssertionError(f"{label}: session FP64 error {session_error:.3g} exceeds eager {eager_error:.3g}")
-    return row
+    def __call__(self, sample: Tensor) -> Tensor:
+        if sample.dtype != self.dtype or not sample.is_cuda or not sample.is_contiguous():
+            raise ValueError("The session expects a contiguous CUDA tensor of its I/O dtype")
+        dims = ShapeABI.from_dimensions(sample.shape)
+        io = IoABI(ctypes.sizeof(IoABI))
+        dll, handle = self.session._dll, self.session._handle
+        check_status(dll, dll.umzi_session_describe(handle, ctypes.byref(dims), ctypes.byref(io)))
+        result = torch.empty(io.output.shape.dimensions_tuple(), dtype=self.dtype, device="cuda")
+        stream = torch.cuda.current_stream().cuda_stream
+        check_status(
+            dll,
+            dll.umzi_session_enqueue(
+                handle,
+                ctypes.byref(dims),
+                sample.data_ptr(),
+                io.input.bytes,
+                result.data_ptr(),
+                io.output.bytes,
+                stream,
+            ),
+        )
+        return result
 
 
 def check_stress(
-    reference: GateRV2, sessions: dict[str, InferenceSession], cases: dict[str, Tensor], output: Path
+    reference: GateRV2, model: Path, library: Path, cases: dict[str, Tensor], output: Path
 ) -> dict[str, Any]:
-    reference64 = copy.deepcopy(reference).double()
-    rows: dict[str, Any] = {}
-    for label, sample in cases.items():
-        expected = reference(sample.cuda()).cpu()
-        row: dict[str, Any] = {"input_shape": list(sample.shape)}
-        for mode, session in sessions.items():
-            actual = run_session(session, sample)
-            row[mode] = comparison(actual.numpy(), expected.numpy())
-            if not row[mode]["finite"]:
-                raise AssertionError(f"{mode} {label} produced non-finite output")
-            if not within_tolerance(actual, expected):
-                row[mode]["fp64"] = fp64_check(reference64, sample, expected, actual, f"{mode} {label}")
-            if label == "checkerboard" and mode == "graph":
-                row[mode]["ssimulacra2"] = score_stress_render(output / "stress-renders", label, expected, actual)
-        if len(sample) > 1:
-            graph = sessions["graph"]
-            batched = run_session(graph, sample)
-            row["vs_individual"] = [
-                comparison(item.numpy(), run_session(graph, tile)[0].numpy())
-                for item, tile in zip(batched, sample.split(1), strict=True)
-            ]
-        rows[label] = row
-        note = " (FP64-anchored)" if "fp64" in row["graph"] else ""
-        print(f"{label}: graph {row['graph'].get('psnr_db')} dB, max {row['graph']['max_abs']:.3g}{note}", flush=True)
+    expected = {label: reference(sample.cuda()).cpu() for label, sample in cases.items()}
+    rows: dict[str, Any] = {label: {"input_shape": list(sample.shape)} for label, sample in cases.items()}
+    for precision, dtype in PRECISIONS.items():
+        graph = DeviceSession(InferenceSession(model, SessionOptions(precision=precision, dll_path=library)))
+        direct = DeviceSession(
+            InferenceSession(model, SessionOptions(precision=precision, enable_cuda_graph=False, dll_path=library))
+        )
+        try:
+            for label, sample in cases.items():
+                x = sample.to(device="cuda", dtype=dtype)
+                actual = graph(x).float().cpu()
+                row = comparison(actual.numpy(), expected[label].numpy())
+                if not row["finite"]:
+                    raise AssertionError(f"{precision} {label} produced non-finite output")
+                row["direct_matches_graph"] = torch.equal(direct(x).float().cpu(), actual)
+                if not row["direct_matches_graph"]:
+                    raise AssertionError(f"{precision} {label}: direct execution differs from CUDA Graph")
+                if label in ("checkerboard", "noise"):
+                    row["ssimulacra2"] = score_stress_render(
+                        output / "stress-renders" / precision, label, expected[label], actual
+                    )
+                if len(sample) > 1:
+                    individual = torch.cat([graph(tile).float().cpu() for tile in x.split(1)])
+                    consistency = comparison(actual.numpy(), individual.numpy())
+                    row["vs_individual"] = consistency
+                    psnr = consistency["psnr_db"]
+                    if psnr is not None and psnr < BATCH_CONSISTENCY_PSNR_DB:
+                        raise AssertionError(f"{precision} {label}: batch items depend on each other ({psnr} dB)")
+                rows[label][precision] = row
+                note = f", SSIMULACRA2 {row['ssimulacra2']:.3f}" if "ssimulacra2" in row else ""
+                print(f"{precision} {label}: {row['psnr_db']:.3f} dB, max {row['max_abs']:.3g}{note}", flush=True)
+            rows.setdefault("_session_info", {})[precision] = graph.session.get_session_info()
+        finally:
+            graph.session.close()
+            direct.session.close()
     return rows
 
 
-def check_enqueue(library: Path, model: Path, reference: GateRV2) -> dict[str, Any]:
-    from umzi_native._abi import ShapeABI, check_status
-
-    result: dict[str, Any] = {}
-    with InferenceSession(model, SessionOptions(dll_path=library)) as session:
-        dll, handle = session._dll, session._handle
-        generator = torch.Generator().manual_seed(7)
-        for shape in ((2, 3, 128, 128), (1, 3, 65, 79)):
-            source = torch.rand(shape, generator=generator).cuda()
-            target = torch.empty_like(source)
-            stream = torch.cuda.Stream()
-            dims = ShapeABI.from_dimensions(shape)
-            nbytes = source.numel() * 4
-            stream.wait_stream(torch.cuda.current_stream())
-            check_status(
-                dll,
-                dll.umzi_session_enqueue(
-                    handle, dims, source.data_ptr(), nbytes, target.data_ptr(), nbytes, stream.cuda_stream
-                ),
-            )
-            stream.synchronize()
-            expected = reference(source)
-            if not within_tolerance(target, expected):
-                raise AssertionError(f"Device enqueue differs from eager FP32 for {shape}")
-            result["x".join(map(str, shape))] = comparison(target.cpu().numpy(), expected.cpu().numpy())
+def check_host_io(reference: GateRV2, model: Path, library: Path) -> dict[str, Any]:
+    """Host run must equal device enqueue for the same input."""
+    sample = torch.rand((2, 3, 65, 79), generator=torch.Generator().manual_seed(11))
+    result = {}
+    for precision, dtype in PRECISIONS.items():
+        with InferenceSession(model, SessionOptions(precision=precision, dll_path=library)) as session:
+            x = sample.to(dtype)
+            host = torch.from_numpy(session.run(None, {"input": x.numpy()})[0])
+            device = DeviceSession(session)(x.cuda()).cpu()
+            if not torch.equal(host, device):
+                raise AssertionError(f"{precision}: host run differs from device enqueue")
+            result[precision] = comparison(host.float().numpy(), reference(sample.cuda()).cpu().numpy())
     return result
 
 
 def check_cleanup(library: Path, model: Path) -> dict[str, Any]:
     torch.cuda.synchronize()
     free_before, _ = torch.cuda.mem_get_info()
-    sample = np.random.default_rng(3).random((4, 3, 128, 128), dtype=np.float32)
     shapes = []
-    for _ in range(3):
-        with InferenceSession(model, SessionOptions(dll_path=library)) as session:
+    for precision, dtype in (*PRECISIONS.items(), ("mixed", torch.float32)):
+        sample = np.random.default_rng(3).random((4, 3, 128, 160)).astype(torch.empty(0, dtype=dtype).numpy().dtype)
+        with InferenceSession(model, SessionOptions(precision=precision, dll_path=library)) as session:
             for shape in ((4, 3, 128, 128), (1, 3, 65, 79), (2, 3, 128, 160), (4, 3, 128, 128)):
                 session.run(None, {"input": np.ascontiguousarray(sample[: shape[0], :, : shape[2], : shape[3]])})
                 shapes.append(session.get_session_info()["padded_shape"])
@@ -229,63 +231,43 @@ def check_cleanup(library: Path, model: Path) -> dict[str, Any]:
     }
 
 
-class SessionRunner(Runner):
-    """Time a host session call; the session copies RGB through device memory."""
-
-    def __init__(self, session: InferenceSession):
-        super().__init__(lambda sample: sample, torch.float32)
-        self.session = session
-
-    def prepare(self, host: Tensor) -> Tensor:
-        return host.contiguous()
-
-    def measure(self, host: Tensor) -> tuple[Tensor, float]:
-        sample = host.contiguous().numpy()
-        self.session.prepare(sample.shape)
-        torch.cuda.synchronize()
-        started = time.perf_counter()
-        (result,) = self.session.run(None, {"input": sample})
-        return torch.from_numpy(result), time.perf_counter() - started
-
-
-def check_pages(
-    reference: GateRV2, library: Path, model: Path, sources: list[Path], output: Path
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def check_pages(reference: GateRV2, library: Path, model: Path, sources: list[Path], output: Path) -> dict[str, Any]:
     if not METRIC.is_file():
         raise FileNotFoundError(METRIC)
-    options = SessionOptions(dll_path=library)
-    pages = []
-    with InferenceSession(model, options) as batched, InferenceSession(model, options) as single:
-        batched.prepare((FAMILY.batch, 3, FAMILY.tile, FAMILY.tile))
-        single.prepare((1, 3, FAMILY.tile, FAMILY.tile))
-        runners: dict[int, Runner] = {1: SessionRunner(single), FAMILY.batch: SessionRunner(batched)}
-        eager = Runner(reference, torch.float32)
-        for path in sources:
-            image = read_image(path)
-            row, candidate = timed_page(image, path.name, runners, FAMILY, FAMILY.batch)
-            reference_row, expected = timed_page(
-                image, path.name, {1: eager, FAMILY.batch: eager}, FAMILY, FAMILY.batch
-            )
-            row.update(comparison(candidate.numpy(), expected.numpy()))
-            row["within_eager_tolerance"] = within_tolerance(candidate, expected)
-            if not row["finite"]:
-                raise AssertionError(f"Non-finite output for {path.name}")
-            ref_png, native_png = output / f"{path.stem}-fp32.png", output / f"{path.stem}-session.png"
-            image_tensor(expected).save(ref_png)
-            image_tensor(candidate).save(native_png)
-            row["ssimulacra2"] = ssimulacra2(ref_png, native_png)
-            row["differing_rgb_samples"] = int(
-                np.count_nonzero(np.asarray(image_tensor(expected)) != np.asarray(image_tensor(candidate)))
-            )
-            row["reference_timing"] = reference_row
-            pages.append(row)
-            print(
-                f"{path.name}: {row['psnr_db']} dB, SSIMULACRA2 {row['ssimulacra2']}, "
-                f"batch-16 {row['batch_inference_seconds']:.3f} s",
-                flush=True,
-            )
-    reference_pages = [page["reference_timing"] for page in pages]
-    return pages, {"session": summarize(pages), "eager_fp32": summarize(reference_pages)}
+    eager = Runner(reference, torch.float32)
+    expected_pages = {}
+    reference_rows = []
+    for path in sources:
+        row, expected = timed_page(read_image(path), path.name, {1: eager, FAMILY.batch: eager}, FAMILY, FAMILY.batch)
+        expected_pages[path.name] = expected
+        image_tensor(expected).save(output / f"{path.stem}-fp32.png")
+        reference_rows.append(row)
+    result: dict[str, Any] = {"eager_fp32": {"pages": reference_rows, "summary": summarize(reference_rows)}}
+    for precision, dtype in PRECISIONS.items():
+        options = SessionOptions(precision=precision, dll_path=library)
+        # Batch-1 latency uses a separate session prepared once for batch 1.
+        with InferenceSession(model, options) as batched, InferenceSession(model, options) as single:
+            batched.prepare((FAMILY.batch, 3, FAMILY.tile, FAMILY.tile))
+            single.prepare((1, 3, FAMILY.tile, FAMILY.tile))
+            runners = {1: Runner(DeviceSession(single), dtype), FAMILY.batch: Runner(DeviceSession(batched), dtype)}
+            pages = []
+            for path in sources:
+                row, candidate = timed_page(read_image(path), path.name, runners, FAMILY, FAMILY.batch)
+                expected = expected_pages[path.name]
+                row.update(comparison(candidate.numpy(), expected.numpy()))
+                if not row["finite"]:
+                    raise AssertionError(f"{precision}: non-finite output for {path.name}")
+                rendered = output / f"{path.stem}-{precision}.png"
+                image_tensor(candidate).save(rendered)
+                row["ssimulacra2"] = ssimulacra2(output / f"{path.stem}-fp32.png", rendered)
+                pages.append(row)
+                print(
+                    f"{precision} {path.name}: {row['psnr_db']:.3f} dB, SSIMULACRA2 {row['ssimulacra2']:.3f}, "
+                    f"batch-16 {row['batch_inference_seconds']:.3f} s",
+                    flush=True,
+                )
+            result[precision] = {"pages": pages, "summary": summarize(pages)}
+    return result
 
 
 @torch.inference_mode()
@@ -309,7 +291,6 @@ def main() -> None:
         "library": str(library),
         "device": torch.cuda.get_device_name(),
         "torch": torch.__version__,
-        "output_tolerance": NETWORK_TOLERANCE,
         "inputs": {path.name: digest(path) for path in sources},
     }
     with tempfile.TemporaryDirectory(dir=args.output) as directory:
@@ -335,21 +316,16 @@ def main() -> None:
     generator = torch.Generator().manual_seed(9)
     cases["rect-9x9"] = torch.rand((1, 3, 9, 9), generator=generator)
     cases["rect-31x47-batch3"] = torch.rand((3, 3, 31, 47), generator=generator)
-    with (
-        InferenceSession(model, SessionOptions(dll_path=library)) as graph,
-        InferenceSession(model, SessionOptions(dll_path=library, enable_cuda_graph=False)) as direct,
-    ):
-        report["stress"] = check_stress(reference, {"graph": graph, "direct": direct}, cases, args.output)
-        report["session_info"] = graph.get_session_info()
-    report["enqueue"] = check_enqueue(library, model, reference)
+    report["stress"] = check_stress(reference, model, library, cases, args.output)
+    report["host_io"] = check_host_io(reference, model, library)
     report["cleanup"] = check_cleanup(library, model)
     report_path = args.output / "report.json"
     report_path.write_text(json.dumps(report, indent=2, allow_nan=False), encoding="utf-8")
     if args.pages:
-        report["pages"], report["summary"] = check_pages(reference, library, model, sources, args.output)
+        report["pages"] = check_pages(reference, library, model, sources, args.output)
         report_path.write_text(json.dumps(report, indent=2, allow_nan=False), encoding="utf-8")
     print(f"Wrote {report_path}")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

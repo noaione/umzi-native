@@ -1,9 +1,9 @@
 # GateRV2 native integration handoff
 
-Updated 2026-11-22. The GateRV2 FP32 package (family `3`, schema `1`) and its
-C++ `KernelSession` now run through `umzi_native.InferenceSession` and pass
-the shipping-path checks below. Pick up with FP16 execution, then profiling
-and tuning. [Architecture expansion plan](umzi-native-architecture-expansion.md)
+Updated 2026-11-22. GateRV2 packages (family `3`, schema `1`) run in the C++
+`KernelSession` in mixed precision and FP16, like GateRV3. There is no FP32
+execution mode. Both modes pass the shipping-path checks on Windows. The
+Linux build matches Windows bitwise. Pick up with the next tuning pass. [Architecture expansion plan](umzi-native-architecture-expansion.md)
 
 ## What is ready
 
@@ -86,40 +86,41 @@ checkpoint, image hashes, and tiling before running a candidate.
 | `gaterv2-native-validation/report.json` | Primitive checks, stage-by-stage FP32 deltas, all stress outputs, and per-page metrics |
 | `gaterv2-gaterv3-regression/{digital,idc}-session.json` | Aligned and odd-rectangle session checks for the rebuilt Windows DLL |
 
-## FP32 package and session
+## Native package and session
 
 - **Payload.** Section 1 holds the architecture as sixteen 32-bit values.
   Section 2 is a 644-entry table of FP32 parameter offsets and counts.
-  Section 3 holds the parameters in execution order, with Q/K/V concatenated
-  per latent block. Section 4 holds the checkpoint digest. The
+  Section 3 holds the parameters in execution order, with Q/K/V
+  concatenated per latent block. Section 4 holds the checkpoint digest. The
   [packer](../src/umzi_native/exporter/_gaterv2.py), the
   [reader](../src/umzi_native/_model.py), and the
   [session](../native/kernels/gaterv2/runner.cpp) derive the same parameter
   list. `python -m umzi_native export` and `read` handle GateRV2.
-- **Session.** It uses NCHW FP32, with cuDNN `CUDNN_FMA_MATH` convolutions
-  and no TF32. The [kernels](../native/kernels/gaterv2/kernels.cu) cover the
-  remaining operations and compile without fast math. The session takes any
-  batch and any valid padded shape. It supports CUDA Graph and direct
-  execution, and host and device I/O. Only the default precision is
-  accepted, kernel options are rejected, and no plan cache is written.
-- **Build.** [The build hook](../hatch_build.py) embeds GateRV2 cubins and the
-  PTX fallback next to GateRV3, with fast math disabled for GateRV2 only.
-- **Checks.** [The session validator](../scripts/validate_gaterv2_session.py)
-  covers deterministic export, ten rejection cases, 14 stress and shape cases
-  in both execution modes, batch consistency, device enqueue, cleanup, and
-  both pages. Both GateRV3 checkpoints re-exported byte for byte. They also
-  passed the session checker bitwise in mixed precision and FP16.
+- **Precision.** Both modes store FP16 NCHW features and run cuDNN
+  convolutions on an FP16 filter copy. Mixed precision uses FP32 RGB I/O and
+  FP32 convolution accumulation. FP16 uses FP16 RGB I/O and FP16
+  convolution arithmetic. Q/K normalization, the contractions, the key sum,
+  and the denominator stay FP32 in both modes, because all-FP16 attention
+  failed on flat tiles. The FP32 parity reference stays in
+  [the private runner](../scripts/reference/gaterv2_native.py).
+- **Session.** It accepts any batch and any valid padded shape, with CUDA
+  Graph or direct execution and host or device I/O. It rejects kernel
+  options and writes no plan cache.
+- **Build.** [The build hook](../hatch_build.py) embeds GateRV2 cubins and
+  PTX, with fast math disabled for GateRV2 only. On Linux, NVRTC 13.0 needs
+  `LD_LIBRARY_PATH` to include its wheel's `lib` directory.
 
 | Path | Batch-16 seconds | Input MPx/s | Mean batch-1 tile ms | Raw page PSNR dB | Page SSIMULACRA2 mean / min |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| C++ FP32 session (host I/O included) | 6.948 | 1.329 | 16.285 | 146.840 | 93.090 / 92.918 |
-| Eager FP32, same run | 9.112 | 1.013 | 50.844 | — | — |
+| Eager FP32, same run | 9.015 | 1.024 | 47.220 | — | — |
+| Native mixed | 3.633 | 2.542 | 7.716 | 74.067 | 90.578 / 90.367 |
+| Native FP16 | 3.525 | 2.619 | 7.849 | 70.431 | 90.450 / 90.111 |
 
-The checkerboard is the only case outside `atol=1e-5`, `rtol=5e-5`: two
-values reach 1.88e-5. Its attention denominator falls to 1.45e-4, and eager
-FP32 is itself 1.68e-5 from an FP64 run there. The session is 1.80e-5 from
-FP64. The validator accepts such a case only within 1.5 times eager FP32's
-FP64 error. [Session validation and measurements](umzi-native-architecture-expansion.md#gaterv2-fp32-package-and-session)
+Native times are synchronized device-resident enqueue calls. The
+checkerboard scores 44.681 dB in mixed precision and 32.923 dB in FP16. The
+Inductor candidate scores 35.727 dB and RTX 35.072 dB on that case. All
+stress outputs are finite, graph and direct execution match, and cleanup
+returns all device memory. [Validation, profile, and Linux details](umzi-native-architecture-expansion.md#gaterv2-native-package-and-session)
 
 ```powershell
 & $py scripts/build_native.py --output output/gaterv2-session/native --arch sm_86 --nvrtc-root output/nvrtc-13.0/nvidia/cu13
@@ -129,24 +130,18 @@ $env:PYTHONPATH = 'src;scripts'
 
 ## Where to pick up
 
-1. **Add FP16 execution.** Follow the corrected Inductor candidate. Run the
-   convolutions and elementwise work in FP16. Keep Q/K/V normalization, the
-   contractions, and the denominator in FP32, because the all-FP16 path
-   failed on flat tiles. Expose it as `UMZI_FP16` only after it passes the
-   stress, page, and SSIMULACRA2 checks against eager FP32. Compare it with
-   the Inductor and TensorRT-RTX FP16 rows above.
-2. **Profile, then tune.** The session uses straightforward kernels: the
-   inception and grouped convolutions, RMSNorm, and the attention reductions
-   each use one thread per output. cuDNN chooses its first FMA-math
-   algorithm without timing. Profile batch 16 and batch 1 before choosing
-   what to fuse or replace. Add a `.umplan` cache only if timed algorithm
-   selection pays for itself.
-3. **Measure device-resident throughput.** The page timings include the RGB
-   copies through host memory. Add a device-buffer timing path through
-   `umzi_session_enqueue` for comparison with the eager and RTX rows.
+1. **Tune the custom kernels.** The grouped local convolution and gate
+   (19.7% of batch-16 time) and the post-inception gate (9.7%) lead the
+   profile. Try fusing the gate into the fc2 input, writing NHWC directly
+   to avoid cuDNN's layout conversions, and timing cuDNN algorithm choices.
+   A shared-memory tile for the local convolution was slower as written.
+2. **Close the gap to TensorRT-RTX.** RTX FP16 runs 2.338 s and 4.880 ms
+   against native FP16 at 3.525 s and 7.849 ms. Keep page SSIMULACRA2 at or
+   above the RTX scores while tuning.
+3. **Add a plan cache only if algorithm timing pays off.** Reuse the GateRV3
+   `.umplan` format and keying.
 4. **Keep the regression loop.** After native changes, rerun the GateRV2
-   validator, both GateRV3 session checks, and the Linux build. The Linux
-   build has not been run with GateRV2 yet.
+   validator, both GateRV3 session checks, and the WSL comparison.
 
 After Python edits, run `ruff format scripts src`, `ruff check scripts src`,
 and `pyrefly check` from the repository root.
