@@ -325,6 +325,14 @@ def check_plan_cache(library: Path, model: Path, output: Path) -> dict[str, Any]
             )
         if expected_status == "hit" and info["diagnostics"]["timed_plans"]:
             raise AssertionError(f"{precision} batch {batch}: retimed a cache hit")
+        retained = info["buffer_bytes"]["workspace"]
+        peak = info["diagnostics"].get("peak_plan_workspace_bytes", retained)
+        if retained > peak or (expected_status == "hit" and peak != retained):
+            raise AssertionError(
+                f"{precision} batch {batch}: {expected_status} used peak workspace {peak} for {retained}"
+            )
+        if options.get("workspace_mib") == 0 and peak:
+            raise AssertionError(f"{precision} batch {batch}: allocated workspace with a zero cap")
         if not torch.isfinite(prediction).all():
             raise AssertionError(f"{precision} batch {batch}: cache validation returned non-finite values")
         return prediction, {"prepare_ms": prepare_ms, **info}

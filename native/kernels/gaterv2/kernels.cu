@@ -218,10 +218,16 @@ __device__ void output_conv(Io* out, const half* features, const float* weight, 
 //   Mode 1: PixelUnshuffle(2) of a, which has channels / 4 channels at 2x size
 //   Mode 2: mish(a), or mish(a) * vec + b
 //   Mode 3: a * vec[image, channel] + b
-template<int Mode>
+template<int Mode, bool FullTile = false, bool WriteNorm = true>
 __device__ void pixel_norm(half* out_x, half* out_norm, const half* a, const half* b, const float* vec,
                            const float* scale, const float* offset, int channels, int lanes, int pixels, int width,
                            float inverse_root, int total) {
+    if constexpr (FullTile) {
+        channels = 32;
+        lanes = 1;
+        pixels = 128 * 128;
+        inverse_root = 0.1767766952966369f;
+    }
     const int lane = threadIdx.x & (lanes - 1);
     const int pixel = grid_index() / lanes;
     const bool active = pixel < total;
@@ -252,7 +258,7 @@ __device__ void pixel_norm(half* out_x, half* out_norm, const half* a, const hal
                 }
             } else if (Mode == 2) {
                 load8(a + at, v);
-                if (vec) {
+                if (FullTile || vec) {
                     float shortcut[8];
                     load8(b + at, shortcut);
 #pragma unroll
@@ -270,7 +276,8 @@ __device__ void pixel_norm(half* out_x, half* out_norm, const half* a, const hal
                 for (int k = 0; k < 8; ++k) v[k] = fmaf(v[k], multiplier[k], shortcut[k]);
             }
 #pragma unroll
-            for (int k = 0; k < 8; ++k) sum = fmaf(v[k], v[k], sum);
+            for (int k = 0; k < 8; ++k)
+                if (WriteNorm) sum = fmaf(v[k], v[k], sum);
         }
     }
     sum = group_sum(sum, lanes);
@@ -281,8 +288,8 @@ __device__ void pixel_norm(half* out_x, half* out_norm, const half* a, const hal
         if (j < vectors) {
             const int c = 8 * (lane + j * lanes);
             const size_t at = size_t(pixel) * channels + c;
-            if (out_x) store8(out_x + at, x + 8 * j);
-            if (out_norm) {
+            if (FullTile || out_x) store8(out_x + at, x + 8 * j);
+            if (WriteNorm && (FullTile || out_norm)) {
                 float normalized[8];
 #pragma unroll
                 for (int k = 0; k < 8; ++k) normalized[k] = fmaf(scale[c + k], x[8 * j + k] * inverse, offset[c + k]);
@@ -300,21 +307,27 @@ __device__ void pixel_norm(half* out_x, half* out_norm, const half* a, const hal
 // gated output, reduced in a fixed order, for the average pool.
 constexpr int gate_rows = 4;
 
-extern "C" __global__ void local_gate(half* out, float* partial, const half* in, const float* weight,
-                                      const float* bias, int channels, int height, int width) {
+template<bool FullTile>
+__device__ void local_gate_tile(half* out, float* partial, const half* in, const float* weight,
+                                const float* bias, int channels, int height, int width) {
+    if constexpr (FullTile) {
+        channels = 32;
+        height = width = 128;
+    }
     __shared__ float2 sums[256];
-    const int pairs = channels / 2, columns = blockDim.x / pairs;
+    const int pairs = channels / 2, columns = 256 / pairs;
     const int p = threadIdx.x % pairs, column = threadIdx.x / pairs;
     const int x = blockIdx.x * columns + column, y0 = blockIdx.y * gate_rows, n = blockIdx.z;
     const int stride = 2 * channels;
     float w1[2][18], w2[2][18];
 #pragma unroll
-    for (int o = 0; o < 2; ++o)
-#pragma unroll
-        for (int t = 0; t < 18; ++t) {
-            w1[o][t] = weight[(2 * p + o) * 18 + t];
-            w2[o][t] = weight[(channels + 2 * p + o) * 18 + t];
-        }
+    for (int t = 0; t < 18; ++t) {
+        const float4 pair = reinterpret_cast<const float4*>(weight)[t * pairs + p];
+        w1[0][t] = pair.x;
+        w1[1][t] = pair.y;
+        w2[0][t] = pair.z;
+        w2[1][t] = pair.w;
+    }
     float a1[gate_rows][2], a2[gate_rows][2];
 #pragma unroll
     for (int r = 0; r < gate_rows; ++r) a1[r][0] = a1[r][1] = a2[r][0] = a2[r][1] = 0;
@@ -374,6 +387,16 @@ extern "C" __global__ void local_gate(half* out, float* partial, const half* in,
     }
 }
 
+extern "C" __global__ void local_gate(half* out, float* partial, const half* in, const float* weight,
+                                      const float* bias, int channels, int height, int width) {
+    local_gate_tile<false>(out, partial, in, weight, bias, channels, height, width);
+}
+
+extern "C" __global__ void local_gate32_128(half* out, float* partial, const half* in, const float* weight,
+                                            const float* bias, int channels, int height, int width) {
+    local_gate_tile<true>(out, partial, in, weight, bias, channels, height, width);
+}
+
 // Average pool from the local_gate partial sums, the channel-attention 1x1
 // projection, and gamma0: multiplier[n, o] = (W mean + b)[o] * gamma0[o].
 // Each block recomputes the means and produces eight outputs.
@@ -403,15 +426,11 @@ extern "C" __global__ void pool_project(float* multiplier, const float* partial,
 // groups of C/8. One thread computes eight channels of one pixel. Lanes of a
 // warp cover consecutive channel vectors of the same pixel, so their loads
 // coalesce, and each thread loops only over its vector's single kernel kind.
-extern "C" __global__ void inception_gate(half* out, const half* projected, const float* square,
-                                          const float* square_bias, const float* row, const float* row_bias,
-                                          const float* column, const float* column_bias, int channels, int height,
-                                          int width, int total) {
-    const int index = grid_index();
-    if (index >= total) return;
-    const int hidden = 3 * channels / 2, vectors = hidden / 8, stride = 2 * hidden;
-    const int ch = 8 * (index % vectors);
-    const int pixel = index / vectors;
+template<bool WholeVectors>
+__device__ void inception_vector(half* out, const half* projected, const float* square, const float* square_bias,
+                                  const float* row, const float* row_bias, const float* column, const float* column_bias,
+                                  int channels, int height, int width, int pixel, int ch) {
+    const int hidden = 3 * channels / 2, stride = 2 * hidden;
     const half* here = projected + size_t(pixel) * stride;
     float g[8], value[8];
     load8(here + ch, g);
@@ -419,17 +438,15 @@ extern "C" __global__ void inception_gate(half* out, const half* projected, cons
     const int conv = 2 * hidden - channels;
     const int branch = channels / 8, identity = channels - 3 * branch;
     const int j0 = ch - identity_gate;
-    if (ch < identity_gate) {
+    if (ch + 8 <= hidden - 3 * branch) {
         load8(here + hidden + ch, value);
-    } else if (j0 + 8 <= identity) {
-        load8(here + conv + j0, value);
     } else {
         const int pixels = height * width, rest = pixel % pixels;
         const int y = rest / width, x = rest % width;
         const half* image = projected + size_t(pixel - rest) * stride + conv + j0;
         const int first = (j0 - identity) / branch, last = (j0 + 7 - identity) / branch;
         float t[8];
-        if (j0 >= identity && first == last) {
+        if (WholeVectors || (j0 >= identity && first == last)) {
             // All eight channels use one kernel kind.
             const int group = j0 - identity - first * branch;
             if (first == 0) {
@@ -513,6 +530,38 @@ extern "C" __global__ void inception_gate(half* out, const half* projected, cons
 #pragma unroll
     for (int k = 0; k < 8; ++k) result[k] = mish(g[k]) * value[k];
     store8(out + size_t(pixel) * hidden + ch, result);
+}
+
+extern "C" __global__ void inception_gate(half* out, const half* projected, const float* square,
+                                          const float* square_bias, const float* row, const float* row_bias,
+                                          const float* column, const float* column_bias, int channels, int height,
+                                          int width, int total) {
+    const int index = grid_index(), vectors = 3 * channels / 16;
+    if (index < total)
+        inception_vector<false>(out, projected, square, square_bias, row, row_bias, column, column_bias,
+                                channels, height, width, index / vectors, 8 * (index % vectors));
+}
+
+// Every branch occupies a whole eight-channel vector when C is divisible by
+// 64. Put the identity and convolution branches in separate blocks so all
+// lanes in each warp execute the same branch.
+extern "C" __global__ void inception_gate_aligned(
+    half* out, const half* projected, const float* square, const float* square_bias, const float* row,
+    const float* row_bias, const float* column, const float* column_bias, int channels, int height, int width,
+    int pixels, unsigned identity_blocks, unsigned branch_blocks) {
+    const int branch = channels / 64;
+    unsigned block = blockIdx.x;
+    int offset = 0, vectors = 9 * branch;
+    if (block >= identity_blocks) {
+        block -= identity_blocks;
+        offset = (9 + int(block / branch_blocks)) * branch;
+        block %= branch_blocks;
+        vectors = branch;
+    }
+    const int index = block * blockDim.x + threadIdx.x;
+    if (index < pixels * vectors)
+        inception_vector<true>(out, projected, square, square_bias, row, row_bias, column, column_bias,
+                               channels, height, width, index / vectors, 8 * (offset + index % vectors));
 }
 
 // At C=32 the 48 gated channels are [36 identity | 4 square | 4 row | 4 column].
@@ -760,3 +809,11 @@ UMZI_PIXEL_NORM(0)
 UMZI_PIXEL_NORM(1)
 UMZI_PIXEL_NORM(2)
 UMZI_PIXEL_NORM(3)
+
+#define UMZI_PIXEL_NORM_FULL(NAME, MODE, WRITE_NORM) \
+extern "C" __global__ void NAME(half* x, half* norm, const half* a, const half* b, const float* v, \
+    const float* s, const float* o, int c, int lanes, int p, int w, float r, int t) \
+    { pixel_norm<MODE, true, WRITE_NORM>(x, norm, a, b, v, s, o, c, lanes, p, w, r, t); }
+UMZI_PIXEL_NORM_FULL(pixel_mish32_128, 2, false)
+UMZI_PIXEL_NORM_FULL(pixel_norm_mish32_128, 2, true)
+UMZI_PIXEL_NORM_FULL(pixel_norm_scaled32_128, 3, true)

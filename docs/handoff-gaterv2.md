@@ -3,10 +3,11 @@
 Updated 2026-11-22. GateRV2 packages (family `3`, schema `1`) run in the C++
 `KernelSession` in mixed precision and FP16. The session uses NHWC FP16
 features, fused kernels, timed plans, and compact weights. The compact build
-beat RTX in three paired page rounds on this workstation. The subsequent
-32-channel inception specialization reduced median batch-16 time by 9.9%
-in mixed and 6.6% in FP16. GateRV2 reuses tuned algorithms across sessions
-when `SessionOptions.cache_dir` is set. [Architecture expansion plan](umzi-native-architecture-expansion.md)
+beat RTX in three paired page rounds on this workstation. The current
+build improves on the 32-channel inception build by a further 8.2% in
+mixed and 10.9% in FP16 at batch 16, with 42.3 MiB less activation storage.
+GateRV2 reuses tuned algorithms across sessions when
+`SessionOptions.cache_dir` is set. [Architecture expansion plan](umzi-native-architecture-expansion.md)
 
 ## What is ready
 
@@ -121,6 +122,7 @@ checkpoint, image hashes, and tiling before running a candidate.
 | 6 | inception_gate: one kernel kind per 8-channel vector, mixed vectors handled per channel | Batch-16 ~49 ms |
 | 7 | VRAM: FP32 copy only for small kernel parameters (3.9 MB), FP16 for projections/filters (59 MB); tuning workspace freed after prepare; work buffers sized per role (3 instead of 4); decoder state reuses the consumed skip buffer | Batch 16: 524 → 232 MiB; batch 1: 278 → 92 MiB; speed unchanged in an interleaved A/B |
 | 8 | Specialize the 32-channel inception gate at 128×128 with fixed four-channel branch loads | About 56% less GPU time in the 32-channel gate at batch 16 and batch 1, in both precisions |
+| 9 | Share skip and scratch storage, allocate plan workspace on demand, vectorize local-gate weight loads, and group wider inception work by branch | Batch-16 activation buffers fell from 130.8 to 88.5 MiB. [Validation and paired results](#gate-and-memory-optimization) |
 
 Tried and dropped: shared-memory tile for local_gate (slower), shared-memory
 halo for inception_gate (no gain), cheaper Mish formula (no gain).
@@ -269,7 +271,7 @@ respectively. The report includes DLL and input hashes plus every timed
 tile's image, index, coordinates, and elapsed time.
 [Local paired report](../output/gaterv2-session/inception-fixed32-paired/report.json)
 
-The packaged validator passed all 15 stress inputs in both precisions,
+The packaged validator passed all 14 stress inputs in both precisions,
 including flat, tiny, and rectangular inputs. It also passed export,
 rejection, host I/O, graph and direct execution, plan-cache, and cleanup
 checks. The table gives the stress scores against eager FP32 with the
@@ -300,6 +302,111 @@ $env:PYTHONPATH = 'src;scripts'
   --output output/gaterv2-session/inception-fixed32-paired
 ```
 
+## Gate and memory optimization
+
+The activation arena gives encoder skips a fixed prefix and places temporary
+projections in the remaining space for each stage. The decoder reuses
+consumed skip space as it moves up the pyramid. The latent attention arrays
+share the space below the latent projection. The local gate and following
+scaled RMSNorm share a buffer in architectures with one writer per norm
+vector. All library tensor offsets keep 256-byte alignment.
+
+Prepare grows temporary workspace only when a validated or timed plan needs
+it, then retains the largest requirement among the selected plans.
+`peak_plan_workspace_bytes` records the largest explicit plan allocation
+during prepare. The cache validator checks that cache hits allocate only the
+retained size and zero-workspace sessions make no workspace allocations.
+
+The local gate loads four coalesced FP32 weights per pair and tap. At 32
+channels and 128×128, the local gate and the residual updates use fixed
+channel and tile dimensions. Widths divisible by 64 dispatch the inception
+identity, square, row, and column work in separate blocks. The FP32
+attention path and accumulation order are preserved. Grouping the
+32-channel inception work by branch raised its mixed batch-16 kernel time
+from 2.658 to 5.237 ms, so that stage keeps its interleaved mapping.
+[Packed-kernel profile](../output/gaterv2-session/full-opt-packed-profile.json)
+· [32-channel grouping probe](../output/gaterv2-session/full-opt-grouped-profile.json)
+
+### VRAM and workspace
+
+Windows RTX 3050 Laptop, 128×128 tiles, default tuning. The control is
+`1c9d607`. Activation bytes are reported by the session. Resident VRAM is the
+device free-memory delta after cached prepare, measured after initializing
+the CUDA context and allocating the caller's input.
+
+| Precision | Batch | Activation MiB, control → optimized | Resident MiB, control → optimized | Optimized peak workspace MiB, miss / hit |
+| --- | ---: | ---: | ---: | ---: |
+| Mixed | 16 | 130.799 → 88.516 | 204 → 160 | 24.143 / 0.008 |
+| FP16 | 16 | 130.799 → 88.516 | 200 → 156 | 9.000 / 0 |
+| Mixed | 1 | 8.175 → 5.532 | 76 → 74 | 9.205 / 3.002 |
+| FP16 | 1 | 8.175 → 5.532 | 74 → 70 | 9.000 / 0.626 |
+
+Activation storage fell by 32.3% at both batch sizes. The control reserved
+64 MiB of plan workspace during each prepare, including cache hits.
+These workspace peaks cover the explicit plan allocation. The resident
+delta includes driver and graph overhead. Each optimized cache hit reused
+its cold session's plans with bitwise-identical output.
+[Memory probe](../output/gaterv2-session/optimization-probes/memory.py)
+· [Local results](../output/gaterv2-session/full-opt-memory.json)
+
+### Paired inference timing and fidelity
+
+Four rotated Windows rounds compared both builds and precisions against the
+same eager CUDA FP32 reference. The benchmark used heuristic plans for both
+builds to control for independent autotuning. Each round uses a warmed CUDA
+Graph session for batch 16 and a separate one for 630 individually timed,
+synchronized batch-1 calls. All four rounds improved in both precision and
+batch-size combinations.
+
+| Precision | Batch-16 seconds, control → optimized | Input MPx/s, control → optimized | Mean batch-1 tile ms, control → optimized |
+| --- | ---: | ---: | ---: |
+| Mixed | 2.014 → 1.849 | 4.585 → 4.993 | 4.431 → 3.953 |
+| FP16 | 1.858 → 1.656 | 4.969 → 5.578 | 4.141 → 3.834 |
+
+| Precision | Page | Batch-16 seconds, control → optimized | Input MPx/s, control → optimized | Mean batch-1 tile ms, control → optimized | Raw PSNR dB | SSIMULACRA2 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Mixed | 085 | 1.017 → 0.921 | 4.542 → 5.015 | 4.360 → 3.886 | 77.571 | 90.798 |
+| Mixed | 086 | 1.001 → 0.933 | 4.612 → 4.951 | 4.320 → 3.926 | 78.301 | 90.285 |
+| FP16 | 085 | 0.928 → 0.825 | 4.976 → 5.597 | 4.122 → 3.801 | 73.545 | 90.658 |
+| FP16 | 086 | 0.913 → 0.831 | 5.057 → 5.558 | 4.169 → 3.765 | 74.166 | 90.164 |
+
+All rendered page tensors matched the control bit for bit within each
+precision. Pooled raw PSNR against eager FP32 was 77.920 dB for mixed and
+73.845 dB for FP16. SSIMULACRA2 mean / minimum was 90.541 / 90.285 and
+90.411 / 90.164, respectively. The report records every batch-1 tile's
+elapsed time, image name, index, and coordinates.
+[Local paired report](../output/gaterv2-session/optimized-paired/report.json)
+
+The default-tuned build returned finite outputs on all 14 stress inputs
+in both precisions. Graph and direct execution matched with shared plans.
+The shape-change cleanup probe recovered all device memory. Both GateRV3
+fixtures passed the session, cache, and CLI checks. Synthetic 16-, 32-, and
+64-base-channel fixtures matched the control bit for bit when switching
+between tiny and padded rectangular shapes in one session. Stress scores
+below compare with eager CUDA FP32.
+
+| Input | Mixed raw PSNR dB / SSIMULACRA2 | FP16 raw PSNR dB / SSIMULACRA2 |
+| --- | ---: | ---: |
+| Checkerboard | 35.420 / 95.555 | 34.561 / 94.884 |
+| Noise | 75.000 / 97.820 | 73.200 / 97.625 |
+
+[Local validation report](../output/gaterv2-session/optimized-validation/report.json)
+· [Synthetic layout checks](../output/gaterv2-session/optimized-other-shapes.json)
+
+```powershell
+$py = 'C:\Python314\python.exe'
+$env:PYTHONPATH = 'src;scripts'
+& $py scripts/build_native.py --output output/gaterv2-session/optimized-win --nvrtc-root output/nvrtc-13.0/nvidia/cu13
+& $py scripts/benchmark_gaterv2_backends.py `
+  --control-library output/gaterv2-session/inception-fixed32-win/umzi_native.dll `
+  --library output/gaterv2-session/optimized-win/umzi_native.dll `
+  --model output/gaterv2-session/inception-fixed32-validation/gaterv2.ummodel `
+  --output output/gaterv2-session/optimized-paired
+& $py scripts/validate_gaterv2_session.py `
+  --library output/gaterv2-session/optimized-win/umzi_native.dll `
+  --output output/gaterv2-session/optimized-validation --pages
+```
+
 ## Where to pick up
 
 The [GateRV2 plan-cache checks](umzi-native-architecture-expansion.md#gaterv2-plan-cache)
@@ -307,12 +414,9 @@ record prepare latency, key isolation, and recovery from corrupt or
 unavailable cache files. Graph and direct stress runs use the same cached
 plans so the dispatch comparison excludes differences from tuning.
 
-1. **Next speed work.** In the specialized build's mixed batch-16 profile,
-   the local gate accounts for 19.4% of GPU kernel time and the two residual
-   RMSNorm kernels together account for 16.3%. Check whether the local gate
-   output can be written directly as the next norm input.
-2. **Further VRAM:** skips for all levels are kept (about 45 MiB at batch
-   16); a lifetime planner like GateRV3's could share them with work buffers.
+The current path uses cuBLASLt for biased projections and cuDNN for scale
+convolutions. Compare further changes against the paired page benchmark and
+the default-tuned cache checks.
 
 After Python edits, run `ruff format scripts src`, `ruff check scripts src`,
 and `pyrefly check` from the repository root.

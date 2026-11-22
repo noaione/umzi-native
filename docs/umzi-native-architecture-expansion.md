@@ -254,6 +254,7 @@ algorithms. [GateRV2 session options](quickstart.md#gaterv2-kernel-options)
 | 6 | Select one inception branch per eight-channel vector where possible | About 49 ms per mixed batch-16 forward |
 | 7 | Pack only the weight copies each operator uses, release unused tuning workspace, size three work buffers by role, and reuse the consumed skip as decoder state | Mixed VRAM fell from 524 to 232 MiB at batch 16 and from 278 to 92 MiB at batch 1 |
 | 8 | Specialize the 32-channel 128×128 inception gate with four-channel depthwise branch loads | About 56% less GPU time in the specialized gate in both precisions. [Profile and paired validation](handoff-gaterv2.md#32-channel-inception-gate) |
+| 9 | Share activation storage, size plan workspace on demand, and optimize local gate, RMSNorm, and wider inception dispatch | Batch-16 activation buffers fell from 130.8 to 88.5 MiB. [Paired timing and VRAM results](handoff-gaterv2.md#gate-and-memory-optimization) |
 
 Shared-memory tiling for the local and inception gates and a cheaper Mish
 formula were evaluated in the earlier experiments. The timing details and
@@ -306,6 +307,8 @@ options, GPU, driver, cuDNN, and cuBLASLt versions. The session checks
 cached algorithms against their current descriptors and workspace before
 reuse. Invalid plans are selected again. Cache read and write failures
 remain visible through `cache_status` and `cache_message`.
+On a validated cache hit, prepare allocates only the largest workspace
+requested by a selected plan. [Workspace measurements](handoff-gaterv2.md#gate-and-memory-optimization)
 [Shared cache implementation](../native/common/cuda_plan_cache.h)
 
 Windows measurements cover `session.prepare()` for 128×128 tiles,

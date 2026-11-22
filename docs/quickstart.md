@@ -108,12 +108,13 @@ The package header selects the kernel family. `session.kernel`,
 | Key | Default | Effect |
 | --- | ---: | --- |
 | `tune_plans` | `1` | Time cuBLASLt and cuDNN candidates when preparing a shape. Set `0` to use the first heuristic plan and shorten prepare. |
-| `workspace_mib` | `64` | Cap the candidate workspace in MiB. Accepts integers from `0` to `1024`. Prepare retains only the workspace needed by the selected plans. |
+| `workspace_mib` | `64` | Cap the candidate workspace in MiB. Accepts integers from `0` to `1024`. Prepare grows workspace as needed and retains the size required by the selected plans. |
 
 For example, use `SessionOptions(kernel_options={"tune_plans": 0})` when
 prepare latency matters on a new shape. Set `cache_dir` to keep the chosen
 plans in `gaterv2_<hex-key>.umplan` files. With a compatible cache hit,
 the session reuses those algorithms with `timed_plans == 0`. Inspect
-`timed_plans`, `plan_workspace_bytes`,
-`fp32_weight_bytes`, and `fp16_weight_bytes` in
-`get_session_info()["diagnostics"]`. [GateRV2 measurements](handoff-gaterv2.md)
+`peak_plan_workspace_bytes` for the largest workspace allocation during
+prepare and `plan_workspace_bytes` for the retained size. The same
+`get_session_info()["diagnostics"]` dictionary reports `fp32_weight_bytes`
+and `fp16_weight_bytes`. [GateRV2 measurements](handoff-gaterv2.md)
