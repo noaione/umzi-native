@@ -1329,6 +1329,8 @@ int report_errors(F action) noexcept {
 
 std::unique_ptr<umzi::KernelSession> umzi::make_gaterv3(const ModelPackage& package,
                                                       const UmziSessionOptions& options) {
+    if (options.precision != UMZI_MIXED && options.precision != UMZI_FP16)
+        throw std::runtime_error("Unsupported GateRV3 session precision");
     auto session = std::make_unique<GateSession>();
     session->open(package, options);
     return session;
@@ -1428,19 +1430,21 @@ int session_cli(int argc, char** argv) {
     if (argc == 2 || (argc == 3 && std::string(argv[2]) == "--help")) {
         std::cout
             << "Usage: umzi_native run --model file --batch N --height H --width W --input raw --output raw\n"
-            << "  --precision mixed|fp16   Select RGB and accumulator precision (default: mixed)\n"
+            << "  --precision mixed|fp16|fp32   Select a precision supported by the model (default: mixed)\n"
             << "  --device index           Select a CUDA device (default: 0)\n"
             << "  --cache-dir path         Read and write tuned plans in this directory\n"
             << "  --direct                 Dispatch inference without capturing a CUDA Graph\n"
             << "  --fuse-silu              Try cuDNN convolution/SiLU fusion at eligible sites\n"
             << "  --tune-projections       Time a wider cuBLASLt candidate search under CUDA Graph replay\n"
             << "  --fuse-gate-pool         Fuse eligible 128x128 grouped gate/pooling sites\n"
-            << "  --fp16-qkv               Use FP16 accumulation for QKV in mixed precision\n";
+            << "  --fp16-qkv               Use FP16 accumulation for QKV in mixed precision\n"
+            << "  --unexact-erf            Use CUDA erff for GFISRv2 Fourier GELU\n";
         return argc == 2 ? 2 : 0;
     }
     return report_errors([&] {
         UmziSessionOptions options{sizeof(UmziSessionOptions), 0, UMZI_MIXED, UMZI_CUDA_GRAPH};
         uint32_t gate_flags = 0;
+        bool unexact_erf = false;
         std::string model, input, output;
         uint32_t batch = 0, height = 0, width = 0;
         for (int i = 2; i < argc; ++i) {
@@ -1451,6 +1455,10 @@ int session_cli(int argc, char** argv) {
             }
             if (name == "--direct") {
                 options.flags &= ~UMZI_CUDA_GRAPH;
+                continue;
+            }
+            if (name == "--unexact-erf") {
+                unexact_erf = true;
                 continue;
             }
             if (++i >= argc) throw std::runtime_error("Missing value for " + name);
@@ -1469,7 +1477,8 @@ int session_cli(int argc, char** argv) {
                 std::string mode = argv[i];
                 if (mode == "fp16") options.precision = UMZI_FP16;
                 else if (mode == "mixed") options.precision = UMZI_MIXED;
-                else throw std::runtime_error("Precision must be mixed or fp16");
+                else if (mode == "fp32") options.precision = UMZI_FP32;
+                else throw std::runtime_error("Precision must be mixed, fp16, or fp32");
             } else throw std::runtime_error("Invalid option " + name);
         }
         if (model.empty() || input.empty() || output.empty())
@@ -1477,6 +1486,7 @@ int session_cli(int argc, char** argv) {
         std::vector<UmziOption> flags;
         for (const auto& flag : gate_options)
             if (gate_flags & flag.second) flags.push_back({flag.first, 1});
+        if (unexact_erf) flags.push_back({"unexact_erf", 1});
         options.kernel_options = flags.data();
         options.kernel_option_count = static_cast<uint32_t>(flags.size());
         std::unique_ptr<UmziSession, decltype(&umzi_session_close)> session(

@@ -15,6 +15,7 @@ import numpy as np
 
 from ._abi import IoABI, ModelABI, ShapeABI, TensorABI, check_status, open_session, read_session_info, session_setup
 from ._loader import PathArg, find_session_library, load_cuda_libraries, load_session_library
+from ._model import GFISRV2_FAMILY, MAGIC, PREFIX
 
 __all__ = ["InferenceSession", "SessionOptions", "TensorInfo"]
 
@@ -56,8 +57,8 @@ class InferenceSession:
 
     def __init__(self, model_path: PathArg, sess_options: SessionOptions | None = None):
         options = sess_options if sess_options is not None else SessionOptions()
-        if options.precision not in ("mixed", "fp16"):
-            raise ValueError("precision must be 'mixed' or 'fp16'")
+        if options.precision not in ("mixed", "fp16", "fp32"):
+            raise ValueError("precision must be 'mixed', 'fp16', or 'fp32'")
         device_id = operator.index(options.device_id)
         if not 0 <= device_id < 2**31:
             raise ValueError("device_id must be a non-negative CUDA device index")
@@ -76,7 +77,12 @@ class InferenceSession:
         self._library = find_session_library(model, options.dll_path)
         self._lock = Lock()
         if options.dll_dirs:
-            load_cuda_libraries(*options.dll_dirs)
+            with model.open("rb") as file:
+                header = file.read(PREFIX.size)
+            is_gfisrv2 = (
+                len(header) == PREFIX.size and header[:8] == MAGIC and PREFIX.unpack(header)[2] == GFISRV2_FAMILY
+            )
+            load_cuda_libraries(*options.dll_dirs, include_cufft=is_gfisrv2)
         self._dll = load_session_library(self._library)
         self._handle = open_session(
             self._dll, model, device_id, options.precision, options.enable_cuda_graph, cache, kernel_options

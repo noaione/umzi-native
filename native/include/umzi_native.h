@@ -22,7 +22,7 @@ typedef enum UmziStatus {
     UMZI_OK = 0, UMZI_ERROR = -1, UMZI_OUT_OF_MEMORY = -2
 } UmziStatus;
 typedef enum UmziPrecision {
-    UMZI_MIXED = 0, UMZI_FP16 = 1
+    UMZI_MIXED = 0, UMZI_FP16 = 1, UMZI_FP32 = 2
 } UmziPrecision;
 typedef enum UmziDtype {
     UMZI_FLOAT32 = 1, UMZI_FLOAT16 = 2

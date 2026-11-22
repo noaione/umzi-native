@@ -166,7 +166,7 @@ records the current MoESR state and the next steps.
 | --- | --- | --- | --- |
 | GateRV2 | Verified | FP32, RTX FP16, and Inductor FP16 with FP32 attention measured | Package (family 3, schema 1) and C++ session in mixed and FP16 validated on Windows and Linux; first tuning pass done |
 | MoESR | Verified, supplied ONNX validated | FP32, Inductor FP16, and RTX FP16 measured | [Private FP32 parity](#moesr-private-fp32-validation) and [family-4 mixed/FP16 session](#moesr-native-package-and-session) validated on Windows and Linux wheels (Pass 4: 1.84× RTX in FP16, 1.14× RTX in 68.2 dB mixed) |
-| GFISRv2 | Verified, prior handoff reviewed | FP32, eager FP16, and Inductor FP16 measured, flat-tile fidelity failure traced, RTX skipped | [Private FP32 parity with cuFFT](#gfisrv2-private-fp32-parity). Package and C++ session pending |
+| GFISRv2 | Verified, prior handoff reviewed | FP32, eager FP16, and Inductor FP16 measured, flat-tile fidelity failure traced, RTX skipped | [Packaged native FP32 session](#gfisrv2-native-fp32-package-and-session) verified on Windows. |
 
 ### GateRV2 private FP32 validation
 
@@ -695,7 +695,162 @@ $env:PYTHONPATH = 'src;scripts'
 & 'C:\Python314\python.exe' scripts/validate_gfisrv2.py --pages
 ```
 
-The next native integration step is to move the transforms, packing,
-and normalization into the C++ path and rerun the saved FP32 comparison
-before reducing precision.
 [Local validation report](../output/gfisrv2-native-validation/report.json)
+
+### GFISRv2 native FP32 package and session
+
+Family 2, schema 1 stores fixed architecture metadata, FP32 OIHW weights
+and biases, and the checkpoint SHA-256. Two exports produced the same
+16,887,428-byte file. Python and C++ rejected invalid schema, architecture,
+and weight sections. The runtime allocates input and 4× output independently.
+The DLL loads cuFFT 12 when opening GFISRv2 and creates forward and inverse
+FP32 plans with reusable work areas before capturing the graph. Convolutions
+use cuDNN FP32 FMA math. Use `precision="fp32"` to select this path
+explicitly. The default `mixed` selector currently uses the same FP32 path.
+
+The first native build diverged from eager FP32 on flat gray. The first
+different tensor in the trace was the learned spectrum after exact GELU
+in the first Fourier unit. The CUDA 13.0 `erff` differed by up to one FP32
+ULP from the CUDA 13.2 PyTorch reference on the traced spectrum. The native
+kernel reproduces the reference's rounding while retaining the CUDA 13.0
+build target. The complete 256×256 flat-gray trace matched after the fix.
+
+On the RTX 3050 Laptop GPU, 13 of 18 stress outputs matched eager FP32 bit for
+bit, including 0.5 gray, 128/255 gray, checkerboard, noise, and distinct batch
+inputs. The five inputs from 1×1 to 8×9 passed the FP32 tolerance with a worst
+absolute error of 2.19e-5. All 18 matched between graph and direct execution.
+The host API, alternate CUDA stream, and native CLI also agreed bit for bit.
+Both flat-gray renders scored 100 SSIMULACRA2. Each 256×256 gray input
+produces a visibly textured 1024×1024 result in both implementations. The raw
+output range was −2.6953 to 3.4432 for 0.5 gray and −1.5791 to 2.5717 for
+128/255 gray before clipping for PNG.
+[Flat-gray PNGs](../output/gfisrv2-session/erf-off/stress-renders/)
+· [Raw arrays and inputs](../output/gfisrv2-session/erf-off/stress-raw/)
+
+All three pages matched the saved eager FP32 outputs bit for bit, with zero raw
+error, infinite PSNR, and 100 SSIMULACRA2 per page. The run used 256×256 tiles
+with 32 px overlap and separate warmed sessions for batch 2 and batch 1.
+Batch-2 throughput uses the unpadded input image area. The report contains all
+72 individually timed, synchronized batch-1 calls with tile coordinates.
+
+| Page | Batch-2 time (s) | Input MPx/s | Mean batch-1 tile (ms) |
+| --- | ---: | ---: | ---: |
+| `lb-page-003.png` | 4.809 | 0.2526 | 208.768 |
+| `lb-page-004.png` | 5.231 | 0.2323 | 215.405 |
+| `lb-page-005.png` | 4.757 | 0.2554 | 203.692 |
+| All three | 14.798 | 0.2463 | 209.288 |
+
+```powershell
+$py = 'C:\Python314\python.exe'
+$build = 'output/gfisrv2-session/validated-win'
+& $py scripts/build_native.py --output $build --nvrtc-root output/nvrtc-13.0/nvidia/cu13
+& $py scripts/validate_gfisrv2_session.py --library "$build/umzi_native.dll" --cli "$build/umzi_native.exe" --pages
+```
+
+[Native validation report](../output/gfisrv2-session/validated/report.json)
+
+GateRV2, both GateRV3 packages, and MoESR passed the mixed and FP16 Windows
+session checks, including CLI parity and plan-cache reopen. Those processes
+ran without PyTorch and loaded no cuFFT module. The GFISRv2 smoke check
+verified both erf settings with standalone CUDA libraries. The default mixed
+selector matched explicit FP32 with `unexact_erf=0` bit for bit on flat gray.
+[Session regression reports](../output/gfisrv2-session/regression/)
+
+#### Optional CUDA erf
+
+Set `kernel_options={"unexact_erf": 1}` or use the native CLI's
+`--unexact-erf` switch to select CUDA `erff` in the Fourier GELU.
+`unexact_erf=0` is the default. Both settings use FP32 and the same package.
+The enabled mode changed the pattern on both gray tiles while leaving strong
+crosshatching visible. RMSE below measures deviation from the uniform input
+level. PSNR and SSIMULACRA2 compare with untouched PyTorch FP32.
+
+| Input level | RMSE to flat level, off → on | Output outside [0, 1], off → on | Enabled PSNR (dB) | Enabled SSIMULACRA2 |
+| --- | ---: | ---: | ---: | ---: |
+| 0.5 | 0.36706 → 0.36516 | 18.71% → 18.33% | 8.194 | −124.823 |
+| 128/255 | 0.36614 → 0.36515 | 18.73% → 18.50% | 8.120 | −125.217 |
+
+[Renders with the option off](../output/gfisrv2-session/erf-off/stress-renders/)
+· [Renders with the option on](../output/gfisrv2-session/erf-on/stress-renders/)
+· [Enabled raw arrays](../output/gfisrv2-session/erf-on/stress-raw/)
+· [Gray comparison archive](../output/gfisrv2-session/flat-gray-erf-comparison.zip)
+
+The enabled mode stayed finite on all 18 stress inputs. The graph, direct,
+host and device, and CLI checks passed. It also stayed finite on all three
+pages. The rendered MangaScale pages scored 88.585 mean SSIMULACRA2 with the
+option on. On `lb-page-003.png`, 660 of 58,320,000 rendered channel values
+changed by one 8-bit level.
+
+| Page | Batch-2 time (s) | Input MPx/s | Mean batch-1 tile (ms) | Raw PSNR (dB) | SSIMULACRA2 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `lb-page-003.png` | 4.947 | 0.2456 | 208.165 | 137.314 | 89.546 |
+| `lb-page-004.png` | 4.891 | 0.2484 | 207.430 | 131.655 | 89.050 |
+| `lb-page-005.png` | 4.861 | 0.2500 | 203.283 | 69.015 | 87.160 |
+| All three | 14.698 | 0.2480 | 206.293 | 73.786 | 88.585 |
+
+```powershell
+$py = 'C:\Python314\python.exe'
+$build = 'output/gfisrv2-session/erf-option-win'
+& $py scripts/build_native.py --output $build --nvrtc-root output/nvrtc-13.0/nvidia/cu13
+& $py scripts/validate_gfisrv2_session.py --library "$build/umzi_native.dll" --cli "$build/umzi_native.exe" --output output/gfisrv2-session/erf-off
+& $py scripts/validate_gfisrv2_session.py --library "$build/umzi_native.dll" --cli "$build/umzi_native.exe" --output output/gfisrv2-session/erf-on --unexact-erf --pages
+```
+
+[Disabled report](../output/gfisrv2-session/erf-off/report.json)
+· [Enabled report and per-tile timings](../output/gfisrv2-session/erf-on/report.json)
+
+#### Flat-gray padding diagnostic
+
+On a 256×256 RGB tile filled with 0.5, untouched eager FP32 produced
+crosshatching with two prominent irregular blobs. In one diagnostic, changing
+the first convolution to replicate padding moved the irregular patches.
+Changing all padded spatial convolutions to replicate padding removed the
+two visible blobs on that tile. The fine crosshatching remained. The
+diagnostic kept the checkpoint and the Fourier layers' padding and arithmetic.
+
+| Variant | Std. dev. of local mean brightness | RMSE from constant 0.5 |
+| --- | ---: | ---: |
+| Untouched eager FP32 | 0.01337 | 0.36706 |
+| Replicate on first convolution | 0.00832 | 0.37213 |
+| Replicate on all spatial convolutions | 0.00282 | 0.39152 |
+| Untouched eager FP16 | 0.00446 | 0.39287 |
+
+Local means use interior 32×32 output patches and the mean of the three
+RGB channels. The replicate result had about 4.7× less variation between
+patches. Per-pixel deviation from flat gray increased, so these measurements
+describe different properties of the output. The native runtime uses the
+checkpoint's original zero padding. The replicate test covered one uniform
+tile. Effects at page seams, text edges and halftone regions are unmeasured.
+[Original FP32](../output/gfisrv2-session/diagnose-gray/eager_fp32.png)
+· [All spatial convolutions](../output/gfisrv2-session/diagnose-gray/replicate_spatial_convs.png)
+· [First convolution only](../output/gfisrv2-session/diagnose-gray/replicate_first_conv.png)
+· [Eager FP16](../output/gfisrv2-session/diagnose-gray/eager_fp16.png)
+
+A constant-per-channel input to the first Fourier unit had zero non-DC
+coefficients at the forward FFT. The learned spectral layers populated
+non-DC coefficients before the inverse FFT. In a separate test, using CUDA
+13.0 `erff` only in the first GELU changed that activation by at most
+4.77e-7 and the final RGB output by 2.45 on flat gray. In block 3 the
+maximum difference grew from 4.16e-4 to 0.201 across spectral RMSNorm.
+The same first-GELU change moved the final output by at most 2.21e-5 on
+random input. [Probe source](../output/gfisrv2-session/diagnose-gray/diagnose.py)
+· [Diagnostic report](../output/gfisrv2-session/diagnose-gray/report.json)
+
+#### Next GFISRv2 milestone
+
+1. Implement a native FP16 control with the original zero padding. Keep the
+   cuFFT transforms in FP32 and reproduce eager FP16's rounding boundaries
+   around the Fourier layers. Compare against eager FP16 for implementation
+   parity and against untouched FP32 for numeric fidelity.
+2. Establish mixed precision with FP32 RGB I/O. Start by keeping the
+   Fourier unit and residual additions in FP32 while testing narrower
+   spatial weights and activations. Change one precision boundary at a time.
+3. Compare both candidates on the three MangaScale pages using 256×256
+   tiles, batch 2 and 32 px overlap. Record raw PSNR, SSIMULACRA2, VRAM,
+   batch-2 throughput and actual synchronized batch-1 tile latency. Include
+   flat gray and checkerboard, and inspect the gray renders for blob and
+   texture changes. Tune kernels after these controls are established.
+
+Replicate padding remains a model-behavior experiment. A follow-up would
+compare it on actual MangaScale pages, especially panel edges, halftones
+and tile overlaps.

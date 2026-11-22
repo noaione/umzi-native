@@ -18,6 +18,7 @@ PACKAGE_DIR = Path(__file__).resolve().parent
 # components by name at run time, so the explicit loader preloads them too.
 CUDA_LIBRARIES = ("cublasLt64_13.dll", "cudnn64_9.dll") if WINDOWS else ("libcublasLt.so.13", "libcudnn.so.9")
 CUDNN_COMPONENTS = "cudnn_*64_9.dll" if WINDOWS else "libcudnn_*.so.9"
+CUFFT_LIBRARY = "cufft64_12.dll" if WINDOWS else "libcufft.so.12"
 _load_lock = Lock()
 _session_libraries: dict[Path, ctypes.CDLL] = {}
 _cuda_libraries: dict[Path, ctypes.CDLL] = {}
@@ -30,7 +31,7 @@ def _load(path: Path) -> ctypes.CDLL:
     return ctypes.CDLL(str(path))
 
 
-def load_cuda_libraries(*directories: PathArg) -> dict[str, Path]:
+def load_cuda_libraries(*directories: PathArg, include_cufft: bool = False) -> dict[str, Path]:
     """Load cuBLASLt 13 and cuDNN 9 from explicit directories.
 
     Call this before opening a session when no other module, such as CUDA
@@ -39,6 +40,7 @@ def load_cuda_libraries(*directories: PathArg) -> dict[str, Path]:
     the cuDNN components beside ``cudnn`` are preloaded because cuDNN opens
     them by name later. Neither ``PATH`` nor ``LD_LIBRARY_PATH`` is changed.
 
+    With `include_cufft`, also preload cuFFT 12 if it is in the directories.
     Returns the resolved path of each loaded library, keyed by file name.
     """
     folders = [Path(path).resolve() for path in directories]
@@ -68,9 +70,14 @@ def load_cuda_libraries(*directories: PathArg) -> dict[str, Path]:
     components = sorted(cudnn.parent.glob(CUDNN_COMPONENTS))
     # cuDNN's engine libraries import the graph library, so load it first.
     components.sort(key=lambda path: "graph" not in path.name)
+    fft = (
+        next((folder / CUFFT_LIBRARY for folder in folders if (folder / CUFFT_LIBRARY).is_file()), None)
+        if include_cufft
+        else None
+    )
     loaded = {}
     with _load_lock:
-        for path in (*optional, cublas, *components, cudnn):
+        for path in (*optional, cublas, *components, cudnn, *((fft,) if fft else ())):
             if path not in _cuda_libraries:
                 try:
                     _cuda_libraries[path] = _load(path)

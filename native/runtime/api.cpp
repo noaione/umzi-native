@@ -69,7 +69,7 @@ UmziSession* umzi_session_open(const char* path, const UmziSessionOptions* optio
         if (!path || !*path) throw std::runtime_error("An Umzi model path is required");
         if (!options) options = &defaults;
         if (options->struct_size < sizeof(*options) || options->reserved || options->device < 0
-            || options->precision > UMZI_FP16 || (options->flags & ~UMZI_CUDA_GRAPH)
+            || options->precision > UMZI_FP32 || (options->flags & ~UMZI_CUDA_GRAPH)
             || options->kernel_option_count > 64 || (options->kernel_option_count && !options->kernel_options))
             throw std::runtime_error("Invalid Umzi session options");
         const umzi::ModelPackage package(std::filesystem::u8path(path));

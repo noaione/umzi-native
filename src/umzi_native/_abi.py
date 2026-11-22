@@ -130,7 +130,14 @@ def open_session(
         *(OptionABI(name.encode("utf-8"), value) for name, value in kernel_options.items())
     )
     options = OptionsABI(
-        ctypes.sizeof(OptionsABI), device, int(precision == "fp16"), int(graph), cache_dir, entries, len(entries), 0
+        ctypes.sizeof(OptionsABI),
+        device,
+        {"mixed": 0, "fp16": 1, "fp32": 2}[precision],
+        int(graph),
+        cache_dir,
+        entries,
+        len(entries),
+        0,
     )
     handle = dll.umzi_session_open(str(path).encode("utf-8"), ctypes.byref(options))
     if not handle:

@@ -8,6 +8,7 @@ namespace umzi {
 KernelFactory kernel_factory(uint32_t family) {
     switch (family) {
         case gaterv3_id: return make_gaterv3;
+        case gfisrv2_id: return make_gfisrv2;
         case gaterv2_id: return make_gaterv2;
         case moesr_id: return make_moesr;
 #ifdef UMZI_TEST_KERNEL

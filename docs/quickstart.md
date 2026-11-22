@@ -2,7 +2,7 @@
 
 `umzi-native` runs packed `.ummodel` packages on NVIDIA GPUs through one
 Python API (`InferenceSession`) across all supported model families:
-**GateRV3**, **GateRV2**, and **MoESR**.
+**GateRV3**, **GateRV2**, **MoESR**, and **GFISRv2**.
 
 **Prerequisites:**
 
@@ -58,7 +58,8 @@ Image.fromarray(png).save("output/restored-tile.png")
 - **Precision and dtype must match:**
   - `precision="mixed"` (default) expects `np.float32` input and returns `np.float32`.
   - `precision="fp16"` expects `np.float16` input (`tiles.astype(np.float16)`) and returns `np.float16`.
-  - Both modes use the exact same `.ummodel` file.
+  - `precision="fp32"` selects the GFISRv2 FP32 path and uses `np.float32` input and output.
+  - The same `.ummodel` file works with all precision modes supported by its family.
 - **Batching:** Stack multiple equal-size CHW tiles with `np.stack(chw_tiles)`
   to get `(N, 3, H, W)`; `restored[i]` corresponds to tile `i`.
 - **Padding and dynamic shapes:** The runtime automatically pads each tile to
@@ -85,7 +86,7 @@ model-specific kernel switches.
 
 | Field | Default | What it does |
 | --- | --- | --- |
-| `precision` | `"mixed"` | `"mixed"` uses FP32 NumPy I/O and FP32 accumulation in convolutions/projections for maximum fidelity. `"fp16"` uses FP16 NumPy I/O and the native FP16 compute path for maximum speed. |
+| `precision` | `"mixed"` | GateRV3, GateRV2, and MoESR support mixed precision with FP32 NumPy I/O and FP16 precision with FP16 NumPy I/O. GFISRv2 runs in FP32 with either `"fp32"` or the default `"mixed"` selector. |
 | `device_id` | `0` | CUDA GPU index to run on (respects `CUDA_VISIBLE_DEVICES`). |
 | `cache_dir` | `None` | Writable directory for saving and reusing tuned GPU algorithm choices (`<family>_<key>.umplan`). **Strongly recommended:** first run tunes and writes the file; later runs skip tuning. Keys include the model, padded shape, precision, relevant options, GPU, driver, and CUDA/cuDNN versions. CUDA Graphs are still captured per process. |
 | `enable_cuda_graph` | `True` | Captures the forward pass into a CUDA Graph and replays it to cut CPU launch overhead. Set `False` to submit kernels directly (still uses tuned cuBLASLt/cuDNN plans). |
@@ -123,7 +124,7 @@ standalone = umzi.SessionOptions(
 ## 4. Model-specific `kernel_options`
 
 The `.ummodel` header automatically selects the kernel family (`gaterv3`,
-`gaterv2`, or `moesr`). Each family accepts its own `kernel_options` keys as
+`gaterv2`, `moesr`, or `gfisrv2`). Each family accepts its own `kernel_options` keys as
 integers.
 
 ### GateRV3
@@ -202,6 +203,23 @@ low_vram = umzi.SessionOptions(
 
 More detail: [MoESR measurements](handoff-moesr.md).
 
+### GFISRv2
+
+GFISRv2 returns a 4× RGB result and requires cuFFT 12. If you load the
+dependencies with `dll_dirs`, include the directory containing
+`cufft64_12.dll` on Windows or `libcufft.so.12` on Linux. The GFISRv2 session
+loads cuFFT when it opens.
+
+| Option | Default | Valid values | What it does |
+| --- | ---: | --- | --- |
+| `unexact_erf` | `0` | `0` or `1` | `0` uses the PyTorch reference's erf rounding for Fourier GELU. `1` uses the build toolchain's CUDA `erff`. The native CLI enables this via `--unexact-erf`. |
+
+```python
+options = umzi.SessionOptions(precision="fp32", kernel_options={"unexact_erf": 1})
+```
+
+See the [GFISRv2 validation and gray renders](umzi-native-architecture-expansion.md#gfisrv2-native-fp32-package-and-session).
+
 ## 5. Inspecting models and sessions
 
 ### Before opening a session (`peek_model`)
@@ -215,7 +233,7 @@ print(info.family_name, info.supported, info.problems)
 
 ### On an open session
 
-- **Metadata properties:** `session.kernel` (`"gaterv3"`, `"gaterv2"`, or `"moesr"`),
+- **Metadata properties:** `session.kernel` (`"gaterv3"`, `"gaterv2"`, `"moesr"`, or `"gfisrv2"`),
   `session.scale_factor`, `session.context`,
   `session.library_path`, `session.closed`.
 - **Runtime diagnostics (`session.get_session_info()`):** Call after

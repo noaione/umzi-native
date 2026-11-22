@@ -24,9 +24,9 @@ import numpy as np
 CASES = ((1, 3, 128, 128), (3, 3, 65, 79))
 WINDOWS = sys.platform == "win32"
 CUDA_NAMES = (
-    ("cublasLt64_13.dll", "cudnn64_9.dll", "cudnn_graph64_9.dll")
+    ("cublasLt64_13.dll", "cudnn64_9.dll", "cudnn_graph64_9.dll", "cufft64_12.dll")
     if WINDOWS
-    else ("libcublasLt.so.13", "libcudnn.so.9", "libcudnn_graph.so.9")
+    else ("libcublasLt.so.13", "libcudnn.so.9", "libcudnn_graph.so.9", "libcufft.so.12")
 )
 
 
@@ -64,6 +64,7 @@ def cli_output(
     sample: np.ndarray,
     temp: Path,
     output_shape: tuple[int, ...] | None = None,
+    switches: tuple[str, ...] = (),
 ) -> np.ndarray:
     batch, _, height, width = sample.shape
     source, target = temp / "cli-input.raw", temp / "cli-output.raw"
@@ -80,6 +81,7 @@ def cli_output(
             *("--model", str(model), "--precision", precision, "--cache-dir", str(cache)),
             *("--batch", str(batch), "--height", str(height), "--width", str(width)),
             *("--input", str(source), "--output", str(target)),
+            *switches,
         ],
         check=True,
         env=env,

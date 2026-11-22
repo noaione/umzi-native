@@ -47,6 +47,7 @@ info = export_model("models/4x_dwtp_ds_moesr_v2.pth", "output/moesr.ummodel", ke
 | `gaterv3` | `1x_umzi_idc_gaterv3.safetensors` | 1× | IDC fine-tune, 8-pixel alignment |
 | `gaterv2` | `1x_umzi_dehalftone_gater2_v1_smooth.safetensors` | 1× | Dehalftone, 16-pixel alignment |
 | `moesr` | `4x_dwtp_ds_moesr_v2.pth` | 4× | DWTP DS direct-shuffle topology only |
+| `gfisrv2` | `4x_wtp_MangaScale_GfisrV2.pth` | 4× | FP32 weights, MangaScale 24-block topology |
 
 For example:
 
@@ -54,10 +55,11 @@ For example:
 python -m umzi_native export models/1x_umzi_digital_decompress_gaterv3_1.pth -o output/native/gaterv3.ummodel
 python -m umzi_native export models/1x_umzi_dehalftone_gater2_v1_smooth.safetensors -o output/native/gaterv2.ummodel --kernel gaterv2
 python -m umzi_native export models/4x_dwtp_ds_moesr_v2.pth -o output/native/moesr.ummodel --kernel moesr
+python -m umzi_native export models/4x_wtp_MangaScale_GfisrV2.pth -o output/native/gfisrv2.ummodel --kernel gfisrv2
 ```
 
 A checkpoint with a different architecture or configuration is rejected
-with the reason. GFISRv2 has no packer yet.
+with the reason.
 
 ## Inspect a package
 

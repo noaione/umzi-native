@@ -39,8 +39,9 @@
 
 The separate runs show no material steady-state regression. Warmed VRAM
 is device usage above the pre-session baseline. GateRV3 still keeps one
-active shape. Linux validation and the production GFISRv2 adapter are
-deferred. Ruff and Pyrefly passed.
+active shape. Linux validation remains pending. The GFISRv2 adapter is
+tracked in the [architecture expansion](umzi-native-architecture-expansion.md#gfisrv2-native-fp32-package-and-session).
+Ruff and Pyrefly passed.
 [Shape validation](../output/umzi-multi-kernel/validation/shapes.json) ·
 [Manga timings](../output/umzi-multi-kernel/manga/report.json) ·
 [VRAM](../output/umzi-multi-kernel/memory/report.json)
@@ -199,7 +200,7 @@ specified byte offsets.
 | ---: | ---: | --- |
 | 0 | 8 | `UMZINPKG` |
 | 8 | 4 | Container version |
-| 12 | 4 | Kernel family ID. Assign `1` to GateRV3, `3` to GateRV2, and `4` to MoESR; reserve `2` for GFISRv2. |
+| 12 | 4 | Kernel family ID. `1` is GateRV3, `2` is GFISRv2, `3` is GateRV2, and `4` is MoESR. |
 | 16 | 4 | Kernel payload schema version |
 | 20 | 4 | Section count |
 | 24 | 8 | Total package size in bytes |

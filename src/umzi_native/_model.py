@@ -11,7 +11,7 @@ from typing import BinaryIO
 
 from ._loader import PathArg
 
-__all__ = ["GateRV2Model", "GateRV3Model", "MoESRModel", "ModelInfo", "ModelSection", "peek_model"]
+__all__ = ["GFISRv2Model", "GateRV2Model", "GateRV3Model", "MoESRModel", "ModelInfo", "ModelSection", "peek_model"]
 
 MAGIC = b"UMZINPKG"
 VERSION = 1
@@ -29,10 +29,11 @@ OPERATION = struct.Struct("<11i")
 # Keep the tables below in step with native/runtime/registry.cpp and the
 # family parsers under native/kernels/.
 GATERV3_FAMILY = 1
+GFISRV2_FAMILY = 2
 GATERV2_FAMILY = 3
 MOESR_FAMILY = 4
-FAMILIES = {GATERV3_FAMILY: "gaterv3", GATERV2_FAMILY: "gaterv2", MOESR_FAMILY: "moesr"}
-SCHEMAS = {"gaterv3": 1, "gaterv2": 1, "moesr": 1}
+FAMILIES = {GATERV3_FAMILY: "gaterv3", GFISRV2_FAMILY: "gfisrv2", GATERV2_FAMILY: "gaterv2", MOESR_FAMILY: "moesr"}
+SCHEMAS = {"gaterv3": 1, "gfisrv2": 1, "gaterv2": 1, "moesr": 1}
 SECTION_NAMES = {1: "architecture", 2: "schedule", 3: "weights", 4: "checkpoint"}
 # GateRV2 schema 1 architecture: input, output, scale, alignment, base
 # channels, levels, latent blocks, the attention epsilon as float32, four
@@ -44,6 +45,8 @@ GATERV2_MAX_LEVELS = 4
 GATERV2_MAX_WEIGHT_BYTES = 512 << 20
 MOESR_ARCHITECTURE = struct.Struct("<10I")
 MOESR_CONFIG = (3, 3, 4, 2, 64, 9, 4, 3, 170, 96)
+GFISRV2_ARCHITECTURE = struct.Struct("<7I")
+GFISRV2_CONFIG = (3, 3, 4, 48, 24, 128, 30)
 
 
 class GateRV3Op(IntEnum):
@@ -132,6 +135,49 @@ class MoESRModel:
     checkpoint: str
 
 
+@dataclass(frozen=True)
+class GFISRv2Model:
+    """Direct-shuffle GFISRv2 payload (schema 1)."""
+
+    input_channels: int
+    output_channels: int
+    scale: int
+    base_channels: int
+    blocks: int
+    hidden_channels: int
+    fourier_channels: int
+    weight_bytes: int
+    checkpoint: str
+
+
+def gfisrv2_parameter_sizes() -> list[int]:
+    """FP32 tensor sizes in bytes in native execution order."""
+    cin, cout, scale, dim, blocks, hidden, fourier = GFISRV2_CONFIG
+    band = (dim - fourier) // 3
+    packed = 2 * fourier
+
+    def conv(inputs: int, outputs: int, taps: int = 9, groups: int = 1) -> list[int]:
+        return [outputs * (inputs // groups) * taps * 4, outputs * 4]
+
+    block = [
+        dim * 4,
+        dim * 4,
+        *conv(dim, 2 * hidden),
+        packed * 4,
+        packed * 4,
+        *conv(packed, packed, groups=packed),
+        *conv(packed, packed, 1),
+        fourier * 4,
+        fourier * 4,
+        *conv(band, band, groups=band),
+        *conv(band, band, 11, band),
+        *conv(band, band, 11, band),
+        *conv(hidden, dim),
+        dim * 4,
+    ]
+    return conv(cin, dim) + block * blocks + conv(dim, 2 * dim) + conv(2 * dim, dim) + conv(dim, cout * scale**2)
+
+
 def moesr_parameter_sizes() -> list[int]:
     """Packed parameter sizes in bytes, in the order used by the native runner."""
     _, _, _, _, dim, groups, full, reduced, full_hidden, reduced_hidden = MOESR_CONFIG
@@ -206,7 +252,7 @@ class ModelInfo:
     schema: int
     digest: str
     sections: tuple[ModelSection, ...]
-    payload: GateRV3Model | GateRV2Model | MoESRModel | None = None
+    payload: GateRV3Model | GateRV2Model | MoESRModel | GFISRv2Model | None = None
     problems: tuple[str, ...] = ()
 
     @property
@@ -290,6 +336,8 @@ def peek_model(path: PathArg) -> ModelInfo:
         payload = _read_gaterv2(schema, contents.get(1), contents.get(2), weights, contents.get(4), problems)
     elif family_name == "moesr":
         payload = _read_moesr(schema, contents.get(1), contents.get(2), weights, contents.get(4), problems)
+    elif family_name == "gfisrv2":
+        payload = _read_gfisrv2(schema, contents.get(1), contents.get(2), weights, contents.get(4), problems)
     return ModelInfo(
         path=model,
         size=size,
@@ -488,4 +536,30 @@ def _read_moesr(
         if table is None and expected == weight_bytes:
             return MoESRModel(*MOESR_CONFIG, weight_bytes, checkpoint.hex())
         problems.append("Invalid MoESR weight layout")
+    return None
+
+
+def _read_gfisrv2(
+    schema: int,
+    architecture: bytes | None,
+    table: bytes | None,
+    weight_bytes: int,
+    checkpoint: bytes | None,
+    problems: list[str],
+) -> GFISRv2Model | None:
+    if schema != SCHEMAS["gfisrv2"]:
+        problems.append("Unsupported GFISRv2 model payload version")
+    elif (
+        architecture != GFISRV2_ARCHITECTURE.pack(*GFISRV2_CONFIG)
+        or checkpoint is None
+        or len(checkpoint) != DIGEST_SIZE
+    ):
+        problems.append("Unsupported GFISRv2 model architecture or checkpoint metadata")
+    else:
+        expected = 0
+        for size in gfisrv2_parameter_sizes():
+            expected = (expected + 255) // 256 * 256 + size
+        if table is None and expected == weight_bytes:
+            return GFISRv2Model(*GFISRV2_CONFIG, weight_bytes, checkpoint.hex())
+        problems.append("Invalid GFISRv2 weight layout")
     return None
