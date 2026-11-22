@@ -50,9 +50,11 @@ from umzi_native.exporter._package import write_package
 
 FAMILY = FAMILIES["gaterv2"]
 PRECISIONS = {"mixed": torch.float32, "fp16": torch.float16}
-# Separate tiles must not see each other inside a batch. Allow only the
-# variation that batch-dependent cuDNN algorithms may introduce.
-BATCH_CONSISTENCY_PSNR_DB = 60.0
+# Direct execution, CUDA Graph replay, and batch-1 runs use separately timed
+# cuBLASLt and cuDNN algorithms, so their roundings differ. Each must be as
+# close to eager FP32 as the graph run: a coupled batch or a broken path would
+# lose far more than this. FP16 flat tiles vary by about 1.3 dB between plans.
+CONSISTENCY_MARGIN_DB = 3.0
 
 
 def file_digest(path: Path) -> str:
@@ -154,6 +156,14 @@ class DeviceSession:
         return result
 
 
+def consistent(candidate: Tensor, expected: Tensor, graph: dict[str, Any], message: str) -> dict[str, Any]:
+    row = comparison(candidate.numpy(), expected.numpy())
+    psnr, baseline = row["psnr_db"], graph["psnr_db"]
+    if not row["finite"] or (psnr is not None and baseline is not None and psnr < baseline - CONSISTENCY_MARGIN_DB):
+        raise AssertionError(f"{message} ({psnr} dB against eager FP32; graph run {baseline} dB)")
+    return row
+
+
 def check_stress(
     reference: GateRV2, model: Path, library: Path, cases: dict[str, Tensor], output: Path
 ) -> dict[str, Any]:
@@ -171,20 +181,23 @@ def check_stress(
                 row = comparison(actual.numpy(), expected[label].numpy())
                 if not row["finite"]:
                     raise AssertionError(f"{precision} {label} produced non-finite output")
-                row["direct_matches_graph"] = torch.equal(direct(x).float().cpu(), actual)
-                if not row["direct_matches_graph"]:
-                    raise AssertionError(f"{precision} {label}: direct execution differs from CUDA Graph")
+                if not torch.equal(graph(x).float().cpu(), actual):
+                    raise AssertionError(f"{precision} {label}: repeated CUDA Graph runs differ")
+                direct_output = direct(x).float().cpu()
+                if not torch.equal(direct(x).float().cpu(), direct_output):
+                    raise AssertionError(f"{precision} {label}: repeated direct runs differ")
+                row["direct_vs_graph"] = comparison(direct_output.numpy(), actual.numpy())
+                row["direct"] = consistent(direct_output, expected[label], row, f"{precision} {label}: direct run")
                 if label in ("checkerboard", "noise"):
                     row["ssimulacra2"] = score_stress_render(
                         output / "stress-renders" / precision, label, expected[label], actual
                     )
                 if len(sample) > 1:
                     individual = torch.cat([graph(tile).float().cpu() for tile in x.split(1)])
-                    consistency = comparison(actual.numpy(), individual.numpy())
-                    row["vs_individual"] = consistency
-                    psnr = consistency["psnr_db"]
-                    if psnr is not None and psnr < BATCH_CONSISTENCY_PSNR_DB:
-                        raise AssertionError(f"{precision} {label}: batch items depend on each other ({psnr} dB)")
+                    row["vs_individual"] = comparison(actual.numpy(), individual.numpy())
+                    row["individual"] = consistent(
+                        individual, expected[label], row, f"{precision} {label}: batch-1 runs of the batch"
+                    )
                 rows[label][precision] = row
                 note = f", SSIMULACRA2 {row['ssimulacra2']:.3f}" if "ssimulacra2" in row else ""
                 print(f"{precision} {label}: {row['psnr_db']:.3f} dB, max {row['max_abs']:.3g}{note}", flush=True)
@@ -205,7 +218,7 @@ def check_host_io(reference: GateRV2, model: Path, library: Path) -> dict[str, A
             host = torch.from_numpy(session.run(None, {"input": x.numpy()})[0])
             device = DeviceSession(session)(x.cuda()).cpu()
             if not torch.equal(host, device):
-                raise AssertionError(f"{precision}: host run differs from device enqueue")
+                raise AssertionError(f"{precision}: host run differs from device enqueue in the same session")
             result[precision] = comparison(host.float().numpy(), reference(sample.cuda()).cpu().numpy())
     return result
 

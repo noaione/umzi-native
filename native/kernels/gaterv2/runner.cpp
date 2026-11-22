@@ -1,14 +1,16 @@
-// GateRV2 kernel session. Features are NCHW FP16 in both precisions; the
-// convolutions run through cuDNN and the family's CUDA kernels handle
-// normalization, gating, layout and the linear attention. Attention
-// normalization, contractions and the denominator always stay FP32, because
-// an all-FP16 attention cancels to a zero denominator on flat tiles.
-//   UMZI_MIXED: FP32 RGB I/O, FP32 convolution accumulation.
-//   UMZI_FP16:  FP16 RGB I/O, FP16 convolution arithmetic.
+// GateRV2 kernel session. Features are NHWC FP16 in both precisions:
+//   UMZI_MIXED: FP32 RGB I/O, FP32 accumulation in cuBLASLt and cuDNN.
+//   UMZI_FP16:  FP16 RGB I/O, FP16 arithmetic in cuBLASLt and cuDNN.
+// The Q/K/V projection output, normalization, contractions, key sum and
+// denominator of the linear attention are FP32 in both modes, because an
+// all-FP16 attention cancels to a zero denominator on flat tiles.
+// 1x1 convolutions are cuBLASLt GEMMs with a fused bias; the 3x3 down and up
+// convolutions use cuDNN; the remaining operations are fused CUDA kernels.
 // The FP32 parity reference is scripts/reference/gaterv2_native.py.
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <cuda.h>
+#include <cublasLt.h>
 #include <cudnn.h>
 
 #define UMZI_BUILD
@@ -35,9 +37,10 @@ namespace {
 using umzi::AllocationError;
 using Clock = std::chrono::steady_clock;
 constexpr int threads = 256;
-constexpr size_t workspace_limit = size_t(256) << 20;
+constexpr size_t scratch_bytes = size_t(64) << 20;
 constexpr size_t architecture_words = 16;
 constexpr uint32_t max_levels = 4;
+constexpr float bad_timing = 1e30f;
 
 double milliseconds_since(Clock::time_point start) {
     return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
@@ -52,6 +55,11 @@ void check(CUresult status, const char* operation) {
 void check(cudnnStatus_t status, const char* operation) {
     if (status != CUDNN_STATUS_SUCCESS)
         throw std::runtime_error(std::string(operation) + ": " + cudnnGetErrorString(status));
+}
+
+void check(cublasStatus_t status, const char* operation) {
+    if (status != CUBLAS_STATUS_SUCCESS)
+        throw std::runtime_error(std::string(operation) + ": cuBLASLt status " + std::to_string(int(status)));
 }
 #define CHECK(expr) check((expr), #expr)
 
@@ -192,9 +200,12 @@ Architecture parse_architecture(std::string_view bytes) {
     std::memcpy(&a.eps, &eps, sizeof(eps));
     for (auto& value : a.encoder) value = reader.number<uint32_t>();
     for (auto& value : a.decoder) value = reader.number<uint32_t>();
+    // The kernels assume 8-channel vectors, at most 64 base channels and 64 keys,
+    // and at most 256 channels in a MetaGated block.
     bool valid = a.input == 3 && a.output == 3 && a.scale == 1 && a.levels >= 1 && a.levels <= max_levels
         && a.alignment == (1u << a.levels) && a.base >= 16 && a.base <= 64 && a.base % 16 == 0
-        && a.latent >= 1 && a.latent <= 64 && a.eps > 0 && a.eps < 1;
+        && a.latent >= 1 && a.latent <= 64 && a.eps > 0 && a.eps < 1
+        && (a.base << (a.levels - 1)) <= 256 && (a.base << a.levels) / 16 <= 64;
     for (uint32_t i = 0; i < max_levels; ++i) {
         const bool used = i < a.levels;
         valid = valid && (used ? a.encoder[i] <= 32 && a.decoder[i] <= 32 : !a.encoder[i] && !a.decoder[i]);
@@ -222,17 +233,55 @@ struct Convolution {
     }
 };
 
+struct Gemm {
+    cublasLtMatmulDesc_t desc = nullptr;
+    cublasLtMatrixLayout_t weight = nullptr, input = nullptr, output = nullptr;
+    cublasLtMatmulAlgo_t algorithm{};
+    size_t workspace = 0;
+    bool half_compute = false;
+    ~Gemm() {
+        if (desc) cublasLtMatmulDescDestroy(desc);
+        if (weight) cublasLtMatrixLayoutDestroy(weight);
+        if (input) cublasLtMatrixLayoutDestroy(input);
+        if (output) cublasLtMatrixLayoutDestroy(output);
+    }
+};
+
+struct Events {
+    CUevent start = nullptr, stop = nullptr;
+    Events() {
+        CHECK(cuEventCreate(&start, CU_EVENT_DEFAULT));
+        CHECK(cuEventCreate(&stop, CU_EVENT_DEFAULT));
+    }
+    ~Events() {
+        if (start) cuEventDestroy(start);
+        if (stop) cuEventDestroy(stop);
+    }
+    template<class Launch>
+    float measure(CUstream stream, Launch launch) {
+        if (!launch()) return bad_timing;
+        CHECK(cuEventRecord(start, stream));
+        constexpr int repeats = 3;
+        for (int i = 0; i < repeats; ++i)
+            if (!launch()) return bad_timing;
+        CHECK(cuEventRecord(stop, stream));
+        CHECK(cuEventSynchronize(stop));
+        float elapsed = 0;
+        CHECK(cuEventElapsedTime(&elapsed, start, stop));
+        return elapsed / repeats;
+    }
+};
+
 constexpr const char* kernel_names[] = {
-    "pad_features_f32", "pad_features_f16", "residual_crop_f32", "residual_crop_f16", "weights_to_half",
-    "rms_norm_f16", "local_gate_f16", "plane_sum_f16", "project", "local_skip_f16", "inception_f16",
-    "gate_f16", "mish_skip_f16", "normalize_qk_f16", "key_value_f16", "attention_output_f16", "unshuffle_f16",
-    "up_concat_f16", "add_bias_f16", "plane_sum_f32",
+    "input_conv_f32", "input_conv_f16", "output_conv_f32", "output_conv_f16", "weights_to_half",
+    "pixel_norm_0", "pixel_norm_1", "pixel_norm_2", "pixel_norm_3", "local_gate", "pool_project",
+    "inception_gate", "attention_prepare", "attention_reduce", "attention_gate", "shuffle_concat",
 };
 enum KernelId {
-    PadF32, PadF16, CropF32, CropF16, WeightsToHalf, RmsNorm, LocalGate, PlaneSum, Project, LocalSkip, Inception,
-    Gate, MishSkip, NormalizeQk, KeyValue, AttentionOutput, Unshuffle, UpConcat, AddBias, PlaneSumF32, KernelCount,
+    InputF32, InputF16, OutputF32, OutputF16, WeightsToHalf, NormCopy, NormUnshuffle, NormMish, NormScaled,
+    LocalGate, PoolProject, InceptionGate, AttentionPrepare, AttentionReduce, AttentionGate, ShuffleConcat,
+    KernelCount,
 };
-constexpr uint64_t feature_bytes = 2;
 static_assert(std::size(kernel_names) == KernelCount);
 
 class GateRV2Session final : public umzi::KernelSession {
@@ -242,7 +291,7 @@ public:
     std::vector<uint64_t> offsets;
     size_t weight_bytes = 0;
     bool use_graph = false;
-    bool fp16_io = false;
+    bool fp16 = false;
     CUdevice device = 0;
     CUcontext context = nullptr;
     CUmodule module = nullptr;
@@ -251,26 +300,32 @@ public:
     CUstream stream = nullptr;
     CUevent completed = nullptr;
     cudnnHandle_t cudnn = nullptr;
+    cublasLtHandle_t blas = nullptr;
     bool pending = false;
 
     // State for the prepared padded shape.
     Shape prepared{};
-    std::map<std::tuple<int, int, int, int, int, int>, std::unique_ptr<Convolution>> convolutions;
-    std::array<CUdeviceptr, 5> work{};
+    std::map<std::tuple<int, int, int, int, int>, std::unique_ptr<Convolution>> convolutions;
+    std::map<std::tuple<int, int, int, int, int>, std::unique_ptr<Gemm>> gemms;
+    std::array<CUdeviceptr, 4> work{};
     std::vector<CUdeviceptr> skips;
-    CUdeviceptr features_in = 0, stage_in = 0, stage_out = 0, mean = 0, sca = 0, key_sum = 0, value_sum = 0, matrix = 0, scratch = 0;
+    CUdeviceptr latent_x = 0, decoder_x = 0, qkv = 0, key_sum = 0, value_sum = 0, matrix = 0;
+    CUdeviceptr key_part = 0, value_part = 0, matrix_part = 0, local_part = 0, multiplier = 0;
+    CUdeviceptr stage_in = 0, stage_out = 0, scratch = 0;
     size_t activation_bytes = 0, workspace_bytes = 0, io_bytes = 0;
     CUgraph graph = nullptr;
     CUgraphExec executable = nullptr;
-    bool planning = false;
     CUstream target = nullptr;
+    CUdeviceptr input_rgb = 0, output_rgb = 0;
+    Shape request{};
     std::array<double, 4> setup_ms{};
+    int timed_plans = 0;
 
     void open(const umzi::ModelPackage& package, const UmziSessionOptions& options) {
         if (package.schema != 1) throw std::runtime_error("Unsupported GateRV2 model payload version");
         if (options.precision != UMZI_MIXED && options.precision != UMZI_FP16)
             throw std::runtime_error("Unsupported GateRV2 session precision");
-        fp16_io = options.precision == UMZI_FP16;
+        fp16 = options.precision == UMZI_FP16;
         if (options.kernel_option_count) throw std::runtime_error("GateRV2 sessions take no kernel options");
         use_graph = (options.flags & UMZI_CUDA_GRAPH) != 0;
         arch = parse_architecture(package.section(1));
@@ -303,16 +358,48 @@ public:
         ContextScope scope(context);
         umzi::load_kernel_module(device, module, gaterv2_images::embedded_cubins, gaterv2_images::embedded_ptx);
         for (int i = 0; i < KernelCount; ++i) CHECK(cuModuleGetFunction(&functions[i], module, kernel_names[i]));
-        CHECK(cuMemAlloc(&weights, weight_bytes));
-        CHECK(cuMemcpyHtoD(weights, data.data(), weight_bytes));
-        // Convolution filters read an FP16 copy at half the FP32 byte offset.
-        CHECK(cuMemAlloc(&half_weights, weight_bytes / 2));
         CHECK(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
-        target = stream;
-        elementwise(WeightsToHalf, int(weight_bytes / 4), half_weights, weights);
-        CHECK(cuStreamSynchronize(stream));
         CHECK(cuEventCreate(&completed, CU_EVENT_DISABLE_TIMING));
         CHECK(cudnnCreate(&cudnn));
+        CHECK(cublasLtCreate(&blas));
+        CHECK(cuMemAlloc(&weights, weight_bytes));
+        CHECK(cuMemcpyHtoD(weights, data.data(), weight_bytes));
+        upload_half_weights(data);
+    }
+
+    // The FP16 copy keeps every parameter at half its FP32 byte offset. The 3x3
+    // down and up filters become KRSC for NHWC cuDNN, and the up filter's
+    // outputs are reordered subpixel-major for shuffle_concat.
+    void upload_half_weights(std::string_view data) {
+        std::vector<float> values(weight_bytes / 4);
+        std::memcpy(values.data(), data.data(), weight_bytes);
+        auto to_krsc = [&](size_t index, int outputs, int inputs, auto output_row) {
+            float* filter = values.data() + offsets[index] / 4;
+            std::vector<float> original(filter, filter + size_t(outputs) * inputs * 9);
+            for (int o = 0; o < outputs; ++o)
+                for (int i = 0; i < inputs; ++i)
+                    for (int t = 0; t < 9; ++t)
+                        filter[(size_t(output_row(o)) * 9 + t) * inputs + i] = original[(size_t(o) * inputs + i) * 9 + t];
+        };
+        for (const auto& level : network->encoder)
+            to_krsc(level.scale_w, level.dim / 2, level.dim, [](int o) { return o; });
+        for (const auto& level : network->decoder) {
+            const int half = level.dim, dim = 2 * half;
+            to_krsc(level.scale_w, 2 * dim, dim, [half](int o) { return (o % 4) * half + o / 4; });
+        }
+        CUdeviceptr staging = 0;
+        CHECK(cuMemAlloc(&staging, weight_bytes));
+        try {
+            CHECK(cuMemcpyHtoD(staging, values.data(), weight_bytes));
+            CHECK(cuMemAlloc(&half_weights, weight_bytes / 2));
+            target = stream;
+            elementwise(WeightsToHalf, int(weight_bytes / 4), half_weights, staging);
+            CHECK(cuStreamSynchronize(stream));
+        } catch (...) {
+            cuMemFree(staging);
+            throw;
+        }
+        CHECK(cuMemFree(staging));
     }
 
     ~GateRV2Session() override {
@@ -321,6 +408,7 @@ public:
         if (stream) cuStreamSynchronize(stream);
         release_shape();
         if (cudnn) cudnnDestroy(cudnn);
+        if (blas) cublasLtDestroy(blas);
         if (completed) cuEventDestroy(completed);
         if (stream) cuStreamDestroy(stream);
         if (weights) cuMemFree(weights);
@@ -333,7 +421,7 @@ public:
 
     CUdeviceptr param(size_t index) const { return weights + offsets[index]; }
     CUdeviceptr filter(size_t index) const { return half_weights + offsets[index] / 2; }
-    uint64_t io_element() const { return fp16_io ? 2 : 4; }
+    uint64_t io_element() const { return fp16 ? 2 : 4; }
 
     // ---- Shapes ----
 
@@ -355,19 +443,16 @@ public:
         return {shape.n, (shape.h + align - 1) / align * align, (shape.w + align - 1) / align * align};
     }
 
-    // Elements of the largest feature buffer, which also bounds 32-bit kernel indexing.
+    // Elements of the largest work buffer: three base widths at full resolution.
     uint64_t total_elements(Shape p) const {
-        const uint64_t pixels = uint64_t(p.h) * uint64_t(p.w);
-        uint64_t largest = 3 * pixels;
-        for (uint32_t level = 0; level <= arch.levels; ++level) {
-            const uint64_t level_dim = uint64_t(arch.base) << level;
-            largest = std::max(largest, 3 * level_dim * (pixels >> (2 * level)));
-        }
-        const uint64_t total = largest * uint64_t(p.n);
+        const uint64_t total = uint64_t(p.n) * uint64_t(p.h) * uint64_t(p.w) * 3 * arch.base;
         if (total > uint64_t(INT_MAX) - 256)
             throw std::runtime_error("Requested shape exceeds native tensor indexing limits");
         return total;
     }
+
+    int tokens() const { return (prepared.h >> arch.levels) * (prepared.w >> arch.levels); }
+    int chunks() const { return (tokens() + 63) / 64; }
 
     void release_shape() {
         if (executable) cuGraphExecDestroy(executable);
@@ -375,6 +460,7 @@ public:
         executable = nullptr;
         graph = nullptr;
         convolutions.clear();
+        gemms.clear();
         for (auto& buffer : work) {
             if (buffer) cuMemFree(buffer);
             buffer = 0;
@@ -382,14 +468,15 @@ public:
         for (auto buffer : skips)
             if (buffer) cuMemFree(buffer);
         skips.clear();
-        for (auto* buffer : {&features_in, &stage_in, &stage_out, &mean, &sca, &key_sum, &value_sum, &matrix,
-                             &scratch}) {
+        for (auto* buffer : {&latent_x, &decoder_x, &qkv, &key_sum, &value_sum, &matrix, &key_part, &value_part,
+                             &matrix_part, &local_part, &multiplier, &stage_in, &stage_out, &scratch}) {
             if (*buffer) cuMemFree(*buffer);
             *buffer = 0;
         }
         prepared = {};
         activation_bytes = workspace_bytes = io_bytes = 0;
         setup_ms = {};
+        timed_plans = 0;
     }
 
     void allocate(CUdeviceptr& pointer, uint64_t bytes) {
@@ -412,45 +499,60 @@ public:
         release_shape();
         try {
             auto start = Clock::now();
+            const uint64_t n = uint64_t(p.n), pixels = uint64_t(p.h) * uint64_t(p.w);
             const uint64_t elements = total_elements(p);
-            for (auto& buffer : work) allocate(buffer, elements * feature_bytes);
-            const uint64_t pixels = uint64_t(p.h) * uint64_t(p.w);
+            for (auto& buffer : work) allocate(buffer, elements * 2);
             for (uint32_t level = 0; level < arch.levels; ++level) {
                 skips.push_back(0);
-                allocate(skips.back(), uint64_t(p.n) * uint64_t(arch.dim(level)) * (pixels >> (2 * level))
-                    * feature_bytes);
+                allocate(skips.back(), n * uint64_t(arch.dim(level)) * (pixels >> (2 * level)) * 2);
             }
-            const uint64_t l = uint64_t(arch.latent_dim()), k = uint64_t(arch.keys()), n = uint64_t(p.n);
-            allocate(mean, n * l * 4);
-            allocate(sca, n * l * 4);
+            prepared = p;
+            const uint64_t l = uint64_t(arch.latent_dim()), k = uint64_t(arch.keys()), t = uint64_t(tokens());
+            const uint64_t c = uint64_t(chunks());
+            allocate(latent_x, n * t * l * 2);
+            allocate(decoder_x, n * pixels * arch.base * 2);
+            allocate(qkv, n * t * (2 * k + l) * 4);
             allocate(key_sum, n * k * 4);
             allocate(value_sum, n * l * 4);
             allocate(matrix, n * k * l * 4);
-            allocate(features_in, n * 3 * pixels * feature_bytes);
-            // Host runs stage unpadded RGB in device memory; the padded size bounds every shape.
+            if (c > 1) {
+                allocate(key_part, n * c * k * 4);
+                allocate(value_part, n * c * l * 4);
+                allocate(matrix_part, n * c * k * l * 4);
+            }
+            uint64_t parts = 0;
+            for (uint32_t level = 0; level < arch.levels; ++level) {
+                const int dim = arch.dim(level);
+                const auto grid = gate_grid(dim, p.h >> level, p.w >> level, 1);
+                parts = std::max(parts, uint64_t(grid[0]) * grid[1] * uint64_t(dim));
+            }
+            allocate(local_part, n * parts * 4);
+            allocate(multiplier, n * 256 * 4);
             io_bytes = n * 3 * pixels * io_element();
             CHECK(cuMemAlloc(&stage_in, io_bytes));
             CHECK(cuMemAlloc(&stage_out, io_bytes));
-            prepared = p;
+            CHECK(cuMemAlloc(&scratch, scratch_bytes));
+            for (auto buffer : work) CHECK(cuMemsetD8Async(buffer, 0, elements * 2, stream));
+            CHECK(cuMemsetD8Async(stage_in, 0, io_bytes, stream));
+            request = p;
             setup_ms[0] = milliseconds_since(start);
 
+            // The first pass times and records every cuBLASLt and cuDNN plan.
             start = Clock::now();
-            planning = true;
+            CHECK(cudnnSetStream(cudnn, stream));
+            input_rgb = stage_in;
+            output_rgb = stage_out;
             forward(stream);
-            planning = false;
-            if (workspace_bytes) CHECK(cuMemAlloc(&scratch, workspace_bytes));
+            CHECK(cuStreamSynchronize(stream));
             setup_ms[1] = milliseconds_since(start);
 
             start = Clock::now();
-            CHECK(cuMemsetD8Async(features_in, 0, n * 3 * pixels * feature_bytes, stream));
-            CHECK(cudnnSetStream(cudnn, stream));
             forward(stream);
             CHECK(cuStreamSynchronize(stream));
             setup_ms[2] = milliseconds_since(start);
 
             if (use_graph) {
                 start = Clock::now();
-                CHECK(cudnnSetStream(cudnn, stream));
                 CHECK(cuStreamBeginCapture(stream, CU_STREAM_CAPTURE_MODE_THREAD_LOCAL));
                 try {
                     forward(stream);
@@ -467,7 +569,6 @@ public:
                 setup_ms[3] = milliseconds_since(start);
             }
         } catch (...) {
-            planning = false;
             cuStreamSynchronize(stream);
             release_shape();
             throw;
@@ -477,28 +578,118 @@ public:
     // ---- Operations ----
 
     template<class... Args>
-    void launch_shaped(KernelId id, unsigned blocks, unsigned block_x, unsigned block_y, Args... args) {
-        if (planning) return;
+    void launch_shared(KernelId id, std::array<unsigned, 3> grid, unsigned block, unsigned shared, Args... args) {
         void* parameters[] = {&args...};
-        CHECK(cuLaunchKernel(functions[id], blocks, 1, 1, block_x, block_y, 1, 0, target, parameters, nullptr));
+        CHECK(cuLaunchKernel(functions[id], grid[0], grid[1], grid[2], block, 1, 1, shared, target, parameters,
+                             nullptr));
     }
 
     template<class... Args>
-    void launch(KernelId id, unsigned blocks, Args... args) {
-        launch_shaped(id, blocks, threads, 1, args...);
+    void launch3(KernelId id, std::array<unsigned, 3> grid, unsigned block, Args... args) {
+        launch_shared(id, grid, block, 0, args...);
+    }
+
+    template<class... Args>
+    void launch(KernelId id, unsigned grid_x, unsigned grid_y, unsigned block, Args... args) {
+        launch3(id, {grid_x, grid_y, 1}, block, args...);
+    }
+
+    // local_gate covers 256 / (C / 2) columns and gate_rows (4) rows per block.
+    static std::array<unsigned, 3> gate_grid(int channels, int h, int w, int n) {
+        const int columns = threads / (channels / 2);
+        return {unsigned((w + columns - 1) / columns), unsigned((h + 3) / 4), unsigned(n)};
     }
 
     template<class... Args>
     void elementwise(KernelId id, int total, Args... args) {
-        launch(id, unsigned((total + threads - 1) / threads), args..., total);
+        launch(id, unsigned((total + threads - 1) / threads), 1, threads, args..., total);
     }
 
-    // A same-size convolution of cin channels from an NCHW slice whose batch
-    // items are batch_planes planes apart. The bias is added separately, as in
-    // the reference runner's cuDNN convolution followed by a bias addition.
-    void conv(CUdeviceptr out, CUdeviceptr in, int cin, int batch_planes, int h, int w,
-              size_t weight, int cout, int k, CUdeviceptr bias) {
-        auto& plan = convolutions[std::make_tuple(cin, batch_planes, h, w, cout, k)];
+    // D[rows, cout] = A[rows, cin] W^T + bias. A rows are input_stride
+    // elements apart. The QKV projection writes FP32 with an FP32 bias; all
+    // other projections write FP16 with an FP16 bias.
+    void gemm(CUdeviceptr out, CUdeviceptr in, int input_stride, int cin, int cout, int rows, size_t weight,
+              size_t bias, bool fp32_output = false) {
+        auto& plan = gemms[std::make_tuple(cin, cout, rows, input_stride, int(fp32_output))];
+        const CUdeviceptr bias_pointer = fp32_output ? param(bias) : filter(bias);
+        if (!plan) {
+            plan = std::make_unique<Gemm>();
+            auto& p = *plan;
+            p.half_compute = fp16 && !fp32_output;
+            CHECK(cublasLtMatmulDescCreate(&p.desc, p.half_compute ? CUBLAS_COMPUTE_16F : CUBLAS_COMPUTE_32F,
+                                           p.half_compute ? CUDA_R_16F : CUDA_R_32F));
+            cublasOperation_t transpose = CUBLAS_OP_T;
+            CHECK(cublasLtMatmulDescSetAttribute(p.desc, CUBLASLT_MATMUL_DESC_TRANSA, &transpose, sizeof(transpose)));
+            cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
+            CHECK(cublasLtMatmulDescSetAttribute(p.desc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
+            cudaDataType_t bias_type = fp32_output ? CUDA_R_32F : CUDA_R_16F;
+            CHECK(cublasLtMatmulDescSetAttribute(p.desc, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &bias_type,
+                                                 sizeof(bias_type)));
+            CHECK(cublasLtMatrixLayoutCreate(&p.weight, CUDA_R_16F, cin, cout, cin));
+            CHECK(cublasLtMatrixLayoutCreate(&p.input, CUDA_R_16F, cin, rows, input_stride));
+            CHECK(cublasLtMatrixLayoutCreate(&p.output, fp32_output ? CUDA_R_32F : CUDA_R_16F, cout, rows, cout));
+            cublasLtMatmulPreference_t preference = nullptr;
+            CHECK(cublasLtMatmulPreferenceCreate(&preference));
+            std::unique_ptr<std::remove_pointer_t<cublasLtMatmulPreference_t>,
+                            decltype(&cublasLtMatmulPreferenceDestroy)> owner(preference,
+                                                                              cublasLtMatmulPreferenceDestroy);
+            uint64_t limit = scratch_bytes;
+            CHECK(cublasLtMatmulPreferenceSetAttribute(preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &limit,
+                                                       sizeof(limit)));
+            std::array<cublasLtMatmulHeuristicResult_t, 8> results{};
+            int found = 0;
+            CHECK(cublasLtMatmulAlgoGetHeuristic(blas, p.desc, p.weight, p.input, p.output, p.output, preference,
+                                                int(results.size()), results.data(), &found));
+            if (!found) throw std::runtime_error("No cuBLASLt plan for a GateRV2 projection");
+            Events events;
+            float best = bad_timing;
+            int chosen = -1;
+            for (int i = 0; i < found; ++i) {
+                if (results[i].state != CUBLAS_STATUS_SUCCESS) continue;
+                p.algorithm = results[i].algo;
+                p.workspace = results[i].workspaceSize;
+                const float elapsed = events.measure(target, [&] {
+                    return run_gemm(p, out, in, weight, bias_pointer) == CUBLAS_STATUS_SUCCESS;
+                });
+                if (elapsed < best) {
+                    best = elapsed;
+                    chosen = i;
+                }
+            }
+            if (chosen < 0) throw std::runtime_error("No working cuBLASLt plan for a GateRV2 projection");
+            p.algorithm = results[chosen].algo;
+            p.workspace = results[chosen].workspaceSize;
+            workspace_bytes = std::max(workspace_bytes, p.workspace);
+            ++timed_plans;
+        }
+        CHECK(run_gemm(*plan, out, in, weight, bias_pointer));
+    }
+
+    // Plans are shared by projections of the same shape, so each call sets its own bias.
+    cublasStatus_t run_gemm(const Gemm& p, CUdeviceptr out, CUdeviceptr in, size_t weight, CUdeviceptr bias) {
+        const auto status = cublasLtMatmulDescSetAttribute(p.desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias,
+                                                           sizeof(bias));
+        if (status != CUBLAS_STATUS_SUCCESS) return status;
+        const float one = 1, zero = 0;
+        const uint16_t half_one = 0x3c00, half_zero = 0;
+        const void* alpha = p.half_compute ? static_cast<const void*>(&half_one) : &one;
+        const void* beta = p.half_compute ? static_cast<const void*>(&half_zero) : &zero;
+        auto* y = reinterpret_cast<void*>(out);
+        return cublasLtMatmul(blas, p.desc, alpha, reinterpret_cast<void*>(filter(weight)), p.weight,
+                              reinterpret_cast<void*>(in), p.input, beta, y, p.output, y, p.output, &p.algorithm,
+                              p.workspace ? reinterpret_cast<void*>(scratch) : nullptr, p.workspace, target);
+    }
+
+    // A 3x3 NHWC convolution without bias.
+    void conv3x3(CUdeviceptr out, CUdeviceptr in, int cin, int cout, int h, int w, size_t weight) {
+        auto& plan = convolutions[std::make_tuple(cin, cout, h, w, prepared.n)];
+        const float one = 1, zero = 0;
+        auto run = [&](const Convolution& p) {
+            return cudnnConvolutionForward(cudnn, &one, p.input, reinterpret_cast<void*>(in), p.filter,
+                                           reinterpret_cast<void*>(filter(weight)), p.conv, p.algorithm,
+                                           reinterpret_cast<void*>(scratch), p.workspace, &zero, p.output,
+                                           reinterpret_cast<void*>(out));
+        };
         if (!plan) {
             plan = std::make_unique<Convolution>();
             auto& p = *plan;
@@ -506,154 +697,198 @@ public:
             CHECK(cudnnCreateTensorDescriptor(&p.output));
             CHECK(cudnnCreateFilterDescriptor(&p.filter));
             CHECK(cudnnCreateConvolutionDescriptor(&p.conv));
-            CHECK(cudnnSetTensor4dDescriptorEx(p.input, CUDNN_DATA_HALF, prepared.n, cin, h, w,
-                                               batch_planes * h * w, h * w, w, 1));
-            CHECK(cudnnSetTensor4dDescriptor(p.output, CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, prepared.n, cout, h, w));
-            CHECK(cudnnSetFilter4dDescriptor(p.filter, CUDNN_DATA_HALF, CUDNN_TENSOR_NCHW, cout, cin, k, k));
-            // Mixed precision accumulates in FP32; FP16 sessions use FP16 arithmetic.
-            CHECK(cudnnSetConvolution2dDescriptor(p.conv, k / 2, k / 2, 1, 1, 1, 1, CUDNN_CROSS_CORRELATION,
-                                                  fp16_io ? CUDNN_DATA_HALF : CUDNN_DATA_FLOAT));
+            CHECK(cudnnSetTensor4dDescriptor(p.input, CUDNN_TENSOR_NHWC, CUDNN_DATA_HALF, prepared.n, cin, h, w));
+            CHECK(cudnnSetTensor4dDescriptor(p.output, CUDNN_TENSOR_NHWC, CUDNN_DATA_HALF, prepared.n, cout, h, w));
+            CHECK(cudnnSetFilter4dDescriptor(p.filter, CUDNN_DATA_HALF, CUDNN_TENSOR_NHWC, cout, cin, 3, 3));
+            CHECK(cudnnSetConvolution2dDescriptor(p.conv, 1, 1, 1, 1, 1, 1, CUDNN_CROSS_CORRELATION,
+                                                  fp16 ? CUDNN_DATA_HALF : CUDNN_DATA_FLOAT));
             CHECK(cudnnSetConvolutionMathType(p.conv, CUDNN_TENSOR_OP_MATH));
             std::array<cudnnConvolutionFwdAlgoPerf_t, CUDNN_CONVOLUTION_FWD_ALGO_COUNT> results{};
             int count = 0;
             CHECK(cudnnGetConvolutionForwardAlgorithm_v7(cudnn, p.input, p.filter, p.conv, p.output,
                                                         int(results.size()), &count, results.data()));
-            const cudnnConvolutionFwdAlgoPerf_t* chosen = nullptr;
-            for (int i = 0; i < count && !chosen; ++i) {
+            Events events;
+            float best = bad_timing;
+            cudnnConvolutionFwdAlgoPerf_t chosen{};
+            for (int i = 0; i < count; ++i) {
                 const auto& candidate = results[i];
-                if (candidate.status == CUDNN_STATUS_SUCCESS && candidate.memory <= workspace_limit)
-                    chosen = &candidate;
+                if (candidate.status != CUDNN_STATUS_SUCCESS || candidate.memory > scratch_bytes) continue;
+                CHECK(cudnnSetConvolutionMathType(p.conv, candidate.mathType));
+                p.algorithm = candidate.algo;
+                p.workspace = candidate.memory;
+                const float elapsed = events.measure(target, [&] { return run(p) == CUDNN_STATUS_SUCCESS; });
+                if (elapsed < best) {
+                    best = elapsed;
+                    chosen = candidate;
+                }
             }
-            if (!chosen) throw std::runtime_error("No cuDNN convolution algorithm for GateRV2");
-            CHECK(cudnnSetConvolutionMathType(p.conv, chosen->mathType));
-            p.algorithm = chosen->algo;
-            p.workspace = chosen->memory;
+            if (best >= bad_timing) throw std::runtime_error("No cuDNN convolution algorithm for GateRV2");
+            CHECK(cudnnSetConvolutionMathType(p.conv, chosen.mathType));
+            p.algorithm = chosen.algo;
+            p.workspace = chosen.memory;
             workspace_bytes = std::max(workspace_bytes, p.workspace);
+            ++timed_plans;
         }
-        if (planning) return;
-        const float one = 1, zero = 0;
-        CHECK(cudnnConvolutionForward(cudnn, &one, plan->input, reinterpret_cast<void*>(in), plan->filter,
-                                      reinterpret_cast<void*>(filter(weight)), plan->conv, plan->algorithm,
-                                      reinterpret_cast<void*>(scratch), plan->workspace, &zero, plan->output,
-                                      reinterpret_cast<void*>(out)));
-        if (bias) elementwise(AddBias, prepared.n * cout * h * w, out, bias, cout, h * w);
+        CHECK(run(*plan));
     }
 
-    static CUdeviceptr planes(CUdeviceptr base, int count, int pixels) {
-        return base + uint64_t(count) * uint64_t(pixels) * feature_bytes;
-    }
-
-    void rms(CUdeviceptr out, CUdeviceptr in, size_t scale, size_t offset, int channels, int pixels) {
+    // Per-pixel channel work with an optional RMSNorm; see pixel_norm in kernels.cu.
+    void pixel_norm(KernelId mode, CUdeviceptr out_x, CUdeviceptr out_norm, CUdeviceptr a, CUdeviceptr b,
+                    CUdeviceptr vec, size_t scale, size_t offset, int channels, int pixels, int width) {
+        const int lanes = std::max(1, channels / 32);
         const int total = prepared.n * pixels;
-        launch_shaped(RmsNorm, unsigned((total + 31) / 32), 32, 8, out, in, param(scale), param(offset), channels,
-                      pixels, float(1.0 / std::sqrt(double(channels))), total);
+        const CUdeviceptr scale_pointer = out_norm ? param(scale) : 0, offset_pointer = out_norm ? param(offset) : 0;
+        launch(mode, unsigned((uint64_t(total) * lanes + threads - 1) / threads), 1, threads, out_x, out_norm, a, b,
+               vec, scale_pointer, offset_pointer, channels, lanes, pixels, width,
+               float(1.0 / std::sqrt(double(channels))), total);
     }
 
-    void plane_sum(CUdeviceptr out, CUdeviceptr in, int pixels, int count, int batch_planes, int offset,
-                   float add, int average, KernelId kernel = PlaneSum) {
-        launch(kernel, unsigned(prepared.n * count), out, in, pixels, count, batch_planes, offset, add, average);
+    // The normalization parameters of the next consumer, or none.
+    struct Next {
+        size_t scale = 0, offset = 0;
+        bool present = false;
+    };
+
+    // One MetaGated block on x, whose local norm is already in work[0]. It
+    // leaves x updated and, when next is present, its norm in work[0].
+    void meta(const Meta& m, CUdeviceptr x, int h, int w, Next next) {
+        const auto [norm, expanded, local, last] = work;
+        const int n = prepared.n, dim = m.dim, pixels = h * w, rows = n * pixels, hidden = 3 * dim / 2;
+        gemm(expanded, norm, dim, dim, 2 * dim, rows, m.expand_w, m.expand_b);
+        const auto grid = gate_grid(dim, h, w, n);
+        const int tiles = int(grid[0] * grid[1]);
+        launch3(LocalGate, grid, threads, local, local_part, expanded, param(m.local_w), param(m.local_b), dim, h, w);
+        launch(PoolProject, unsigned(n), unsigned((dim + 7) / 8), threads, multiplier, local_part, param(m.sca_w),
+               param(m.sca_b), param(m.gamma0), dim, tiles, pixels);
+        pixel_norm(NormScaled, x, norm, local, x, multiplier, m.glob_scale, m.glob_offset, dim, pixels, w);
+        gemm(expanded, norm, dim, dim, 2 * hidden, rows, m.fc1_w, m.fc1_b);
+        elementwise(InceptionGate, rows * (hidden / 8), local, expanded, param(m.square_w), param(m.square_b),
+                    param(m.row_w), param(m.row_b), param(m.column_w), param(m.column_b), dim, h, w);
+        gemm(last, local, hidden, hidden, dim, rows, m.fc2_w, m.fc2_b);
+        pixel_norm(NormMish, x, next.present ? norm : 0, last, x, param(m.gamma1), next.scale, next.offset, dim,
+                   pixels, w);
     }
 
-    // MetaGated block from work[0] back to work[0].
-    void meta(const Meta& m, int h, int w) {
-        const auto [a, b, c, d, e] = work;
-        const int n = prepared.n, dim = m.dim, pixels = h * w, hidden = 3 * dim / 2;
-        rms(b, a, m.norm_scale, m.norm_offset, dim, pixels);
-        // The 1x1 biases are added by the kernels that consume those convolutions.
-        conv(c, b, dim, dim, h, w, m.expand_w, 2 * dim, 1, 0);
-        elementwise(LocalGate, n * dim * pixels, b, c, param(m.expand_b), param(m.local_w), param(m.local_b), dim, h,
-                    w);
-        plane_sum(mean, b, pixels, dim, dim, 0, 0.f, 1);
-        elementwise(Project, n * dim, sca, mean, param(m.sca_w), param(m.sca_b), dim, dim);
-        elementwise(LocalSkip, n * dim * pixels, d, b, sca, a, param(m.gamma0), dim, pixels);
-        rms(b, d, m.glob_scale, m.glob_offset, dim, pixels);
-        conv(c, b, dim, dim, h, w, m.fc1_w, 2 * hidden, 1, 0);
-        const CUdeviceptr fc1_bias = param(m.fc1_b);
-        elementwise(Inception, n * dim * pixels, b, planes(c, 2 * hidden - dim, pixels),
-                    fc1_bias + uint64_t(2 * hidden - dim) * 4, param(m.square_w), param(m.square_b), param(m.row_w), param(m.row_b),
-                    param(m.column_w), param(m.column_b), dim, dim / 8, 2 * hidden, h, w);
-        elementwise(Gate, n * hidden * pixels, e, c, fc1_bias, b, hidden, hidden - dim, pixels);
-        conv(b, e, hidden, hidden, h, w, m.fc2_w, dim, 1, 0);
-        elementwise(MishSkip, n * dim * pixels, a, b, param(m.fc2_b), d, param(m.gamma1), dim, pixels);
+    void latent(const Latent& block, Next next) {
+        const auto [norm, projected, gated, last] = work;
+        const int n = prepared.n, dim = arch.latent_dim(), keys = arch.keys(), t = tokens();
+        const int rows = n * t, hidden = 3 * dim / 2, stride = 2 * keys + dim;
+        gemm(projected, norm, dim, dim, 2 * hidden, rows, block.fc1_w, block.fc1_b);
+        gemm(qkv, projected + uint64_t(2 * hidden - dim) * 2, 2 * hidden, dim, stride, rows, block.qkv_w,
+             block.qkv_b, true);
+        const int parts = chunks();
+        const unsigned slices = unsigned((dim + 63) / 64);
+        if (parts == 1) {
+            launch3(AttentionPrepare, {1, unsigned(n), slices}, threads, qkv, key_sum, value_sum, matrix, keys, dim,
+                    t, arch.eps, 1);
+        } else {
+            launch3(AttentionPrepare, {unsigned(parts), unsigned(n), slices}, threads, qkv, key_part, value_part,
+                    matrix_part, keys, dim, t, arch.eps, 0);
+            launch(AttentionReduce, unsigned(n), 1, threads, key_sum, value_sum, matrix, key_part, value_part,
+                   matrix_part, keys, dim, parts, arch.eps);
+        }
+        elementwise(AttentionGate, rows * (hidden / 8), gated, projected, qkv, key_sum, value_sum, matrix, keys, dim,
+                    t);
+        gemm(last, gated, hidden, hidden, dim, rows, block.fc2_w, block.fc2_b);
+        pixel_norm(NormMish, latent_x, next.present ? norm : 0, last, CUdeviceptr(0), CUdeviceptr(0), next.scale,
+                   next.offset, dim, t, 1);
     }
 
-    // Latent GatedCNNBlock with linear attention, from work[0] back to work[0].
-    void latent(const Latent& block, int h, int w) {
-        const auto [a, b, c, d, e] = work;
-        const int n = prepared.n, dim = arch.latent_dim(), keys = arch.keys(), tokens = h * w;
-        const int hidden = 3 * dim / 2, projected = 2 * keys + dim;
-        rms(b, a, block.scale, block.offset, dim, tokens);
-        conv(c, b, dim, dim, h, w, block.fc1_w, 2 * hidden, 1, param(block.fc1_b));
-        conv(d, planes(c, 2 * hidden - dim, tokens), dim, 2 * hidden, h, w, block.qkv_w, projected, 1,
-             param(block.qkv_b));
-        elementwise(NormalizeQk, n * tokens, e, d, keys, projected, tokens);
-        plane_sum(key_sum, e, tokens, keys, 2 * keys, keys, arch.eps, 0, PlaneSumF32);
-        plane_sum(value_sum, d, tokens, dim, projected, 2 * keys, 0.f, 0);
-        const int outputs = n * keys * dim;
-        launch(KeyValue, unsigned((uint64_t(outputs) * 32 + threads - 1) / threads), matrix, e, d, keys, dim, projected,
-               2 * keys, tokens, outputs);
-        elementwise(AttentionOutput, n * dim * tokens, b, e, matrix, key_sum, value_sum, keys, dim, tokens);
-        elementwise(Gate, n * hidden * tokens, e, c, CUdeviceptr(0), b, hidden, hidden - dim, tokens);
-        conv(b, e, hidden, hidden, h, w, block.fc2_w, dim, 1, 0);
-        elementwise(MishSkip, n * dim * tokens, a, b, param(block.fc2_b), CUdeviceptr(0), CUdeviceptr(0), dim, tokens);
+    Next first_norm(const Level& level) const {
+        if (level.blocks.empty()) return {};
+        return {level.blocks.front().norm_scale, level.blocks.front().norm_offset, true};
     }
 
-    // Padded FP16 RGB in features_in to the network output, before the RGB residual, in work[1].
+    void blocks(const Level& level, CUdeviceptr x, int h, int w, Next after) {
+        for (size_t i = 0; i < level.blocks.size(); ++i) {
+            const Next next = i + 1 < level.blocks.size() ? first_norm_of(level.blocks[i + 1]) : after;
+            meta(level.blocks[i], x, h, w, next);
+        }
+    }
+
+    static Next first_norm_of(const Meta& m) { return {m.norm_scale, m.norm_offset, true}; }
+
+    // Unpadded RGB in input_rgb to the cropped RGB output in output_rgb.
     void forward(CUstream stream_target) {
         target = stream_target;
-        const auto [a, b, c, d, e] = work;
-        const int n = prepared.n, height = prepared.h, width = prepared.w;
         const auto& net = *network;
-        conv(a, features_in, 3, 3, height, width, net.in_w, int(arch.base), 3, param(net.in_b));
+        const int n = prepared.n, height = prepared.h, width = prepared.w;
+        const int h0 = request.h, w0 = request.w;
+        const CUdeviceptr norm = work[0];
+        const Next level0 = first_norm(net.encoder[0]);
+        const int base = int(arch.base);
+        elementwise(fp16 ? InputF16 : InputF32, n * height * width, skips[0], level0.present ? norm : 0,
+                    input_rgb, param(net.in_w), param(net.in_b), level0.present ? param(level0.scale) : 0,
+                    level0.present ? param(level0.offset) : 0, base, h0, w0, height, width,
+                    float(1.0 / std::sqrt(double(base))));
         for (uint32_t level = 0; level < arch.levels; ++level) {
             const auto& item = net.encoder[level];
             const int h = height >> level, w = width >> level, dim = item.dim;
-            for (const auto& block : item.blocks) meta(block, h, w);
-            if (!planning)
-                CHECK(cuMemcpyDtoDAsync(skips[level], a, uint64_t(n) * dim * h * w * feature_bytes, target));
-            conv(b, a, dim, dim, h, w, item.scale_w, dim / 2, 3, 0);
-            elementwise(Unshuffle, n * 2 * dim * (h / 2) * (w / 2), a, b, dim / 2, h / 2, w / 2);
+            blocks(item, skips[level], h, w, {});
+            conv3x3(work[1], skips[level], dim, dim / 2, h, w, item.scale_w);
+            const bool deepest = level + 1 == arch.levels;
+            const Next next = deepest ? Next{net.latent[0].scale, net.latent[0].offset, true}
+                                      : first_norm(net.encoder[level + 1]);
+            pixel_norm(NormUnshuffle, deepest ? latent_x : skips[level + 1], next.present ? norm : 0, work[1],
+                       CUdeviceptr(0), CUdeviceptr(0), next.scale, next.offset, 2 * dim, (h / 2) * (w / 2), w / 2);
+        }
+        for (size_t i = 0; i < net.latent.size(); ++i) {
+            const Next next = i + 1 < net.latent.size() ? Next{net.latent[i + 1].scale, net.latent[i + 1].offset, true}
+                                                         : Next{};
+            latent(net.latent[i], next);
         }
         const int low_h = height >> arch.levels, low_w = width >> arch.levels;
-        for (const auto& block : net.latent) latent(block, low_h, low_w);
         for (uint32_t i = 0; i < arch.levels; ++i) {
             const auto& item = net.decoder[i];
-            const int dim = 2 * item.dim, h = low_h << i, w = low_w << i;
-            conv(b, a, dim, dim, h, w, item.scale_w, 2 * dim, 3, 0);
-            elementwise(UpConcat, n * dim * 4 * h * w, c, b, skips[arch.levels - 1 - i], item.dim, 2 * h, 2 * w);
-            conv(a, c, dim, dim, 2 * h, 2 * w, item.shor_w, item.dim, 1, param(item.shor_b));
-            for (const auto& block : item.blocks) meta(block, 2 * h, 2 * w);
+            const int half = item.dim, dim = 2 * half, h = low_h << i, w = low_w << i;
+            const CUdeviceptr source = i ? decoder_x : latent_x;
+            conv3x3(work[1], source, dim, 2 * dim, h, w, item.scale_w);
+            const int pixels = 4 * h * w;
+            elementwise(ShuffleConcat, n * pixels * (dim / 8), work[2], work[1], skips[arch.levels - 1 - i], half,
+                        2 * h, 2 * w);
+            gemm(decoder_x, work[2], dim, dim, half, n * pixels, item.shor_w, item.shor_b);
+            const Next first = first_norm(item);
+            if (first.present)
+                pixel_norm(NormCopy, CUdeviceptr(0), norm, decoder_x, CUdeviceptr(0), CUdeviceptr(0), first.scale,
+                           first.offset, half, pixels, 2 * w);
+            blocks(item, decoder_x, 2 * h, 2 * w, {});
         }
-        conv(b, a, int(arch.base), int(arch.base), height, width, net.out_w, 3, 3, param(net.out_b));
-        (void)n;
-    }
-
-    void execute(CUstream stream_target) {
-        if (executable) {
-            CHECK(cuGraphLaunch(executable, stream_target));
-        } else {
-            CHECK(cudnnSetStream(cudnn, stream_target));
-            forward(stream_target);
-        }
-    }
-
-    // The input must stay valid until the stream completes: the crop adds it as the RGB residual.
-    void enqueue_shape(Shape shape, CUdeviceptr input, CUdeviceptr output, CUstream stream_target) {
-        const auto p = prepared;
-        target = stream_target;
-        elementwise(fp16_io ? PadF16 : PadF32, p.n * 3 * p.h * p.w, features_in, input, shape.h, shape.w, p.h, p.w);
-        execute(stream_target);
-        target = stream_target;
-        elementwise(fp16_io ? CropF16 : CropF32, shape.n * 3 * shape.h * shape.w, output, work[1], input,
-                    shape.h, shape.w, p.h, p.w);
+        elementwise(fp16 ? OutputF16 : OutputF32, n * h0 * w0, output_rgb, decoder_x, param(net.out_w),
+                    param(net.out_b), input_rgb, base, h0, w0, height, width);
     }
 
     // ---- KernelSession ----
 
+    // Graph replays use the shape and buffers they were captured with, so other
+    // shapes and buffers run directly.
+    void enqueue_shape(Shape shape, CUdeviceptr input, CUdeviceptr output, CUstream stream_target) {
+        const bool replay = executable && shape == request && input == stage_in && output == stage_out;
+        if (replay) {
+            CHECK(cuGraphLaunch(executable, stream_target));
+            return;
+        }
+        if (executable && shape == request) {
+            // Keep the graph's fixed buffers and copy through them.
+            CHECK(cuMemcpyDtoDAsync(stage_in, input, io_bytes_for(shape), stream_target));
+            CHECK(cuGraphLaunch(executable, stream_target));
+            CHECK(cuMemcpyDtoDAsync(output, stage_out, io_bytes_for(shape), stream_target));
+            return;
+        }
+        request = shape;
+        input_rgb = input;
+        output_rgb = output;
+        CHECK(cudnnSetStream(cudnn, stream_target));
+        forward(stream_target);
+    }
+
+    uint64_t io_bytes_for(Shape shape) const {
+        return uint64_t(shape.n) * 3 * uint64_t(shape.h) * uint64_t(shape.w) * io_element();
+    }
+
     UmziModelInfo model_info() const override { return {sizeof(UmziModelInfo), "gaterv2", 1, 0}; }
 
     UmziIo tensors() const override {
-        const auto dtype = static_cast<uint32_t>(fp16_io ? UMZI_FLOAT16 : UMZI_FLOAT32);
+        const auto dtype = static_cast<uint32_t>(fp16 ? UMZI_FLOAT16 : UMZI_FLOAT32);
         return {sizeof(UmziIo), {"input", {4, {0, 3, 0, 0}}, dtype, 0}, {"output", {4, {0, 3, 0, 0}}, dtype, 0}};
     }
 
@@ -662,18 +897,47 @@ public:
         total_elements(padded(concrete));
         auto io = tensors();
         io.input.shape = io.output.shape = shape;
-        io.input.bytes = io.output.bytes
-            = uint64_t(concrete.n) * 3 * uint64_t(concrete.h) * uint64_t(concrete.w) * io_element();
+        io.input.bytes = io.output.bytes = io_bytes_for(concrete);
         return io;
     }
 
-    void prepare_shape(const UmziShape& shape) override { prepare(checked(shape)); }
+    // Graphs are captured for the shape a session was prepared with; prepare
+    // the exact unpadded shape so the captured crop matches it.
+    void prepare_exact(Shape shape) {
+        prepare(shape);
+        if (!(request == shape) && executable) {
+            ContextScope scope(context);
+            cuGraphExecDestroy(executable);
+            cuGraphDestroy(graph);
+            executable = nullptr;
+            graph = nullptr;
+            request = shape;
+            input_rgb = stage_in;
+            output_rgb = stage_out;
+            CHECK(cudnnSetStream(cudnn, stream));
+            CHECK(cuStreamBeginCapture(stream, CU_STREAM_CAPTURE_MODE_THREAD_LOCAL));
+            try {
+                forward(stream);
+            } catch (...) {
+                CUgraph failed = nullptr;
+                cuStreamEndCapture(stream, &failed);
+                if (failed) cuGraphDestroy(failed);
+                throw;
+            }
+            CHECK(cuStreamEndCapture(stream, &graph));
+            CHECK(cuGraphInstantiate(&executable, graph, 0));
+            CHECK(cuGraphUpload(executable, stream));
+            CHECK(cuStreamSynchronize(stream));
+        }
+    }
+
+    void prepare_shape(const UmziShape& shape) override { prepare_exact(checked(shape)); }
 
     void run_host(const UmziShape& shape, const void* input, void* output) override {
         const auto concrete = checked(shape);
-        prepare(concrete);
+        prepare_exact(concrete);
         ContextScope scope(context);
-        const uint64_t bytes = uint64_t(concrete.n) * 3 * uint64_t(concrete.h) * uint64_t(concrete.w) * io_element();
+        const uint64_t bytes = io_bytes_for(concrete);
         CHECK(cuMemcpyHtoDAsync(stage_in, input, bytes, stream));
         enqueue_shape(concrete, stage_in, stage_out, stream);
         CHECK(cuMemcpyDtoHAsync(output, stage_out, bytes, stream));
@@ -682,7 +946,7 @@ public:
 
     void enqueue_device(const UmziShape& shape, uint64_t input, uint64_t output, UmziStream stream_target) override {
         const auto concrete = checked(shape);
-        prepare(concrete);
+        prepare_exact(concrete);
         ContextScope scope(context);
         auto selected = reinterpret_cast<CUstream>(stream_target);
         try {
@@ -703,15 +967,22 @@ public:
         if (prepared.n) {
             result.prepared_input = {4, {uint32_t(prepared.n), 3, uint32_t(prepared.h), uint32_t(prepared.w)}};
             result.buffer_bytes[1] = activation_bytes;
-            result.buffer_bytes[2] = workspace_bytes;
+            result.buffer_bytes[2] = scratch_bytes;
             result.buffer_bytes[3] = 2 * io_bytes;
             std::copy(setup_ms.begin(), setup_ms.end(), result.shape_setup_ms);
         }
         return result;
     }
 
+    uint32_t diagnostic_count() const override { return 2; }
+    UmziDiagnostic diagnostic(uint32_t index) const override {
+        if (index == 0) return {sizeof(UmziDiagnostic), "timed_plans", timed_plans};
+        if (index == 1) return {sizeof(UmziDiagnostic), "plan_workspace_bytes", int64_t(workspace_bytes)};
+        throw std::runtime_error("Invalid GateRV2 diagnostic index");
+    }
+
     const char* kernel_message() const override {
-        return fp16_io ? "GateRV2 FP16 with FP32 attention" : "GateRV2 mixed precision with FP32 attention";
+        return fp16 ? "GateRV2 FP16 with FP32 attention" : "GateRV2 mixed precision with FP32 attention";
     }
 };
 } // namespace

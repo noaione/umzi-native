@@ -54,67 +54,14 @@ extern "C" __global__ void finish_attention(
 }
 
 
-// The kernels below execute the packaged session in NCHW order. Feature
-// tensors are stored as T (half in both session precisions); register
-// arithmetic, small parameters and attention intermediates are FP32. The build compiles this family
-// without fast math, and explicit _rn intrinsics keep the separate roundings
-// of the eager operations they replace.
+
+// ---------------------------------------------------------------------------
+// Native session kernels. Features are NHWC FP16. Register arithmetic, small
+// parameters, pooling and the linear attention are FP32. The build compiles
+// this family without fast math.
 
 __device__ __forceinline__ int grid_index() {
     return blockIdx.x * blockDim.x + threadIdx.x;
-}
-
-__device__ __forceinline__ float load(const float* p, size_t i) { return p[i]; }
-__device__ __forceinline__ float load(const half* p, size_t i) { return __half2float(p[i]); }
-__device__ __forceinline__ void store(float* p, size_t i, float v) { p[i] = v; }
-__device__ __forceinline__ void store(half* p, size_t i, float v) { p[i] = __float2half_rn(v); }
-
-__device__ __forceinline__ float bias_at(const float* bias, int channel) { return bias ? bias[channel] : 0.f; }
-
-__device__ __forceinline__ float warp_sum(float value) {
-    for (int delta = 16; delta; delta /= 2) value = __fadd_rn(value, __shfl_xor_sync(0xffffffffu, value, delta));
-    return value;
-}
-
-__device__ __forceinline__ float mish(float x) {
-    return __fmul_rn(x, tanhf(log1pf(expf(x))));
-}
-
-// Reflection padding from the caller's RGB input into FP16 features.
-template<class In>
-__device__ void pad_features(half* out, const In* in, int h, int w, int ph, int pw, int total) {
-    const int index = grid_index();
-    if (index >= total) return;
-    const int plane = index / (ph * pw);
-    int y = index / pw % ph, x = index % pw;
-    if (y >= h) y = ph - h < h ? 2 * h - 2 - y : h - 1;
-    if (x >= w) x = pw - w < w ? 2 * w - 2 - x : w - 1;
-    out[index] = __float2half_rn(load(in, (size_t(plane) * h + y) * w + x));
-}
-
-// Crop the padded network output and add the unpadded input. Inside the crop
-// the reflection-padded input equals the original input.
-template<class Io>
-__device__ void residual_crop(Io* out, const half* network, const Io* in, int h, int w, int ph, int pw, int total) {
-    const int index = grid_index();
-    if (index >= total) return;
-    const int plane = index / (h * w), y = index / w % h, x = index % w;
-    store(out, index, __fadd_rn(__half2float(network[(size_t(plane) * ph + y) * pw + x]), load(in, index)));
-}
-
-extern "C" __global__ void pad_features_f32(half* o, const float* i, int h, int w, int ph, int pw, int t) {
-    pad_features(o, i, h, w, ph, pw, t);
-}
-extern "C" __global__ void pad_features_f16(half* o, const half* i, int h, int w, int ph, int pw, int t) {
-    pad_features(o, i, h, w, ph, pw, t);
-}
-extern "C" __global__ void residual_crop_f32(float* o, const half* n, const float* i, int h, int w, int ph, int pw,
-                                             int t) {
-    residual_crop(o, n, i, h, w, ph, pw, t);
-}
-extern "C" __global__ void residual_crop_f16(half* o, const half* n, const half* i, int h, int w, int ph, int pw,
-                                             int t) {
-    residual_crop(o, n, i, h, w, ph, pw, t);
 }
 
 extern "C" __global__ void weights_to_half(half* out, const float* in, int total) {
@@ -122,351 +69,624 @@ extern "C" __global__ void weights_to_half(half* out, const float* in, int total
     if (index < total) out[index] = __float2half_rn(in[index]);
 }
 
-// RMSNorm over channels at each pixel. A block covers 32 pixels; its eight
-// rows split the channels and reduce through shared memory. total is the
-// number of pixels over the batch.
-template<class T>
-__device__ void rms_norm(T* out, const T* in, const float* scale, const float* offset,
-                         int channels, int pixels, float inverse_root, int total) {
-    __shared__ float partial[8][33];
-    const int index = blockIdx.x * 32 + threadIdx.x;
-    const bool active = index < total;
-    const size_t base = active ? size_t(index / pixels) * channels * pixels + index % pixels : 0;
-    float sum = 0;
-    if (active)
-        for (int c = threadIdx.y; c < channels; c += 8) {
-            const float value = load(in, base + size_t(c) * pixels);
-            sum = fmaf(value, value, sum);
-        }
-    partial[threadIdx.y][threadIdx.x] = sum;
-    __syncthreads();
-    if (!threadIdx.y) {
-        for (int row = 1; row < 8; ++row) sum = __fadd_rn(sum, partial[row][threadIdx.x]);
-        partial[0][threadIdx.x] = __fadd_rn(__fmul_rn(sqrtf(sum), inverse_root), 1e-6f);
-    }
-    __syncthreads();
-    if (!active) return;
-    const float denominator = partial[0][threadIdx.x];
-    for (int c = threadIdx.y; c < channels; c += 8) {
-        const size_t at = base + size_t(c) * pixels;
-        store(out, at, __fadd_rn(__fmul_rn(scale[c], __fdiv_rn(load(in, at), denominator)), offset[c]));
+__device__ __forceinline__ float load(const float* p, size_t i) { return p[i]; }
+__device__ __forceinline__ float load(const half* p, size_t i) { return __half2float(p[i]); }
+__device__ __forceinline__ void store(float* p, size_t i, float v) { p[i] = v; }
+__device__ __forceinline__ void store(half* p, size_t i, float v) { p[i] = __float2half_rn(v); }
+
+__device__ __forceinline__ void load8(const half* p, float* out) {
+    const uint4 raw = *reinterpret_cast<const uint4*>(p);
+    const half2* pairs = reinterpret_cast<const half2*>(&raw);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float2 value = __half22float2(pairs[i]);
+        out[2 * i] = value.x;
+        out[2 * i + 1] = value.y;
     }
 }
 
-template<class T>
-__device__ __forceinline__ float grouped3x3(
-    const T* image, const float* weight, float bias, const float* input_bias, int channel, int height, int width,
-    int y, int x
-) {
-    // Each group has two input and two output channels.
-    const size_t source = size_t(channel & ~1) * height * width;
-    const float* kernel = weight + channel * 18;
-    float sum = 0;
-    for (int i = 0; i < 2; ++i) {
-        const float shift = input_bias[(channel & ~1) + i];
-        for (int ky = 0; ky < 3; ++ky) {
-            const int yy = y + ky - 1;
-            if (yy < 0 || yy >= height) continue;
+__device__ __forceinline__ void store8(half* p, const float* in) {
+    uint4 raw;
+    half2* pairs = reinterpret_cast<half2*>(&raw);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) pairs[i] = __floats2half2_rn(in[2 * i], in[2 * i + 1]);
+    *reinterpret_cast<uint4*>(p) = raw;
+}
+
+// x * tanh(softplus(x)) = x * n / (n + 2) with n = e^x (e^x + 2). Above 15 the
+// ratio rounds to one in FP32, and the guard keeps n finite.
+__device__ __forceinline__ float mish(float x) {
+    if (x > 15.f) return x;
+    const float e = expf(x);
+    const float n = e * (e + 2.f);
+    return x * n / (n + 2.f);
+}
+
+__device__ __forceinline__ float group_sum(float value, int lanes) {
+    for (int delta = lanes / 2; delta; delta /= 2) value += __shfl_xor_sync(0xffffffffu, value, delta);
+    return value;
+}
+
+__device__ __forceinline__ int reflect(int value, int size, int padded) {
+    if (value < size) return value;
+    return padded - size < size ? 2 * size - 2 - value : size - 1;
+}
+
+// The 3x3 input convolution on the reflection-padded RGB input, its bias, and
+// the first RMSNorm. One thread computes all channels of one padded pixel.
+template<class In>
+__device__ void input_conv(half* out_x, half* out_norm, const In* in, const float* weight, const float* bias,
+                           const float* scale, const float* offset, int channels, int h, int w, int ph, int pw,
+                           float inverse_root, int total) {
+    __shared__ float kernel[64 * 27];
+    for (int i = threadIdx.x; i < channels * 27; i += blockDim.x) kernel[i] = weight[i];
+    __syncthreads();
+    const int index = grid_index();
+    if (index >= total) return;
+    const int x = index % pw, y = index / pw % ph, n = index / (pw * ph);
+    float taps[27];
+#pragma unroll
+    for (int c = 0; c < 3; ++c)
+#pragma unroll
+        for (int ky = 0; ky < 3; ++ky)
+#pragma unroll
             for (int kx = 0; kx < 3; ++kx) {
-                const int xx = x + kx - 1;
-                if (xx < 0 || xx >= width) continue;
-                const float value = __fadd_rn(load(image, source + (size_t(i) * height + yy) * width + xx), shift);
-                sum = fmaf(kernel[(i * 3 + ky) * 3 + kx], value, sum);
+                const int py = y + ky - 1, px = x + kx - 1;
+                float value = 0;
+                if (py >= 0 && py < ph && px >= 0 && px < pw)
+                    value = load(in, ((size_t(n) * 3 + c) * h + reflect(py, h, ph)) * w + reflect(px, w, pw));
+                taps[(c * 3 + ky) * 3 + kx] = value;
+            }
+    float values[64];
+    float sum = 0;
+#pragma unroll
+    for (int c = 0; c < 64; ++c) {
+        if (c < channels) {
+            float acc = 0;
+#pragma unroll
+            for (int t = 0; t < 27; ++t) acc = fmaf(kernel[c * 27 + t], taps[t], acc);
+            values[c] = acc + bias[c];
+            sum = fmaf(values[c], values[c], sum);
+        }
+    }
+    const float inverse = 1.f / (sqrtf(sum) * inverse_root + 1e-6f);
+    const size_t at = size_t(index) * channels;
+#pragma unroll
+    for (int c = 0; c < 64; c += 8) {
+        if (c < channels) {
+            float normalized[8];
+#pragma unroll
+            for (int k = 0; k < 8; ++k) normalized[k] = fmaf(scale[c + k], values[c + k] * inverse, offset[c + k]);
+            store8(out_x + at + c, values + c);
+            if (out_norm) store8(out_norm + at + c, normalized);
+        }
+    }
+}
+
+// The 3x3 output convolution to RGB, its bias, and the RGB residual, written as
+// the cropped NCHW output. One thread computes the three channels of one pixel.
+template<class Io>
+__device__ void output_conv(Io* out, const half* features, const float* weight, const float* bias, const Io* in,
+                            int channels, int h, int w, int ph, int pw, int total) {
+    __shared__ float kernel[3 * 64 * 9];
+    for (int i = threadIdx.x; i < 3 * channels * 9; i += blockDim.x) kernel[i] = weight[i];
+    __syncthreads();
+    const int index = grid_index();
+    if (index >= total) return;
+    const int x = index % w, y = index / w % h, n = index / (w * h);
+    float acc[3] = {0, 0, 0};
+    for (int ky = 0; ky < 3; ++ky) {
+        const int py = y + ky - 1;
+        if (py < 0 || py >= ph) continue;
+        for (int kx = 0; kx < 3; ++kx) {
+            const int px = x + kx - 1;
+            if (px < 0 || px >= pw) continue;
+            const half* source = features + ((size_t(n) * ph + py) * pw + px) * channels;
+            for (int c0 = 0; c0 < channels; c0 += 8) {
+                float v[8];
+                load8(source + c0, v);
+#pragma unroll
+                for (int k = 0; k < 8; ++k)
+#pragma unroll
+                    for (int o = 0; o < 3; ++o)
+                        acc[o] = fmaf(kernel[(o * channels + c0 + k) * 9 + ky * 3 + kx], v[k], acc[o]);
             }
         }
     }
-    return __fadd_rn(sum, bias);
+#pragma unroll
+    for (int o = 0; o < 3; ++o) {
+        const size_t at = ((size_t(n) * 3 + o) * h + y) * w + x;
+        store(out, at, acc[o] + bias[o] + load(in, at));
+    }
 }
 
-// Grouped 3x3 convolution with 2 * channels outputs, followed by SimpleGate.
-// input_bias is the bias of the preceding 1x1 expansion.
-template<class T>
-__device__ void local_gate(T* out, const T* in, const float* input_bias, const float* weight, const float* bias,
-                           int channels, int height, int width, int total) {
-    const int index = grid_index();
-    if (index >= total) return;
-    const int pixels = height * width;
-    const int pixel = index % pixels;
-    const int channel = index / pixels % channels;
-    const int batch = index / pixels / channels;
-    const T* image = in + size_t(batch) * 2 * channels * pixels;
-    const int y = pixel / width, x = pixel % width;
-    const int other = channel + channels;
-    // Round each convolution output to FP16 storage, as a separate convolution would.
-    const float first = __half2float(__float2half_rn(
-        grouped3x3(image, weight, bias[channel], input_bias, channel, height, width, y, x)));
-    const float second = __half2float(__float2half_rn(
-        grouped3x3(image, weight, bias[other], input_bias, other, height, width, y, x)));
-    store(out, index, __fmul_rn(first, second));
-}
-
-// One block per selected plane. The FP32 output is the plane sum plus add, or its mean.
-template<class T>
-__device__ void plane_sum(float* out, const T* in, int pixels, int planes, int batch_planes, int plane_offset,
-                          float add, int average) {
-    __shared__ float partial[256];
-    const int plane = blockIdx.x;
-    const size_t source = (size_t(plane / planes) * batch_planes + plane_offset + plane % planes) * pixels;
+// Per-pixel channel work in NHWC, with an optional RMSNorm of the result.
+// A group of lanes (a power of two up to 32) covers one pixel; each lane holds
+// up to four vectors of eight channels. The source x is:
+//   Mode 0: a (+ vec as a channel bias)
+//   Mode 1: PixelUnshuffle(2) of a, which has channels / 4 channels at 2x size
+//   Mode 2: mish(a), or mish(a) * vec + b
+//   Mode 3: a * vec[image, channel] + b
+template<int Mode>
+__device__ void pixel_norm(half* out_x, half* out_norm, const half* a, const half* b, const float* vec,
+                           const float* scale, const float* offset, int channels, int lanes, int pixels, int width,
+                           float inverse_root, int total) {
+    const int lane = threadIdx.x & (lanes - 1);
+    const int pixel = grid_index() / lanes;
+    const bool active = pixel < total;
+    const int vectors = channels / (8 * lanes);
+    float x[32];
     float sum = 0;
-    for (int i = threadIdx.x; i < pixels; i += blockDim.x) sum = __fadd_rn(sum, load(in, source + i));
-    partial[threadIdx.x] = sum;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        if (j < vectors && active) {
+            const int c = 8 * (lane + j * lanes);
+            float* v = x + 8 * j;
+            const size_t at = size_t(pixel) * channels + c;
+            if (Mode == 0) {
+                load8(a + at, v);
+                if (vec)
+#pragma unroll
+                    for (int k = 0; k < 8; ++k) v[k] += vec[c + k];
+            } else if (Mode == 1) {
+                const int n = pixel / pixels, rest = pixel % pixels, y = rest / width, xx = rest % width;
+                const int source_channels = channels / 4;
+#pragma unroll
+                for (int s = 0; s < 4; ++s) {
+                    const size_t hi = (size_t(n) * 4 * pixels + size_t(2 * y + s / 2) * 2 * width + 2 * xx + s % 2)
+                        * source_channels + c / 4;
+                    const float2 pair = __half22float2(*reinterpret_cast<const half2*>(a + hi));
+                    v[s] = pair.x;
+                    v[4 + s] = pair.y;
+                }
+            } else if (Mode == 2) {
+                load8(a + at, v);
+                if (vec) {
+                    float shortcut[8];
+                    load8(b + at, shortcut);
+#pragma unroll
+                    for (int k = 0; k < 8; ++k) v[k] = fmaf(mish(v[k]), vec[c + k], shortcut[k]);
+                } else {
+#pragma unroll
+                    for (int k = 0; k < 8; ++k) v[k] = mish(v[k]);
+                }
+            } else {
+                float shortcut[8];
+                load8(a + at, v);
+                load8(b + at, shortcut);
+                const float* multiplier = vec + size_t(pixel / pixels) * channels + c;
+#pragma unroll
+                for (int k = 0; k < 8; ++k) v[k] = fmaf(v[k], multiplier[k], shortcut[k]);
+            }
+#pragma unroll
+            for (int k = 0; k < 8; ++k) sum = fmaf(v[k], v[k], sum);
+        }
+    }
+    sum = group_sum(sum, lanes);
+    if (!active) return;
+    const float inverse = 1.f / (sqrtf(sum) * inverse_root + 1e-6f);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        if (j < vectors) {
+            const int c = 8 * (lane + j * lanes);
+            const size_t at = size_t(pixel) * channels + c;
+            if (out_x) store8(out_x + at, x + 8 * j);
+            if (out_norm) {
+                float normalized[8];
+#pragma unroll
+                for (int k = 0; k < 8; ++k) normalized[k] = fmaf(scale[c + k], x[8 * j + k] * inverse, offset[c + k]);
+                store8(out_norm + at, normalized);
+            }
+        }
+    }
+}
+
+// Grouped 3x3 convolution (two inputs and two outputs per group) on the 2C
+// expansion, then SimpleGate. A thread owns one channel pair of both
+// convolutions, keeps their 72 weights in registers, and computes a column of
+// gate_rows pixels, reusing each loaded input row for up to three outputs. A
+// block covers 256 / (C / 2) columns and writes its per-channel sums of the
+// gated output, reduced in a fixed order, for the average pool.
+constexpr int gate_rows = 4;
+
+extern "C" __global__ void local_gate(half* out, float* partial, const half* in, const float* weight,
+                                      const float* bias, int channels, int height, int width) {
+    __shared__ float2 sums[256];
+    const int pairs = channels / 2, columns = blockDim.x / pairs;
+    const int p = threadIdx.x % pairs, column = threadIdx.x / pairs;
+    const int x = blockIdx.x * columns + column, y0 = blockIdx.y * gate_rows, n = blockIdx.z;
+    const int stride = 2 * channels;
+    float w1[2][18], w2[2][18];
+#pragma unroll
+    for (int o = 0; o < 2; ++o)
+#pragma unroll
+        for (int t = 0; t < 18; ++t) {
+            w1[o][t] = weight[(2 * p + o) * 18 + t];
+            w2[o][t] = weight[(channels + 2 * p + o) * 18 + t];
+        }
+    float a1[gate_rows][2], a2[gate_rows][2];
+#pragma unroll
+    for (int r = 0; r < gate_rows; ++r) a1[r][0] = a1[r][1] = a2[r][0] = a2[r][1] = 0;
+    const half* image = in + size_t(n) * height * width * stride;
+    if (x < width) {
+#pragma unroll
+        for (int i = 0; i < gate_rows + 2; ++i) {
+            const int yy = y0 + i - 1;
+            if (yy < 0 || yy >= height) continue;
+#pragma unroll
+            for (int kx = 0; kx < 3; ++kx) {
+                const int xx = x + kx - 1;
+                if (xx < 0 || xx >= width) continue;
+                const half* at = image + (size_t(yy) * width + xx) * stride;
+                const float2 a = __half22float2(*reinterpret_cast<const half2*>(at + 2 * p));
+                const float2 b = __half22float2(*reinterpret_cast<const half2*>(at + channels + 2 * p));
+#pragma unroll
+                for (int ky = 0; ky < 3; ++ky) {
+                    const int r = i - ky;
+                    if (r < 0 || r >= gate_rows) continue;
+                    const int tap = ky * 3 + kx;
+#pragma unroll
+                    for (int o = 0; o < 2; ++o) {
+                        a1[r][o] = fmaf(w1[o][9 + tap], a.y, fmaf(w1[o][tap], a.x, a1[r][o]));
+                        a2[r][o] = fmaf(w2[o][9 + tap], b.y, fmaf(w2[o][tap], b.x, a2[r][o]));
+                    }
+                }
+            }
+        }
+    }
+    const float b10 = bias[2 * p], b11 = bias[2 * p + 1];
+    const float b20 = bias[channels + 2 * p], b21 = bias[channels + 2 * p + 1];
+    float2 total = make_float2(0.f, 0.f);
+#pragma unroll
+    for (int r = 0; r < gate_rows; ++r) {
+        const int y = y0 + r;
+        if (x >= width || y >= height) continue;
+        const float g0 = (a1[r][0] + b10) * (a2[r][0] + b20);
+        const float g1 = (a1[r][1] + b11) * (a2[r][1] + b21);
+        const half2 value = __floats2half2_rn(g0, g1);
+        *reinterpret_cast<half2*>(out + ((size_t(n) * height + y) * width + x) * channels + 2 * p) = value;
+        const float2 rounded = __half22float2(value);
+        total.x += rounded.x;
+        total.y += rounded.y;
+    }
+    sums[threadIdx.x] = total;
     __syncthreads();
-    for (int stride = blockDim.x / 2; stride; stride /= 2) {
-        if (threadIdx.x < stride) partial[threadIdx.x] = __fadd_rn(partial[threadIdx.x], partial[threadIdx.x + stride]);
-        __syncthreads();
-    }
-    if (!threadIdx.x) out[plane] = average ? __fdiv_rn(partial[0], float(pixels)) : __fadd_rn(partial[0], add);
-}
-
-// A 1x1 convolution of per-plane FP32 values: out[b, o] = sum_i w[o, i] * in[b, i] + bias[o].
-extern "C" __global__ void project(
-    float* out, const float* in, const float* weight, const float* bias, int inputs, int outputs, int total
-) {
-    const int index = grid_index();
-    if (index >= total) return;
-    const int output = index % outputs;
-    const float* source = in + size_t(index / outputs) * inputs;
-    const float* row = weight + size_t(output) * inputs;
-    float sum = 0;
-    for (int i = 0; i < inputs; ++i) sum = fmaf(row[i], source[i], sum);
-    out[index] = __fadd_rn(sum, bias[output]);
-}
-
-// MetaGated local residual: local * attention * gamma0 + shortcut.
-template<class T>
-__device__ void local_skip(T* out, const T* local, const float* attention, const T* shortcut, const float* gamma,
-                           int channels, int pixels, int total) {
-    const int index = grid_index();
-    if (index >= total) return;
-    const int plane = index / pixels;
-    const float value = __fmul_rn(__fmul_rn(load(local, index), attention[plane]), gamma[plane % channels]);
-    store(out, index, __fadd_rn(value, load(shortcut, index)));
-}
-
-template<class T>
-__device__ __forceinline__ float depthwise(
-    const T* image, size_t source, const float* kernel, float bias, float shift, int height, int width, int y, int x,
-    int kernel_height, int kernel_width
-) {
-    float sum = 0;
-    for (int ky = 0; ky < kernel_height; ++ky) {
-        const int yy = y + ky - kernel_height / 2;
-        if (yy < 0 || yy >= height) continue;
-        for (int kx = 0; kx < kernel_width; ++kx) {
-            const int xx = x + kx - kernel_width / 2;
-            if (xx < 0 || xx >= width) continue;
-            sum = fmaf(kernel[ky * kernel_width + kx], __fadd_rn(load(image, source + size_t(yy) * width + xx), shift),
-                       sum);
+    if (threadIdx.x < pairs) {
+        float2 s = make_float2(0.f, 0.f);
+        for (int c = 0; c < columns; ++c) {
+            s.x += sums[c * pairs + threadIdx.x].x;
+            s.y += sums[c * pairs + threadIdx.x].y;
         }
-    }
-    return __fadd_rn(sum, bias);
-}
-
-// InceptionDWConv2d on a channel slice whose batches are batch_planes apart:
-// identity, 3x3, 1x11 and 11x1 depthwise branches.
-template<class T>
-__device__ void inception(T* out, const T* in, const float* input_bias, const float* square, const float* square_bias,
-                          const float* row, const float* row_bias, const float* column, const float* column_bias,
-                          int channels, int branch, int batch_planes, int height, int width, int total) {
-    const int index = grid_index();
-    if (index >= total) return;
-    const int pixels = height * width;
-    const int pixel = index % pixels;
-    const int channel = index / pixels % channels;
-    const int batch = index / pixels / channels;
-    const size_t source = (size_t(batch) * batch_planes + channel) * pixels;
-    const int identity = channels - 3 * branch;
-    const float shift = bias_at(input_bias, channel);
-    if (channel < identity) {
-        store(out, index, __fadd_rn(load(in, source + pixel), shift));
-        return;
-    }
-    const int kind = (channel - identity) / branch;
-    const int group = (channel - identity) % branch;
-    const int y = pixel / width, x = pixel % width;
-    float value;
-    if (kind == 0)
-        value = depthwise(in, source, square + group * 9, square_bias[group], shift, height, width, y, x, 3, 3);
-    else if (kind == 1)
-        value = depthwise(in, source, row + group * 11, row_bias[group], shift, height, width, y, x, 1, 11);
-    else
-        value = depthwise(in, source, column + group * 11, column_bias[group], shift, height, width, y, x, 11, 1);
-    store(out, index, value);
-}
-
-// mish(g) * cat(i, mixed), where g and i are the first channels of the
-// 2 * hidden fc1 output and mixed holds hidden - identity contiguous channels.
-template<class T>
-__device__ void gate(T* out, const T* projected, const float* projected_bias, const T* mixed, int hidden,
-                     int identity, int pixels, int total) {
-    const int index = grid_index();
-    if (index >= total) return;
-    const int pixel = index % pixels;
-    const int channel = index / pixels % hidden;
-    const int batch = index / pixels / hidden;
-    const size_t source = size_t(batch) * 2 * hidden * pixels + pixel;
-    float gated = mish(__fadd_rn(load(projected, source + size_t(channel) * pixels), bias_at(projected_bias, channel)));
-    gated = __half2float(__float2half_rn(gated));  // Mish output is an FP16 tensor in eager.
-    const float value = channel < identity
-        ? __fadd_rn(load(projected, source + size_t(hidden + channel) * pixels), bias_at(projected_bias, hidden + channel))
-        : load(mixed, (size_t(batch) * (hidden - identity) + channel - identity) * pixels + pixel);
-    store(out, index, __fmul_rn(gated, value));
-}
-
-// mish(x), optionally followed by * gamma + shortcut.
-template<class T>
-__device__ void mish_skip(T* out, const T* in, const float* in_bias, const T* shortcut, const float* gamma,
-                          int channels, int pixels, int total) {
-    const int index = grid_index();
-    if (index >= total) return;
-    const int channel = index / pixels % channels;
-    float value = mish(__fadd_rn(load(in, index), bias_at(in_bias, channel)));
-    if (gamma) {
-        value = __half2float(__float2half_rn(value));
-        value = __fadd_rn(__fmul_rn(value, gamma[channel]), load(shortcut, index));
-    }
-    store(out, index, value);
-}
-
-// Normalize Q and K (the first 2 * channels planes of each batch) over
-// channels at each token into a packed FP32 [batch, 2 * channels, tokens] buffer.
-template<class T>
-__device__ void normalize_qk_packed(float* out, const T* in, int channels, int batch_planes, int tokens,
-                                    int total_tokens) {
-    const int index = grid_index();
-    if (index >= total_tokens) return;
-    const int batch = index / tokens, token = index % tokens;
-    for (int half_index = 0; half_index < 2; ++half_index) {
-        const size_t source = (size_t(batch) * batch_planes + half_index * channels) * tokens + token;
-        float* target = out + (size_t(batch) * 2 + half_index) * channels * tokens + token;
-        float sum = 0;
-        for (int c = 0; c < channels; ++c) {
-            const float value = load(in, source + size_t(c) * tokens);
-            sum = fmaf(value, value, sum);
-        }
-        const float inverse = __fdiv_rn(1.f, sqrtf(sum));
-        for (int c = 0; c < channels; ++c)
-            target[size_t(c) * tokens] = __fmul_rn(load(in, source + size_t(c) * tokens), inverse);
+        const size_t tile = size_t(blockIdx.y) * gridDim.x + blockIdx.x;
+        const size_t tiles = size_t(gridDim.x) * gridDim.y;
+        *reinterpret_cast<float2*>(partial + ((size_t(n) * tiles + tile) * channels + 2 * threadIdx.x)) = s;
     }
 }
 
-// matrix[b, m, c] = sum_n K[b, m, n] * V[b, c, n]. K comes from the FP32
-// normalized buffer and V from the projection output, value_offset planes in.
-// One warp reduces each output over the tokens; total counts outputs.
-template<class T>
-__device__ void key_value(float* out, const float* normalized, const T* projected, int key_channels,
-                          int value_channels, int batch_planes, int value_offset, int tokens, int total) {
-    const int index = grid_index() / 32, lane = threadIdx.x % 32;
-    if (index >= total) return;
-    const int channel = index % value_channels;
-    const int key = index / value_channels % key_channels;
-    const int batch = index / value_channels / key_channels;
-    const float* k = normalized + (size_t(batch) * 2 * key_channels + key_channels + key) * tokens;
-    const size_t v = (size_t(batch) * batch_planes + value_offset + channel) * tokens;
-    float sum = 0;
-    for (int n = lane; n < tokens; n += 32) sum = fmaf(k[n], load(projected, v + n), sum);
-    sum = warp_sum(sum);
-    if (!lane) out[index] = sum;
-}
-
-// (value_sum + Q^T matrix) * 1 / (tokens + Q^T (sum K + eps)), in NCHW order.
-template<class T>
-__device__ void attention_output(T* out, const float* normalized, const float* matrix, const float* key_sum,
-                                 const float* value_sum, int key_channels, int value_channels, int tokens,
-                                 int total) {
-    const int index = grid_index();
-    if (index >= total) return;
-    const int token = index % tokens;
-    const int channel = index / tokens % value_channels;
-    const int batch = index / tokens / value_channels;
-    const float* q = normalized + size_t(batch) * 2 * key_channels * tokens + token;
-    const float* m = matrix + size_t(batch) * key_channels * value_channels + channel;
-    const float* k = key_sum + size_t(batch) * key_channels;
-    float contraction = 0, product = 0;
-    for (int i = 0; i < key_channels; ++i) {
-        const float query = q[size_t(i) * tokens];
-        contraction = fmaf(query, k[i], contraction);
-        product = fmaf(query, m[size_t(i) * value_channels], product);
+// Average pool from the local_gate partial sums, the channel-attention 1x1
+// projection, and gamma0: multiplier[n, o] = (W mean + b)[o] * gamma0[o].
+// Each block recomputes the means and produces eight outputs.
+extern "C" __global__ void pool_project(float* multiplier, const float* partial, const float* weight,
+                                        const float* bias, const float* gamma, int channels, int tiles,
+                                        int pixels) {
+    __shared__ float mean[256];
+    const int n = blockIdx.x;
+    for (int c = threadIdx.x; c < channels; c += blockDim.x) {
+        float s = 0;
+        for (int t = 0; t < tiles; ++t) s += partial[(size_t(n) * tiles + t) * channels + c];
+        mean[c] = s / float(pixels);
     }
-    const float numerator = __fadd_rn(value_sum[size_t(batch) * value_channels + channel], product);
-    const float reciprocal = __fdiv_rn(1.f, __fadd_rn(float(tokens), contraction));
-    store(out, index, __fmul_rn(numerator, reciprocal));
+    __syncthreads();
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int o = blockIdx.y * (blockDim.x / 32) + warp;
+    if (o >= channels) return;
+    float acc = 0;
+    for (int i = lane; i < channels; i += 32) acc = fmaf(weight[size_t(o) * channels + i], mean[i], acc);
+    acc = group_sum(acc, 32);
+    if (!lane) multiplier[size_t(n) * channels + o] = (acc + bias[o]) * gamma[o];
 }
 
-// PixelUnshuffle(2): out[b, 4c + 2i + j, y, x] = in[b, c, 2y + i, 2x + j].
-template<class T>
-__device__ void unshuffle(T* out, const T* in, int channels, int height, int width, int total) {
+// e = mish(g) * cat(identity, mixed) from the 3C fc1 output
+// [g (1.5C) | identity (0.5C) | conv (C)]. mixed keeps the first C - 3C/8 conv
+// channels and applies 3x3, 1x11 and 11x1 depthwise kernels to the next three
+// groups of C/8. One thread computes eight channels of one pixel. Lanes of a
+// warp cover consecutive channel vectors of the same pixel, so their loads
+// coalesce, and each thread loops only over its vector's single kernel kind.
+extern "C" __global__ void inception_gate(half* out, const half* projected, const float* square,
+                                          const float* square_bias, const float* row, const float* row_bias,
+                                          const float* column, const float* column_bias, int channels, int height,
+                                          int width, int total) {
     const int index = grid_index();
     if (index >= total) return;
-    const int x = index % width, y = index / width % height;
-    const int plane = index / width / height;
-    const int sub = plane % 4, channel = plane / 4 % channels, batch = plane / 4 / channels;
-    out[index] = in[((size_t(batch) * channels + channel) * 2 * height + 2 * y + sub / 2) * 2 * width
-        + 2 * x + sub % 2];
-}
-
-// cat(PixelShuffle(2)(up), skip): both halves have half_channels at height x width.
-template<class T>
-__device__ void up_concat(T* out, const T* up, const T* skip, int half_channels, int height, int width, int total) {
-    const int index = grid_index();
-    if (index >= total) return;
-    const int x = index % width, y = index / width % height;
-    const int channel = index / width / height % (2 * half_channels);
-    const int batch = index / width / height / (2 * half_channels);
-    if (channel < half_channels) {
-        const int source = channel * 4 + (y % 2) * 2 + x % 2;
-        out[index] = up[((size_t(batch) * 4 * half_channels + source) * (height / 2) + y / 2) * (width / 2) + x / 2];
+    const int hidden = 3 * channels / 2, vectors = hidden / 8, stride = 2 * hidden;
+    const int ch = 8 * (index % vectors);
+    const int pixel = index / vectors;
+    const half* here = projected + size_t(pixel) * stride;
+    float g[8], value[8];
+    load8(here + ch, g);
+    const int identity_gate = hidden - channels;
+    const int conv = 2 * hidden - channels;
+    const int branch = channels / 8, identity = channels - 3 * branch;
+    const int j0 = ch - identity_gate;
+    if (ch < identity_gate) {
+        load8(here + hidden + ch, value);
+    } else if (j0 + 8 <= identity) {
+        load8(here + conv + j0, value);
     } else {
-        out[index] = skip[((size_t(batch) * half_channels + channel - half_channels) * height + y) * width + x];
+        const int pixels = height * width, rest = pixel % pixels;
+        const int y = rest / width, x = rest % width;
+        const half* image = projected + size_t(pixel - rest) * stride + conv + j0;
+        const int first = (j0 - identity) / branch, last = (j0 + 7 - identity) / branch;
+        float t[8];
+        if (j0 >= identity && first == last) {
+            // All eight channels use one kernel kind.
+            const int group = j0 - identity - first * branch;
+            if (first == 0) {
+#pragma unroll
+                for (int k = 0; k < 8; ++k) value[k] = square_bias[group + k];
+                for (int ky = 0; ky < 3; ++ky) {
+                    const int yy = y + ky - 1;
+                    if (yy < 0 || yy >= height) continue;
+                    for (int kx = 0; kx < 3; ++kx) {
+                        const int xx = x + kx - 1;
+                        if (xx < 0 || xx >= width) continue;
+                        load8(image + (size_t(yy) * width + xx) * stride, t);
+#pragma unroll
+                        for (int k = 0; k < 8; ++k)
+                            value[k] = fmaf(square[(group + k) * 9 + ky * 3 + kx], t[k], value[k]);
+                    }
+                }
+            } else {
+                const float* kernel = first == 1 ? row : column;
+                const float* bias = first == 1 ? row_bias : column_bias;
+#pragma unroll
+                for (int k = 0; k < 8; ++k) value[k] = bias[group + k];
+                for (int s = -5; s <= 5; ++s) {
+                    const int yy = first == 1 ? y : y + s, xx = first == 1 ? x + s : x;
+                    if (yy < 0 || yy >= height || xx < 0 || xx >= width) continue;
+                    load8(image + (size_t(yy) * width + xx) * stride, t);
+#pragma unroll
+                    for (int k = 0; k < 8; ++k) value[k] = fmaf(kernel[(group + k) * 11 + s + 5], t[k], value[k]);
+                }
+            }
+        } else {
+            // Narrow blocks: branches of four channels share a vector, possibly
+            // with identity channels. Handle each channel's kind separately.
+            load8(here + conv + j0, value);
+            int kind[8], index[8], kinds = 0;
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                const int d = j0 + k - identity;
+                kind[k] = d < 0 ? -1 : d / branch;
+                index[k] = d < 0 ? 0 : d - kind[k] * branch;
+                if (kind[k] >= 0) {
+                    kinds |= 1 << kind[k];
+                    value[k] = kind[k] == 0 ? square_bias[index[k]]
+                        : kind[k] == 1 ? row_bias[index[k]] : column_bias[index[k]];
+                }
+            }
+            if (kinds & 1) {
+                for (int ky = 0; ky < 3; ++ky) {
+                    const int yy = y + ky - 1;
+                    if (yy < 0 || yy >= height) continue;
+                    for (int kx = 0; kx < 3; ++kx) {
+                        const int xx = x + kx - 1;
+                        if (xx < 0 || xx >= width) continue;
+                        load8(image + (size_t(yy) * width + xx) * stride, t);
+#pragma unroll
+                        for (int k = 0; k < 8; ++k)
+                            if (kind[k] == 0) value[k] = fmaf(square[index[k] * 9 + ky * 3 + kx], t[k], value[k]);
+                    }
+                }
+            }
+            if (kinds & 6) {
+                for (int s = -5; s <= 5; ++s) {
+                    const bool in_row = x + s >= 0 && x + s < width, in_column = y + s >= 0 && y + s < height;
+                    if ((kinds & 2) && in_row) {
+                        load8(image + (size_t(y) * width + x + s) * stride, t);
+#pragma unroll
+                        for (int k = 0; k < 8; ++k)
+                            if (kind[k] == 1) value[k] = fmaf(row[index[k] * 11 + s + 5], t[k], value[k]);
+                    }
+                    if ((kinds & 4) && in_column) {
+                        load8(image + (size_t(y + s) * width + x) * stride, t);
+#pragma unroll
+                        for (int k = 0; k < 8; ++k)
+                            if (kind[k] == 2) value[k] = fmaf(column[index[k] * 11 + s + 5], t[k], value[k]);
+                    }
+                }
+            }
+        }
+    }
+    float result[8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) result[k] = mish(g[k]) * value[k];
+    store8(out + size_t(pixel) * hidden + ch, result);
+}
+
+// Linear attention, part one. qkv is FP32 [image, token, 2K + V]. A block
+// normalizes Q and K of up to 64 tokens of one image and accumulates K^T V for
+// 64 value channels; four threads per value channel split the keys. Blocks of
+// the first value slice also normalize Q in place and sum K. With one chunk
+// per image the sums are final and include epsilon; otherwise
+// attention_reduce adds the chunks.
+extern "C" __global__ void attention_prepare(float* qkv, float* key_sum, float* value_sum, float* matrix,
+                                             int keys, int values, int tokens, float eps, int final_sums) {
+    __shared__ float normalized[64][65];
+    __shared__ float value_tile[64][65];
+    const int n = blockIdx.y, chunk = blockIdx.x, slice = blockIdx.z, t0 = chunk * 64;
+    const int count = min(64, tokens - t0);
+    const int stride = 2 * keys + values;
+    float* base = qkv + (size_t(n) * tokens + t0) * stride;
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    for (int t = warp; t < 64; t += blockDim.x / 32) {
+        if (t >= count) {
+            normalized[t][lane] = normalized[t][lane + 32] = 0.f;
+            continue;
+        }
+        float* row = base + size_t(t) * stride;
+        const float ka = lane < keys ? row[keys + lane] : 0.f, kb = lane + 32 < keys ? row[keys + lane + 32] : 0.f;
+        const float k_inverse = 1.f / sqrtf(group_sum(fmaf(kb, kb, ka * ka), 32));
+        normalized[t][lane] = ka * k_inverse;
+        normalized[t][lane + 32] = kb * k_inverse;
+        if (!slice) {
+            const float qa = lane < keys ? row[lane] : 0.f, qb = lane + 32 < keys ? row[lane + 32] : 0.f;
+            const float q_inverse = 1.f / sqrtf(group_sum(fmaf(qb, qb, qa * qa), 32));
+            if (lane < keys) row[lane] = qa * q_inverse;
+            if (lane + 32 < keys) row[lane + 32] = qb * q_inverse;
+        }
+    }
+    const int c0 = slice * 64;
+    for (int i = threadIdx.x; i < 64 * 64; i += blockDim.x) {
+        const int t = i / 64, c = i % 64;
+        value_tile[t][c] = t < count && c0 + c < values ? base[size_t(t) * stride + 2 * keys + c0 + c] : 0.f;
+    }
+    __syncthreads();
+    const size_t slot = final_sums ? size_t(n) : size_t(n) * gridDim.x + chunk;
+    if (!slice && threadIdx.x < keys) {
+        float s = 0;
+        for (int t = 0; t < count; ++t) s += normalized[t][threadIdx.x];
+        key_sum[slot * keys + threadIdx.x] = final_sums ? s + eps : s;
+    }
+    const int c = threadIdx.x % 64, quarter = threadIdx.x / 64;
+    if (c0 + c >= values) return;
+    if (!quarter) {
+        float total = 0;
+        for (int t = 0; t < count; ++t) total += value_tile[t][c];
+        value_sum[slot * values + c0 + c] = total;
+    }
+    float acc[16];
+#pragma unroll
+    for (int m = 0; m < 16; ++m) acc[m] = 0;
+    for (int t = 0; t < count; ++t) {
+        const float v = value_tile[t][c];
+#pragma unroll
+        for (int m = 0; m < 16; ++m) acc[m] = fmaf(normalized[t][quarter * 16 + m], v, acc[m]);
+    }
+#pragma unroll
+    for (int m = 0; m < 16; ++m) {
+        const int key = quarter * 16 + m;
+        if (key < keys) matrix[(slot * keys + key) * values + c0 + c] = acc[m];
     }
 }
 
-template<class T>
-__device__ void add_bias(T* out, const float* bias, int channels, int pixels, int total) {
+// Linear attention, part two, for images with more than 64 tokens.
+extern "C" __global__ void attention_reduce(float* key_sum, float* value_sum, float* matrix, const float* key_part,
+                                            const float* value_part, const float* matrix_part, int keys, int values,
+                                            int chunks, float eps) {
+    const int n = blockIdx.x;
+    for (int i = threadIdx.x; i < keys; i += blockDim.x) {
+        float s = 0;
+        for (int c = 0; c < chunks; ++c) s += key_part[(size_t(n) * chunks + c) * keys + i];
+        key_sum[size_t(n) * keys + i] = s + eps;
+    }
+    for (int i = threadIdx.x; i < values; i += blockDim.x) {
+        float s = 0;
+        for (int c = 0; c < chunks; ++c) s += value_part[(size_t(n) * chunks + c) * values + i];
+        value_sum[size_t(n) * values + i] = s;
+    }
+    const int size = keys * values;
+    for (int i = threadIdx.x; i < size; i += blockDim.x) {
+        float s = 0;
+        for (int c = 0; c < chunks; ++c) s += matrix_part[(size_t(n) * chunks + c) * size + i];
+        matrix[size_t(n) * size + i] = s;
+    }
+}
+
+// Linear attention, part three, fused with the latent gate:
+// e = mish(g) * cat(identity, (vsum + Q M) / (tokens + Q ksum)).
+extern "C" __global__ void attention_gate(half* out, const half* projected, const float* qkv, const float* key_sum,
+                                          const float* value_sum, const float* matrix, int keys, int values,
+                                          int tokens, int total) {
     const int index = grid_index();
     if (index >= total) return;
-    store(out, index, __fadd_rn(load(out, index), bias[index / pixels % channels]));
+    const int hidden = 3 * values / 2, vectors = hidden / 8;
+    const int ch = 8 * (index % vectors);
+    const int token = index / vectors;
+    const half* here = projected + size_t(token) * 2 * hidden;
+    float g[8], value[8];
+    load8(here + ch, g);
+    const int identity = hidden - values;
+    if (ch < identity) {
+        load8(here + hidden + ch, value);
+    } else {
+        const int c0 = ch - identity, n = token / tokens;
+        const float* q = qkv + size_t(token) * (2 * keys + values);
+        const float* k = key_sum + size_t(n) * keys;
+        const float* m = matrix + size_t(n) * keys * values + c0;
+        float contraction = 0, product[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        for (int i = 0; i < keys; ++i) {
+            const float query = q[i];
+            contraction = fmaf(query, k[i], contraction);
+            const float4 lo = *reinterpret_cast<const float4*>(m + size_t(i) * values);
+            const float4 hi = *reinterpret_cast<const float4*>(m + size_t(i) * values + 4);
+            product[0] = fmaf(query, lo.x, product[0]);
+            product[1] = fmaf(query, lo.y, product[1]);
+            product[2] = fmaf(query, lo.z, product[2]);
+            product[3] = fmaf(query, lo.w, product[3]);
+            product[4] = fmaf(query, hi.x, product[4]);
+            product[5] = fmaf(query, hi.y, product[5]);
+            product[6] = fmaf(query, hi.z, product[6]);
+            product[7] = fmaf(query, hi.w, product[7]);
+        }
+        const float reciprocal = 1.f / (float(tokens) + contraction);
+        const float* sums = value_sum + size_t(n) * values + c0;
+#pragma unroll
+        for (int k8 = 0; k8 < 8; ++k8) value[k8] = (sums[k8] + product[k8]) * reciprocal;
+    }
+    float result[8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) result[k] = mish(g[k]) * value[k];
+    store8(out + size_t(token) * hidden + ch, result);
 }
 
-template<class T>
-__device__ void add(T* out, const T* a, const T* b, int total) {
+// cat(PixelShuffle(2)(up), skip) in NHWC at the higher resolution. The up
+// convolution's output channels are stored subpixel-major, so each subpixel's
+// channels are contiguous.
+extern "C" __global__ void shuffle_concat(half* out, const half* up, const half* skip, int half_channels,
+                                          int height, int width, int total) {
     const int index = grid_index();
     if (index >= total) return;
-    store(out, index, __fadd_rn(load(a, index), load(b, index)));
+    const int vectors = half_channels / 4;
+    const int c0 = 8 * (index % vectors);
+    const int pixel = index / vectors;
+    const int pixels = height * width, n = pixel / pixels, rest = pixel % pixels;
+    const int y = rest / width, x = rest % width;
+    const half* source;
+    if (c0 < half_channels) {
+        const int s = (y % 2) * 2 + x % 2;
+        source = up + ((size_t(n) * (height / 2) + y / 2) * (width / 2) + x / 2) * 4 * half_channels
+            + s * half_channels + c0;
+    } else {
+        source = skip + size_t(pixel) * half_channels + c0 - half_channels;
+    }
+    *reinterpret_cast<uint4*>(out + size_t(pixel) * 2 * half_channels + c0) = *reinterpret_cast<const uint4*>(source);
 }
 
-#define UMZI_FEATURE_KERNELS(T, S) \
-extern "C" __global__ void rms_norm_##S(T* o, const T* i, const float* s, const float* f, int c, int p, float r, int t) \
-    { rms_norm(o, i, s, f, c, p, r, t); } \
-extern "C" __global__ void local_gate_##S(T* o, const T* i, const float* ib, const float* w, const float* b, int c, \
-    int h, int x, int t) { local_gate(o, i, ib, w, b, c, h, x, t); } \
-extern "C" __global__ void plane_sum_##S(float* o, const T* i, int p, int n, int bp, int f, float a, int m) \
-    { plane_sum(o, i, p, n, bp, f, a, m); } \
-extern "C" __global__ void local_skip_##S(T* o, const T* l, const float* a, const T* s, const float* g, int c, int p, \
-    int t) { local_skip(o, l, a, s, g, c, p, t); } \
-extern "C" __global__ void inception_##S(T* o, const T* i, const float* ib, const float* a, const float* ab, \
-    const float* b, const float* bb, const float* c, const float* cb, int ch, int br, int bp, int h, int w, int t) \
-    { inception(o, i, ib, a, ab, b, bb, c, cb, ch, br, bp, h, w, t); } \
-extern "C" __global__ void gate_##S(T* o, const T* p, const float* pb, const T* m, int h, int i, int x, int t) \
-    { gate(o, p, pb, m, h, i, x, t); } \
-extern "C" __global__ void mish_skip_##S(T* o, const T* i, const float* ib, const T* s, const float* g, int c, int p, \
-    int t) { mish_skip(o, i, ib, s, g, c, p, t); } \
-extern "C" __global__ void normalize_qk_##S(float* o, const T* i, int c, int bp, int n, int t) \
-    { normalize_qk_packed(o, i, c, bp, n, t); } \
-extern "C" __global__ void key_value_##S(float* o, const float* q, const T* p, int k, int v, int bp, int f, int n, \
-    int t) { key_value(o, q, p, k, v, bp, f, n, t); } \
-extern "C" __global__ void attention_output_##S(T* o, const float* q, const float* m, const float* k, \
-    const float* v, int kc, int vc, int n, int t) { attention_output(o, q, m, k, v, kc, vc, n, t); } \
-extern "C" __global__ void unshuffle_##S(T* o, const T* i, int c, int h, int w, int t) \
-    { unshuffle(o, i, c, h, w, t); } \
-extern "C" __global__ void up_concat_##S(T* o, const T* u, const T* s, int c, int h, int w, int t) \
-    { up_concat(o, u, s, c, h, w, t); } \
-extern "C" __global__ void add_bias_##S(T* o, const float* b, int c, int p, int t) { add_bias(o, b, c, p, t); } \
-extern "C" __global__ void add_##S(T* o, const T* a, const T* b, int t) { add(o, a, b, t); }
-
-UMZI_FEATURE_KERNELS(half, f16)
-
-// The key sum reduces the FP32 normalized keys.
-extern "C" __global__ void plane_sum_f32(float* o, const float* i, int p, int n, int bp, int f, float a, int m) {
-    plane_sum(o, i, p, n, bp, f, a, m);
+extern "C" __global__ void input_conv_f32(half* x, half* norm, const float* in, const float* w, const float* b,
+                                          const float* s, const float* o, int c, int h, int width, int ph, int pw,
+                                          float r, int t) {
+    input_conv(x, norm, in, w, b, s, o, c, h, width, ph, pw, r, t);
 }
+extern "C" __global__ void input_conv_f16(half* x, half* norm, const half* in, const float* w, const float* b,
+                                          const float* s, const float* o, int c, int h, int width, int ph, int pw,
+                                          float r, int t) {
+    input_conv(x, norm, in, w, b, s, o, c, h, width, ph, pw, r, t);
+}
+extern "C" __global__ void output_conv_f32(float* out, const half* f, const float* w, const float* b,
+                                           const float* in, int c, int h, int width, int ph, int pw, int t) {
+    output_conv(out, f, w, b, in, c, h, width, ph, pw, t);
+}
+extern "C" __global__ void output_conv_f16(half* out, const half* f, const float* w, const float* b, const half* in,
+                                           int c, int h, int width, int ph, int pw, int t) {
+    output_conv(out, f, w, b, in, c, h, width, ph, pw, t);
+}
+
+#define UMZI_PIXEL_NORM(M) \
+extern "C" __global__ void pixel_norm_##M(half* x, half* norm, const half* a, const half* b, const float* v, \
+    const float* s, const float* o, int c, int lanes, int p, int w, float r, int t) \
+    { pixel_norm<M>(x, norm, a, b, v, s, o, c, lanes, p, w, r, t); }
+UMZI_PIXEL_NORM(0)
+UMZI_PIXEL_NORM(1)
+UMZI_PIXEL_NORM(2)
+UMZI_PIXEL_NORM(3)
