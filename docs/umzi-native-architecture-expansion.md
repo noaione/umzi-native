@@ -158,10 +158,12 @@ tile context.
 
 The [CUDA baseline runbook and results](umzi-native-architecture-baselines.md)
 record the reference and backend runs.
+The [GateRV2 handoff](handoff-gaterv2.md) records the validated behavior and
+the remaining package and session work.
 
 | Family | CPU checkpoint load | CUDA baselines | Native FP32 parity, export, and session |
 | --- | --- | --- | --- |
-| GateRV2 | Verified | FP32, RTX FP16, and Inductor FP16 with FP32 attention measured | Private FP32 network validated, package and session pending |
+| GateRV2 | Verified | FP32, RTX FP16, and Inductor FP16 with FP32 attention measured | FP32 package (family 3, schema 1) and C++ session validated; FP16 and tuning pending |
 | MoESR | Verified, supplied ONNX validated | FP32, Inductor FP16, and RTX FP16 measured | Pending |
 | GFISRv2 | Verified, prior handoff reviewed | FP32, eager FP16, and Inductor FP16 measured, flat-tile fidelity failure traced, RTX skipped | Pending |
 
@@ -210,6 +212,86 @@ packages after extracting the shared CUDA resize code. The rebuilt
 Windows DLL passed the aligned and odd-rectangle session checks in
 mixed precision and FP16. Both checkpoints matched the CLI bit for
 bit and reused the disk cache when reopened.
+
+### GateRV2 FP32 package and session
+
+GateRV2 packages use family ID `3` and payload schema `1`. Section 1 holds
+sixteen little-endian 32-bit values: input and output channels, scale,
+padding alignment, base channels, level count, latent block count, the
+attention epsilon as FP32, four encoder depths, and four decoder depths.
+Unused levels are zero. Section 2 is a table of 644 entries, each a 64-bit
+byte offset and FP32 element count. Section 3 holds the FP32 parameters at
+256-byte offsets in execution order. The Q, K and V projections of each
+latent block are concatenated into one projection. Section 4 holds the
+checkpoint SHA-256. The [packer](../src/umzi_native/exporter/_gaterv2.py),
+the [package reader](../src/umzi_native/_model.py), and the
+[session](../native/kernels/gaterv2/runner.cpp) derive the same parameter
+list from the architecture and reject any other count, order, or layout.
+
+The session keeps NCHW FP32 features. It runs every convolution through
+cuDNN with `CUDNN_FMA_MATH`, so TF32 is excluded, then adds the bias in a
+separate kernel. The [CUDA kernels](../native/kernels/gaterv2/kernels.cu)
+compile without fast math and implement RMSNorm, the grouped local
+convolution and gate, pooling and channel attention, the inception
+depthwise branches, Mish gating, pixel unshuffle and shuffle, and the
+linear attention. The attention adds epsilon to the reduced K vector
+before the Q contraction and then adds the token count. The session
+supports any batch and any height and width whose reflection padding is
+valid, CUDA Graph or direct execution, and host or device buffers. It
+accepts only the default precision and rejects kernel options. FP16
+modes and plan caching are not implemented yet.
+
+`scripts/validate_gaterv2_session.py` exported the checkpoint twice with
+identical bytes. It rejected the wrong schema, the GateRV3 family ID, an
+8-pixel alignment, a wrong parameter count, a truncated parameter table,
+trailing weights, FP16 precision, a kernel option, an 8×9 input, and a
+one-channel input. CUDA Graph and direct execution produced identical
+outputs on all 14 stress cases. The cases included 65×79, 128×160, 9×9,
+three 31×47 tiles, and a distinct batch of 16. Each batch item was within
+1.07e-6 of its batch-1 run. Device enqueue matched eager FP32 on a
+128×128 batch of two and a 65×79 tile. Three sessions that each switched
+through four shapes returned the device's free memory to its starting value.
+
+Thirteen stress cases met `atol=1e-5` and `rtol=5e-5` against eager FP32,
+with at most 1.19e-6 error. The checkerboard reached 1.88e-5 at 108.574 dB,
+with two of its 49,152 values outside the tolerance and 98.327 SSIMULACRA2.
+That tile drives the attention denominator down to 1.45e-4 against 64
+tokens. An FP64 run of the same model shows that eager FP32 is itself
+1.68e-5 from FP64 there. The session is 1.80e-5 from FP64. The validator
+therefore accepts a tolerance miss only when the session's FP64 error is
+within 1.5 times eager FP32's error. Accumulating the denominator in FP64
+did not reduce the session's error, so the kernel keeps FP32.
+
+The page benchmark uses the same tiling as the baseline: 128×128 tiles,
+batch 16, zero overlap. Session times are synchronized host calls, so they
+include the host-to-device and device-to-host RGB copies. The eager
+reference runs on device-resident tensors in the same process. Batch-1
+latency times each of the 630 real tiles in a separate synchronized call to
+a separate session prepared for batch 1.
+
+| Source page | Batch-16 inference | Input MPx/s | Mean batch-1 tile ms | Raw PSNR dB | SSIMULACRA2 | Max abs error |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| watanare-page-085.jpg | 3.437 s | 1.343 | 16.232 | 146.658 | 92.918 | 1.01e-6 |
+| watanare-page-086.jpg | 3.511 s | 1.315 | 16.337 | 147.029 | 93.263 | 1.73e-6 |
+| Both pages | 6.948 s | 1.329 | 16.285 | 146.840 | 93.090 mean / 92.918 min | 1.73e-6 |
+| Eager FP32, same run | 9.112 s | 1.013 | 50.844 | — | — | — |
+
+Both pages met the eager tolerance. The rendered PNGs differed from the
+FP32 renders in 85 and 70 RGB samples. The eager batch-1 tile latency in this run was slower than the 43.658 ms
+baseline report, so compare the session with the paired eager row.
+
+```powershell
+$py = 'C:\Python314\python.exe'
+& $py scripts/build_native.py --output output/gaterv2-session/native --arch sm_86 --nvrtc-root output/nvrtc-13.0/nvidia/cu13
+$env:PYTHONPATH = 'src;scripts'
+& $py scripts/validate_gaterv2_session.py --library output/gaterv2-session/native/umzi_native.dll --pages
+```
+
+The report is `output/gaterv2-session/report.json`. The same build
+re-exported both GateRV3 checkpoints with bytes identical to the previous
+packages. Both passed `scripts/check_python_session.py` in mixed precision
+and FP16, with bitwise CLI matches and cache reuse on reopen. Those reports
+are in `output/gaterv2-session/gaterv3-regression/`.
 
 Related design documents are the [runtime and package plan](umzi-native-runtime-plan.md)
 and the [exporter plan](umzi-model-exporter-plan.md).

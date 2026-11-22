@@ -11,7 +11,7 @@ from typing import BinaryIO
 
 from ._loader import PathArg
 
-__all__ = ["GateRV3Model", "ModelInfo", "ModelSection", "peek_model"]
+__all__ = ["GateRV2Model", "GateRV3Model", "ModelInfo", "ModelSection", "peek_model"]
 
 MAGIC = b"UMZINPKG"
 VERSION = 1
@@ -29,9 +29,18 @@ OPERATION = struct.Struct("<11i")
 # Keep the tables below in step with native/runtime/registry.cpp and the
 # family parsers under native/kernels/.
 GATERV3_FAMILY = 1
-FAMILIES = {GATERV3_FAMILY: "gaterv3"}
-SCHEMAS = {"gaterv3": 1}
+GATERV2_FAMILY = 3
+FAMILIES = {GATERV3_FAMILY: "gaterv3", GATERV2_FAMILY: "gaterv2"}
+SCHEMAS = {"gaterv3": 1, "gaterv2": 1}
 SECTION_NAMES = {1: "architecture", 2: "schedule", 3: "weights", 4: "checkpoint"}
+# GateRV2 schema 1 architecture: input, output, scale, alignment, base
+# channels, levels, latent blocks, the attention epsilon as float32, four
+# encoder depths and four decoder depths. Unused levels are zero.
+GATERV2_ARCHITECTURE = struct.Struct("<7If8I")
+# GateRV2 schema 1 parameter table entry: byte offset and float32 count.
+GATERV2_PARAMETER = struct.Struct("<QQ")
+GATERV2_MAX_LEVELS = 4
+GATERV2_MAX_WEIGHT_BYTES = 512 << 20
 
 
 class GateRV3Op(IntEnum):
@@ -85,11 +94,66 @@ class GateRV3Model:
 
 
 @dataclass(frozen=True)
+class GateRV2Model:
+    """Architecture declared by a GateRV2 payload (schema 1)."""
+
+    input_channels: int
+    output_channels: int
+    base_channels: int
+    scale: int
+    alignment: int
+    encoder_depths: tuple[int, ...]
+    decoder_depths: tuple[int, ...]
+    latent_blocks: int
+    attention_eps: float
+    parameters: int
+    weight_bytes: int
+    checkpoint: str | None
+
+
+def _meta_counts(dim: int) -> list[int]:
+    hidden, branch = 3 * dim // 2, dim // 8
+    return [
+        *(dim, dim, 2 * dim * dim, 2 * dim, 2 * dim * 2 * 9, 2 * dim, dim * dim, dim, dim),
+        *(dim, dim, 2 * hidden * dim, 2 * hidden),
+        *(branch * 9, branch, branch * 11, branch, branch * 11, branch),
+        *(dim * hidden, dim, dim),
+    ]
+
+
+def gaterv2_parameter_counts(
+    base: int, encoder: tuple[int, ...], decoder: tuple[int, ...], latent: int, channels: int = 3
+) -> list[int]:
+    """Return the float32 element count of each packed GateRV2 parameter in payload order.
+
+    Keep the order in step with ``Network`` in native/kernels/gaterv2/runner.cpp.
+    """
+    counts = [base * channels * 9, base]
+    for level, depth in enumerate(encoder):
+        dim = base << level
+        for _ in range(depth):
+            counts += _meta_counts(dim)
+        counts.append(dim // 2 * dim * 9)
+    width = base << len(encoder)
+    keys = width // 16
+    for _ in range(latent):
+        counts += [width, width, 3 * width * width, 3 * width, (2 * keys + width) * width, 2 * keys + width]
+        counts += [width * 3 * width // 2, width]
+    for index, depth in enumerate(decoder):
+        dim = width >> index
+        counts += [2 * dim * dim * 9, dim // 2 * dim, dim // 2]
+        for _ in range(depth):
+            counts += _meta_counts(dim // 2)
+    counts += [channels * base * 9, channels]
+    return counts
+
+
+@dataclass(frozen=True)
 class ModelInfo:
     """What a model package declares, and whether this runtime accepts it.
 
     ``payload`` holds the family-specific metadata; GateRV3 packages return a
-    :class:`GateRV3Model`. A package from an unsupported family keeps
+    :class:`GateRV3Model` and GateRV2 packages a :class:`GateRV2Model`. A package from an unsupported family keeps
     ``payload = None`` because its payload layout is unknown.
     """
 
@@ -101,7 +165,7 @@ class ModelInfo:
     schema: int
     digest: str
     sections: tuple[ModelSection, ...]
-    payload: GateRV3Model | None = None
+    payload: GateRV3Model | GateRV2Model | None = None
     problems: tuple[str, ...] = ()
 
     @property
@@ -181,6 +245,8 @@ def peek_model(path: PathArg) -> ModelInfo:
         problems.append(f"Kernel family {family} is not supported by this build")
     elif family_name == "gaterv3":
         payload = _read_gaterv3(schema, contents.get(1), contents.get(2), weights, contents.get(4), problems)
+    elif family_name == "gaterv2":
+        payload = _read_gaterv2(schema, contents.get(1), contents.get(2), weights, contents.get(4), problems)
     return ModelInfo(
         path=model,
         size=size,
@@ -279,4 +345,82 @@ def _read_gaterv3(
         weight_bytes=weight_bytes,
         checkpoint=checkpoint.hex() if checkpoint else None,
         op_kinds=op_kinds,
+    )
+
+
+def _read_gaterv2(
+    schema: int,
+    architecture: bytes | None,
+    table: bytes | None,
+    weight_bytes: int,
+    checkpoint: bytes | None,
+    problems: list[str],
+) -> GateRV2Model | None:
+    """Mirror the payload checks in ``GateRV2Session::open``."""
+    if schema != SCHEMAS["gaterv2"]:
+        problems.append("Unsupported GateRV2 model payload version")
+        return None
+    if (
+        architecture is None
+        or len(architecture) != GATERV2_ARCHITECTURE.size
+        or (checkpoint is not None and len(checkpoint) != DIGEST_SIZE)
+    ):
+        problems.append("Invalid GateRV2 model metadata size")
+        return None
+    values = GATERV2_ARCHITECTURE.unpack(architecture)
+    input_channels, output_channels, scale, alignment, base, levels, latent, eps = values[:8]
+    depths = values[8:]
+    encoder_all, decoder_all = depths[:GATERV2_MAX_LEVELS], depths[GATERV2_MAX_LEVELS:]
+    if not (
+        (input_channels, output_channels, scale) == (3, 3, 1)
+        and 1 <= levels <= GATERV2_MAX_LEVELS
+        and alignment == 1 << levels
+        and 16 <= base <= 64
+        and base % 16 == 0
+        and 1 <= latent <= 64
+        and 0 < eps < 1
+        and all(depth <= 32 for depth in depths)
+        and not any(encoder_all[levels:])
+        and not any(decoder_all[levels:])
+    ):
+        problems.append("Unsupported GateRV2 model architecture")
+        return None
+    encoder, decoder = tuple(encoder_all[:levels]), tuple(decoder_all[:levels])
+    counts = gaterv2_parameter_counts(base, encoder, decoder, latent)
+    if (
+        table is None
+        or len(table) != len(counts) * GATERV2_PARAMETER.size
+        or not 0 < weight_bytes <= GATERV2_MAX_WEIGHT_BYTES
+    ):
+        problems.append("Invalid GateRV2 parameter table or weights")
+    else:
+        end = 0
+        entries = GATERV2_PARAMETER.iter_unpack(table)
+        for index, ((offset, stored), count) in enumerate(zip(entries, counts, strict=True)):
+            if (
+                stored != count
+                or offset % 256
+                or offset < end
+                or offset > weight_bytes
+                or count > (weight_bytes - offset) // 4
+            ):
+                problems.append(f"Invalid GateRV2 parameter {index}")
+                break
+            end = offset + count * 4
+        else:
+            if end != weight_bytes:
+                problems.append("Unexpected trailing GateRV2 weight data")
+    return GateRV2Model(
+        input_channels=input_channels,
+        output_channels=output_channels,
+        base_channels=base,
+        scale=scale,
+        alignment=alignment,
+        encoder_depths=encoder,
+        decoder_depths=decoder,
+        latent_blocks=latent,
+        attention_eps=eps,
+        parameters=len(counts),
+        weight_bytes=weight_bytes,
+        checkpoint=checkpoint.hex() if checkpoint else None,
     )

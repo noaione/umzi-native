@@ -7,6 +7,7 @@
 
 namespace umzi {
 inline constexpr uint32_t gaterv3_id = 1;
+inline constexpr uint32_t gaterv2_id = 3;
 
 class ModelPackage {
     std::vector<char> bytes;

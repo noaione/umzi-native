@@ -8,7 +8,7 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
-from ._model import GateRV3Model, ModelInfo, peek_model
+from ._model import GateRV2Model, GateRV3Model, ModelInfo, peek_model
 
 
 def _bytes(count: int) -> str:
@@ -51,6 +51,18 @@ def _summary(info: ModelInfo) -> str:
         )
         if payload.op_kinds:
             lines.append("  operations: " + ", ".join(f"{name} {count}" for name, count in payload.op_kinds.items()))
+        if payload.checkpoint:
+            lines.append(f"  checkpoint: {payload.checkpoint}")
+    elif isinstance(payload, GateRV2Model):
+        lines.append(
+            f"  {payload.input_channels} -> {payload.output_channels} channels, x{payload.scale} scale, "
+            f"{payload.alignment}-pixel padding, {payload.base_channels} base channels"
+        )
+        lines.append(
+            f"  encoder {payload.encoder_depths}, decoder {payload.decoder_depths}, "
+            f"{payload.latent_blocks} latent attention blocks (eps {payload.attention_eps:g})"
+        )
+        lines.append(f"  {payload.parameters} FP32 parameters, {_bytes(payload.weight_bytes)} of weights")
         if payload.checkpoint:
             lines.append(f"  checkpoint: {payload.checkpoint}")
     lines.extend(f"  problem: {problem}" for problem in info.problems)
@@ -107,7 +119,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     export.add_argument("checkpoint", type=Path, help=".safetensors, .pth, .pt, or .ckpt state dictionary")
     export.add_argument("-o", "--output", type=Path, required=True, help="destination .ummodel file")
-    export.add_argument("--kernel", help="assert the detected native kernel family, such as gaterv3")
+    export.add_argument("--kernel", help="assert the detected native kernel family, such as gaterv3 or gaterv2")
     export.set_defaults(handler=_export)
 
     arguments = list(sys.argv[1:] if argv is None else argv)

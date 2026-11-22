@@ -23,7 +23,9 @@ from typing import NamedTuple
 
 ROOT = Path(__file__).resolve().parent
 NATIVE = ROOT / "native"
-KERNEL_SOURCES = {"gaterv3": NATIVE / "kernels" / "gaterv3"}
+KERNEL_SOURCES = {"gaterv3": NATIVE / "kernels" / "gaterv3", "gaterv2": NATIVE / "kernels" / "gaterv2"}
+# GateRV2 runs FP32 parity kernels; fast math would change their rounding.
+EXACT_MATH_FAMILIES = frozenset({"gaterv2"})
 HOST_SOURCES = (
     *(source / "runner.cpp" for source in KERNEL_SOURCES.values()),
     NATIVE / "runtime" / "api.cpp",
@@ -319,10 +321,12 @@ def build(output: Path, settings: BuildSettings | None = None) -> Path:
     output.mkdir(parents=True, exist_ok=True)
     nvrtc = _load_nvrtc(toolchain.nvrtc)
     for family, source in KERNEL_SOURCES.items():
+        fast_math = family not in EXACT_MATH_FAMILIES
         cubins = {
-            arch: _compile_kernels(nvrtc, toolchain.includes, arch, source) for arch in dict.fromkeys(settings.arches)
+            arch: _compile_kernels(nvrtc, toolchain.includes, arch, source, fast_math=fast_math)
+            for arch in dict.fromkeys(settings.arches)
         }
-        ptx = _compile_kernels(nvrtc, toolchain.includes, PTX_TARGET, source)
+        ptx = _compile_kernels(nvrtc, toolchain.includes, PTX_TARGET, source, fast_math=fast_math)
         for arch, image in cubins.items():
             (output / f"{family}-{arch}.cubin").write_bytes(image)
         (output / f"{family}-{PTX_TARGET}.ptx").write_bytes(ptx)

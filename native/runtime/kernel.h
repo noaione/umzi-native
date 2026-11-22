@@ -29,5 +29,6 @@ public:
 
 using KernelFactory = std::unique_ptr<KernelSession>(*)(const ModelPackage&, const UmziSessionOptions&);
 std::unique_ptr<KernelSession> make_gaterv3(const ModelPackage& package, const UmziSessionOptions& options);
+std::unique_ptr<KernelSession> make_gaterv2(const ModelPackage& package, const UmziSessionOptions& options);
 KernelFactory kernel_factory(uint32_t family);
 }
