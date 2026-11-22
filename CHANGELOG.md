@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+Nothing yet!
+
+## [0.0.4] - 2026-11-23
+
 ### Changed
 
 - Improved GateRV3 attention kernel fidelity scores while keeping the same
