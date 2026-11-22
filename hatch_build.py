@@ -381,7 +381,18 @@ def _build_linux(
             "-ldl",
         ]
         library = output / LIBRARY_NAME
-        _run(compiler, *objects, *link_tail, "-shared", "-o", str(library))
+        version_script = output / "umzi_native.map"
+        version_script.write_text("{\n  global:\n    umzi_*;\n  local:\n    *;\n};\n", encoding="ascii")
+        _run(
+            compiler,
+            *objects,
+            *link_tail,
+            "-shared",
+            "-Wl,--exclude-libs,ALL",
+            f"-Wl,--version-script={version_script}",
+            "-o",
+            str(library),
+        )
         _run(compiler, *objects, str(cli_obj), *link_tail, "-o", str(output / CLI_NAME))
         return library
     finally:
