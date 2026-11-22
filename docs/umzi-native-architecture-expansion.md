@@ -166,9 +166,41 @@ records the current MoESR state and the next steps.
 
 | Family | CPU checkpoint load | CUDA baselines | Native FP32 parity, export, and session |
 | --- | --- | --- | --- |
-| GateRV2 | Verified | FP32, RTX FP16, and Inductor FP16 with FP32 attention measured | Package (family 3, schema 1) and C++ session in mixed and FP16 validated on Windows and Linux; first tuning pass done |
-| MoESR | Verified, supplied ONNX validated | FP32, Inductor FP16, and RTX FP16 measured | [Private FP32 parity](#moesr-private-fp32-validation) and [family-4 mixed/FP16 session](#moesr-native-package-and-session) validated on Windows and Linux wheels (Pass 4: 1.84× RTX in FP16, 1.14× RTX in 68.2 dB mixed) |
-| GFISRv2 | Verified, prior handoff reviewed | FP32, eager FP16, and Inductor FP16 measured, flat-tile fidelity failure traced, RTX skipped | [Packaged native session](#gfisrv2-native-fp32-package-and-session) validated in FP32, FP16, and Mixed on Windows (Passes 1–3: **1.96× TRT 10** in FP16 at 2.46 s/page, **1.39× TRT 10** in 70.4 dB Mixed at 3.47 s/page) |
+| GateRV2 | Verified | FP32, RTX FP16, and Inductor FP16 with FP32 attention measured | Package (family 3, schema 1) and C++ session in mixed and FP16 validated on Windows and Linux (Step 9: `1.656 s` FP16 / `1.849 s` Mixed, `156 / 160 MiB` b16 VRAM) |
+| MoESR | Verified, supplied ONNX validated | FP32, Inductor FP16, and RTX FP16 measured | [Private FP32 parity](#moesr-private-fp32-validation) and [family-4 mixed/FP16 session](#moesr-native-package-and-session) validated on Windows and Linux wheels (Pass 4: **1.84× RTX** in FP16, **1.14× RTX** in 68.2 dB Mixed) |
+| GFISRv2 | Verified, prior handoff reviewed | FP32, eager FP16, and Inductor FP16 measured, flat-tile fidelity failure traced, RTX skipped | [Packaged native session](#gfisrv2-native-fp32-package-and-session) validated in FP32, FP16, and Mixed on Windows (Passes 1–3: **1.96× TRT 10** in FP16 at `2.46 s/page`, **1.39× TRT 10** in 70.4 dB Mixed at `3.47 s/page`) |
+
+### Final timing and fidelity summary (RTX 3050 Laptop)
+
+All final measurements were taken on the same Windows workstation (NVIDIA
+GeForce RTX 3050 Laptop 4 GiB, driver 610.62, Python 3.14.5, PyTorch
+2.15.0+cu132, cuDNN 9.26) with TF32 disabled, CUDA Graph replay enabled for
+native sessions, raw-float PSNR (peak 1, pre-quantization) against eager CUDA
+FP32, and separately timed individual synchronized batch-1 tiles.
+
+| Architecture & workload | Runner / precision | Batched time | Input MPx/s | Mean batch-1 tile (ms) | VRAM (MiB) | Raw PSNR (dB) | SSIMULACRA2 (mean / min) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| **GateRV2** (1× Dehalftone, 2 pages `1800×2565`, 128×128 b16 ov0, 630 tiles) | Eager FP32 baseline | 8.929 s | 1.034 | 43.658 | 756 (b16) / 188 (b1) | — | — |
+| | Inductor FP16 (FP32 attn) | 7.565 s | 1.221 | 21.625 | — | 73.754 | 90.440 / 90.186 |
+| | TensorRT-RTX FP16 (paired) | 2.323 s | 3.975 | 4.931 | 242 (b16) / 108 (b1) | 69.730 | 90.361 / 90.058 |
+| | **Native Mixed (Step 9 final)** | **1.849 s** | **4.993** | **3.953** | **160** (b16) / 74 (b1) | **77.920** | **90.541 / 90.285** |
+| | **Native FP16 (Step 9 final)** | **1.656 s** | **5.578** | **3.834** | **156** (b16) / 70 (b1) | 73.845 | 90.411 / 90.164 |
+| **MoESR** (4× DWTP DS, 3 pages `900×1350`, 256×256 b2 ov0, 72 tiles) | Eager FP32 baseline | 76.963 s | 0.047 | 565.989 | — | — | — |
+| | Inductor FP16 baseline | 18.143 s | 0.201 | 258.581 | — | 67.263 | 87.287 / 87.058 |
+| | TensorRT-RTX FP16 (paired) | 12.441 s | 0.2930 | 134.5 | — | 60.188 | 86.210 / 85.517 |
+| | **Native Mixed (Pass 4 final, paired vs RTX)** | **10.934 s** (1.14× RTX) | **0.3334** | 154.5 | **172** (b2) / 102 (b1) | **68.215** | **87.287 / 87.152** |
+| | **Native FP16 (Pass 4 final, paired vs RTX)** | **6.778 s** (1.84× RTX) | **0.5378** | **98.0** | **158** (b2) / 96 (b1) | 60.154 | 86.051 / 85.337 |
+| **GFISRv2** (4× MangaScale, `lb-page-003.png`, matched 128×128 b1 ov32, 150 tiles, full page) | Historical ORT TRT 10 FP16 | 4.8052 s/page | 0.2529 | — | 292.49 (NVML steady) | 60.4422 | 87.2950 (gray) |
+| | **Native Mixed (Pass 3 final)** | **3.4668 s/page** (1.39× TRT) | **0.3505** | **20.322** dev / 22.235 host | **118.49** (NVML steady) | **70.3614** | **87.5083** (gray) |
+| | **Native FP16 (Pass 3 final)** | **2.4558 s/page** (1.96× TRT) | **0.4948** | **13.740** dev / 14.925 host | **106.49** (NVML steady) | 59.4502 | **87.4620** (gray) |
+| **GFISRv2** (4× MangaScale, 3 pages `900×1350`, 256×256 b2 ov64, 105 tiles) | Native FP32 (bit-exact) | 22.634 s | 0.1610 | 213.498 | 362 (b2 delta) | ∞ | 100.000 / 100.000 |
+| | **Native Mixed (Pass 3 final)** | **7.424 s** (2.32× base) | **0.4910** | **69.631** | **220** (b2 delta, 0 B ws) | **65.798** | **86.612 / 85.752** |
+| | **Native FP16 (Pass 3 final)** | **4.989 s** (3.28× base) | **0.7307** | **48.159** | **166** (b2 delta, 0 B ws) | 56.878 | 86.235 / 85.442 |
+
+Notes:
+- **GateRV2:** Step-9 timings are medians over 4 rotated rounds (`output/gaterv2-session/optimized-paired/report.json`, heuristic plans for build-vs-build control; Step 9 improved over Step 8 by 10.9% FP16 / 8.2% Mixed, and Step 8 already beat RTX at 1.772 s FP16 / 1.936 s Mixed vs 2.264 s RTX with default tuned plans). Resident VRAM is device free-memory delta on cached prepare (`88.5 MiB` activations, `0–0.008 MiB` retained workspace).
+- **MoESR:** Pass-4 paired-vs-RTX timings are medians over 3 rotated rounds (`output/moesr-session/paired-p4-rtx/report.json`). In the 4-round Pass 4 vs Pass 3 run, Pass 4 measured `6.168 s` (`0.5909 MPx/s`, `88.3 ms/tile`) in FP16 and `9.799 s` (`0.3720 MPx/s`, `138.5 ms/tile`) in Mixed; GPU delta is `cuMemGetInfo` above context (`0 B` workspace).
+- **GFISRv2:** Matched 128×128 full-page timings are medians over 4 paired rounds including host tiling, transfers, inference, and stitching (`output/gfisrv2-session/opt-final-matched-128/summary.json`); 256×256 ov64 timings are synchronized device-resident forward totals (`output/gfisrv2-session/opt-final-ov64-*/report.json`). Full details live in the [GateRV2](handoff-gaterv2.md), [MoESR](handoff-moesr.md), and [GFISRv2](handoff-gfisrv2.md) handoffs.
 
 ### GateRV2 private FP32 validation
 
@@ -385,6 +417,20 @@ checks their hashes and profiles each RTX graph again.
   --output output/gaterv2-session/step7-paired
 ```
 
+#### GateRV2 final timings and VRAM (Step 9)
+
+Steps 8–9 specialized the 32-channel 128×128 inception and local gates,
+grouped wider inception dispatches by branch, shared encoder/decoder activation
+arena space (`130.8 → 88.5 MiB` at batch 16), and allocated plan workspace on
+demand (`0–0.008 MiB` on cache hits). Four rotated Windows rounds against Step
+8 (`output/gaterv2-session/optimized-paired/report.json`) and cached VRAM probes
+(`output/gaterv2-session/full-opt-memory.json`):
+
+| Precision | Batch-16 seconds | Input MPx/s | Mean batch-1 tile ms | Resident VRAM b16 / b1 (MiB) | Raw PSNR dB | SSIMULACRA2 mean / min |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| **Native mixed (Step 9)** | **1.849** | **4.993** | **3.953** | **160 / 74** | **77.920** | **90.541 / 90.285** |
+| **Native FP16 (Step 9)** | **1.656** | **5.578** | **3.834** | **156 / 70** | 73.845 | 90.411 / 90.164 |
+
 Related design documents are the [runtime and package plan](umzi-native-runtime-plan.md)
 and the [exporter plan](umzi-model-exporter-plan.md).
 
@@ -521,10 +567,18 @@ float-shared-memory kernel, and fuses the 18 chain-entry `norm_nhwc` launches
 into `input_bias_norm`, `reduce_norm_nhwc`, and `expand_residual_norm_nhwc`.
 Only four small cuDNN plans remain (`first`, `down`, `up`, `last`), with 0 B
 retained workspace and 158 / 172 MiB batch-2 device memory delta (FP16 /
-mixed). In a three-round rotated comparison against TensorRT-RTX (0.293 MPx/s,
-134.5 ms, 60.19 dB), native FP16 reached **0.538 MPx/s (1.84× RTX)** with
-**98.0 ms** batch-1 latency (27.1% lower) at 60.15 dB, and native mixed
-reached **0.333 MPx/s (1.14× RTX)** with 154.5 ms latency at **68.22 dB**.
+mixed). Three-round rotated comparison against TensorRT-RTX
+(`output/moesr-session/paired-p4-rtx/report.json`):
+
+| Backend | Batch-2 inference s | Batch-2 input MPx/s | Batch-1 tile latency ms | Batch-2 / Batch-1 GPU delta (MiB) | Raw PSNR dB | SSIMULACRA2 mean / min |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| **Native FP16 (Pass 4)** | **6.778** (1.84× RTX) | **0.5378** | **98.0** | **158 / 96** (0 B ws) | 60.154 | 86.051 / 85.337 |
+| **Native Mixed (Pass 4)** | **10.934** (1.14× RTX) | **0.3334** | 154.5 | **172 / 102** (0 B ws) | **68.215** | **87.287 / 87.152** |
+| TensorRT-RTX FP16 | 12.441 | 0.2930 | 134.5 | — | 60.188 | 86.210 / 85.517 |
+
+In the 4-round Pass 4 vs Pass 3 run (`output/moesr-session/paired-p4-vs-p3/report.json`),
+Pass 4 measured `6.168 s` (`0.5909 MPx/s`, `88.3 ms/tile`) in FP16 and
+`9.799 s` (`0.3720 MPx/s`, `138.5 ms/tile`) in Mixed.
 [Pass 4 details](handoff-moesr.md#optimization-pass-4-2026-11-22)
 
 The Windows package export was byte-identical across runs and produced a

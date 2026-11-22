@@ -16,7 +16,9 @@ kernels, and CUDA Graph replay.
 | **GFISRv2** | `fp32`, `mixed`, `fp16` | Also requires cuFFT 12 at runtime |
 
 See [Supported checkpoints and export options](docs/export.md) for the exact
-checkpoint topologies accepted by the exporter.
+checkpoint topologies accepted by the exporter, and the
+[final timing & fidelity summary](docs/umzi-native-architecture-expansion.md#final-timing-and-fidelity-summary-rtx-3050-laptop)
+for RTX 3050 Laptop benchmarks across GateRV2, MoESR, and GFISRv2.
 
 ## Requirements
 
