@@ -1,4 +1,4 @@
-name: Build Windows packages
+name: Build packages
 
 on:
   push:
@@ -88,10 +88,129 @@ jobs:
           path: dist/native/
           if-no-files-found: error
 
+  linux-x64:
+    name: Linux x64 wheel and native SDK
+    runs-on: ubuntu-24.04
+    container:
+      image: quay.io/pypa/manylinux_2_34_x86_64
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Ensure OpenSSL 3 development headers
+        run: |
+          set -euo pipefail
+          test -f /usr/include/openssl/evp.h || dnf install -y openssl-devel
+
+      - name: Build platform wheel and stage native SDK
+        env:
+          UMZI_NATIVE_BUILD_DIR: ${{ runner.temp }}/umzi-native-build
+          UMZI_WHEEL_PLATFORM: manylinux_2_34_x86_64
+        run: |
+          set -euo pipefail
+          PYTHON=/opt/python/cp312-cp312/bin/python
+          "$PYTHON" -m pip wheel --no-deps --wheel-dir dist .
+
+          mkdir -p dist/native
+          cp "$UMZI_NATIVE_BUILD_DIR/libumzi_native.so" dist/native/
+          cp "$UMZI_NATIVE_BUILD_DIR/umzi_native" dist/native/
+          cp native/include/umzi_native.h dist/native/
+
+      - name: Verify the installed wheel and ELF ABI
+        run: |
+          set -euo pipefail
+          PYTHON=/opt/python/cp312-cp312/bin/python
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          if [ "${#wheels[@]}" -ne 1 ] || [[ "${wheels[0]}" != *-py3-none-manylinux_2_34_x86_64.whl ]]; then
+            echo "Expected one py3-none-manylinux_2_34_x86_64 wheel, found: ${wheels[*]}" >&2
+            exit 1
+          fi
+
+          "$PYTHON" - <<'PY'
+          import re
+          import subprocess
+          from pathlib import Path
+
+          lib = Path("dist/native/libumzi_native.so")
+          dynamic = subprocess.check_output(["readelf", "-d", str(lib)], text=True)
+          needed = set(re.findall(r"\(NEEDED\)\s+Shared library:\s+\[([^\]]+)\]", dynamic))
+          print("DT_NEEDED:", sorted(needed))
+          for required in ("libcuda.so.1", "libcublasLt.so.13", "libcudnn.so.9", "libcrypto.so.3"):
+              assert required in needed, f"Missing DT_NEEDED {required}: {needed}"
+          assert "libcufft.so.12" not in needed, f"Unexpected link-time cuFFT dependency: {needed}"
+
+          syms = subprocess.check_output(["readelf", "-sW", "--dyn-syms", str(lib)], text=True)
+          glibc = [(int(a), int(b)) for a, b in re.findall(r"@GLIBC_(\d+)\.(\d+)", syms)]
+          max_glibc = max(glibc, default=(0, 0))
+          print("Max GLIBC:", max_glibc)
+          assert max_glibc <= (2, 34), f"Exceeds manylinux_2_34 baseline: GLIBC_{max_glibc[0]}.{max_glibc[1]}"
+
+          nm = subprocess.check_output(["nm", "-D", "--defined-only", "--format=posix", str(lib)], text=True)
+          exported = sorted(
+              parts[0]
+              for line in nm.splitlines()
+              if (parts := line.split()) and len(parts) >= 2 and parts[1] == "T" and parts[0] not in {"_init", "_fini"}
+          )
+          expected = sorted([
+              "umzi_abi_version",
+              "umzi_error",
+              "umzi_error_code",
+              "umzi_session_open",
+              "umzi_session_close",
+              "umzi_session_model",
+              "umzi_session_tensors",
+              "umzi_session_describe",
+              "umzi_session_prepare",
+              "umzi_session_run",
+              "umzi_session_enqueue",
+              "umzi_session_info",
+              "umzi_session_diagnostic_count",
+              "umzi_session_diagnostic",
+              "umzi_session_cache_message",
+              "umzi_session_kernel_message",
+              "umzi_session_profile",
+          ])
+          assert exported == expected, f"Unexpected exports: {exported}"
+          print(f"Verified {len(exported)} base ABI exports and ELF dependencies")
+          PY
+
+          install_dir="$RUNNER_TEMP/umzi-wheel-smoke"
+          "$PYTHON" -m pip install --target "$install_dir" "${wheels[0]}"
+          "$PYTHON" -I - "$install_dir" <<'PY'
+          import sys
+          from importlib.resources import files
+
+          sys.path.insert(0, sys.argv[1])
+          import umzi_native
+
+          assert callable(umzi_native.InferenceSession)
+          assert files(umzi_native).joinpath("libumzi_native.so").is_file()
+          assert "torch" not in sys.modules
+          print("Wheel imports and contains libumzi_native.so")
+          PY
+
+      - name: Upload Linux wheel
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: umzi-native-wheel-linux-x64
+          path: dist/*.whl
+          if-no-files-found: error
+
+      - name: Upload Linux native SDK
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: umzi-native-sdk-linux-x64
+          path: dist/native/
+          if-no-files-found: error
+
   publish:
-    name: Publish wheel to private PyPI
+    name: Publish wheels to private PyPI
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && !github.event.deleted
-    needs: windows-x64
+    needs: [windows-x64, linux-x64]
     runs-on: ubuntu-24.04
     environment:
       name: pypi
@@ -102,6 +221,12 @@ jobs:
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: umzi-native-wheel-windows-x64
+          path: dist/
+
+      - name: Download the verified Linux wheel
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: umzi-native-wheel-linux-x64
           path: dist/
 
       - name: Upload to the private index

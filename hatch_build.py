@@ -104,7 +104,7 @@ def _find(supplied: Path | None, relative: str, candidates: Iterable[Path], what
 def find_toolchain(settings: BuildSettings) -> Toolchain:
     sites = _nvidia_dirs()
     cuda = _find(settings.cuda_root, "include/cuda.h", (site / "cu13" for site in sites), "CUDA 13 headers")
-    nvrtc = _find(settings.nvrtc_root, NVRTC, (cuda,), "CUDA 13.0 NVRTC") / NVRTC
+    nvrtc = _find(settings.nvrtc_root, NVRTC, (cuda, *(site / "cu13" for site in sites)), "CUDA 13.0 NVRTC") / NVRTC
     cudnn = _find(settings.cudnn_root, CUDNN, (site / "cudnn" for site in sites), "cuDNN 9")
     header = cuda / "include" / "cuda.h"
     if not header.is_file() or not re.search(
@@ -123,6 +123,13 @@ def _load_nvrtc(path: Path) -> ctypes.CDLL:
         # NVRTC loads its version-matched builtins DLL by name through the
         # standard search order, which add_dll_directory does not affect.
         os.environ["PATH"] = os.pathsep.join((str(path.parent), os.environ.get("PATH", "")))
+    else:
+        # Preload the sibling builtins DSO globally so libnvrtc.so.13 finds it
+        # via dlopen without requiring LD_LIBRARY_PATH to be set beforehand.
+        for builtins in sorted(path.parent.glob("libnvrtc-builtins.so.*"), key=lambda item: len(item.name)):
+            if builtins.is_file():
+                ctypes.CDLL(str(builtins), mode=ctypes.RTLD_GLOBAL)
+                break
     nvrtc = ctypes.CDLL(str(path))
     major, minor = ctypes.c_int(), ctypes.c_int()
     if nvrtc.nvrtcVersion(ctypes.byref(major), ctypes.byref(minor)) or (major.value, minor.value) != (13, 0):
@@ -294,6 +301,44 @@ def _build_windows(output: Path, toolchain: Toolchain, includes: Sequence[Path],
     return library
 
 
+def _linux_cuda_driver_link(
+    compiler: str, output: Path, objects: Sequence[str], driver: Path | None
+) -> tuple[list[str], Path | None]:
+    if driver is not None:
+        return [str(driver)], None
+    candidates = (
+        Path("/usr/lib/wsl/lib/libcuda.so.1"),
+        Path("/usr/lib/x86_64-linux-gnu/libcuda.so.1"),
+        Path("/usr/lib64/libcuda.so.1"),
+        Path("/lib/x86_64-linux-gnu/libcuda.so.1"),
+        Path("/lib64/libcuda.so.1"),
+    )
+    found = next((path for path in candidates if path.is_file()), None)
+    if found is not None:
+        return [str(found)], None
+    # GPU-less build hosts (such as Linux CI containers) have no NVIDIA driver
+    # installed. Generate a minimal SONAME stub for link-time symbol resolution
+    # and remove it immediately after linking so it can never shadow the real
+    # driver at runtime.
+    nm_tool = shutil.which("nm")
+    if nm_tool is None:
+        raise RuntimeError("nm was not found on PATH to generate a Linux libcuda.so.1 link stub")
+    nm = subprocess.check_output([nm_tool, "-u", "--format=posix", *objects], text=True)
+    symbols = sorted({match.group(1) for line in nm.splitlines() if (match := re.match(r"^(cu[A-Z]\w*)\s+U\b", line))})
+    if not symbols:
+        raise RuntimeError("Could not discover CUDA driver symbols in compiled objects")
+    stub_dir = output / "cuda-driver-stub"
+    stub_dir.mkdir(exist_ok=True)
+    stub_source = stub_dir / "cuda_driver_stub.cpp"
+    stub_source.write_text(
+        'extern "C" {\n' + "".join(f"void {symbol}(void) {{}}\n" for symbol in symbols) + "}\n",
+        encoding="ascii",
+    )
+    stub_library = stub_dir / "libcuda.so.1"
+    _run(compiler, "-shared", "-fPIC", "-Wl,-soname,libcuda.so.1", "-o", str(stub_library), str(stub_source))
+    return [f"-L{stub_dir}", "-l:libcuda.so.1"], stub_dir
+
+
 def _build_linux(
     output: Path, toolchain: Toolchain, includes: Sequence[Path], driver: Path | None, test_kernel: bool
 ) -> Path:
@@ -318,27 +363,30 @@ def _build_linux(
         *(f"-I{path}" for path in includes),
         *("-o", str(cli_obj), str(CLI_SOURCE)),
     )
-    if driver is None:
-        # The driver is linked by soname; any copy of libcuda.so.1 will do.
-        driver = next(
-            (path for path in (Path("/usr/lib/wsl/lib/libcuda.so.1"),) if path.is_file()),
-            None,
-        )
-    link_tail = [
-        "-Wl,-z,defs",
-        "-Wl,-rpath,$ORIGIN",
-        str(driver) if driver else "-l:libcuda.so.1",
-        f"-L{toolchain.cuda / 'lib'}",
-        f"-L{toolchain.cudnn / 'lib'}",
-        "-l:libcublasLt.so.13",
-        "-l:libcudnn.so.9",
-        "-l:libcrypto.so.3",
-        "-ldl",
-    ]
-    library = output / LIBRARY_NAME
-    _run(compiler, *objects, *link_tail, "-shared", "-o", str(library))
-    _run(compiler, *objects, str(cli_obj), *link_tail, "-o", str(output / CLI_NAME))
-    return library
+    driver_flags, stub_dir = _linux_cuda_driver_link(compiler, output, objects, driver)
+    try:
+        cuda_lib = toolchain.cuda / "lib"
+        cudnn_lib = toolchain.cudnn / "lib"
+        link_tail = [
+            "-Wl,-z,defs",
+            "-Wl,-rpath,$ORIGIN",
+            f"-Wl,-rpath-link,{cuda_lib}",
+            f"-Wl,-rpath-link,{cudnn_lib}",
+            *driver_flags,
+            f"-L{cuda_lib}",
+            f"-L{cudnn_lib}",
+            "-l:libcublasLt.so.13",
+            "-l:libcudnn.so.9",
+            "-l:libcrypto.so.3",
+            "-ldl",
+        ]
+        library = output / LIBRARY_NAME
+        _run(compiler, *objects, *link_tail, "-shared", "-o", str(library))
+        _run(compiler, *objects, str(cli_obj), *link_tail, "-o", str(output / CLI_NAME))
+        return library
+    finally:
+        if stub_dir is not None:
+            shutil.rmtree(stub_dir, ignore_errors=True)
 
 
 def build(output: Path, settings: BuildSettings | None = None) -> Path:
@@ -453,7 +501,12 @@ else:
             build_data["force_include"][str(library)] = f"umzi_native/{LIBRARY_NAME}"
             # The library is loaded through ctypes, so the wheel depends on the
             # operating system and machine but not on the Python version or ABI.
-            platform = sysconfig.get_platform().replace("-", "_").replace(".", "_")
+            # Official PyPA manylinux containers export AUDITWHEEL_PLAT.
+            platform = (
+                (os.environ.get("UMZI_WHEEL_PLATFORM") or os.environ.get("AUDITWHEEL_PLAT") or sysconfig.get_platform())
+                .replace("-", "_")
+                .replace(".", "_")
+            )
             build_data["pure_python"] = False
             build_data["tag"] = f"py3-none-{platform}"
 

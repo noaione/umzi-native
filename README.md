@@ -34,9 +34,10 @@ standalone NVIDIA library directories without PyTorch via
 
 ## Install
 
-### Prebuilt wheel (Windows x64)
+### Prebuilt wheels (Windows & Linux x64)
 
-Install a tagged release from the private package index:
+Install a tagged release from the private package index (Windows x64 and Linux
+`manylinux_2_34_x86_64`, glibc 2.34+ / OpenSSL 3):
 
 ```powershell
 python -m pip install --extra-index-url https://pypi.serik.at/simple/ umzi-native

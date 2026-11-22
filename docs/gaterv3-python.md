@@ -127,6 +127,7 @@ frontends pass no command-line arguments to the hook:
 | `UMZI_CUDA_DRIVER_LIB` | Linux `libcuda.so.1` to link against. |
 | `UMZI_NATIVE_BUILD_DIR` | Build in this directory and keep it, including the `umzi_native` CLI linked from the same object. |
 | `UMZI_NATIVE_LIBRARY` | Skip compilation and bundle this prebuilt library. |
+| `UMZI_WHEEL_PLATFORM` | Override the wheel platform tag (defaults to `AUDITWHEEL_PLAT` in `manylinux` containers or `sysconfig.get_platform()`). |
 
 Editable installs (`pip install -e .`) skip the native build. Build the
 library with `scripts/build_native.py` and pass its path as
