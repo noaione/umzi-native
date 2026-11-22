@@ -103,31 +103,92 @@ def check_io(session: InferenceSession, sample: Tensor, output: Tensor) -> dict[
 
 
 def check_plan_cache(model: Path, library: Path, precision: str, root: Path) -> dict[str, Any]:
-    """Check a cold miss, a warm hit without timing, and key separation by workspace cap."""
+    """Check cold/warm cache, key isolation (workspace_mib, fused_gate), corrupt rebuild, and unavailable dir."""
     sample = torch.rand((2, 3, 64, 96), generator=torch.Generator().manual_seed(7))
     sample = sample.to(device="cuda", dtype=PRECISIONS[precision])
     cache = root.parent / f"cache-check-{precision}"
     shutil.rmtree(cache, ignore_errors=True)
 
-    def run(expected: str, timed: bool, **kernel_options: int) -> Tensor:
-        options = SessionOptions(precision=precision, dll_path=library, cache_dir=cache, kernel_options=kernel_options)
+    def run(
+        expected: str, timed: bool, cache_dir: Path = cache, **kernel_options: int
+    ) -> tuple[Tensor, dict[str, Any]]:
+        options = SessionOptions(
+            precision=precision, dll_path=library, cache_dir=cache_dir, kernel_options=kernel_options
+        )
         with InferenceSession(model, options) as session:
             result = DeviceSession(session)(sample)
             torch.cuda.synchronize()
             info = session.get_session_info()
         if info["cache_status"] != expected or bool(info["diagnostics"]["timed_plans"]) != timed:
             raise AssertionError(f"MoESR {precision} plan cache: expected {expected}, got {info['cache_status']}")
-        return result
+        if not torch.isfinite(result).all():
+            raise AssertionError(f"MoESR {precision} plan cache ({kernel_options}) returned non-finite values")
+        return result, info
 
-    cold = run("miss", True)
-    warm = run("hit", False)
+    cold, _ = run("miss", True)
+    warm, _ = run("hit", False)
     if not torch.equal(cold, warm):
         raise AssertionError(f"MoESR {precision} output changed after reusing cached plans")
-    run("miss", True, workspace_mib=64)
+    zero_first, zero_info = run("miss", True, workspace_mib=0)
+    zero_warm, zero_hit = run("hit", False, workspace_mib=0)
+    if zero_info["buffer_bytes"]["workspace"] or zero_hit["buffer_bytes"]["workspace"]:
+        raise AssertionError(f"MoESR {precision} allocated workspace with workspace_mib=0")
+    if not torch.equal(zero_first, zero_warm):
+        raise AssertionError(f"MoESR {precision} workspace_mib=0 changed output on cache hit")
+    unfused, unfused_info = run("miss", True, fused_gate=0)
+    unfused_warm, _ = run("hit", False, fused_gate=0)
+    if unfused_info["diagnostics"]["fused_gate"] != 0 or not torch.equal(unfused, unfused_warm):
+        raise AssertionError(f"MoESR {precision} fused_gate=0 did not reproduce on cache hit")
+    agreement = comparison(cold.float().cpu().numpy(), unfused.float().cpu().numpy())
+    if not agreement["finite"] or (agreement["psnr_db"] is not None and agreement["psnr_db"] < 55):
+        raise AssertionError(f"MoESR {precision} fused vs unfused diverged: {agreement}")
     files = sorted(path.name for path in cache.glob("moesr_*.umplan"))
-    if len(files) != 2:
-        raise AssertionError(f"MoESR {precision} cache keys did not separate workspace caps: {files}")
-    return {"cold": "miss", "warm": "hit", "warm_timed_plans": 0, "warm_bitwise_match": True, "files": len(files)}
+    if len(files) != 3:
+        raise AssertionError(f"MoESR {precision} cache keys did not separate options: {files}")
+
+    corrupt_cache = cache / "corrupt"
+    run("miss", True, cache_dir=corrupt_cache)
+    plan = next(corrupt_cache.glob("moesr_*.umplan"))
+    data = bytearray(plan.read_bytes())
+    data[-1] ^= 1
+    plan.write_bytes(data)
+    repaired, _ = run("rebuilt", True, cache_dir=corrupt_cache)
+    reopened, _ = run("hit", False, cache_dir=corrupt_cache)
+    if not torch.equal(repaired, reopened):
+        raise AssertionError(f"MoESR {precision} rebuilt plan cache changed output")
+
+    unavailable = cache / "regular-file"
+    unavailable.touch()
+    run("unavailable", True, cache_dir=unavailable)
+
+    for bad_options, message in (
+        ({"unknown_opt": 1}, "Unknown MoESR option"),
+        ({"fused_gate": 2}, "fused_gate must be 0 or 1"),
+        ({"workspace_mib": 5000}, "workspace_mib must be"),
+    ):
+        try:
+            with InferenceSession(
+                model, SessionOptions(precision=precision, dll_path=library, kernel_options=bad_options)
+            ):
+                pass
+        except RuntimeError as error:
+            if message not in str(error):
+                raise
+        else:
+            raise AssertionError(f"MoESR {precision} accepted invalid options {bad_options}")
+
+    return {
+        "cold": "miss",
+        "warm": "hit",
+        "warm_timed_plans": 0,
+        "warm_bitwise_match": True,
+        "zero_workspace_bytes": zero_hit["buffer_bytes"]["workspace"],
+        "fused_vs_unfused_psnr_db": agreement["psnr_db"],
+        "corrupt_rebuilt": True,
+        "unavailable_fallback": True,
+        "option_rejections": 3,
+        "files": len(files),
+    }
 
 
 def validate_cases(

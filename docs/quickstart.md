@@ -1,132 +1,237 @@
 # Python inference quickstart
 
-Install `umzi-native` with Python 3.12 or newer and have a `.ummodel`
-package ready. To create one from a checkpoint, see the
-[export guide](export.md). [Installation and CUDA library loading](gaterv3-python.md#install)
+`umzi-native` runs packed `.ummodel` packages on NVIDIA GPUs through one
+Python API (`InferenceSession`) across all supported model families:
+**GateRV3**, **GateRV2**, and **MoESR**.
 
-## Run your first inference
+**Prerequisites:**
 
-Put the `.ummodel` at `output/native/gaterv3.ummodel` or use the path to your
-package. Run `python -m pip install Pillow` to read and save images in this example.
-Import CUDA PyTorch before opening the session, or call the explicit CUDA
-library loader. The example processes a single 128×128 crop of a
-repository sample. [CUDA library loading](gaterv3-python.md#library-loading)
+- Python 3.12+ with `umzi-native` installed ([install & CUDA setup](gaterv3-python.md#install))
+- A packed `.ummodel` file ([how to export a checkpoint](export.md))
+- `Pillow` if you want to run the image example below (`python -m pip install Pillow`)
+
+## 1. Run your first inference
+
+Before opening a session, the CUDA runtime libraries (`cublasLt`, `cudnn`)
+must be loaded in the process. The simplest way is to `import torch` first
+(see [CUDA library loading](gaterv3-python.md#library-loading) if you don't
+use PyTorch).
 
 ```python
 from pathlib import Path
 
 import numpy as np
-import torch  # Loads the CUDA libraries used by the session.
+import torch  # Makes PyTorch's bundled CUDA/cuDNN/cuBLASLt libraries available.
 from PIL import Image
 
 import umzi_native as umzi
 
+# Load a 128x128 RGB crop and convert HWC uint8 [0, 255] -> NCHW float32 [0, 1].
 with Image.open("samples/input/page-001.jpg") as page:
     rgb = page.convert("RGB").crop((0, 0, 128, 128))
 pixels = np.asarray(rgb, dtype=np.float32) / np.float32(255)
-tiles = pixels.transpose(2, 0, 1)[None, ...]  # RGB HWC to NCHW.
+tiles = pixels.transpose(2, 0, 1)[None, ...]  # Shape: (1, 3, 128, 128)
 
+# Point cache_dir at a writable folder so tuned GPU plans are reused across runs.
 options = umzi.SessionOptions(cache_dir=Path("output/cache/gaterv3"))
+
 with umzi.InferenceSession("output/native/gaterv3.ummodel", sess_options=options) as session:
-    input_name = session.get_inputs()[0].name
+    input_name = session.get_inputs()[0].name  # "input"
     (restored,) = session.run(None, {input_name: tiles})
     print(restored.shape, restored.dtype, session.get_session_info()["cache_status"])
 
+# Convert NCHW float32 [0, 1] -> HWC uint8 [0, 255] and save.
 rgb_out = restored[0].transpose(1, 2, 0)
 png = np.rint(np.clip(rgb_out, 0, 1) * 255).astype(np.uint8)
 Image.fromarray(png).save("output/restored-tile.png")
 ```
 
-The input is one NumPy array named `input` in RGB NCHW layout. Supply
-RGB values on the model's 0–1 input scale. The 1× model returns an
-array named `output` with the same shape and dtype. Use
-`run(["output"], {"input": tiles})` to name the output explicitly.
-Each call returns its own array. Strided inputs are copied into
-contiguous storage when needed.
+## 2. Inputs, outputs, and batching
 
-The default mixed session uses FP32 RGB arrays. For full FP16, set
-`precision="fp16"` and pass `tiles.astype(np.float16)`. Both precisions use
-the same packed model. To batch several equal-size tiles, normalize each tile
-and stack the CHW arrays with `np.stack(chw_tiles)`. `restored[i]` is the output
-for tile `i`. The runtime pads each tile to the model's alignment and crops
-the result back to the original size. Batch size, height, and width can
-change between calls. `session.prepare(tiles.shape)` can allocate and tune
-the shape ahead of the first `run()`. The context manager closes the session
-and releases its device resources. For full-page tiling and stitching, see
-the [manga tiling benchmark](gaterv3-manga-tiling.md).
+- **Tensor layout and range:** Pass a single NumPy array named `"input"` in
+  RGB **NCHW** layout `(N, 3, H, W)` with values scaled to `[0, 1]`. Non-contiguous
+  arrays are copied automatically when needed.
+- **Output shape:** `session.run(None, {"input": tiles})` (or
+  `session.run(["output"], {"input": tiles})`) returns a fresh NumPy array of
+  shape `(N, 3, scale * H, scale * W)` with the same dtype as the input, where
+  `scale` is `session.scale_factor`.
+- **Precision and dtype must match:**
+  - `precision="mixed"` (default) expects `np.float32` input and returns `np.float32`.
+  - `precision="fp16"` expects `np.float16` input (`tiles.astype(np.float16)`) and returns `np.float16`.
+  - Both modes use the exact same `.ummodel` file.
+- **Batching:** Stack multiple equal-size CHW tiles with `np.stack(chw_tiles)`
+  to get `(N, 3, H, W)`; `restored[i]` corresponds to tile `i`.
+- **Padding and dynamic shapes:** The runtime automatically pads each tile to
+  the model's required alignment and crops the output back to `scale * H × scale * W`.
+  You can change batch size, height, or width between calls—the session keeps
+  one active prepared shape at a time and re-prepares when the padded shape
+  changes.
+- **Pre-warming a shape:** Call `session.prepare((N, 3, H, W))` ahead of time
+  if you want allocation, algorithm tuning, and CUDA Graph capture to finish
+  before your first `run()`.
+- **Cleanup and OOM recovery:** Use `with umzi.InferenceSession(...) as session:`
+  (or call `session.close()`) to free GPU memory. If a batch or tile size runs
+  out of VRAM, `prepare()` or `run()` raises `MemoryError`, and you can
+  immediately retry with a smaller batch on the same session.
 
-## Session options
+For full-page tiling and stitching, see the
+[manga tiling benchmark](gaterv3-manga-tiling.md).
 
-| `SessionOptions` field | Default | Effect |
+## 3. Session options (`SessionOptions`)
+
+Pass a `umzi.SessionOptions(...)` instance to `InferenceSession` to control
+precision, GPU selection, disk plan caching, CUDA Graphs, library loading, and
+model-specific kernel switches.
+
+| Field | Default | What it does |
 | --- | --- | --- |
-| `precision` | `"mixed"` | Mixed precision uses FP32 NumPy input and output and FP32 accumulation in the default convolution and projection paths. `"fp16"` uses FP16 arrays and enables the native FP16 compute path. |
-| `device_id` | `0` | CUDA ordinal for the session. Use the ordinal visible to the process when CUDA devices are masked. |
-| `cache_dir` | `None` | Set a writable directory to reuse tuned algorithms from the family's `.umplan` files (GateRV3, GateRV2, and MoESR). The key includes the model, padded shape and batch, precision, plan options, and CUDA environment. Each process captures its own CUDA Graph. |
-| `enable_cuda_graph` | `True` | Capture and replay a CUDA Graph to reduce launch overhead for the prepared shape. `False` submits the operations directly. It still uses cuBLASLt and cuDNN plans. |
-| `kernel_options` | `{}` | Pass the kernel-specific switches below as a mapping of names to integer values. |
-| `dll_path` | `None` | Override the path to the Umzi DLL or shared library. By default the loader checks the installed package directory and then the model directory. |
-| `dll_dirs` | `()` | Search these directories in order to explicitly load CUDA dependencies into the process before loading the Umzi library. An empty sequence uses libraries already available to the process. |
+| `precision` | `"mixed"` | `"mixed"` uses FP32 NumPy I/O and FP32 accumulation in convolutions/projections for maximum fidelity. `"fp16"` uses FP16 NumPy I/O and the native FP16 compute path for maximum speed. |
+| `device_id` | `0` | CUDA GPU index to run on (respects `CUDA_VISIBLE_DEVICES`). |
+| `cache_dir` | `None` | Writable directory for saving and reusing tuned GPU algorithm choices (`<family>_<key>.umplan`). **Strongly recommended:** first run tunes and writes the file; later runs skip tuning. Keys include the model, padded shape, precision, relevant options, GPU, driver, and CUDA/cuDNN versions. CUDA Graphs are still captured per process. |
+| `enable_cuda_graph` | `True` | Captures the forward pass into a CUDA Graph and replays it to cut CPU launch overhead. Set `False` to submit kernels directly (still uses tuned cuBLASLt/cuDNN plans). |
+| `kernel_options` | `{}` | Dictionary of `name: int` switches specific to the model family (see tables below). Unknown names or out-of-range values raise `RuntimeError`. |
+| `dll_path` | `None` | Explicit path to `umzi_native.dll` / `libumzi_native.so`. By default the loader checks the installed package directory, then the `.ummodel` file's directory. |
+| `dll_dirs` | `()` | Sequence of directories searched in order to explicitly load CUDA dependencies (`cublasLt`, `cudnn`) before loading `umzi_native`. Leave empty if PyTorch or the system PATH already loaded them. |
 
-The session keeps one prepared padded shape and batch active at a time. If
-either changes, the session prepares the new shape and can reuse matching
-disk-cached algorithms. `cache_status` reports `disabled`, `miss`, `hit`,
-`rebuilt`, or `unavailable`. Check `cache_message` for cache errors.
-Changing `fuse_silu` or `fuse_gate_pool` can reuse the same cached
-convolution and projection algorithms.
+### Common configurations
 
-### GateRV3 kernel options
+```python
+from pathlib import Path
+import umzi_native as umzi
 
-Every switch defaults to `0`. Set it to `1` to enable it. The kernel rejects
-unknown names and values outside `0` and `1`.
+# 1. Fastest FP16 inference with persistent plan cache (works for GateRV3, GateRV2, MoESR)
+fast_fp16 = umzi.SessionOptions(
+    precision="fp16",
+    cache_dir=Path("output/cache"),
+)
 
-| Key | Effect | Check in `get_session_info()` |
-| --- | --- | --- |
-| `fuse_silu` | Tries a cuDNN graph for compatible bias-free 3×3 convolutions followed by SiLU on 32-channel feature maps at the padded tile size. If cuDNN cannot run or capture the fused plan for that shape and precision, the runtime uses separate operations. | `diagnostics["fused_silu_count"]` and `kernel_message` |
-| `tune_projections` | Tries more cuBLASLt candidates for eligible 1×1 projections, timing candidates with CUDA Graph replay during tuning. This can increase first-shape setup time. The switch is independent of CUDA Graph replay for inference. | `diagnostics["replay_tuned_shapes"]` |
-| `fuse_gate_pool` | Combines the grouped spatial gate and partial pooling on eligible 32-channel feature maps at the padded tile size. Supports mixed and FP16, including rectangular tiles. | `diagnostics["fused_gate_pool_sites"]` |
-| `fp16_qkv` | In mixed precision, uses FP16 accumulation for the original GateRV3 model's folded QKV projections. The IDC model has no attention projections, and the full FP16 path already uses FP16 accumulation there. | `diagnostics["fp16_qkv_projections"]` |
+# 2. High-fidelity mixed precision on GPU 1, without CUDA Graphs
+mixed_direct = umzi.SessionOptions(
+    precision="mixed",
+    device_id=1,
+    cache_dir=Path("output/cache"),
+    enable_cuda_graph=False,
+)
 
-For example, pass `SessionOptions(kernel_options={"tune_projections": 1,
-"fuse_gate_pool": 1})` to enable replay-based tuning and gate/pool fusion.
-The runtime uses a specialized gate/pool kernel when the padded tile is
-128×128 and a shape-aware kernel for other sizes.
+# 3. Without PyTorch: point dll_dirs at standalone CUDA / cuDNN wheel directories
+standalone = umzi.SessionOptions(
+    cache_dir=Path("output/cache"),
+    dll_dirs=[Path("C:/cuda-libs/cublas/bin"), Path("C:/cuda-libs/cudnn/bin")],
+)
+```
 
-After preparing or running a shape, `get_session_info()` returns the
-padded shape, cache status, setup times, runner buffer sizes and
-kernel-specific counters in the `diagnostics` dictionary. An out-of-memory error during shape preparation
-or inference raises `MemoryError`, and the same session can accept
-a smaller batch. [Native optimization details](gaterv3-native-refactor.md#session-optimization-options)
+## 4. Model-specific `kernel_options`
 
-The package header selects the kernel family. `session.kernel`,
-`session.scale_factor` and `session.context` expose model metadata, and
-`session.closed` reports whether the session still holds device resources.
-[Runtime and format spec](umzi-native-runtime-plan.md)
+The `.ummodel` header automatically selects the kernel family (`gaterv3`,
+`gaterv2`, or `moesr`). Each family accepts its own `kernel_options` keys as
+integers.
 
-### GateRV2 kernel options
+### GateRV3
 
-| Key | Default | Effect |
-| --- | ---: | --- |
-| `tune_plans` | `1` | Time cuBLASLt and cuDNN candidates when preparing a shape. Set `0` to use the first heuristic plan and shorten prepare. |
-| `workspace_mib` | `64` | Cap the candidate workspace in MiB. Accepts integers from `0` to `1024`. Prepare grows workspace as needed and retains the size required by the selected plans. |
+All GateRV3 switches are off (`0`) by default; set to `1` to enable. Any other
+key or value outside `{0, 1}` is rejected.
 
-For example, use `SessionOptions(kernel_options={"tune_plans": 0})` when
-prepare latency matters on a new shape. Set `cache_dir` to keep the chosen
-plans in `gaterv2_<hex-key>.umplan` files. With a compatible cache hit,
-the session reuses those algorithms with `timed_plans == 0`. Inspect
-`peak_plan_workspace_bytes` for the largest workspace allocation during
-prepare and `plan_workspace_bytes` for the retained size. The same
-`get_session_info()["diagnostics"]` dictionary reports `fp32_weight_bytes`
-and `fp16_weight_bytes`. [GateRV2 measurements](handoff-gaterv2.md)
+| Option | Default | What it does | Diagnostic in `get_session_info()` |
+| --- | ---: | --- | --- |
+| `fuse_silu` | `0` | Tries to fuse compatible bias-free 3×3 convolutions + SiLU via a cuDNN graph on 32-channel full-tile maps. Falls back to separate ops automatically if unsupported. | `diagnostics["fused_silu_count"]`, `kernel_message` |
+| `tune_projections` | `0` | Benchmarks extra cuBLASLt candidates for eligible 1×1 projections using CUDA Graph replay during `prepare()`. Slower first-time setup, potentially faster steady-state. Independent of `enable_cuda_graph`. | `diagnostics["replay_tuned_shapes"]` |
+| `fuse_gate_pool` | `0` | Fuses the grouped spatial gate and partial pooling on eligible 32-channel feature maps (mixed and FP16, including rectangular tiles; uses a specialized kernel at 128×128). | `diagnostics["fused_gate_pool_sites"]` |
+| `fp16_qkv` | `0` | In `"mixed"` precision, allows FP16 accumulation on the original GateRV3 folded QKV attention projections. No effect on IDC models (no attention) or `"fp16"` mode (already FP16). | `diagnostics["fp16_qkv_projections"]` |
 
-### MoESR kernel options
+Changing `fuse_silu` or `fuse_gate_pool` reuses existing cached plans in
+`cache_dir`; changing `tune_projections` or `fp16_qkv` uses a separate cache
+key.
 
-| Key | Default | Effect |
-| --- | ---: | --- |
-| `workspace_mib` | `512` | Cap the cuDNN candidate workspace in MiB. Accepts integers from `0` to `4096`. Prepare times the candidates that fit and keeps the size the selected plans need. Caps below about 45 MiB per 256×256 tile force slower plans at batch 2 and above. |
+```python
+options = umzi.SessionOptions(
+    cache_dir=Path("output/cache/gaterv3"),
+    kernel_options={"tune_projections": 1, "fuse_gate_pool": 1},
+)
+```
 
-MoESR is 4×: an input of shape `(N, 3, H, W)` returns `(N, 3, 4H, 4W)` in
-the session's I/O dtype. Both spatial dimensions must be at least two.
-Set `cache_dir` to keep the chosen plans in `moesr_<hex-key>.umplan` files.
-A compatible cache hit reports `timed_plans == 0`, and
-`diagnostics["plan_workspace_bytes"]` reports the retained workspace.
-[MoESR measurements](handoff-moesr.md)
+More detail: [GateRV3 optimization notes](gaterv3-native-refactor.md#session-optimization-options).
+
+### GateRV2
+
+| Option | Default | Valid values | What it does |
+| --- | ---: | --- | --- |
+| `tune_plans` | `1` | `0` or `1` | `1` times cuBLASLt and cuDNN candidates on first prepare for best throughput. Set `0` to pick the first heuristic plan immediately when startup latency matters more than peak speed. |
+| `workspace_mib` | `64` | `0` to `1024` | Maximum temporary workspace (MiB) candidates may use during tuning. Prepare allocates only what the winning plans actually need after tuning. |
+
+Both options are part of the `gaterv2_<key>.umplan` cache key. Diagnostics in
+`get_session_info()["diagnostics"]`: `timed_plans`, `plan_workspace_bytes`,
+`peak_plan_workspace_bytes`, `fp32_weight_bytes`, and `fp16_weight_bytes`.
+
+```python
+# Fast cold startup (skip candidate timing)
+options = umzi.SessionOptions(
+    cache_dir=Path("output/cache/gaterv2"),
+    kernel_options={"tune_plans": 0},
+)
+```
+
+More detail: [GateRV2 measurements](handoff-gaterv2.md).
+
+### MoESR
+
+MoESR requires `H >= 2` and `W >= 2` (for reflection padding).
+
+| Option | Default | Valid values | What it does |
+| --- | ---: | --- | --- |
+| `fused_gate` | `1` | `0` or `1` | `1` (recommended) runs custom tensor-core kernels that fuse the 64→344 / 64→192 expansions with the Mish gate plus a tiled depthwise branch kernel—faster in both FP16 and mixed, smaller activation buffers, and 0 B cuDNN workspace at batch 2. Set `0` to fall back to separate cuDNN expansion convolutions (useful for A/B comparison). |
+| `workspace_mib` | `512` | `0` to `4096` | Maximum cuDNN workspace (MiB) candidates may use during tuning. Prepare retains only what the selected plans need. Only matters noticeably when `fused_gate=0`, where caps below ~45 MiB per 256×256 tile force much slower convolution kernels at batch 2+. |
+
+Both options are part of the `moesr_<key>.umplan` cache key. Diagnostics in
+`get_session_info()["diagnostics"]`: `timed_plans`, `plan_workspace_bytes`,
+and `fused_gate`.
+
+```python
+# Default MoESR FP16 (fused_gate=1 is already on by default)
+options = umzi.SessionOptions(
+    precision="fp16",
+    cache_dir=Path("output/cache/moesr"),
+)
+
+# Force zero cuDNN workspace (e.g. tight VRAM budget)
+low_vram = umzi.SessionOptions(
+    precision="fp16",
+    cache_dir=Path("output/cache/moesr"),
+    kernel_options={"workspace_mib": 0},
+)
+```
+
+More detail: [MoESR measurements](handoff-moesr.md).
+
+## 5. Inspecting models and sessions
+
+### Before opening a session (`peek_model`)
+
+`umzi.peek_model(path)` inspects a `.ummodel` header without initializing CUDA:
+
+```python
+info = umzi.peek_model("output/native/moesr.ummodel")
+print(info.family_name, info.supported, info.problems)
+```
+
+### On an open session
+
+- **Metadata properties:** `session.kernel` (`"gaterv3"`, `"gaterv2"`, or `"moesr"`),
+  `session.scale_factor`, `session.context`,
+  `session.library_path`, `session.closed`.
+- **Runtime diagnostics (`session.get_session_info()`):** Call after
+  `prepare()` or `run()` to inspect:
+  - `padded_shape`: actual padded `(N, 3, H, W)` shape running on the GPU (`None` before first prepare).
+  - `cache_status`:
+    - `"disabled"` — `cache_dir` was not set.
+    - `"miss"` — no saved plan file existed; algorithms were tuned and saved.
+    - `"hit"` — reused saved plans from disk (`timed_plans == 0`).
+    - `"rebuilt"` — saved file was corrupt or incompatible and was re-tuned and overwritten.
+    - `"unavailable"` — `cache_dir` could not be read or written (see `cache_message`); inference still succeeded without disk caching.
+  - `cache_message` / `kernel_message`: human-readable notes or fallback reasons when non-empty.
+  - `stages_ms`: wall-clock setup breakdown (`model`, `shape_allocation`, `plans`, `allocation_warmup`, `capture`).
+  - `buffer_bytes`: GPU bytes allocated for `weights`, `activations`, `workspace`, and `rgb_io`.
+  - `startup_device_used_bytes`: total GPU memory in use across setup stages (`context`, `tuning_workspace`, `tuned`, `captured`).
+  - `diagnostics`: family-specific integer counters listed in the tables above.
+
+For the binary package format and C ABI specification, see the
+[runtime and format spec](umzi-native-runtime-plan.md).

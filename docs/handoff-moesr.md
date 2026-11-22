@@ -9,15 +9,15 @@ design detail, see the [architecture expansion plan](umzi-native-architecture-ex
 | Step | State |
 | --- | --- |
 | FP32 private parity (`scripts/validate_moesr.py`) | Done (committed in `bd53b8e`) |
-| Packer `src/umzi_native/exporter/_moesr.py` and Python reader | Done, not committed |
-| C++ session `native/kernels/moesr/runner.cpp` (mixed and FP16, graph replay) | Done, not committed |
-| Session validation `scripts/validate_moesr_session.py` | Passed on the timed and cached build (2026-11-22) |
-| Timed cuDNN plan selection and `workspace_mib` option | Done in this pass |
-| Plan cache on disk (`cache_dir`, `moesr_<key>.umplan`) | Done in this pass and validated |
-| Optimization pass 1: channel padding, divergence-free gate, backend plans, FP16 accumulation | Done and validated (see below) |
-| Optimization pass 2: grouped gate layout, fused residual + LayerNorm, noise-based plan timing, 64-thread gate blocks | Done and validated, small gain (see below) |
-| Further work to widen the lead over TensorRT-RTX | **Next** (see next steps) |
-| Linux build and validation | Not started |
+| Packer `src/umzi_native/exporter/_moesr.py` and Python reader | Done (committed) |
+| C++ session `native/kernels/moesr/runner.cpp` (mixed and FP16, graph replay) | Done (committed) |
+| Session validation `scripts/validate_moesr_session.py` | Passed on pass-3 build, including corrupt-cache rebuild, `workspace_mib=0`, `fused_gate=0`, option rejections (2026-11-22) |
+| Timed cuDNN plan selection and `workspace_mib` option | Done (committed) |
+| Plan cache on disk (`cache_dir`, `moesr_<key>.umplan`) | Done (committed) |
+| Optimization pass 1: channel padding, divergence-free gate, backend plans, FP16 accumulation | Done (committed in `176c581`) |
+| Optimization pass 2: grouped gate layout, fused residual + LayerNorm, noise-based plan timing, 64-thread gate blocks | Done (committed in `3460ba5`) |
+| Optimization pass 3: fused all-channel expansion + Mish gate (`expand_gate_*`), tiled depthwise branch (`gate_branch_tiled_*`), validator follow-ups | Done and validated, not committed (see below) |
+| Linux build and validation | **Next** |
 
 ## Session changes in this pass
 
@@ -205,6 +205,111 @@ Dead ends in pass 2:
   part of the gate slowed from 0.68 to 0.76 ms, so it was reverted.
 - **Gate block sizes 128 and 512:** 1.44 and 1.31 ms, against 1.17 ms for 64.
 
+**Reading SSIMULACRA2 on these pages.** On the manga pages the scores
+saturate at about 86–87 for any image that is not bit-identical. In a check
+on `lb-page-004.png`, the FP32 reference itself scored 87.03 after changing
+just 0.1% of its 8-bit values by ±1, and 86.56 at 1%. Native mixed differs
+in 3.2% of values (0.06% by more than 1 step), and FP16 and RTX in about 7.5–7.8%.
+So 86–87 means "visually identical, a few rounding steps differ". The
+differences between backends are within the metric's noise, and only a
+bit-exact output scores 100. Use raw PSNR to rank fidelity.
+
+## Optimization pass 3 (2026-11-22)
+
+Build: `output/moesr-session/p3-win`. Validation: `output/moesr-session/validated-p3/report.json`
+passed all package, stress, tiny/odd shape (`2×2` through `128×160`), CLI,
+alternate-stream, host I/O, corrupt-cache rebuild, `workspace_mib=0`,
+`fused_gate=0`, option-rejection, and page checks. The GateRV2 and both
+GateRV3 regression checks (`gaterv2.json`, `gaterv3-digital.json`,
+`gaterv3-idc.json`) also passed on this DLL.
+
+What changed:
+
+1. **Fused all-channel expansion + plain Mish gate** (`expand_gate_full_f16`,
+   `expand_gate_full_f32`, `expand_gate_reduced_f16`, `expand_gate_reduced_f32`
+   in `native/kernels/moesr/kernels.cu`). Enabled by default via kernel option
+   `fused_gate=1` (`fused_gate=0` retains the pass-2 cuDNN expansion path for
+   A/B checks). Each block owns an 8×16 pixel tile (10×18 halo = 22.5 KB,
+   loaded once into shared memory and reused across all N-passes) with 8 warps
+   (256 threads, ≤ 47.6 KB shared memory, 2 active blocks/SM on `sm_86`, zero
+   local spills). Weights are pre-packed on the host (`pack_swizzle32_pass` in
+   `runner.cpp`) into contiguous swizzle32 K=32 stages:
+   - Full-res FP16 (`64→344`): 2 passes (`192 + 160 = 352` ch), 2-stage ring,
+     `4×2` warps, double-buffered `k16` fragments.
+   - Full-res Mixed (`64→344`, FP32 acc): 4 passes (`4×88 = 352` ch), 3-stage
+     ring, `8×1` warps (124 regs, zero spills).
+   - Reduced-res FP16 (`64→192`): 1 pass (`192` ch), 2-stage ring, `4×2` warps.
+   - Reduced-res Mixed (`64→192`, FP32 acc): 2 passes (`2×96 = 192` ch),
+     3-stage ring, `8×1` warps.
+   Plain groups (37 full, 18 reduced) are placed at slot offset 0 (32-byte
+   aligned), compute `fast_mish` across all 32 warp lanes, and store 16-byte
+   `uint4` vectors directly to `gated`. The 48 depthwise-branch channels are
+   written in planar-by-type layout to `projected` (three 8-channel value
+   planes + one 24-channel gate plane), eliminating both the `64→344` and
+   `64→192` cuDNN expansion plans, shrinking `projected` 5.4× (batch-2
+   activations 117 MB, cuDNN workspace 0 B), and reducing tuned plans from 8 to 6.
+2. **Tiled 16×16 depthwise branch + gate** (`gate_branch_tiled_full`,
+   `gate_branch_tiled_reduced`). Loads each 8-channel value plane once per
+   16×16 tile into shared memory via coalesced `uint4` loads, computes the
+   3×3, 1×11, or 11×1 depthwise stencil and Mish gate, and writes `uint4`
+   outputs to the branch slots (`152..175` full, `72..95` reduced). Cut
+   branch-gate time by ~23% (0.37 → 0.28 ms/call).
+3. **Validator follow-ups** (`scripts/validate_moesr_session.py`). Added
+   `workspace_mib=0`, `fused_gate=0` agreement + key isolation, corrupt-file
+   cache rebuild (`rebuilt` → `hit`), unavailable cache-directory fallback,
+   and invalid kernel-option rejection checks.
+
+Same-process alternating A/B (`scripts/ab_moesr_builds.py`, median ms/tile on
+256×256 random tiles):
+
+| Mode | Batch 1 (p2 → p3) | Batch 2 (p2 → p3) | Batch 4 (p2 → p3) |
+| --- | ---: | ---: | ---: |
+| **FP16** | 126.5 → **105.6** (−16.5%) | 129.6 → **99.8** (−22.9%) | 122.9 → **108.3** (−11.9%) |
+| **Mixed** | 179.7 → **164.0** (−8.7%) | 181.5 → **167.0** (−8.0%) | 189.9 → **170.2** (−10.4%) |
+
+Batch 4 did not beat batch 2 per tile on this 4 GB laptop GPU, so batch 2
+remains the best operating point.
+
+Four-round rotated page benchmark, pass 3 vs pass 2
+(`output/moesr-session/paired-p3-vs-p2/report.json`):
+
+| Build | Mode | Batch-2 inference s | Batch-2 input MPx/s | Batch-1 tile latency ms | Raw PSNR dB | SSIMULACRA2 mean / min |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Pass 2 | FP16 | 9.183 | 0.3969 | 129.9 | 59.993 | 86.094 / 85.420 |
+| **Pass 3** | **FP16** | **7.959** | **0.4582** | **115.2** | **60.185** | **86.302 / 85.685** |
+| Pass 2 | Mixed | 13.105 | 0.2781 | 190.4 | 68.133 | 87.263 / 87.095 |
+| **Pass 3** | **Mixed** | **12.704** | **0.2869** | **171.2** | 68.081 | 87.294 / 86.973 |
+
+Three-round rotated page benchmark against TensorRT-RTX
+(`output/moesr-session/paired-p3-rtx/report.json`):
+
+| Backend | Batch-2 inference s | Batch-2 input MPx/s | Batch-1 tile latency ms | Raw PSNR dB | SSIMULACRA2 mean / min |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **Native FP16 (Pass 3)** | **7.771** | **0.4691** | **109.1** | 60.060 | 86.111 / 85.398 |
+| **Native Mixed (Pass 3)** | **11.915** | **0.3059** | 167.7 | **68.086** | **87.327 / 87.203** |
+| TensorRT-RTX FP16 | 12.508 | 0.2914 | 134.9 | 60.188 | 86.210 / 85.517 |
+
+Native FP16 is now **1.61× faster** than TensorRT-RTX FP16 in batch-2
+throughput with **19.1% lower** batch-1 tile latency at matching fidelity.
+Native Mixed (68.09 dB, +7.9 dB over RTX) now also beats TensorRT-RTX FP16 in
+batch-2 throughput by **5.0%**.
+
+Post-pass-3 batch-2 FP16 profile (195 ms total): `expand_gate_full_f16` 48%,
+`176→64` projection (cuDNN) 22.5%, `residual_norm_nhwc` 6.1%,
+`gate_branch_tiled_full` 5.1%, `expand_gate_reduced_f16` 5.1%, remaining
+convolutions and elementwise kernels 13%.
+
+Dead ends recorded in pass 3:
+
+- **Large 8×64×64 16-warp single-block-per-SM tile** (100 KB shared memory)
+  with 5 separate N-blocks and uncoalesced `half2` stores: 4.07 ms FP16 /
+  5.71 ms FP32 (vs 2.14–2.42 ms FP16 / 4.07 ms FP32 for 8-warp 2-blocks/SM
+  8×16 with in-block N-passes, pre-packed swizzle32 weights, and `uint4`
+  epilogue stores).
+- **Keeping `cuDNN 64→48` for the 48 depthwise-branch channels:** fusing all
+  344 channels into `expand_gate_full_*` beat `cuDNN 64→48 + expand_gate(296)`
+  while eliminating both expansion cuDNN plans and shrinking workspace to 0 B.
+
 ## Page measurements
 
 ### Paired comparison with TensorRT-RTX after pass 1
@@ -272,27 +377,19 @@ GateRV3 regression reports are in the same folder.
 1. ~~Validate the timed and cached build.~~ Done.
 2. ~~Remove channel padding, speed up the gate, and compare with RTX.~~ Done
    in pass 1. Native FP16 beats RTX.
-3. ~~Commit~~ pass 1 (done by the user in `176c581`). **Pass 2 is
-   uncommitted.** Validator follow-ups: add corrupt-file rebuild and
-   `workspace_mib=0` checks, as in `validate_gaterv2_session.py`.
-4. **Pass 3 candidates**, from the post-pass-2 profile:
-   - **Custom fused expansion + gate kernel** (largest remaining win). The
-     64→344 convolution writes 344 FP16 channels per pixel and the gate
-     reads them back. A tensor-core implicit-GEMM kernel (WMMA/mma.sync,
-     64 input channels × 9 taps) can apply bias and Mish in its epilogue and
-     write only the 176 gated channels. The 24 depthwise channels need a 1-
-     or 5-pixel halo, so either keep that part in a small second kernel or
-     tile spatially with halos. Expect to save most of the gate's 19%, plus
-     about half of the expansion's write traffic.
-   - **Projection + residual + next norm:** a custom 176→64 convolution
-     with a residual and LayerNorm epilogue would remove `residual_norm`
-     (5%) and one state round-trip.
-   - **Mixed mode:** the FP32-accumulation expansion takes 48%. Consider
-     FP16 accumulation for the expansion only, measuring the fidelity cost
-     against the 68 dB target, or a split-K custom kernel.
-   - **Batch 4 and larger tiles:** throughput may scale better, so measure
-     before writing kernels (`--batch` on the benchmark script).
-5. Build and validate on Linux.
-6. Rounding drift between engines: mixed `tiny-2x2` scored 92.8 dB at first,
-   then 89.2 in pass 1 and 88.3 in pass 2. FP16 checkerboard scored 64.7,
-   then 63.4 and 65.6. All remain far above the page scores (about 59–70 dB).
+3. ~~Commit pass 1 and pass 2; add validator follow-ups.~~ Pass 1 (`176c581`)
+   and pass 2 (`3460ba5`) committed; validator follow-ups (`corrupt` rebuild,
+   `workspace_mib=0`, `fused_gate=0`, option rejections) done in pass 3.
+4. ~~Pass 3: fused expansion + Mish gate, tiled depthwise branch, batch-4
+   scaling measurement.~~ Done in pass 3 (uncommitted). Native FP16 is 1.61×
+   faster than TensorRT-RTX (19% lower batch-1 latency), and Native Mixed
+   (68.1 dB) now beats TensorRT-RTX FP16 in batch-2 throughput.
+5. **Commit pass 3**, then build and validate on Linux (and verify on `sm_89` /
+   `sm_120` if available).
+6. Optional pass 4 candidate: custom fused `176→64` projection + Mish +
+   residual + next LayerNorm kernel (currently 22.5% + 6.1% = 28.6% of FP16
+   runtime).
+7. Rounding drift between engines: mixed `tiny-2x2` scored 92.8 dB at first,
+   then 89.2 in pass 1, 88.3 in pass 2, and 89.4 in pass 3. FP16 checkerboard
+   scored 64.7, then 63.4, 65.6, and 65.6. All remain far above the page scores
+   (about 59–70 dB).

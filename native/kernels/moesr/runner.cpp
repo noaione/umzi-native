@@ -30,9 +30,17 @@ constexpr int channels = 64, scale = 4, full_hidden = 170, reduced_hidden = 96, 
 constexpr int rgb_lanes = 8;
 constexpr int lanes(int count) { return (count + 7) & ~7; }
 constexpr int expand_width(int hidden) { return 8 * ((hidden + 3) / 4); }
+// Shared memory for the 8x16 fused expansion+gate kernels (180-pixel halo +
+// K=32 weight ring buffer): full/reduced FP16 use 2x192, full FP32 uses 3x88,
+// reduced FP32 uses 3x96.
+constexpr int fused_rows = 8, fused_cols = 16, halo_halves = 180 * 64;
+constexpr int fused_shared_full_f16 = (halo_halves + 2 * 192 * 32) * 2;
+constexpr int fused_shared_full_f32 = (halo_halves + 3 * 88 * 32) * 2;
+constexpr int fused_shared_reduced_f16 = (halo_halves + 2 * 192 * 32) * 2;
+constexpr int fused_shared_reduced_f32 = (halo_halves + 3 * 96 * 32) * 2;
 constexpr uint64_t default_workspace_mib = 512, max_workspace_mib = 4096;
 // Bump when plan keys, descriptor semantics, or the choice format change.
-constexpr uint32_t plan_schema = 4;
+constexpr uint32_t plan_schema = 5;
 constexpr std::array<uint32_t, 10> configuration{3, 3, scale, 2, channels, 9, 4, 3, full_hidden, reduced_hidden};
 using Clock = std::chrono::steady_clock;
 
@@ -91,14 +99,17 @@ struct Group {
 
 // With padded = false the offsets match the packer's section 3. With padded =
 // true they describe the device copy, whose first, expand and project filters
-// use the padded channel counts of the device layout.
+// use the padded channel counts of the device layout. When fused = true the
+// full-resolution expansion weight is padded to 352 channels for swizzle32
+// K=32 passes (192 + 160 for FP16, 4 x 88 for FP32).
 struct Network {
     Filter first, last;
     std::array<Group, configuration[5]> groups;
     size_t bytes = 0;
-    bool padded = false;
+    bool padded = false, fused = false;
 
-    explicit Network(bool padded_layout = false) : padded(padded_layout) {
+    explicit Network(bool padded_layout = false, bool fused_layout = false)
+        : padded(padded_layout), fused(fused_layout) {
         first = dense(padded ? rgb_lanes : 3, channels);
         for (auto& group : groups) {
             for (auto& block : group.full) block = gated(full_hidden);
@@ -118,11 +129,12 @@ struct Network {
     Filter depthwise(int taps) { return {take(8 * taps * 4), take(8 * 4)}; }
     Block gated(int hidden) {
         const int width = padded ? lanes(hidden) : hidden;
+        const int expand_cout = padded ? expand_width(hidden) : 2 * hidden;
+        const int weight_cout = (padded && fused && hidden == full_hidden) ? 352 : expand_cout;
         Block block;
         block.norm_weight = take(channels * 4);
         block.norm_bias = take(channels * 4);
-        // The expansion writes 8 channels per group of four hidden slots.
-        block.expand = dense(channels, padded ? 8 * ((hidden + 3) / 4) : 2 * hidden);
+        block.expand = {take(size_t(channels) * weight_cout * 9 * 2), take(size_t(expand_cout) * 4)};
         block.square = depthwise(9);
         block.row = depthwise(11);
         block.column = depthwise(11);
@@ -148,15 +160,41 @@ void copy_dense(std::vector<char>& out, const char* in, Filter to, Filter from, 
     }
 }
 
-// Slot of hidden channel k in a gated block's device layout: the 24 depthwise
-// branch channels (the last 24) come first, then the plain ones. Slots form
-// groups of four; see gate_groups in kernels.cu.
-int hidden_slot(int k, int hidden) {
+// Pack one N-pass [ch_start .. ch_start + ntile) of a logical [total_ch, 9, 64]
+// FP16 weight into 18 contiguous swizzle32 K=32 stages (9 taps x 2 k-halves).
+void pack_swizzle32_pass(char* dst, const uint16_t* logical, int total_ch, int ch_start, int ntile) {
+    for (int step = 0; step < 18; ++step) {
+        const int tap = step / 2, kh = step % 2;
+        for (int row = 0; row < ntile; ++row) {
+            const int ch = ch_start + row;
+            if (ch >= total_ch) continue;
+            const int mask = (row >> 1) & 3;
+            for (int chunk = 0; chunk < 4; ++chunk) {
+                const size_t dst_halves = (size_t(step * ntile + row) * 4 + (chunk ^ mask)) * 8;
+                const size_t src_halves = (size_t(ch) * 9 + tap) * 64 + kh * 32 + chunk * 8;
+                std::memcpy(dst + dst_halves * 2, logical + src_halves, 16);
+            }
+        }
+    }
+}
+
+// Slot of hidden channel k in a gated block's unfused device layout: the 24
+// depthwise branch channels come first, then the plain ones.
+int unfused_hidden_slot(int k, int hidden) {
     const int branch = hidden - 24;
     return k >= branch ? k - branch : 24 + k;
 }
 
-std::vector<char> device_weights(const Network& from, const Network& to, const char* in) {
+// Slot of hidden channel k in the fused projection input: plain channels come
+// first at offset 0 (32-byte aligned for uint4 stores), followed by any zero
+// padding (slots 148..151 at full resolution), then the 24 branch channels.
+int fused_project_slot(int k, int hidden) {
+    const int plain = hidden - 24;
+    return k < plain ? k : lanes(hidden) - 24 + (k - plain);
+}
+
+std::vector<char> device_weights(const Network& from, const Network& to, const char* in, bool fused,
+                                 bool accumulate_fp16) {
     std::vector<char> out(to.bytes, 0);
     const auto raw = [&](size_t target, size_t source, size_t size) {
         std::memcpy(out.data() + target, in + source, size);
@@ -166,26 +204,55 @@ std::vector<char> device_weights(const Network& from, const Network& to, const c
         copy_dense(out, in, target, source, cin, cout, cin, identity, identity);
     };
     const auto block = [&](const Block& target, const Block& source, int hidden) {
-        const int width = lanes(hidden), groups = (hidden + 3) / 4;
+        const int width = lanes(hidden);
         raw(target.norm_weight, source.norm_weight, channels * 4);
         raw(target.norm_bias, source.norm_bias, channels * 4);
-        // Expansion output o < hidden is the gate of hidden channel o, and
-        // o >= hidden is the value of hidden channel o - hidden. Group g
-        // stores [gate x4 | value x4] at device channels 8g .. 8g + 7.
-        const auto expand_slot = [&](int o) {
-            const bool value = o >= hidden;
-            const int slot = hidden_slot(value ? o - hidden : o, hidden);
-            return 8 * (slot / 4) + (value ? 4 : 0) + slot % 4;
-        };
-        static_cast<void>(groups);
-        copy_dense(out, in, target.expand, source.expand, channels, 2 * hidden, channels, expand_slot, identity);
+        if (!fused) {
+            const auto expand_slot = [&](int o) {
+                const bool value = o >= hidden;
+                const int slot = unfused_hidden_slot(value ? o - hidden : o, hidden);
+                return 8 * (slot / 4) + (value ? 4 : 0) + slot % 4;
+            };
+            copy_dense(out, in, target.expand, source.expand, channels, 2 * hidden, channels, expand_slot, identity);
+        } else {
+            const int plain = hidden - 24, plain_groups = (plain + 3) / 4, total_ch = expand_width(hidden);
+            std::vector<uint16_t> logical(size_t(total_ch) * 9 * channels, 0);
+            for (int o = 0; o < 2 * hidden; ++o) {
+                const bool value = o >= hidden;
+                const int k = value ? o - hidden : o;
+                const int g = k < plain ? k / 4 : plain_groups + (k - plain) / 4;
+                const int sub = k < plain ? k % 4 : (k - plain) % 4;
+                const int ch = 8 * g + (value ? 4 : 0) + sub;
+                std::memcpy(logical.data() + size_t(ch) * 9 * channels,
+                            in + source.expand.weight + size_t(o) * 9 * channels * 2, 9 * channels * 2);
+                std::memcpy(out.data() + target.expand.bias + size_t(ch) * 4,
+                            in + source.expand.bias + size_t(o) * 4, 4);
+            }
+            char* dst = out.data() + target.expand.weight;
+            if (hidden == full_hidden) {
+                if (accumulate_fp16) {
+                    pack_swizzle32_pass(dst, logical.data(), total_ch, 0, 192);
+                    pack_swizzle32_pass(dst + size_t(18) * 192 * 32 * 2, logical.data(), total_ch, 192, 160);
+                } else {
+                    for (int p = 0; p < 4; ++p)
+                        pack_swizzle32_pass(dst + size_t(p) * 18 * 88 * 32 * 2, logical.data(), total_ch, p * 88, 88);
+                }
+            } else {
+                if (accumulate_fp16) {
+                    pack_swizzle32_pass(dst, logical.data(), total_ch, 0, 192);
+                } else {
+                    for (int p = 0; p < 2; ++p)
+                        pack_swizzle32_pass(dst + size_t(p) * 18 * 96 * 32 * 2, logical.data(), total_ch, p * 96, 96);
+                }
+            }
+        }
         for (auto [t, s, taps] : {std::tuple{target.square, source.square, 9}, {target.row, source.row, 11},
                                   {target.column, source.column, 11}}) {
             raw(t.weight, s.weight, 8 * taps * 4);
             raw(t.bias, s.bias, 8 * 4);
         }
         copy_dense(out, in, target.project, source.project, hidden, channels, width, identity,
-                   [&](int i) { return hidden_slot(i, hidden); });
+                   [&](int i) { return fused ? fused_project_slot(i, hidden) : unfused_hidden_slot(i, hidden); });
         raw(target.gamma, source.gamma, channels * 4);
     };
     copy_dense(out, in, to.first, from.first, 3, channels, rgb_lanes, identity, identity);
@@ -212,12 +279,13 @@ struct Convolution {
 constexpr const char* kernel_names[] = {
     "pack_rgb_f32", "pack_rgb_f16", "input_bias", "norm_nhwc", "gate_full_nhwc", "gate_reduced_nhwc",
     "gated_residual_nhwc", "residual_norm_nhwc", "reduce_nhwc", "expand_residual_nhwc", "add_nhwc",
-    "output_nhwc_f32", "output_nhwc_f16", "fill_noise",
+    "output_nhwc_f32", "output_nhwc_f16", "fill_noise", "gate_branch_tiled_full", "gate_branch_tiled_reduced",
+    "expand_gate_full_f16", "expand_gate_full_f32", "expand_gate_reduced_f16", "expand_gate_reduced_f32",
 };
 enum Kernel {
     PackF32, PackF16, InputBias, Normalize, GateFull, GateReduced, Residual, ResidualNorm, Reduce, Expand, Add,
-    OutputF32,
-    OutputF16, FillNoise, KernelCount
+    OutputF32, OutputF16, FillNoise, GateBranchFull, GateBranchReduced, ExpandGateFullF16, ExpandGateFullF32,
+    ExpandGateReducedF16, ExpandGateReducedF32, KernelCount
 };
 static_assert(std::size(kernel_names) == KernelCount);
 
@@ -252,7 +320,11 @@ class Session final : public umzi::KernelSession {
     std::array<CUevent, 2> timing{};
     int timed_plans = 0;
     uint64_t workspace_limit = default_workspace_mib << 20;
-    bool accumulate_fp16 = false;
+    bool accumulate_fp16 = false, fused_gate = true;
+    // Device memory in use (cuMemGetInfo) after context creation, after the
+    // weights, after shape preparation (buffers and plans), and after graph
+    // capture. Reported as startup_device_used_bytes.
+    std::array<uint64_t, 4> device_used{};
 
 public:
     void open(const umzi::ModelPackage& package, const UmziSessionOptions& options) {
@@ -271,20 +343,33 @@ public:
         // candidates may use. The fast implicit-GEMM plans need about 45 MB per
         // 256x256 tile, so a small cap forces slow plans at larger batches.
         // Prepare keeps only the selected requirement allocated.
-        bool seen_workspace = false;
+        // fused_gate (0 or 1, default 1): compute the full and reduced expansions
+        // and plain Mish gates in custom tensor-core kernels (expand_gate_*),
+        // writing the 48 depthwise-branch channels to projected for the tiled
+        // depthwise kernel (gate_branch_tiled_*).
+        bool seen_workspace = false, seen_fused = false;
         for (uint32_t i = 0; i < options.kernel_option_count; ++i) {
             const auto& option = options.kernel_options[i];
             const std::string name = option.name ? option.name : "";
-            if (name != "workspace_mib")
-                throw std::runtime_error("Unknown MoESR option: " + name + " (expected workspace_mib)");
-            if (seen_workspace) throw std::runtime_error("Duplicate MoESR option: workspace_mib");
-            if (option.value < 0 || uint64_t(option.value) > max_workspace_mib)
-                throw std::runtime_error("MoESR option workspace_mib must be between 0 and 4096");
-            workspace_limit = uint64_t(option.value) << 20;
-            seen_workspace = true;
+            if (name == "workspace_mib") {
+                if (seen_workspace) throw std::runtime_error("Duplicate MoESR option: workspace_mib");
+                if (option.value < 0 || uint64_t(option.value) > max_workspace_mib)
+                    throw std::runtime_error("MoESR option workspace_mib must be between 0 and 4096");
+                workspace_limit = uint64_t(option.value) << 20;
+                seen_workspace = true;
+            } else if (name == "fused_gate") {
+                if (seen_fused) throw std::runtime_error("Duplicate MoESR option: fused_gate");
+                if (option.value != 0 && option.value != 1)
+                    throw std::runtime_error("MoESR option fused_gate must be 0 or 1");
+                fused_gate = option.value != 0;
+                seen_fused = true;
+            } else {
+                throw std::runtime_error("Unknown MoESR option: " + name + " (expected workspace_mib or fused_gate)");
+            }
         }
         fp16 = options.precision == UMZI_FP16;
         accumulate_fp16 = fp16;
+        device_model = Network(true, fused_gate);
         graph_enabled = (options.flags & UMZI_CUDA_GRAPH) != 0;
         CHECK(cuInit(0));
         CHECK(cuDeviceGet(&device, options.device));
@@ -293,14 +378,21 @@ public:
         const auto& image =
             umzi::load_kernel_module(device, module, moesr_images::embedded_cubins, moesr_images::embedded_ptx);
         for (int i = 0; i < KernelCount; ++i) CHECK(cuModuleGetFunction(&functions[i], module, kernel_names[i]));
+        for (auto [kernel, shared] : {std::pair{ExpandGateFullF16, fused_shared_full_f16},
+                                      std::pair{ExpandGateFullF32, fused_shared_full_f32},
+                                      std::pair{ExpandGateReducedF16, fused_shared_reduced_f16},
+                                      std::pair{ExpandGateReducedF32, fused_shared_reduced_f32}})
+            CHECK(cuFuncSetAttribute(functions[kernel], CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, shared));
+        record_memory(0);
         CHECK(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
         CHECK(cuEventCreate(&complete, CU_EVENT_DISABLE_TIMING));
         for (auto& event : timing) CHECK(cuEventCreate(&event, CU_EVENT_DEFAULT));
         CHECK(cudnnCreate(&cudnn));
-        const auto padded_weights = device_weights(model, device_model, data.data());
+        const auto padded_weights = device_weights(model, device_model, data.data(), fused_gate, accumulate_fp16);
         CHECK(cuMemAlloc(&weights, padded_weights.size()));
         CHECK(cuMemcpyHtoD(weights, padded_weights.data(), padded_weights.size()));
         initialize_cache(options.cache_dir, package.digest, image);
+        record_memory(1);
     }
 
     void initialize_cache(const char* directory, const umzi::Digest& model_digest, const umzi::KernelImage& image) {
@@ -315,6 +407,7 @@ public:
             hash.add(model_digest);
             hash.add(image.data, image.size);
             hash.add(static_cast<uint32_t>(fp16));
+            hash.add(static_cast<uint32_t>(fused_gate));
             hash.add(workspace_limit);
             CUuuid uuid{};
             CHECK(cuDeviceGetUuid(&uuid, device));
@@ -505,7 +598,10 @@ private:
             activation(state, pixels * channels);
             activation(reduced, pixels / 4 * channels);
             activation(normalized, pixels * channels);
-            activation(projected, pixels * expand_width(full_hidden));
+            // With fused_gate no convolution writes the 344-channel expansion: the
+            // widest remaining output is 64 channels per full-resolution pixel
+            // (first, projection and up convolutions), so projected shrinks 5.4x.
+            activation(projected, pixels * (fused_gate ? channels : expand_width(full_hidden)));
             activation(gated, pixels * lanes(full_hidden));
             const auto input_bytes = shape.rgb_bytes(fp16);
             CHECK(cuMemAlloc(&stage_in, input_bytes));
@@ -520,10 +616,10 @@ private:
             load_plan_cache();
             const int h = padded.h, w = padded.w;
             make_plan(h, w, rgb_lanes, channels);
-            make_plan(h, w, channels, expand_width(full_hidden));
+            if (!fused_gate) make_plan(h, w, channels, expand_width(full_hidden));
             make_plan(h, w, lanes(full_hidden), channels);
             make_plan(h, w, channels, channels / 4);
-            make_plan(h / 2, w / 2, channels, expand_width(reduced_hidden));
+            if (!fused_gate) make_plan(h / 2, w / 2, channels, expand_width(reduced_hidden));
             make_plan(h / 2, w / 2, lanes(reduced_hidden), channels);
             make_plan(h / 2, w / 2, channels, 4 * channels);
             make_plan(h, w, channels, 3 * scale * scale);
@@ -540,6 +636,7 @@ private:
             forward(stage_in, stage_out, stream);
             CHECK(cuStreamSynchronize(stream));
             setup_ms[2] = elapsed(start);
+            record_memory(2);
 
             if (graph_enabled) {
                 start = Clock::now();
@@ -555,6 +652,7 @@ private:
                 CHECK(cuGraphUpload(executable, stream));
                 CHECK(cuStreamSynchronize(stream));
                 setup_ms[3] = elapsed(start);
+                record_memory(3);
             }
         } catch (...) {
             cuStreamSynchronize(stream);
@@ -604,12 +702,17 @@ private:
                weights + chain[0].norm_bias, pixels);
         for (size_t i = 0; i < Count; ++i) {
             const auto& params = chain[i];
-            conv(projected, normalized, h, w, channels, expand_width(hidden), params.expand);
-            // gate_groups uses one thread per group of four hidden slots, ordered by filter type.
-            launch(target, hidden == full_hidden ? GateFull : GateReduced, pixels * ((hidden + 3) / 4), gated,
-                   projected, weights + params.expand.bias, weights + params.square.weight,
-                   weights + params.square.bias, weights + params.row.weight, weights + params.row.bias,
-                   weights + params.column.weight, weights + params.column.bias, h, w, pixels);
+            if (fused_gate) {
+                expand_gate(target, normalized, params.expand, h, w, pixels, hidden == full_hidden);
+                gate_branch_tiled(target, params, h, w, pixels, hidden == full_hidden);
+            } else {
+                conv(projected, normalized, h, w, channels, expand_width(hidden), params.expand);
+                // gate_groups uses one thread per group of four hidden slots, ordered by filter type.
+                launch(target, hidden == full_hidden ? GateFull : GateReduced, pixels * ((hidden + 3) / 4), gated,
+                       projected, weights + params.expand.bias, weights + params.square.weight,
+                       weights + params.square.bias, weights + params.row.weight, weights + params.row.bias,
+                       weights + params.column.weight, weights + params.column.bias, h, w, pixels);
+            }
             conv(projected, gated, h, w, lanes(hidden), channels, params.project);
             if (i + 1 < Count) {
                 const auto& next = chain[i + 1];
@@ -620,6 +723,41 @@ private:
                             weights + params.gamma);
             }
         }
+    }
+
+    // Fused expansion + plain Mish gate over 8 x 16 spatial tiles. Writes plain
+    // gated channels to `gated` and the 48 depthwise-branch channels in planar
+    // form to `projected`.
+    void expand_gate(CUstream target, CUdeviceptr input, Filter filter, int h, int w, int pixels, bool full) {
+        int tiles_x = (w + fused_cols - 1) / fused_cols, tiles_y = (h + fused_rows - 1) / fused_rows;
+        CUdeviceptr out = gated, branch = projected, weight = weights + filter.weight, bias = weights + filter.bias;
+        const Kernel kernel = full ? (accumulate_fp16 ? ExpandGateFullF16 : ExpandGateFullF32)
+                                   : (accumulate_fp16 ? ExpandGateReducedF16 : ExpandGateReducedF32);
+        const int shared = full ? (accumulate_fp16 ? fused_shared_full_f16 : fused_shared_full_f32)
+                                : (accumulate_fp16 ? fused_shared_reduced_f16 : fused_shared_reduced_f32);
+        void* parameters[] = {&out, &branch, &input, &weight, &bias, &h, &w, &pixels, &tiles_x, &tiles_y};
+        CHECK(cuLaunchKernel(functions[kernel], unsigned(tiles_x * tiles_y * padded.n), 1, 1, 256, 1, 1, shared,
+                             target, parameters, nullptr));
+    }
+
+    // Tiled 16 x 16 depthwise branch + Mish gate reading the planar 48-channel
+    // branch output from `projected` and writing branch slots into `gated`.
+    void gate_branch_tiled(CUstream target, const Block& params, int h, int w, int pixels, bool full) {
+        int tiles_x = (w + 15) / 16, tiles_y = (h + 15) / 16;
+        CUdeviceptr out = gated, branch = projected, eb = weights + params.expand.bias;
+        CUdeviceptr sq_w = weights + params.square.weight, sq_b = weights + params.square.bias;
+        CUdeviceptr rw_w = weights + params.row.weight, rw_b = weights + params.row.bias;
+        CUdeviceptr cl_w = weights + params.column.weight, cl_b = weights + params.column.bias;
+        void* parameters[] = {&out, &branch, &eb, &sq_w, &sq_b, &rw_w, &rw_b, &cl_w, &cl_b,
+                              &h,   &w,      &pixels, &tiles_x, &tiles_y};
+        CHECK(cuLaunchKernel(functions[full ? GateBranchFull : GateBranchReduced],
+                             unsigned(tiles_x * tiles_y * padded.n), 3, 1, 256, 1, 1, 0, target, parameters, nullptr));
+    }
+
+    void record_memory(size_t stage) {
+        size_t available = 0, total = 0;
+        CHECK(cuMemGetInfo(&available, &total));
+        device_used[stage] = total - available;
     }
 
     void forward(CUdeviceptr input, CUdeviceptr output, CUstream target) {
@@ -718,15 +856,17 @@ public:
             info.buffer_bytes[1] = activation_bytes;
             info.buffer_bytes[2] = workspace_bytes;
             info.buffer_bytes[3] = shape.rgb_bytes(fp16) * (1 + scale * scale);
+            std::copy(device_used.begin(), device_used.end(), info.startup_device_used_bytes);
             std::copy(setup_ms.begin(), setup_ms.end(), info.shape_setup_ms);
         }
         return info;
     }
 
-    uint32_t diagnostic_count() const override { return 2; }
+    uint32_t diagnostic_count() const override { return 3; }
     UmziDiagnostic diagnostic(uint32_t index) const override {
         if (index == 0) return {sizeof(UmziDiagnostic), "timed_plans", timed_plans};
-        return {sizeof(UmziDiagnostic), "plan_workspace_bytes", int64_t(workspace_bytes)};
+        if (index == 1) return {sizeof(UmziDiagnostic), "plan_workspace_bytes", int64_t(workspace_bytes)};
+        return {sizeof(UmziDiagnostic), "fused_gate", int64_t(fused_gate)};
     }
 };
 } // namespace

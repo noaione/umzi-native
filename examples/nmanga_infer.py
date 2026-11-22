@@ -421,9 +421,16 @@ def main() -> None:
     print(f"{IMAGE.name}, FP16, {TILE_SIZE}x{TILE_SIZE} tiles, batch {BATCH_SIZE}")
     with Image.open(IMAGE) as image:
         image.load()
+        start_time_load = time.perf_counter()
         with load_session(MODEL) as native:
+            end_time_load = time.perf_counter()
+            print(f"Native session loaded in {(end_time_load - start_time_load) * 1000:.2f} ms")
             native_time = _benchmark("Umzi native", native, image)
-        rtx_time = _benchmark("TensorRT-RTX", _load_rtx_session(), image)
+        start_time_rtx_load = time.perf_counter()
+        rtx_sess = _load_rtx_session()
+        end_time_rtx_load = time.perf_counter()
+        print(f"RTX session loaded in {(end_time_rtx_load - start_time_rtx_load) * 1000:.2f} ms")
+        rtx_time = _benchmark("TensorRT-RTX", rtx_sess, image)
 
     if native_time <= rtx_time:
         print(f"Umzi native speedup: {rtx_time / native_time:.2f}x")
