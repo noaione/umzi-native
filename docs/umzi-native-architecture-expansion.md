@@ -91,15 +91,17 @@ experiments. The handoff's checkpoint SHA-256 matches the local file.
 | Model | Sample directory | Input tile | Batch size | Input overlap |
 | --- | --- | --- | ---: | ---: |
 | Dehalftone (GateRV2) | `samples/halftone/` | 128×128 | 16 | 0 px |
-| MangaScale (GFISRv2) | `samples/mscale/` | 256×256 | 2 | 32 px, matching the overlap from the `umzi-bench` handoff |
+| MangaScale (GFISRv2 native tuning) | `samples/mscale/` | 256×256 | 2 | 64 px |
+| MangaScale (GFISRv2 matched TRT comparison) | `samples/mscale/lb-page-003.png` | 128×128 | 1 | 32 px |
 | DWTP DS (MoESR) | `samples/mscale/` | 256×256 | 2 | 0 px |
 
-For MangaScale, 32 input pixels of overlap gives a 224-pixel input stride
-and 128 output pixels of overlap at 4×. Use the same tile grid, edge padding,
-feather blending, and crop for every backend and the FP32 reference. The
-prior `umzi-bench` handoff used 128×128 tiles with 32 pixels of overlap. Use a
-fresh FP32 reference at 256×256 because the Fourier blocks see a different
-tile context.
+The 256×256 native tuning mode uses 64 input pixels of overlap for a
+192-pixel stride and 256 output pixels of overlap at 4×. The archived
+256×256 results below used 32 px. Generate a fresh FP32 reference for
+each mode using the same tile grid, edge padding, feather blending and
+crop as its candidates. The [GFISRv2 handoff](handoff-gfisrv2.md#test-modes)
+records the one-page comparison to judge whether the wider overlap
+improves seams enough to justify the added tile calls.
 
 ### Fidelity and timing
 
@@ -644,8 +646,9 @@ $build = 'output/moesr-session/tuned-win'
    results. [Archived flat-tile results](umzi-native-architecture-baselines.md#gfisrv2-flat-tile-fidelity)
 
 Use the three `samples/mscale/` pages with 256×256 input tiles, batch 2,
-and 32 input pixels of overlap. Keep per-page and overall batch-2 time
-and throughput, and time individual synchronized batch-1 tiles separately.
+and 64 input pixels of overlap for the next tuning baseline. Keep per-page
+and overall batch-2 time and throughput, and time individual synchronized
+batch-1 tiles separately.
 The first implementation milestone is the isolated Fourier validator
 with a trace that identifies the first diverging stage.
 
@@ -912,6 +915,9 @@ foreach ($mode in 'fp16', 'mixed', 'fp32') {
 · [FP32 regression report](../output/gfisrv2-session/precision-final-fp32/report.json)
 
 #### GFISRv2 performance target
+
+See the [GFISRv2 tuning handoff](handoff-gfisrv2.md) for pickup commands
+and the ordered validation and profiling plan.
 
 Beat **4.8052 s/page median** on a matched full-page benchmark. The target
 is the captured portable ONNX Runtime TensorRT 10 runner from the

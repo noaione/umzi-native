@@ -1,73 +1,130 @@
-# umzi_native
+# umzi-native
 
-Experimental CUDA inference runtime for Umzi models. It currently supports
-the original GateRV3 Digital Decompression model and the IDC fine-tune.
+Native CUDA inference runtime for [Umzi](https://github.com/umzi2) image
+restoration and upscaling models. It packs supported checkpoints into a
+single portable `.ummodel` file and runs them on NVIDIA GPUs through one
+Python API (`InferenceSession`) with tuned cuBLASLt/cuDNN plans, custom CUDA
+kernels, and CUDA Graph replay.
+
+## Supported models
+
+| Family | Precision modes | Notes |
+| --- | --- | --- |
+| **GateRV3** | `mixed`, `fp16` | Original and IDC variants; opt-in kernel fusions |
+| **GateRV2** | `mixed`, `fp16` | Tuned cuBLASLt/cuDNN plans with optional fast cold start |
+| **MoESR** | `mixed`, `fp16` | Custom fused tensor-core gate and depthwise kernels |
+| **GFISRv2** | `fp32`, `mixed`, `fp16` | Also requires cuFFT 12 at runtime |
+
+See [Supported checkpoints and export options](docs/export.md) for the exact
+checkpoint topologies accepted by the exporter.
+
+## Requirements
+
+- **Python:** 3.12 or newer
+- **GPU runtime:** CUDA 13-compatible NVIDIA driver, cuBLASLt 13, and cuDNN 9
+  (plus cuFFT 12 for GFISRv2)
+
+The easiest way to make the CUDA runtime libraries available is to `import torch`
+from a CUDA-enabled PyTorch install before opening a session. You can also load
+standalone NVIDIA library directories without PyTorch via
+`SessionOptions(dll_dirs=...)` — see
+[CUDA library loading](docs/gaterv3-python.md#library-loading).
 
 ## Install
 
-Use Python 3.12 or newer. For a tagged Windows x64 release, install the wheel
-from the private package index.
+### Prebuilt wheel (Windows x64)
+
+Install a tagged release from the private package index:
 
 ```powershell
 python -m pip install --extra-index-url https://pypi.serik.at/simple/ umzi-native
 ```
 
-For the current development build, install a downloaded GitHub Actions wheel
-with `python -m pip install PATH_TO_WHEEL`, or run `python -m pip install .`
-from the checkout with MSVC available. [Build workflow](.github/workflows/build.yml) · [Source build instructions](docs/gaterv3-python.md#install)
-
-Inference needs a CUDA 13-compatible NVIDIA driver, cuBLASLt 13, and cuDNN 9.
-Import a compatible CUDA PyTorch build or load NVIDIA's libraries explicitly.
-[CUDA library loading](docs/gaterv3-python.md#library-loading)
-
-## Usage
-
-If you already have a `.ummodel`, inspect it with `read`. To create one from a
-supported SafeTensors or PyTorch checkpoint, install the `exporter` extra.
-For the private wheel, use `"umzi-native[exporter]"` in the install command.
-Export runs on CPU and loads Resselt and Torch on demand.
-[Supported checkpoints and export options](docs/export.md)
+If you also want to convert `.safetensors` / `.pth` checkpoints into `.ummodel`
+files, include the `exporter` extra (installs Resselt and PyTorch for CPU-side
+export; not needed if you only run existing `.ummodel` files):
 
 ```powershell
-# From the checkout, if you need to export a checkpoint
-python -m pip install ".[exporter]"
-python -m umzi_native export checkpoint.safetensors -o model.ummodel
+python -m pip install --extra-index-url https://pypi.serik.at/simple/ "umzi-native[exporter]"
 ```
 
+### Development builds and building from source
+
+Install a wheel downloaded from [GitHub Actions](.github/workflows/build.yml)
+with `python -m pip install PATH_TO_WHEEL`, or build from a checkout (requires
+MSVC on Windows or a C++ compiler on Linux):
+
 ```powershell
+python -m pip install .
+# Or with the checkpoint exporter included:
+python -m pip install ".[exporter]"
+```
+
+See [source build instructions](docs/gaterv3-python.md#install) for details.
+
+## Quick start
+
+### 1. Export or inspect a `.ummodel`
+
+Skip the export step if you already have a `.ummodel` file.
+
+```powershell
+# Convert a supported checkpoint to .ummodel (runs on CPU)
+python -m umzi_native export checkpoint.safetensors -o model.ummodel
+
+# Inspect model metadata and validate the package without initializing CUDA
 python -m umzi_native read model.ummodel
 ```
 
-Open `model.ummodel` and pass a normalized RGB NumPy batch in NCHW order.
+### 2. Run inference in Python
+
+Pass a normalized RGB NumPy batch in **NCHW** layout `(N, 3, H, W)` with values
+in `[0, 1]`. Point `cache_dir` at a writable folder so tuned GPU plans are saved
+on the first run and reused on every run after that.
 
 ```python
-import numpy as np
-import torch  # Loads the CUDA dependencies when using CUDA PyTorch.
+from pathlib import Path
 
-from umzi_native import InferenceSession
+import numpy as np
+import torch  # Makes PyTorch's bundled CUDA libraries available.
+
+import umzi_native as umzi
 
 tiles = np.zeros((1, 3, 128, 128), dtype=np.float32)
-with InferenceSession("model.ummodel") as session:
+options = umzi.SessionOptions(
+    precision="mixed",  # Use "fp16" with np.float16 input for fastest throughput.
+    cache_dir=Path("cache"),
+)
+
+with umzi.InferenceSession("model.ummodel", sess_options=options) as session:
     (restored,) = session.run(None, {"input": tiles})
 ```
 
-[Image-to-PNG tutorial](docs/quickstart.md#run-your-first-inference) · [Session and kernel options](docs/quickstart.md#session-options)
+- **Full image-to-PNG walkthrough:** [Python inference quickstart](docs/quickstart.md#1-run-your-first-inference)
+- **Tuning & options (`precision`, `cache_dir`, `enable_cuda_graph`, `kernel_options`):**
+  [Session options](docs/quickstart.md#3-session-options-sessionoptions) ·
+  [Model-specific `kernel_options`](docs/quickstart.md#4-model-specific-kernel_options)
 
 ## Documentation
 
+### Getting started
+- [Python inference quickstart & session options](docs/quickstart.md)
+- [Exporting checkpoints to `.ummodel`](docs/export.md)
+- [Installation, CUDA library loading, and model inspection](docs/gaterv3-python.md)
 - [Changelog](CHANGELOG.md)
-- [Export a checkpoint to `.ummodel` (all families)](docs/export.md)
-- [GateRV3 installation and model inspection](docs/gaterv3-python.md)
-- [Native CUDA build, verification, and results](docs/gaterv3-native.md)
-- [Kernel tuning, full-FP16 experiment, and VRAM measurements](docs/gaterv3-native-optimization.md)
-- [Planned optimizations](docs/gaterv3-native-optimization.md#planned-improvements)
-- [Native runtime refactor plan](docs/gaterv3-native-refactor.md)
-- [Multi-kernel runtime and `.ummodel` plan](docs/umzi-native-runtime-plan.md)
-- [GateRV2, MoESR, and GFISRv2 support plan](docs/umzi-native-architecture-expansion.md)
-- [MoESR handoff and next steps](docs/handoff-moesr.md)
-- [Built-in model exporter plan](docs/umzi-model-exporter-plan.md)
-- [Prepared PyTorch and TensorRT-RTX baseline](docs/gaterv3-baseline.md)
+
+### Runtime & architecture design
+- [Multi-kernel runtime and `.ummodel` format spec](docs/umzi-native-runtime-plan.md)
+- [GateRV2, MoESR, and GFISRv2 architecture expansion](docs/umzi-native-architecture-expansion.md)
+- [Built-in model exporter design](docs/umzi-model-exporter-plan.md)
+- [Native runtime refactor notes](docs/gaterv3-native-refactor.md)
+
+### Benchmarks & optimization notes
+- [GateRV3 native build, verification, and results](docs/gaterv3-native.md)
+- [GateRV3 kernel tuning, FP16 experiments, and VRAM measurements](docs/gaterv3-native-optimization.md)
+- [GateRV3 PyTorch & TensorRT-RTX baseline](docs/gaterv3-baseline.md)
 - [Manga page tiling and batch-size benchmark](docs/gaterv3-manga-tiling.md)
+- [GateRV2](docs/handoff-gaterv2.md) · [MoESR](docs/handoff-moesr.md) · [GFISRv2](docs/handoff-gfisrv2.md) engineering handoffs
 
 ## Links
 
