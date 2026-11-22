@@ -178,7 +178,7 @@ MoESR requires `H >= 2` and `W >= 2` (for reflection padding).
 
 | Option | Default | Valid values | What it does |
 | --- | ---: | --- | --- |
-| `fused_gate` | `1` | `0` or `1` | `1` (recommended) runs custom tensor-core kernels that fuse the 64→344 / 64→192 expansions with the Mish gate plus a tiled depthwise branch kernel—faster in both FP16 and mixed, smaller activation buffers, and 0 B cuDNN workspace at batch 2. Set `0` to fall back to separate cuDNN expansion convolutions (useful for A/B comparison). |
+| `fused_gate` | `1` | `0` or `1` | `1` (recommended) runs custom tensor-core kernels that fuse the 64→344 / 64→192 expansions with the Mish gate, a unified tiled depthwise branch kernel, and fused 176→64 / 96→64 projections with Mish, residual add, and next LayerNorm—faster in both FP16 and mixed, smaller activation buffers, only 4 cuDNN plans, and 0 B cuDNN workspace at batch 2. Set `0` to fall back to separate cuDNN convolutions (useful for A/B comparison). |
 | `workspace_mib` | `512` | `0` to `4096` | Maximum cuDNN workspace (MiB) candidates may use during tuning. Prepare retains only what the selected plans need. Only matters noticeably when `fused_gate=0`, where caps below ~45 MiB per 256×256 tile force much slower convolution kernels at batch 2+. |
 
 Both options are part of the `moesr_<key>.umplan` cache key. Diagnostics in

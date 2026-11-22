@@ -746,107 +746,141 @@ extern "C" __global__ void __launch_bounds__(256, 2) expand_gate_reduced_f32(EXP
                                                            tiles_y);
 }
 
-// Tiled 16x16 depthwise branch + Mish gate for the 24 branch channels written
-// in planar-by-type layout by expand_gate_*. Grid: (tiles_x * tiles_y * n, 3).
+// Unified single-block 16x16 tiled depthwise branch + Mish gate for the 24
+// branch channels written in planar-by-type layout by expand_gate_*. Reuses
+// one 13 KB float shared buffer across square (3x3), row (1x11), and column
+// (11x1), converting half->float and adding expand_bias once per loaded pixel
+// (zeros out of bounds -> branch-free inner loops), then writes all 24 gated
+// channels (48 B contiguous) to `gated` in one shot.
 template<int OutStride, int PlainGroups, int BranchSlotOffset>
 __device__ void gate_branch_tiled(half* gated, const half* branch_out, const float* expand_bias, const float* square,
                                   const float* square_bias, const float* row, const float* row_bias,
                                   const float* column, const float* column_bias, int h, int w, int pixels, int tiles_x,
                                   int tiles_y) {
-    __shared__ __align__(16) half tile_val[26 * 16 * 8];
+    __shared__ __align__(16) float tile_val[26 * 16 * 8];
     const int tid = threadIdx.x, lx = tid & 15, ly = tid >> 4;
-    const int tile = blockIdx.x, type = blockIdx.y;
+    const int tile = blockIdx.x;
     const int tx = tile % tiles_x, ty = tile / tiles_x % tiles_y, image = tile / (tiles_x * tiles_y);
     const int x0 = tx * 16, y0 = ty * 16;
+    const int y = y0 + ly, x = x0 + lx;
+    const bool valid_out = (y < h && x < w);
+    const size_t pix = (size_t(image) * h + (valid_out ? y : 0)) * w + (valid_out ? x : 0);
 
-    const int rx = (type == 0) ? 1 : (type == 1 ? 5 : 0);
-    const int ry = (type == 0) ? 1 : (type == 2 ? 5 : 0);
-    const int sw = 16 + 2 * rx, sh = 16 + 2 * ry, total_tile = sw * sh;
-    const half* plane = branch_out + size_t(type) * pixels * 8;
-    for (int idx = tid; idx < total_tile; idx += 256) {
-        const int sy = idx / sw, sx = idx % sw;
-        const int py = y0 - ry + sy, px = x0 - rx + sx;
-        uint4 v = make_uint4(0, 0, 0, 0);
-        if (unsigned(py) < unsigned(h) && unsigned(px) < unsigned(w)) {
-            const size_t pix = (size_t(image) * h + py) * w + px;
-            v = *reinterpret_cast<const uint4*>(plane + pix * 8);
+    auto load_plane_float = [&](int type, int rx, int ry) {
+        const int sw = 16 + 2 * rx, sh = 16 + 2 * ry, total = sw * sh;
+        const half* plane = branch_out + size_t(type) * pixels * 8;
+        const float* eb = expand_bias + 8 * (PlainGroups + 2 * type);
+        const float vb0 = eb[4], vb1 = eb[5], vb2 = eb[6], vb3 = eb[7];
+        const float vb4 = eb[12], vb5 = eb[13], vb6 = eb[14], vb7 = eb[15];
+        for (int idx = tid; idx < total; idx += 256) {
+            const int sy = idx / sw, sx = idx % sw;
+            const int py = y0 - ry + sy, px = x0 - rx + sx;
+            float* dst = tile_val + idx * 8;
+            if (unsigned(py) < unsigned(h) && unsigned(px) < unsigned(w)) {
+                const size_t sp = (size_t(image) * h + py) * w + px;
+                const uint4 raw = *reinterpret_cast<const uint4*>(plane + sp * 8);
+                const half2* p = reinterpret_cast<const half2*>(&raw);
+                const float2 f0 = __half22float2(p[0]), f1 = __half22float2(p[1]);
+                const float2 f2 = __half22float2(p[2]), f3 = __half22float2(p[3]);
+                *reinterpret_cast<float4*>(dst) = make_float4(f0.x + vb0, f0.y + vb1, f1.x + vb2, f1.y + vb3);
+                *reinterpret_cast<float4*>(dst + 4) = make_float4(f2.x + vb4, f2.y + vb5, f3.x + vb6, f3.y + vb7);
+            } else {
+                *reinterpret_cast<float4*>(dst) = make_float4(0.f, 0.f, 0.f, 0.f);
+                *reinterpret_cast<float4*>(dst + 4) = make_float4(0.f, 0.f, 0.f, 0.f);
+            }
         }
-        *reinterpret_cast<uint4*>(tile_val + idx * 8) = v;
+        __syncthreads();
+    };
+
+    auto finish_type = [&](int type, const float (&accum)[8], const float* dw_bias) -> uint4 {
+        const float* eb = expand_bias + 8 * (PlainGroups + 2 * type);
+        const float gb[8] = {eb[0], eb[1], eb[2], eb[3], eb[8], eb[9], eb[10], eb[11]};
+        const uint4 g_raw = *reinterpret_cast<const uint4*>(branch_out + size_t(pixels) * 24 + pix * 24 + 8 * type);
+        const half2* gp = reinterpret_cast<const half2*>(&g_raw);
+        uint4 res;
+        half2* out_p = reinterpret_cast<half2*>(&res);
+#pragma unroll
+        for (int pair = 0; pair < 4; ++pair) {
+            const float2 gf = __half22float2(gp[pair]);
+            out_p[pair] = __floats2half2_rn(
+                fast_mish(gf.x + gb[2 * pair]) * (accum[2 * pair] + dw_bias[2 * pair]),
+                fast_mish(gf.y + gb[2 * pair + 1]) * (accum[2 * pair + 1] + dw_bias[2 * pair + 1]));
+        }
+        return res;
+    };
+
+    uint4 r0, r1, r2;
+
+    load_plane_float(0, 1, 1);
+    if (valid_out) {
+        float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+        for (int ky = 0; ky < 3; ++ky) {
+#pragma unroll
+            for (int kx = 0; kx < 3; ++kx) {
+                const float* sp = tile_val + ((ly + ky) * 18 + (lx + kx)) * 8;
+                const float4 v0 = *reinterpret_cast<const float4*>(sp);
+                const float4 v1 = *reinterpret_cast<const float4*>(sp + 4);
+                const int tap = ky * 3 + kx;
+                acc[0] = fmaf(square[0 * 9 + tap], v0.x, acc[0]);
+                acc[1] = fmaf(square[1 * 9 + tap], v0.y, acc[1]);
+                acc[2] = fmaf(square[2 * 9 + tap], v0.z, acc[2]);
+                acc[3] = fmaf(square[3 * 9 + tap], v0.w, acc[3]);
+                acc[4] = fmaf(square[4 * 9 + tap], v1.x, acc[4]);
+                acc[5] = fmaf(square[5 * 9 + tap], v1.y, acc[5]);
+                acc[6] = fmaf(square[6 * 9 + tap], v1.z, acc[6]);
+                acc[7] = fmaf(square[7 * 9 + tap], v1.w, acc[7]);
+            }
+        }
+        r0 = finish_type(0, acc, square_bias);
     }
     __syncthreads();
 
-    const int y = y0 + ly, x = x0 + lx;
-    if (y >= h || x >= w) return;
-
-    const float* eb = expand_bias + 8 * (PlainGroups + 2 * type);
-    const float vb[8] = {eb[4], eb[5], eb[6], eb[7], eb[12], eb[13], eb[14], eb[15]};
-    const float gb[8] = {eb[0], eb[1], eb[2], eb[3], eb[8], eb[9], eb[10], eb[11]};
-    const float* filter = (type == 0) ? square : (type == 1 ? row : column);
-    const float* dw_bias = (type == 0) ? square_bias : (type == 1 ? row_bias : column_bias);
-
-    float accum[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-    if (type == 0) {
+    load_plane_float(1, 5, 0);
+    if (valid_out) {
+        float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 #pragma unroll
-        for (int ky = -1; ky <= 1; ++ky) {
-            if (unsigned(y + ky) >= unsigned(h)) continue;
-#pragma unroll
-            for (int kx = -1; kx <= 1; ++kx) {
-                if (unsigned(x + kx) >= unsigned(w)) continue;
-                const uint4 raw = *reinterpret_cast<const uint4*>(tile_val + ((ly + 1 + ky) * 18 + (lx + 1 + kx)) * 8);
-                const half2* p = reinterpret_cast<const half2*>(&raw);
-                const int tap = (ky + 1) * 3 + (kx + 1);
-#pragma unroll
-                for (int pair = 0; pair < 4; ++pair) {
-                    const float2 f = __half22float2(p[pair]);
-                    accum[2 * pair] = fmaf(filter[(2 * pair) * 9 + tap], f.x + vb[2 * pair], accum[2 * pair]);
-                    accum[2 * pair + 1] =
-                        fmaf(filter[(2 * pair + 1) * 9 + tap], f.y + vb[2 * pair + 1], accum[2 * pair + 1]);
-                }
-            }
+        for (int kx = 0; kx < 11; ++kx) {
+            const float* sp = tile_val + (ly * 26 + (lx + kx)) * 8;
+            const float4 v0 = *reinterpret_cast<const float4*>(sp);
+            const float4 v1 = *reinterpret_cast<const float4*>(sp + 4);
+            acc[0] = fmaf(row[0 * 11 + kx], v0.x, acc[0]);
+            acc[1] = fmaf(row[1 * 11 + kx], v0.y, acc[1]);
+            acc[2] = fmaf(row[2 * 11 + kx], v0.z, acc[2]);
+            acc[3] = fmaf(row[3 * 11 + kx], v0.w, acc[3]);
+            acc[4] = fmaf(row[4 * 11 + kx], v1.x, acc[4]);
+            acc[5] = fmaf(row[5 * 11 + kx], v1.y, acc[5]);
+            acc[6] = fmaf(row[6 * 11 + kx], v1.z, acc[6]);
+            acc[7] = fmaf(row[7 * 11 + kx], v1.w, acc[7]);
         }
-    } else if (type == 1) {
-#pragma unroll
-        for (int kx = -5; kx <= 5; ++kx) {
-            if (unsigned(x + kx) >= unsigned(w)) continue;
-            const uint4 raw = *reinterpret_cast<const uint4*>(tile_val + (ly * 26 + (lx + 5 + kx)) * 8);
-            const half2* p = reinterpret_cast<const half2*>(&raw);
-            const int tap = kx + 5;
-#pragma unroll
-            for (int pair = 0; pair < 4; ++pair) {
-                const float2 f = __half22float2(p[pair]);
-                accum[2 * pair] = fmaf(filter[(2 * pair) * 11 + tap], f.x + vb[2 * pair], accum[2 * pair]);
-                accum[2 * pair + 1] =
-                    fmaf(filter[(2 * pair + 1) * 11 + tap], f.y + vb[2 * pair + 1], accum[2 * pair + 1]);
-            }
-        }
-    } else {
-#pragma unroll
-        for (int ky = -5; ky <= 5; ++ky) {
-            if (unsigned(y + ky) >= unsigned(h)) continue;
-            const uint4 raw = *reinterpret_cast<const uint4*>(tile_val + ((ly + 5 + ky) * 16 + lx) * 8);
-            const half2* p = reinterpret_cast<const half2*>(&raw);
-            const int tap = ky + 5;
-#pragma unroll
-            for (int pair = 0; pair < 4; ++pair) {
-                const float2 f = __half22float2(p[pair]);
-                accum[2 * pair] = fmaf(filter[(2 * pair) * 11 + tap], f.x + vb[2 * pair], accum[2 * pair]);
-                accum[2 * pair + 1] =
-                    fmaf(filter[(2 * pair + 1) * 11 + tap], f.y + vb[2 * pair + 1], accum[2 * pair + 1]);
-            }
-        }
+        r1 = finish_type(1, acc, row_bias);
     }
-    const size_t pix = (size_t(image) * h + y) * w + x;
-    const uint4 g_raw = *reinterpret_cast<const uint4*>(branch_out + size_t(pixels) * 24 + pix * 24 + 8 * type);
-    const half2* gp = reinterpret_cast<const half2*>(&g_raw);
-    uint4 res;
-    half2* out_p = reinterpret_cast<half2*>(&res);
+    __syncthreads();
+
+    load_plane_float(2, 0, 5);
+    if (valid_out) {
+        float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 #pragma unroll
-    for (int pair = 0; pair < 4; ++pair) {
-        const float2 gf = __half22float2(gp[pair]);
-        out_p[pair] = __floats2half2_rn(fast_mish(gf.x + gb[2 * pair]) * (accum[2 * pair] + dw_bias[2 * pair]),
-                                        fast_mish(gf.y + gb[2 * pair + 1]) * (accum[2 * pair + 1] + dw_bias[2 * pair + 1]));
+        for (int ky = 0; ky < 11; ++ky) {
+            const float* sp = tile_val + ((ly + ky) * 16 + lx) * 8;
+            const float4 v0 = *reinterpret_cast<const float4*>(sp);
+            const float4 v1 = *reinterpret_cast<const float4*>(sp + 4);
+            acc[0] = fmaf(column[0 * 11 + ky], v0.x, acc[0]);
+            acc[1] = fmaf(column[1 * 11 + ky], v0.y, acc[1]);
+            acc[2] = fmaf(column[2 * 11 + ky], v0.z, acc[2]);
+            acc[3] = fmaf(column[3 * 11 + ky], v0.w, acc[3]);
+            acc[4] = fmaf(column[4 * 11 + ky], v1.x, acc[4]);
+            acc[5] = fmaf(column[5 * 11 + ky], v1.y, acc[5]);
+            acc[6] = fmaf(column[6 * 11 + ky], v1.z, acc[6]);
+            acc[7] = fmaf(column[7 * 11 + ky], v1.w, acc[7]);
+        }
+        r2 = finish_type(2, acc, column_bias);
+
+        half* dst = gated + pix * OutStride + BranchSlotOffset;
+        *reinterpret_cast<uint4*>(dst) = r0;
+        *reinterpret_cast<uint4*>(dst + 8) = r1;
+        *reinterpret_cast<uint4*>(dst + 16) = r2;
     }
-    *reinterpret_cast<uint4*>(gated + pix * OutStride + BranchSlotOffset + 8 * type) = res;
 }
 
 #define BRANCH_TILED_ARGS                                                                                   \
@@ -860,6 +894,193 @@ extern "C" __global__ void gate_branch_tiled_full(BRANCH_TILED_ARGS) {
 }
 extern "C" __global__ void gate_branch_tiled_reduced(BRANCH_TILED_ARGS) {
     gate_branch_tiled<96, 18, 72>(BRANCH_TILED_PASS);
+}
+
+// ---------------------------------------------------------------------------
+// Fused projection + bias + Mish + gamma residual (+ optional next LayerNorm).
+//
+// Replaces the 176->64 (full) and 96->64 (reduced) cuDNN convolutions as well
+// as residual_norm_nhwc / gated_residual_nhwc. Each 4-warp (128-thread) block
+// computes a 16x16 pixel tile (18x18 halo = 324 pixels) across all 64 output
+// channels. Outer loop streams K=16 slices of the input halo and 3-tap rows of
+// pre-packed swizzle16 weights (33,024 B shared memory -> 3 blocks/SM in FP16,
+// 2 blocks/SM in FP32, zero local spills). Because each warp owns all 64 output
+// channels of its rows, the 4 lanes holding a pixel compute LayerNorm with two
+// quad-wide warp shuffles and no extra global round-trip.
+
+__device__ __forceinline__ int swizzle16(int row, int chunk) { return (row * 2 + (chunk ^ ((row >> 2) & 1))) * 8; }
+
+__device__ __forceinline__ float quad_sum(float value) {
+    value += __shfl_xor_sync(0xffffffff, value, 1);
+    value += __shfl_xor_sync(0xffffffff, value, 2);
+    return value;
+}
+
+template<bool HalfAccumulate, bool DoNorm, int Cin>
+__device__ void project_k16_3tap(half* state, half* normalized, const half* in, const half* weight, const float* bias,
+                                 const float* gamma, const float* norm_w, const float* norm_b, int h, int w,
+                                 int tiles_x, int tiles_y) {
+    constexpr int rows = 16, threads = 128, warp_rows = 4;
+    constexpr int halo_cols = 18, halo_count = 18 * 18;
+    constexpr int slices = Cin / 16, a_halves = halo_count * 16;
+    constexpr int b_tap_halves = 64 * 16, b_3tap_halves = 3 * b_tap_halves;
+    static_assert(Cin % 16 == 0);
+
+    half* const a_bufs = expand_shared;
+    half* const b_bufs = expand_shared + 2 * a_halves;
+    const int thread = threadIdx.x, lane = thread & 31, warp = thread >> 5;
+    const int tile = blockIdx.x;
+    const int tx = tile % tiles_x, ty = tile / tiles_x % tiles_y, image = tile / (tiles_x * tiles_y);
+    const int y0 = ty * rows, x0 = tx * 16;
+
+    auto load_a = [&](int ks, half* dst) {
+        const int k_base = ks * 16;
+        for (int index = thread; index < halo_count * 2; index += threads) {
+            const int p = index >> 1, chunk = index & 1;
+            const int py = y0 - 1 + p / halo_cols, px = x0 - 1 + p % halo_cols;
+            const bool valid = unsigned(py) < unsigned(h) && unsigned(px) < unsigned(w);
+            const half* src = valid ? in + ((size_t(image) * h + py) * w + px) * Cin + k_base + chunk * 8 : in;
+            copy_async(dst + swizzle16(p, chunk), src, valid);
+        }
+    };
+    auto load_b3 = [&](int step_g, half* dst) {
+        const half* base = weight + size_t(step_g) * b_3tap_halves;
+#pragma unroll
+        for (int index = thread; index < b_3tap_halves / 8; index += threads)
+            copy_async_always(dst + index * 8, base + index * 8);
+    };
+
+    Accumulator<HalfAccumulate> acc[warp_rows][8];
+    load_a(0, a_bufs);
+    load_b3(0, b_bufs);
+    asm volatile("cp.async.commit_group;\n");
+
+    int step_g = 0;
+    constexpr int all_steps = slices * 3;
+    for (int ks = 0; ks < slices; ++ks) {
+        const half* a_tile = a_bufs + (ks & 1) * a_halves;
+        for (int dy = 0; dy < 3; ++dy) {
+            asm volatile("cp.async.wait_group 0;\n");
+            __syncthreads();
+            const int cb = step_g & 1;
+            if (step_g + 1 < all_steps) load_b3(step_g + 1, b_bufs + (cb ^ 1) * b_3tap_halves);
+            if (dy == 0 && ks + 1 < slices) load_a(ks + 1, a_bufs + ((ks + 1) & 1) * a_halves);
+            if (step_g + 1 < all_steps) asm volatile("cp.async.commit_group;\n");
+            const half* b3 = b_bufs + cb * b_3tap_halves;
+            ++step_g;
+
+            unsigned a_frag[2][warp_rows][4], b_frag[2][4][4];
+            auto load_dx = [&](int dx, int buf) {
+                const half* b_tile = b3 + dx * b_tap_halves;
+#pragma unroll
+                for (int mt = 0; mt < warp_rows; ++mt) {
+                    const int p = (warp * warp_rows + mt + dy) * halo_cols + (lane & 15) + dx;
+                    load_matrix_x4(a_frag[buf][mt], a_tile + swizzle16(p, lane >> 4));
+                }
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const int row = 16 * j + (lane >> 4) * 8 + (lane & 7);
+                    load_matrix_x4(b_frag[buf][j], b_tile + swizzle16(row, (lane >> 3) & 1));
+                }
+            };
+            load_dx(0, 0);
+#pragma unroll
+            for (int dx = 0; dx < 3; ++dx) {
+                if (dx + 1 < 3) load_dx(dx + 1, (dx + 1) & 1);
+                const int cur = dx & 1;
+#pragma unroll
+                for (int mt = 0; mt < warp_rows; ++mt)
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        acc[mt][2 * j].mma(a_frag[cur][mt], b_frag[cur][j][0], b_frag[cur][j][1]);
+                        acc[mt][2 * j + 1].mma(a_frag[cur][mt], b_frag[cur][j][2], b_frag[cur][j][3]);
+                    }
+            }
+        }
+    }
+
+    const int q = lane & 3;
+#pragma unroll
+    for (int mt = 0; mt < warp_rows; ++mt) {
+        const int y = y0 + warp * warp_rows + mt;
+        if (y >= h) continue;
+        const size_t row_off = (size_t(image) * h + y) * w * 64;
+#pragma unroll
+        for (int half_row = 0; half_row < 2; ++half_row) {
+            const int x = x0 + (lane >> 2) + 8 * half_row;
+            const bool valid = x < w;
+            half* st_pix = state + row_off + size_t(valid ? x : 0) * 64;
+            float vals[16];
+            float sum = 0.f;
+#pragma unroll
+            for (int nt = 0; nt < 8; ++nt) {
+                const int c = 8 * nt + 2 * q;
+                const float2 acc_v = acc[mt][nt].pair(half_row);
+                const half2 s_raw =
+                    valid ? *reinterpret_cast<const half2*>(st_pix + c) : __floats2half2_rn(0.f, 0.f);
+                const float2 s_v = __half22float2(s_raw);
+                const half2 upd = __floats2half2_rn(fmaf(fast_mish(acc_v.x + bias[c]), gamma[c], s_v.x),
+                                                    fmaf(fast_mish(acc_v.y + bias[c + 1]), gamma[c + 1], s_v.y));
+                if (valid) *reinterpret_cast<half2*>(st_pix + c) = upd;
+                if constexpr (DoNorm) {
+                    const float2 uf = __half22float2(upd);
+                    vals[2 * nt] = uf.x;
+                    vals[2 * nt + 1] = uf.y;
+                    sum += uf.x + uf.y;
+                }
+            }
+            if constexpr (DoNorm) {
+                const float mean = quad_sum(sum) * (1.f / 64.f);
+                float var = 0.f;
+#pragma unroll
+                for (int i = 0; i < 16; ++i) {
+                    const float d = vals[i] - mean;
+                    vals[i] = d;
+                    var = fmaf(d, d, var);
+                }
+                const float inv = rsqrtf(quad_sum(var) * (1.f / 64.f) + 1e-6f);
+                if (valid) {
+                    half* nm_pix = normalized + row_off + size_t(x) * 64;
+#pragma unroll
+                    for (int nt = 0; nt < 8; ++nt) {
+                        const int c = 8 * nt + 2 * q;
+                        *reinterpret_cast<half2*>(nm_pix + c) = __floats2half2_rn(
+                            fmaf(vals[2 * nt] * inv, norm_w[c], norm_b[c]),
+                            fmaf(vals[2 * nt + 1] * inv, norm_w[c + 1], norm_b[c + 1]));
+                    }
+                }
+            }
+        }
+    }
+}
+
+#define PROJECT_FUSED_ARGS                                                                                   \
+    half *state, half *normalized, const half *in, const half *weight, const float *bias, const float *gamma, \
+        const float *norm_w, const float *norm_b, int h, int w, int tiles_x, int tiles_y
+#define PROJECT_FUSED_PASS state, normalized, in, weight, bias, gamma, norm_w, norm_b, h, w, tiles_x, tiles_y
+extern "C" __global__ void __launch_bounds__(128, 3) project_full_norm_f16(PROJECT_FUSED_ARGS) {
+    project_k16_3tap<true, true, 176>(PROJECT_FUSED_PASS);
+}
+extern "C" __global__ void __launch_bounds__(128, 3) project_full_res_f16(PROJECT_FUSED_ARGS) {
+    project_k16_3tap<true, false, 176>(PROJECT_FUSED_PASS);
+}
+extern "C" __global__ void __launch_bounds__(128, 2) project_full_norm_f32(PROJECT_FUSED_ARGS) {
+    project_k16_3tap<false, true, 176>(PROJECT_FUSED_PASS);
+}
+extern "C" __global__ void __launch_bounds__(128, 2) project_full_res_f32(PROJECT_FUSED_ARGS) {
+    project_k16_3tap<false, false, 176>(PROJECT_FUSED_PASS);
+}
+extern "C" __global__ void __launch_bounds__(128, 3) project_reduced_norm_f16(PROJECT_FUSED_ARGS) {
+    project_k16_3tap<true, true, 96>(PROJECT_FUSED_PASS);
+}
+extern "C" __global__ void __launch_bounds__(128, 3) project_reduced_res_f16(PROJECT_FUSED_ARGS) {
+    project_k16_3tap<true, false, 96>(PROJECT_FUSED_PASS);
+}
+extern "C" __global__ void __launch_bounds__(128, 2) project_reduced_norm_f32(PROJECT_FUSED_ARGS) {
+    project_k16_3tap<false, true, 96>(PROJECT_FUSED_PASS);
+}
+extern "C" __global__ void __launch_bounds__(128, 2) project_reduced_res_f32(PROJECT_FUSED_ARGS) {
+    project_k16_3tap<false, false, 96>(PROJECT_FUSED_PASS);
 }
 
 extern "C" __global__ void gated_residual_nhwc(half* state, const half* projected, const float* bias,
@@ -904,6 +1125,77 @@ extern "C" __global__ void fill_noise(half* out, int total) {
     x ^= x >> 12;
     out[index] = __float2half_rn(float(x & 0xffff) / 32768.f - 1.f);
 }
+extern "C" __global__ void input_bias_norm(half* state, half* initial, half* normalized, const half* projected,
+                                           const float* bias, const float* weight, const float* norm_bias, int pixels) {
+    const int index = thread_index(), pixel = index / 32, c = 2 * (index % 32);
+    if (pixel >= pixels) return;
+    const int at = pixel * features + c;
+    const float2 p = __half22float2(*reinterpret_cast<const half2*>(projected + at));
+    const half2 updated = __floats2half2_rn(p.x + bias[c], p.y + bias[c + 1]);
+    *reinterpret_cast<half2*>(initial + at) = updated;
+    *reinterpret_cast<half2*>(state + at) = updated;
+    const float2 pair = __half22float2(updated);
+    const float mean = warp_sum(pair.x + pair.y) / features;
+    const float lo = pair.x - mean, hi = pair.y - mean;
+    const float inverse = rsqrtf(warp_sum(lo * lo + hi * hi) / features + 1e-6f);
+    *reinterpret_cast<half2*>(normalized + at) =
+        __floats2half2_rn(fmaf(lo * inverse, weight[c], norm_bias[c]), fmaf(hi * inverse, weight[c + 1], norm_bias[c + 1]));
+}
+
+extern "C" __global__ void reduce_norm_nhwc(half* out, half* normalized, const half* in, const float* bias,
+                                            const float* weight, const float* norm_bias, int h, int w, int pixels) {
+    const int index = thread_index(), pixel = index / 32, c = 2 * (index % 32);
+    if (pixel >= pixels) return;
+    const int n = pixel / (h * w), x0 = 2 * (pixel % w), y = 2 * (pixel / w % h) + (c / 2) % 2;
+    const int channel = c / 4;
+    const int source0 = ((n * (2 * h) + y) * (2 * w) + x0) * (features / 4) + channel;
+    const int source1 = source0 + (features / 4);
+    const half2 updated = __floats2half2_rn(leaky(__half2float(in[source0]) + bias[channel]),
+                                            leaky(__half2float(in[source1]) + bias[channel]));
+    const int at = pixel * features + c;
+    *reinterpret_cast<half2*>(out + at) = updated;
+    const float2 pair = __half22float2(updated);
+    const float mean = warp_sum(pair.x + pair.y) / features;
+    const float lo = pair.x - mean, hi = pair.y - mean;
+    const float inverse = rsqrtf(warp_sum(lo * lo + hi * hi) / features + 1e-6f);
+    *reinterpret_cast<half2*>(normalized + at) =
+        __floats2half2_rn(fmaf(lo * inverse, weight[c], norm_bias[c]), fmaf(hi * inverse, weight[c + 1], norm_bias[c + 1]));
+}
+
+extern "C" __global__ void expand_residual_norm_nhwc(half* state, half* normalized, const half* in, const float* bias,
+                                                     const float* weight, const float* norm_bias, int h, int w,
+                                                     int pixels) {
+    const int index = thread_index(), pixel = index / 32, c = 2 * (index % 32);
+    if (pixel >= pixels) return;
+    const int n = pixel / (h * w), x = pixel % w, y = pixel / w % h;
+    const int sub = 2 * (y % 2) + (x % 2);
+    const int base = ((n * (h / 2) + y / 2) * (w / 2) + x / 2) * (4 * features);
+    const int ch0 = 4 * c + sub, ch1 = 4 * (c + 1) + sub;
+    const int at = pixel * features + c;
+    const float2 s = __half22float2(*reinterpret_cast<const half2*>(state + at));
+    const half2 updated = __floats2half2_rn(leaky(__half2float(in[base + ch0]) + bias[ch0]) + s.x,
+                                            leaky(__half2float(in[base + ch1]) + bias[ch1]) + s.y);
+    *reinterpret_cast<half2*>(state + at) = updated;
+    const float2 pair = __half22float2(updated);
+    const float mean = warp_sum(pair.x + pair.y) / features;
+    const float lo = pair.x - mean, hi = pair.y - mean;
+    const float inverse = rsqrtf(warp_sum(lo * lo + hi * hi) / features + 1e-6f);
+    *reinterpret_cast<half2*>(normalized + at) =
+        __floats2half2_rn(fmaf(lo * inverse, weight[c], norm_bias[c]), fmaf(hi * inverse, weight[c + 1], norm_bias[c + 1]));
+}
+
+extern "C" __global__ void expand_residual_add_nhwc(half* state, const half* initial, const half* in,
+                                                    const float* bias, int h, int w, int total) {
+    const int index = thread_index();
+    if (index >= total) return;
+    const int c = index % features, pixel = index / features, n = pixel / (h * w);
+    const int x = pixel % w, y = pixel / w % h;
+    const int channel = 4 * c + 2 * (y % 2) + x % 2;
+    const int source = ((n * (h / 2) + y / 2) * (w / 2) + x / 2) * (4 * features) + channel;
+    const half updated = __float2half_rn(leaky(__half2float(in[source]) + bias[channel]) + __half2float(state[index]));
+    state[index] = __hadd(updated, initial[index]);
+}
+
 extern "C" __global__ void reduce_nhwc(half* out, const half* in, const float* bias, int h, int w, int total) {
     const int index = thread_index();
     if (index >= total) return;
