@@ -373,6 +373,24 @@ throughput with **27.1% lower** batch-1 tile latency (sub-100 ms/tile) at
 matching fidelity. Native Mixed (68.22 dB, +8.0 dB over RTX) now beats
 TensorRT-RTX FP16 in batch-2 throughput by **13.8%**.
 
+### VRAM usage (256×256 tiles)
+
+Runner-allocated device buffers (`buffer_bytes`) and total GPU memory delta
+above the CUDA context (`startup_device_used_bytes["captured"] - ["context"]`),
+from `output/moesr-session/validated-p4/report.json` against Pass 2
+(`output/moesr-session/validated-p2/report.json`):
+
+| Mode & Batch | Pass 2 buffers | Pass 4 buffers | Weights | Activations | Workspace | RGB I/O | GPU delta (`cuMemGetInfo`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| FP16 batch 1 | 129.5 MiB | **94.8 MiB** (−27%) | 32.5 MiB | 56.0 MiB | 0.0 MiB | 6.4 MiB | 96.0 MiB |
+| FP16 batch 2 | 226.9 MiB | **157.2 MiB** (−31%) | 32.5 MiB | 112.0 MiB | 0.0 MiB | 12.8 MiB | 158.0 MiB |
+| Mixed batch 1 | 135.9 MiB | **101.2 MiB** (−26%) | 32.5 MiB | 56.0 MiB | 0.0 MiB | 12.8 MiB | 102.0 MiB |
+| Mixed batch 2 | 271.7 MiB | **170.0 MiB** (−37%) | 32.5 MiB | 112.0 MiB | 0.0 MiB | 25.5 MiB | 172.0 MiB |
+
+Replacing the `64→344` cuDNN expansion shrunk `projected` 5.4× (86 → 16 MiB at
+batch 2), and replacing both expansion and projection cuDNN plans dropped
+retained workspace to 0 MiB (down from 32 MiB in Pass 2 mixed batch 2).
+
 Dead ends recorded in pass 4:
 
 - **`K=32` single-tap `176→64` projection** (54 barriers per call, 49.7 KB
