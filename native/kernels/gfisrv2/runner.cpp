@@ -29,8 +29,10 @@
 namespace {
 constexpr int channels = 48, blocks = 24, scale = 4, hidden = 128, fourier = 30, band = 6, threads = 256;
 constexpr int rgb_lanes = 8, freq_lanes = 64;
+constexpr int expand_shared_bytes = (3 * 180 * 16 + 2 * 3 * 128 * 16) * 2; // 41,856 B
+constexpr int project_shared_bytes = (2 * 324 * 16 + 2 * 3 * 48 * 16) * 2; // 29,952 B
 constexpr uint64_t default_workspace_mib = 512, max_workspace_mib = 4096;
-constexpr uint32_t plan_schema = 1;
+constexpr uint32_t plan_schema = 2;
 constexpr uint32_t saved_plan_marker = 0x4742;
 constexpr std::array<uint32_t, 7> configuration{3, 3, scale, channels, blocks, hidden, fourier};
 constexpr int r2c = 0x2a, c2r = 0x2c;
@@ -142,10 +144,6 @@ struct Network {
     Filter conv(int cin, int cout, int taps = 9) { return {take(size_t(cin) * cout * taps), take(cout)}; }
 };
 
-// Device NHWC weight layout for reduced precision (FP16 / Mixed).
-// Dense spatial filters are FP16 KRSC; spectral 1x1 projection is FP16 KRSC in
-// FP16 mode and FP32 KRSC in Mixed mode (padded 60 -> 64). All biases, norms,
-// depthwise filters, and residual gammas stay FP32.
 struct DeviceNetwork {
     size_t bytes = 0;
     Filter first, tail_expand, tail_project, last;
@@ -189,8 +187,6 @@ struct DeviceNetwork {
     }
 };
 
-// Map original hidden channel k (0..127) in block `block_index` to canonical
-// hidden slot: 0..79 plain, 80..109 Fourier, 110..115 square, 116..121 row, 122..127 col.
 std::array<int, hidden> block_canon(int block_index) {
     std::array<int, hidden> map{};
     for (int k = 0; k < hidden - channels; ++k) map[k] = k;
@@ -210,12 +206,10 @@ std::array<int, hidden> block_canon(int block_index) {
 }
 
 template<class OutSlot, class InSlot>
-void pack_oihw_to_krsc_half(std::vector<char>& out, const char* in, Filter to, Filter from, int cin, int cout,
-                            int to_cin, int taps, OutSlot out_slot, InSlot in_slot) {
+void pack_oihw_to_krsc_half(uint16_t* dst_w, float* dst_b, const char* in, Filter from, int cin, int cout, int to_cin,
+                            int taps, OutSlot out_slot, InSlot in_slot) {
     const auto* src_w = reinterpret_cast<const float*>(in + from.weight);
     const auto* src_b = reinterpret_cast<const float*>(in + from.bias);
-    auto* dst_w = reinterpret_cast<uint16_t*>(out.data() + to.weight);
-    auto* dst_b = reinterpret_cast<float*>(out.data() + to.bias);
     for (int o = 0; o < cout; ++o) {
         const int target_o = out_slot(o);
         dst_b[target_o] = src_b[o];
@@ -229,12 +223,10 @@ void pack_oihw_to_krsc_half(std::vector<char>& out, const char* in, Filter to, F
     }
 }
 
-void pack_oihw_to_krsc_float(std::vector<char>& out, const char* in, Filter to, Filter from, int cin, int cout,
-                             int to_cin, int taps) {
+void pack_oihw_to_krsc_float(float* dst_w, float* dst_b, const char* in, Filter from, int cin, int cout, int to_cin,
+                             int taps) {
     const auto* src_w = reinterpret_cast<const float*>(in + from.weight);
     const auto* src_b = reinterpret_cast<const float*>(in + from.bias);
-    auto* dst_w = reinterpret_cast<float*>(out.data() + to.weight);
-    auto* dst_b = reinterpret_cast<float*>(out.data() + to.bias);
     for (int o = 0; o < cout; ++o) {
         dst_b[o] = src_b[o];
         for (int i = 0; i < cin; ++i) {
@@ -245,15 +237,86 @@ void pack_oihw_to_krsc_float(std::vector<char>& out, const char* in, Filter to, 
     }
 }
 
+// Pack logical [256, 9, 48] KRSC FP16 -> [2 passes][3 ks][3 dy][3 dx][128 rows][2 chunks][8 halves] swizzle16.
+void pack_swizzle16_expand(char* dst, const uint16_t* logical) {
+    constexpr int ntile = 128;
+    auto* out = reinterpret_cast<uint16_t*>(dst);
+    size_t stage = 0;
+    for (int pass = 0; pass < 2; ++pass) {
+        for (int ks = 0; ks < 3; ++ks) {
+            for (int dy = 0; dy < 3; ++dy) {
+                uint16_t* stage_dst = out + stage * (3 * ntile * 16);
+                for (int dx = 0; dx < 3; ++dx) {
+                    const int tap = dy * 3 + dx;
+                    uint16_t* tap_dst = stage_dst + dx * (ntile * 16);
+                    for (int row = 0; row < ntile; ++row) {
+                        const int ch = pass * ntile + row;
+                        const int mask = (row >> 2) & 1;
+                        for (int chunk = 0; chunk < 2; ++chunk) {
+                            const size_t d = (size_t(row) * 2 + (chunk ^ mask)) * 8;
+                            const size_t s = (size_t(ch) * 9 + tap) * channels + ks * 16 + chunk * 8;
+                            std::memcpy(tap_dst + d, logical + s, 16);
+                        }
+                    }
+                }
+                ++stage;
+            }
+        }
+    }
+}
+
+// Pack logical [48, 9, 128] KRSC FP16 -> [8 ks][3 dy][3 dx][48 rows][2 chunks][8 halves] swizzle16.
+void pack_swizzle16_project(char* dst, const uint16_t* logical) {
+    auto* out = reinterpret_cast<uint16_t*>(dst);
+    size_t stage = 0;
+    for (int ks = 0; ks < hidden / 16; ++ks) {
+        for (int dy = 0; dy < 3; ++dy) {
+            uint16_t* stage_dst = out + stage * (3 * channels * 16);
+            for (int dx = 0; dx < 3; ++dx) {
+                const int tap = dy * 3 + dx;
+                uint16_t* tap_dst = stage_dst + dx * (channels * 16);
+                for (int row = 0; row < channels; ++row) {
+                    const int mask = (row >> 2) & 1;
+                    for (int chunk = 0; chunk < 2; ++chunk) {
+                        const size_t d = (size_t(row) * 2 + (chunk ^ mask)) * 8;
+                        const size_t s = (size_t(row) * 9 + tap) * hidden + ks * 16 + chunk * 8;
+                        std::memcpy(tap_dst + d, logical + s, 16);
+                    }
+                }
+            }
+            ++stage;
+        }
+    }
+}
+
+// Pack logical [64, 64] FP16 -> [4 ks][64 rows][2 chunks][8 halves] swizzle16.
+void pack_swizzle16_spectral_f16(char* dst, const uint16_t* logical) {
+    auto* out = reinterpret_cast<uint16_t*>(dst);
+    for (int ks = 0; ks < 4; ++ks) {
+        uint16_t* slice_dst = out + ks * (freq_lanes * 16);
+        for (int row = 0; row < freq_lanes; ++row) {
+            const int mask = (row >> 2) & 1;
+            for (int chunk = 0; chunk < 2; ++chunk) {
+                const size_t d = (size_t(row) * 2 + (chunk ^ mask)) * 8;
+                const size_t s = size_t(row) * freq_lanes + ks * 16 + chunk * 8;
+                std::memcpy(slice_dst + d, logical + s, 16);
+            }
+        }
+    }
+}
+
 std::vector<char> build_device_weights(const Network& from, const DeviceNetwork& to, const char* in,
-                                       bool spectral_half) {
+                                       bool spectral_half, bool fused_conv) {
     std::vector<char> out(to.bytes, 0);
     const auto copy_raw = [&](size_t dst, size_t src, size_t bytes) {
         std::memcpy(out.data() + dst, in + src, bytes);
     };
     const auto id = [](int c) { return c; };
+    const auto w_half = [&](Filter f) { return reinterpret_cast<uint16_t*>(out.data() + f.weight); };
+    const auto w_float = [&](Filter f) { return reinterpret_cast<float*>(out.data() + f.weight); };
+    const auto b_float = [&](Filter f) { return reinterpret_cast<float*>(out.data() + f.bias); };
 
-    pack_oihw_to_krsc_half(out, in, to.first, from.first, 3, channels, rgb_lanes, 9, id, id);
+    pack_oihw_to_krsc_half(w_half(to.first), b_float(to.first), in, from.first, 3, channels, rgb_lanes, 9, id, id);
     for (int i = 0; i < blocks; ++i) {
         const auto& src = from.body[i];
         const auto& dst = to.body[i];
@@ -261,24 +324,42 @@ std::vector<char> build_device_weights(const Network& from, const DeviceNetwork&
         copy_raw(dst.norm.scale, src.norm.scale, channels * 4);
         copy_raw(dst.norm.offset, src.norm.offset, channels * 4);
 
-        const auto expand_slot = [&](int o) {
-            const bool is_value = o >= hidden;
-            const int k = is_value ? o - hidden : o;
-            const int c = canon[k];
-            if (c < 80) return 8 * (c / 4) + (is_value ? 4 : 0) + (c % 4);
-            return (is_value ? 208 : 160) + (c - 80);
-        };
-        pack_oihw_to_krsc_half(out, in, dst.expand, src.expand, channels, 2 * hidden, channels, 9, expand_slot, id);
+        if (fused_conv) {
+            // Uniform [gate x4 | val x4] grouping across all 32 groups (0..19 plain, 20..31 Fourier/branch).
+            std::vector<uint16_t> logical(size_t(2 * hidden) * 9 * channels, 0);
+            const auto fused_expand_slot = [&](int o) {
+                const bool is_value = o >= hidden;
+                const int k = is_value ? o - hidden : o;
+                const int c = canon[k];
+                return 8 * (c / 4) + (is_value ? 4 : 0) + (c % 4);
+            };
+            pack_oihw_to_krsc_half(logical.data(), b_float(dst.expand), in, src.expand, channels, 2 * hidden, channels,
+                                   9, fused_expand_slot, id);
+            pack_swizzle16_expand(out.data() + dst.expand.weight, logical.data());
+        } else {
+            const auto unfused_expand_slot = [&](int o) {
+                const bool is_value = o >= hidden;
+                const int k = is_value ? o - hidden : o;
+                const int c = canon[k];
+                if (c < 80) return 8 * (c / 4) + (is_value ? 4 : 0) + (c % 4);
+                return (is_value ? 208 : 160) + (c - 80);
+            };
+            pack_oihw_to_krsc_half(w_half(dst.expand), b_float(dst.expand), in, src.expand, channels, 2 * hidden,
+                                   channels, 9, unfused_expand_slot, id);
+        }
 
         copy_raw(dst.fft.pre.scale, src.fft.pre.scale, 2 * fourier * 4);
         copy_raw(dst.fft.pre.offset, src.fft.pre.offset, 2 * fourier * 4);
         copy_raw(dst.fft.position.weight, src.fft.position.weight, size_t(2 * fourier) * 9 * 4);
         copy_raw(dst.fft.position.bias, src.fft.position.bias, size_t(2 * fourier) * 4);
         if (spectral_half) {
-            pack_oihw_to_krsc_half(out, in, dst.fft.project, src.fft.project, 2 * fourier, 2 * fourier, freq_lanes, 1,
-                                   id, id);
+            std::vector<uint16_t> logical(size_t(freq_lanes) * freq_lanes, 0);
+            pack_oihw_to_krsc_half(logical.data(), b_float(dst.fft.project), in, src.fft.project, 2 * fourier,
+                                   2 * fourier, freq_lanes, 1, id, id);
+            pack_swizzle16_spectral_f16(out.data() + dst.fft.project.weight, logical.data());
         } else {
-            pack_oihw_to_krsc_float(out, in, dst.fft.project, src.fft.project, 2 * fourier, 2 * fourier, freq_lanes, 1);
+            pack_oihw_to_krsc_float(w_float(dst.fft.project), b_float(dst.fft.project), in, src.fft.project,
+                                    2 * fourier, 2 * fourier, freq_lanes, 1);
         }
         copy_raw(dst.fft.post.scale, src.fft.post.scale, fourier * 4);
         copy_raw(dst.fft.post.offset, src.fft.post.offset, fourier * 4);
@@ -289,18 +370,26 @@ std::vector<char> build_device_weights(const Network& from, const DeviceNetwork&
             copy_raw(dst.bands[b].bias, src.bands[b].bias, size_t(band) * 4);
         }
 
-        pack_oihw_to_krsc_half(out, in, dst.project, src.project, hidden, channels, hidden, 9, id,
-                               [&](int k) { return canon[k]; });
+        if (fused_conv) {
+            std::vector<uint16_t> logical(size_t(channels) * 9 * hidden, 0);
+            pack_oihw_to_krsc_half(logical.data(), b_float(dst.project), in, src.project, hidden, channels, hidden, 9,
+                                   id, [&](int k) { return canon[k]; });
+            pack_swizzle16_project(out.data() + dst.project.weight, logical.data());
+        } else {
+            pack_oihw_to_krsc_half(w_half(dst.project), b_float(dst.project), in, src.project, hidden, channels, hidden,
+                                   9, id, [&](int k) { return canon[k]; });
+        }
         copy_raw(dst.gamma, src.gamma, channels * 4);
     }
-    pack_oihw_to_krsc_half(out, in, to.tail_expand, from.tail_expand, channels, 2 * channels, channels, 9, id, id);
-    pack_oihw_to_krsc_half(out, in, to.tail_project, from.tail_project, 2 * channels, channels, 2 * channels, 9, id,
-                           id);
-    pack_oihw_to_krsc_half(out, in, to.last, from.last, channels, 3 * scale * scale, channels, 9, id, id);
+    pack_oihw_to_krsc_half(w_half(to.tail_expand), b_float(to.tail_expand), in, from.tail_expand, channels,
+                           2 * channels, channels, 9, id, id);
+    pack_oihw_to_krsc_half(w_half(to.tail_project), b_float(to.tail_project), in, from.tail_project, 2 * channels,
+                           channels, 2 * channels, 9, id, id);
+    pack_oihw_to_krsc_half(w_half(to.last), b_float(to.last), in, from.last, channels, 3 * scale * scale, channels, 9,
+                           id, id);
     return out;
 }
 
-// Legacy NCHW convolution plan (retained exclusively for bit-exact FP32 mode).
 struct LegacyConvolution {
     cudnnTensorDescriptor_t input = nullptr, output = nullptr;
     cudnnFilterDescriptor_t filter = nullptr;
@@ -315,7 +404,6 @@ struct LegacyConvolution {
     }
 };
 
-// Backend NHWC convolution plan (used for FP16 and Mixed modes).
 struct BackendConvolution {
     std::unique_ptr<gfi::ConvGraph> graph;
     std::unique_ptr<gfi::Descriptor> plan;
@@ -359,11 +447,16 @@ constexpr const char* kernel_names[] = {
     "gate_plain_nhwc", "extract_fourier_nhwc", "branch_dw_gate_nhwc",
     "pack_rms_fft_nhwc_f16", "pack_rms_fft_nhwc_f32",
     "spectral_dw_res_nhwc_f16", "spectral_dw_res_nhwc_f32",
-    "unpack_bias_gelu_nhwc_f16", "unpack_bias_gelu_nhwc_f32",
     "scale_post_rms_gate_nhwc",
     "bias_silu_nhwc_96", "tail_add_nhwc_f16", "tail_add_nhwc_mixed",
     "bias_shuffle_rgb_nhwc_f16", "bias_shuffle_rgb_nhwc_f32",
     "fill_noise_f16", "fill_noise_f32",
+    // Pass 2 fused tensor-core and compact kernels.
+    "expand_gate_f16", "expand_gate_f32",
+    "branch_dw_gate_compact", "scale_post_rms_gate_compact",
+    "project_res_norm_f16", "project_res_f16",
+    "project_res_norm_f32", "project_res_to_half_f32",
+    "spectral_proj_gelu_unpack_f16", "spectral_proj_gelu_unpack_f32",
 };
 enum Kernel {
     Rms, Depthwise, CopyChannels, Pack, Unpack, ScaleFft, Bias, Gate, Residual, Silu, Add, Shuffle,
@@ -374,11 +467,15 @@ enum Kernel {
     GatePlainNhwc, ExtractFourierNhwc, BranchDwGateNhwc,
     PackRmsFftF16, PackRmsFftF32,
     SpectralDwResF16, SpectralDwResF32,
-    UnpackBiasGeluF16, UnpackBiasGeluF32,
     ScalePostRmsGateNhwc,
     BiasSilu96, TailAddF16, TailAddMixed,
     BiasShuffleRgbF16, BiasShuffleRgbF32,
     FillNoiseF16, FillNoiseF32,
+    ExpandGateF16, ExpandGateF32,
+    BranchDwGateCompact, ScalePostRmsGateCompact,
+    ProjectResNormF16, ProjectResF16,
+    ProjectResNormF32, ProjectResToHalfF32,
+    SpectralProjGeluUnpackF16, SpectralProjGeluUnpackF32,
     KernelCount
 };
 static_assert(std::size(kernel_names) == KernelCount);
@@ -386,7 +483,7 @@ static_assert(std::size(kernel_names) == KernelCount);
 class Session final : public umzi::KernelSession {
     Network model;
     DeviceNetwork dev_model{false};
-    bool graph_enabled = false, pending = false, unexact_erf = false;
+    bool graph_enabled = false, pending = false, unexact_erf = false, fused_conv = true;
     uint32_t precision = UMZI_FP32;
     uint64_t workspace_limit = default_workspace_mib << 20;
     CUdevice device = 0;
@@ -438,7 +535,7 @@ public:
         if (!package.section(2).empty() || data.size() != model.bytes)
             throw std::runtime_error("Invalid GFISRv2 weight layout");
         precision = options.precision;
-        bool seen_erf = false, seen_ws = false;
+        bool seen_erf = false, seen_ws = false, seen_fused = false;
         for (uint32_t i = 0; i < options.kernel_option_count; ++i) {
             const auto& option = options.kernel_options[i];
             const std::string_view name = option.name ? option.name : "";
@@ -454,12 +551,17 @@ public:
                     throw std::runtime_error("GFISRv2 workspace_mib must be between 0 and 4096");
                 workspace_limit = uint64_t(option.value) << 20;
                 seen_ws = true;
+            } else if (name == "fused_conv") {
+                if (seen_fused) throw std::runtime_error("Duplicate GFISRv2 option: fused_conv");
+                if (option.value != 0 && option.value != 1)
+                    throw std::runtime_error("GFISRv2 fused_conv must be 0 or 1");
+                fused_conv = option.value == 1;
+                seen_fused = true;
             } else {
                 throw std::runtime_error("Unknown GFISRv2 option: " + std::string(name));
             }
         }
         graph_enabled = (options.flags & UMZI_CUDA_GRAPH) != 0;
-        if (options.cache_dir && *options.cache_dir) cache_dir = std::filesystem::path(options.cache_dir);
         dev_model = DeviceNetwork(half_io());
 
         fft = std::make_unique<gfi::CufftApi>();
@@ -475,10 +577,18 @@ public:
         for (int i = 0; i < KernelCount; ++i) {
             const char* name = kernel_names[i];
             if (unexact_erf && i == Unpack) name = "unpack_fft_unexact";
-            if (unexact_erf && i == UnpackBiasGeluF16) name = "unpack_bias_gelu_nhwc_f16_unexact";
-            if (unexact_erf && i == UnpackBiasGeluF32) name = "unpack_bias_gelu_nhwc_f32_unexact";
+            if (unexact_erf && i == SpectralProjGeluUnpackF16) name = "spectral_proj_gelu_unpack_f16_unexact";
+            if (unexact_erf && i == SpectralProjGeluUnpackF32) name = "spectral_proj_gelu_unpack_f32_unexact";
             CHECK(cuModuleGetFunction(&functions[i], module, name));
         }
+        for (auto [kernel, shared] : {std::pair{ExpandGateF16, expand_shared_bytes},
+                                      std::pair{ExpandGateF32, expand_shared_bytes},
+                                      std::pair{ProjectResNormF16, project_shared_bytes},
+                                      std::pair{ProjectResF16, project_shared_bytes},
+                                      std::pair{ProjectResNormF32, project_shared_bytes},
+                                      std::pair{ProjectResToHalfF32, project_shared_bytes}})
+            CHECK(cuFuncSetAttribute(functions[kernel], CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, shared));
+
         CHECK(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
         CHECK(cuEventCreate(&complete, CU_EVENT_DISABLE_TIMING));
         CHECK(cuEventCreate(&timing[0], CU_EVENT_DEFAULT));
@@ -490,7 +600,7 @@ public:
             CHECK(cuMemAlloc(&weights, weight_bytes));
             CHECK(cuMemcpyHtoD(weights, data.data(), weight_bytes));
         } else {
-            const auto packed = build_device_weights(model, dev_model, data.data(), half_io());
+            const auto packed = build_device_weights(model, dev_model, data.data(), half_io(), fused_conv);
             weight_bytes = packed.size();
             CHECK(cuMemAlloc(&weights, weight_bytes));
             CHECK(cuMemcpyHtoD(weights, packed.data(), weight_bytes));
@@ -545,6 +655,7 @@ private:
             hash.add(precision);
             hash.add(workspace_limit);
             hash.add(static_cast<uint32_t>(unexact_erf));
+            hash.add(static_cast<uint32_t>(fused_conv));
             CUuuid uuid{};
             CHECK(cuDeviceGetUuid(&uuid, device));
             hash.add(uuid);
@@ -619,7 +730,6 @@ private:
         return true;
     }
 
-    // Legacy FP32 plan setup (bit-exact NCHW path).
     void make_legacy_conv(int h, int w, int cin, int cout, int k) {
         auto plan = std::make_unique<LegacyConvolution>();
         auto& p = *plan;
@@ -744,7 +854,6 @@ private:
             fft_scale = float(1.0 / std::sqrt(double(shape.pixels())));
 
             if (!reduced()) {
-                // Exact FP32 NCHW layout.
                 activation(initial, pixels * channels * sizeof(float));
                 activation(state, pixels * channels * sizeof(float));
                 activation(norm, pixels * channels * sizeof(float));
@@ -755,12 +864,14 @@ private:
                 activation(freq_a, frequency_bytes);
                 activation(freq_b, frequency_bytes);
             } else {
-                // Optimized NHWC layout for FP16 and Mixed.
                 const size_t state_elem = element(half_io());
                 activation(initial, pixels * channels * state_elem);
                 activation(state, pixels * channels * state_elem);
                 activation(norm, pixels * channels * sizeof(uint16_t));
-                activation(projected, pixels * 2 * hidden * sizeof(uint16_t));
+                // With fused_conv, projected holds compact Fourier/branch buffers (80 ch)
+                // during body blocks and tail_expand output (96 ch) during tail.
+                const size_t proj_ch = fused_conv ? size_t(2 * channels) : size_t(2 * hidden);
+                activation(projected, pixels * proj_ch * sizeof(uint16_t));
                 activation(gated, pixels * hidden * sizeof(uint16_t));
                 activation(fft_buf, pixels * fourier * sizeof(float));
                 activation(spectrum, size_t(shape.n) * bins * 2 * fourier * sizeof(float));
@@ -791,20 +902,17 @@ private:
                     if (!ensure_scratch(cudnn_workspace)) CHECK(CUDA_ERROR_OUT_OF_MEMORY);
                 }
             } else {
-                // Fill activation buffers with deterministic pseudo-random data for accurate plan timing.
                 launch(stream, FillNoiseF16, int(pixels * hidden), gated);
-                if (half_io()) launch(stream, FillNoiseF16, int(size_t(shape.n) * bins * freq_lanes), freq_b);
-                else launch(stream, FillNoiseF32, int(size_t(shape.n) * bins * freq_lanes), freq_b);
                 load_plan_cache();
                 const bool fp16_acc = half_io();
                 make_backend_plan(h, w, rgb_lanes, channels, 3, CUDNN_DATA_HALF, fp16_acc, gated, projected);
-                make_backend_plan(h, w, channels, 2 * hidden, 3, CUDNN_DATA_HALF, fp16_acc, gated, projected);
-                make_backend_plan(h, w, hidden, channels, 3, CUDNN_DATA_HALF, fp16_acc, gated, projected);
+                if (!fused_conv) {
+                    make_backend_plan(h, w, channels, 2 * hidden, 3, CUDNN_DATA_HALF, fp16_acc, gated, projected);
+                    make_backend_plan(h, w, hidden, channels, 3, CUDNN_DATA_HALF, fp16_acc, gated, projected);
+                }
                 make_backend_plan(h, w, channels, 2 * channels, 3, CUDNN_DATA_HALF, fp16_acc, gated, projected);
                 make_backend_plan(h, w, 2 * channels, channels, 3, CUDNN_DATA_HALF, fp16_acc, gated, projected);
                 make_backend_plan(h, w, channels, 3 * scale * scale, 3, CUDNN_DATA_HALF, fp16_acc, gated, projected);
-                make_backend_plan(h, w_freq, freq_lanes, freq_lanes, 1,
-                                  half_io() ? CUDNN_DATA_HALF : CUDNN_DATA_FLOAT, fp16_acc, freq_b, freq_a);
                 CHECK(cuStreamSynchronize(stream));
                 if (cudnn_scratch) CHECK(cuMemFree(cudnn_scratch));
                 cudnn_scratch = 0;
@@ -854,12 +962,11 @@ private:
     }
 
     template<class... Args>
-    void launch_grid(CUstream target, Kernel id, int grid_x, int block_x, Args... args) {
+    void launch_grid(CUstream target, Kernel id, int grid_x, int block_x, unsigned shared_bytes, Args... args) {
         void* params[] = {&args...};
-        CHECK(cuLaunchKernel(functions[id], grid_x, 1, 1, block_x, 1, 1, 0, target, params, nullptr));
+        CHECK(cuLaunchKernel(functions[id], grid_x, 1, 1, block_x, 1, 1, shared_bytes, target, params, nullptr));
     }
 
-    // Legacy FP32 helpers (untouched path).
     CUdeviceptr channel_offset_fp32(CUdeviceptr base, int channel) const {
         return base + uint64_t(channel) * shape.pixels() * sizeof(float);
     }
@@ -933,7 +1040,6 @@ private:
         launch(target, Shuffle, area * 3 * scale * scale, output, projected, h, w);
     }
 
-    // Optimized NHWC forward path (FP16 and Mixed).
     void conv_nhwc(CUdeviceptr out, CUdeviceptr in, int h, int w, int cin, int cout, Filter filter) {
         const auto& p = *backend_plans.at(umzi::PlanShape{shape.n, h, w, cin, cout});
         const CUdeviceptr wptr = dev_ptr(filter.weight);
@@ -948,70 +1054,114 @@ private:
         const int h = shape.h, w = shape.w, w_freq = w / 2 + 1;
         const int pixels_per_image = shape.pixels(), total_pixels = shape.n * pixels_per_image;
         const int pix_tiles_per_image = (pixels_per_image + 31) / 32;
-        const int bin_tiles_per_image = (bins + 31) / 32;
-        const int branch_tx = (w + 15) / 16, branch_ty = (h + 15) / 16;
+        const int bin_tiles_32 = (bins + 31) / 32;
+        const int bin_tiles_64 = (bins + 63) / 64;
+        const int expand_tx = (w + 15) / 16, expand_ty = (h + 7) / 8;
+        const int tile16_tx = (w + 15) / 16, tile16_ty = (h + 15) / 16;
         const int spec_tx = (w_freq + 7) / 8, spec_ty = (h + 7) / 8;
         const int rms48_blocks = (total_pixels * 8 + threads - 1) / threads;
 
-        // Pack RGB NCHW -> NHWC 8-ch half into `gated`, then first 8->48 into `projected`,
-        // then fuse first.bias + initial/state copy + block-0 RMSNorm into `norm`.
+        // Compact Fourier/branch sub-buffers aliased inside `projected` when fused_conv is active.
+        const CUdeviceptr fourier_gate = projected;
+        const CUdeviceptr branch_val = projected + uint64_t(total_pixels) * 32 * sizeof(uint16_t);
+        const CUdeviceptr branch_gate = projected + uint64_t(total_pixels) * 56 * sizeof(uint16_t);
+
         launch(target, half_io() ? PackRgbF16 : PackRgbF32, total_pixels, gated, input, h, w);
         conv_nhwc(projected, gated, h, w, rgb_lanes, channels, dev_model.first);
-        launch_grid(target, half_io() ? InputBiasRmsF16 : InputBiasRmsMixed, rms48_blocks, threads,
+        launch_grid(target, half_io() ? InputBiasRmsF16 : InputBiasRmsMixed, rms48_blocks, threads, 0,
                     state, initial, norm, projected, dev_ptr(dev_model.first.bias),
                     dev_ptr(dev_model.body[0].norm.scale), dev_ptr(dev_model.body[0].norm.offset), total_pixels);
 
         for (int i = 0; i < blocks; ++i) {
             const auto& block = dev_model.body[i];
-            conv_nhwc(projected, norm, h, w, channels, 2 * hidden, block.expand);
+            if (fused_conv) {
+                launch_grid(target, half_io() ? ExpandGateF16 : ExpandGateF32, shape.n * expand_tx * expand_ty,
+                            threads, expand_shared_bytes,
+                            gated, fft_buf, fourier_gate, branch_val, branch_gate, norm,
+                            dev_ptr(block.expand.weight), dev_ptr(block.expand.bias),
+                            h, w, pixels_per_image, total_pixels, expand_tx, expand_ty);
 
-            // Plain 80-ch gate -> gated[0..79].
-            launch(target, GatePlainNhwc, total_pixels * 20, gated, projected, dev_ptr(block.expand.bias));
-
-            // Unified 16x16 tiled spatial depthwise (3x3, 1x11, 11x1) + SiLU gate -> gated[110..127].
-            launch_grid(target, BranchDwGateNhwc, shape.n * branch_tx * branch_ty, threads,
-                        gated, projected, dev_ptr(block.expand.bias),
-                        dev_ptr(block.bands[0].weight), dev_ptr(block.bands[0].bias),
-                        dev_ptr(block.bands[1].weight), dev_ptr(block.bands[1].bias),
-                        dev_ptr(block.bands[2].weight), dev_ptr(block.bands[2].bias),
-                        h, w, branch_tx, branch_ty);
-
-            // Fourier unit: extract 30 ch -> cuFFT R2C -> fused pack+preRMS -> tiled 3x3 dw+res
-            // -> 1x1 spectral conv -> fused bias+GELU+unpack -> cuFFT C2R -> fused scale+postRMS+gate.
-            launch_grid(target, ExtractFourierNhwc, shape.n * pix_tiles_per_image, threads,
-                        fft_buf, projected, dev_ptr(block.expand.bias), pixels_per_image, pix_tiles_per_image);
-            FFT_CHECK(fft->r2c(forward_fft.handle, reinterpret_cast<void*>(fft_buf), reinterpret_cast<void*>(spectrum)));
-            launch_grid(target, half_io() ? PackRmsFftF16 : PackRmsFftF32, shape.n * bin_tiles_per_image, threads,
-                        freq_a, spectrum, dev_ptr(block.fft.pre.scale), dev_ptr(block.fft.pre.offset),
-                        bins, bin_tiles_per_image, fft_scale);
-            launch_grid(target, half_io() ? SpectralDwResF16 : SpectralDwResF32, shape.n * spec_tx * spec_ty, threads,
-                        freq_b, freq_a, dev_ptr(block.fft.position.weight), dev_ptr(block.fft.position.bias),
-                        h, w_freq, spec_tx, spec_ty);
-            conv_nhwc(freq_a, freq_b, h, w_freq, freq_lanes, freq_lanes, block.fft.project);
-            launch_grid(target, half_io() ? UnpackBiasGeluF16 : UnpackBiasGeluF32, shape.n * bin_tiles_per_image,
-                        threads, spectrum, freq_a, dev_ptr(block.fft.project.bias), bins, bin_tiles_per_image);
-            FFT_CHECK(fft->c2r(inverse_fft.handle, reinterpret_cast<void*>(spectrum), reinterpret_cast<void*>(fft_buf)));
-            launch_grid(target, ScalePostRmsGateNhwc, shape.n * pix_tiles_per_image, threads,
-                        gated, fft_buf, projected, dev_ptr(block.expand.bias),
-                        dev_ptr(block.fft.post.scale), dev_ptr(block.fft.post.offset),
-                        pixels_per_image, pix_tiles_per_image, fft_scale);
-
-            // Project 128 -> 48 + fused bias + SiLU + gamma residual (+ next block RMSNorm).
-            conv_nhwc(projected, gated, h, w, hidden, channels, block.project);
-            if (i + 1 < blocks) {
-                const auto& next_norm = dev_model.body[i + 1].norm;
-                launch_grid(target, half_io() ? ResidualRmsF16 : ResidualRmsMixed, rms48_blocks, threads,
-                            state, norm, projected, dev_ptr(block.project.bias), dev_ptr(block.gamma),
-                            dev_ptr(next_norm.scale), dev_ptr(next_norm.offset), total_pixels);
+                launch_grid(target, BranchDwGateCompact, shape.n * tile16_tx * tile16_ty, threads, 0,
+                            gated, branch_val, branch_gate,
+                            dev_ptr(block.bands[0].weight), dev_ptr(block.bands[0].bias),
+                            dev_ptr(block.bands[1].weight), dev_ptr(block.bands[1].bias),
+                            dev_ptr(block.bands[2].weight), dev_ptr(block.bands[2].bias),
+                            h, w, total_pixels, tile16_tx, tile16_ty);
             } else {
-                const CUdeviceptr null_ptr = 0;
-                launch_grid(target, half_io() ? ResidualF16 : ResidualToHalfMixed, rms48_blocks, threads,
-                            state, norm, projected, dev_ptr(block.project.bias), dev_ptr(block.gamma),
-                            null_ptr, null_ptr, total_pixels);
+                conv_nhwc(projected, norm, h, w, channels, 2 * hidden, block.expand);
+                launch(target, GatePlainNhwc, total_pixels * 20, gated, projected, dev_ptr(block.expand.bias));
+                launch_grid(target, BranchDwGateNhwc, shape.n * tile16_tx * tile16_ty, threads, 0,
+                            gated, projected, dev_ptr(block.expand.bias),
+                            dev_ptr(block.bands[0].weight), dev_ptr(block.bands[0].bias),
+                            dev_ptr(block.bands[1].weight), dev_ptr(block.bands[1].bias),
+                            dev_ptr(block.bands[2].weight), dev_ptr(block.bands[2].bias),
+                            h, w, tile16_tx, tile16_ty);
+                launch_grid(target, ExtractFourierNhwc, shape.n * pix_tiles_per_image, threads, 0,
+                            fft_buf, projected, dev_ptr(block.expand.bias), pixels_per_image, pix_tiles_per_image);
+            }
+
+            // Fourier unit: cuFFT R2C -> fused pack+preRMS -> tiled 3x3 dw+res
+            // -> fused 1x1+bias+GELU+unpack -> cuFFT C2R -> fused scale+postRMS+gate.
+            FFT_CHECK(fft->r2c(forward_fft.handle, reinterpret_cast<void*>(fft_buf), reinterpret_cast<void*>(spectrum)));
+            launch_grid(target, half_io() ? PackRmsFftF16 : PackRmsFftF32, shape.n * bin_tiles_32, threads, 0,
+                        freq_a, spectrum, dev_ptr(block.fft.pre.scale), dev_ptr(block.fft.pre.offset),
+                        bins, bin_tiles_32, fft_scale);
+            launch_grid(target, half_io() ? SpectralDwResF16 : SpectralDwResF32, shape.n * spec_tx * spec_ty, threads,
+                        0, freq_b, freq_a, dev_ptr(block.fft.position.weight), dev_ptr(block.fft.position.bias),
+                        h, w_freq, spec_tx, spec_ty);
+            if (half_io()) {
+                launch_grid(target, SpectralProjGeluUnpackF16, shape.n * bin_tiles_64, 128, 0,
+                            spectrum, freq_b, dev_ptr(block.fft.project.weight), dev_ptr(block.fft.project.bias),
+                            bins, bin_tiles_64);
+            } else {
+                launch_grid(target, SpectralProjGeluUnpackF32, shape.n * bin_tiles_32, 128, 0,
+                            spectrum, freq_b, dev_ptr(block.fft.project.weight), dev_ptr(block.fft.project.bias),
+                            bins, bin_tiles_32);
+            }
+            FFT_CHECK(fft->c2r(inverse_fft.handle, reinterpret_cast<void*>(spectrum), reinterpret_cast<void*>(fft_buf)));
+
+            if (fused_conv) {
+                launch_grid(target, ScalePostRmsGateCompact, shape.n * pix_tiles_per_image, threads, 0,
+                            gated, fft_buf, fourier_gate,
+                            dev_ptr(block.fft.post.scale), dev_ptr(block.fft.post.offset),
+                            pixels_per_image, pix_tiles_per_image, fft_scale);
+
+                if (i + 1 < blocks) {
+                    const auto& next_norm = dev_model.body[i + 1].norm;
+                    launch_grid(target, half_io() ? ProjectResNormF16 : ProjectResNormF32,
+                                shape.n * tile16_tx * tile16_ty, 128, project_shared_bytes,
+                                state, norm, gated, dev_ptr(block.project.weight), dev_ptr(block.project.bias),
+                                dev_ptr(block.gamma), dev_ptr(next_norm.scale), dev_ptr(next_norm.offset),
+                                h, w, tile16_tx, tile16_ty);
+                } else {
+                    const CUdeviceptr null_ptr = 0;
+                    launch_grid(target, half_io() ? ProjectResF16 : ProjectResToHalfF32,
+                                shape.n * tile16_tx * tile16_ty, 128, project_shared_bytes,
+                                state, norm, gated, dev_ptr(block.project.weight), dev_ptr(block.project.bias),
+                                dev_ptr(block.gamma), null_ptr, null_ptr,
+                                h, w, tile16_tx, tile16_ty);
+                }
+            } else {
+                launch_grid(target, ScalePostRmsGateNhwc, shape.n * pix_tiles_per_image, threads, 0,
+                            gated, fft_buf, projected, dev_ptr(block.expand.bias),
+                            dev_ptr(block.fft.post.scale), dev_ptr(block.fft.post.offset),
+                            pixels_per_image, pix_tiles_per_image, fft_scale);
+
+                conv_nhwc(projected, gated, h, w, hidden, channels, block.project);
+                if (i + 1 < blocks) {
+                    const auto& next_norm = dev_model.body[i + 1].norm;
+                    launch_grid(target, half_io() ? ResidualRmsF16 : ResidualRmsMixed, rms48_blocks, threads, 0,
+                                state, norm, projected, dev_ptr(block.project.bias), dev_ptr(block.gamma),
+                                dev_ptr(next_norm.scale), dev_ptr(next_norm.offset), total_pixels);
+                } else {
+                    const CUdeviceptr null_ptr = 0;
+                    launch_grid(target, half_io() ? ResidualF16 : ResidualToHalfMixed, rms48_blocks, threads, 0,
+                                state, norm, projected, dev_ptr(block.project.bias), dev_ptr(block.gamma),
+                                null_ptr, null_ptr, total_pixels);
+                }
             }
         }
 
-        // Tail: 48->96 + bias + SiLU -> 96->48 + bias + initial -> 48->48 + bias + 4x shuffle.
         conv_nhwc(projected, half_io() ? state : norm, h, w, channels, 2 * channels, dev_model.tail_expand);
         launch(target, BiasSilu96, total_pixels * 12, projected, dev_ptr(dev_model.tail_expand.bias));
         conv_nhwc(norm, projected, h, w, 2 * channels, channels, dev_model.tail_project);
@@ -1119,8 +1269,10 @@ public:
         throw std::runtime_error("Invalid GFISRv2 diagnostic index");
     }
     const char* kernel_message() const override {
-        if (mixed()) return "GFISRv2 NHWC mixed precision with FP32 Fourier and residuals";
-        if (half_io()) return "GFISRv2 NHWC FP16 with FP32 cuFFT";
+        if (mixed()) return fused_conv ? "GFISRv2 fused NHWC mixed precision with FP32 Fourier and residuals"
+                                       : "GFISRv2 NHWC mixed precision with FP32 Fourier and residuals";
+        if (half_io()) return fused_conv ? "GFISRv2 fused NHWC FP16 with FP32 cuFFT"
+                                         : "GFISRv2 NHWC FP16 with FP32 cuFFT";
         return "GFISRv2 FP32 with cuFFT";
     }
 };

@@ -116,6 +116,36 @@ kernels, and shared-memory tiled spatial and spectral depthwise kernels. Kept
   - Remaining FP16 bottlenecks: `expand 48→256` 5.43 ms + `gate_plain` 1.13 ms, `project 128→48` 2.88 ms + `residual_rms` 2.82 ms, stride-256 `branch_dw_gate` 1.65 ms, unvectorized `spectral_dw_res` 1.15 ms, cuFFT ~2.21 ms.
   - Remaining Mixed bottlenecks: `expand` (`indexed_wo_smem`) 9.34 ms, `project` 4.30 ms + `residual_rms` 2.86 ms, `spectral_dw_res` 2.05 ms, `gate_plain` 1.68 ms, `branch_dw_gate` 1.41 ms.
 
+### Optimization pass 2 (2026-11-22)
+
+Build: `output/gfisrv2-session/p2-win` (`--arch sm_86` iteration build).
+Added custom tensor-core `expand_gate_f16` / `expand_gate_f32` (`48→256` 3×3
+fused with 80-ch plain SiLU gate, direct FP32 planar Fourier extraction, and
+compact branch/Fourier gate buffers aliased inside the 96-ch `projected` buffer,
+eliminating the 256-ch `projected` tensor), `project_res_norm_*` (`128→48` 3×3
+fused with bias, SiLU, gamma residual, and quad-shuffle next-block RMSNorm),
+compact `branch_dw_gate_compact` & `scale_post_rms_gate_compact`, shared-memory
+weight caching in `spectral_dw_res_nhwc_*`, and custom fused
+`spectral_proj_gelu_unpack_f16` (FP32-acc tensor-core 64→64 1×1 + bias + GELU +
+unpack) and `spectral_proj_gelu_unpack_f32` (pure deterministic FP32 FMA,
+fixing the Pass 1 Mixed TF32/CLI mismatch). Only the four bookend convolutions
+(`first`, `tail_expand`, `tail_project`, `last`) remain on cuDNN, controlled via
+`fused_conv=1` (default).
+
+- All three smoke validations (`fp32`, `fp16`, `mixed`) passed all 18 stress
+  cases plus graph/direct, host/device/alternate-stream, and CLI bitwise parity.
+- Same-process alternating A/B probe (`base` → `p1` → `p2`):
+  - **128×128 batch 1**: FP16 `38.7 → 21.0 → 14.1 ms/tile` (**2.74× vs base**), Mixed `43.0 → 27.7 → 24.0 ms/tile` (**1.79× vs base**).
+  - **256×256 batch 2**: FP16 `273.8 → 143.3 → 94.9 ms` (`47.5 ms/tile`, **2.89× vs base**), Mixed `315.3 → 214.2 → 170.5 ms` (`85.2 ms/tile`, **1.85× vs base**).
+- Profiled single-page host timing (`output/gfisrv2-session/p2-profile-128.json`):
+  - **FP16**: **2.6048 s/page** (`2.261 s` runner + `0.344 s` CPU stitch/tile).
+  - **Mixed**: **3.9576 s/page** (`3.593 s` runner + `0.365 s` CPU stitch/tile).
+- Remaining Pass 2 bottlenecks (`p2-profile-{128,256}.json`): `expand_gate_f16`
+  at `8×16` pixel tile (44.3 ms at 256×256 b2 due to 2× higher weight traffic),
+  `spectral_proj_gelu_unpack_f32` at `1×16` micro-tile (27.2 ms at 256×256 b2 /
+  3.77 ms at 128×128 b1), and repeated `half→float` conversion in
+  `spectral_dw_res_nhwc_f16` (5.95 ms at 256×256 b2). Addressed in Pass 3.
+
 - FP32 matched all three untouched eager FP32 pages bit for bit.
 - FP16 matched eager FP16 on all 72 raw batch-2 page tiles and all three
   rendered pages. Of 18 stress cases, only 1×7, 2×2, and 3×5 differed. The
