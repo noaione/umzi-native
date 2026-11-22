@@ -23,9 +23,8 @@ from typing import NamedTuple
 
 ROOT = Path(__file__).resolve().parent
 NATIVE = ROOT / "native"
-KERNEL_SOURCES = {"gaterv3": NATIVE / "kernels" / "gaterv3", "gaterv2": NATIVE / "kernels" / "gaterv2"}
-# GateRV2 runs FP32 parity kernels; fast math would change their rounding.
-EXACT_MATH_FAMILIES = frozenset({"gaterv2"})
+KERNEL_SOURCES = {family: NATIVE / "kernels" / family for family in ("gaterv3", "gaterv2", "moesr")}
+EXACT_MATH_FAMILIES = frozenset({"gaterv2", "moesr"})
 HOST_SOURCES = (
     *(source / "runner.cpp" for source in KERNEL_SOURCES.values()),
     NATIVE / "runtime" / "api.cpp",

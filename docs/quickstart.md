@@ -1,9 +1,8 @@
 # Python inference quickstart
 
-Install `umzi-native` with Python 3.12 or newer and have a GateRV3
-`.ummodel` package ready. The install guide covers building from source,
-exporting a checkpoint, and loading CUDA dependencies.
-[Installation and model export](gaterv3-python.md#install)
+Install `umzi-native` with Python 3.12 or newer and have a `.ummodel`
+package ready. To create one from a checkpoint, see the
+[export guide](export.md). [Installation and CUDA library loading](gaterv3-python.md#install)
 
 ## Run your first inference
 
@@ -62,7 +61,7 @@ the [manga tiling benchmark](gaterv3-manga-tiling.md).
 | --- | --- | --- |
 | `precision` | `"mixed"` | Mixed precision uses FP32 NumPy input and output and FP32 accumulation in the default convolution and projection paths. `"fp16"` uses FP16 arrays and enables the native FP16 compute path. |
 | `device_id` | `0` | CUDA ordinal for the session. Use the ordinal visible to the process when CUDA devices are masked. |
-| `cache_dir` | `None` | Set a writable directory to reuse GateRV2 or GateRV3 algorithms from the family's `.umplan` files. The key includes the model, padded shape and batch, precision, plan options, and CUDA environment. Each process captures its own CUDA Graph. |
+| `cache_dir` | `None` | Set a writable directory to reuse tuned algorithms from the family's `.umplan` files (GateRV3, GateRV2, and MoESR). The key includes the model, padded shape and batch, precision, plan options, and CUDA environment. Each process captures its own CUDA Graph. |
 | `enable_cuda_graph` | `True` | Capture and replay a CUDA Graph to reduce launch overhead for the prepared shape. `False` submits the operations directly. It still uses cuBLASLt and cuDNN plans. |
 | `kernel_options` | `{}` | Pass the kernel-specific switches below as a mapping of names to integer values. |
 | `dll_path` | `None` | Override the path to the Umzi DLL or shared library. By default the loader checks the installed package directory and then the model directory. |
@@ -118,3 +117,16 @@ the session reuses those algorithms with `timed_plans == 0`. Inspect
 prepare and `plan_workspace_bytes` for the retained size. The same
 `get_session_info()["diagnostics"]` dictionary reports `fp32_weight_bytes`
 and `fp16_weight_bytes`. [GateRV2 measurements](handoff-gaterv2.md)
+
+### MoESR kernel options
+
+| Key | Default | Effect |
+| --- | ---: | --- |
+| `workspace_mib` | `512` | Cap the cuDNN candidate workspace in MiB. Accepts integers from `0` to `4096`. Prepare times the candidates that fit and keeps the size the selected plans need. Caps below about 45 MiB per 256×256 tile force slower plans at batch 2 and above. |
+
+MoESR is 4×: an input of shape `(N, 3, H, W)` returns `(N, 3, 4H, 4W)` in
+the session's I/O dtype. Both spatial dimensions must be at least two.
+Set `cache_dir` to keep the chosen plans in `moesr_<hex-key>.umplan` files.
+A compatible cache hit reports `timed_plans == 0`, and
+`diagnostics["plan_workspace_bytes"]` reports the retained workspace.
+[MoESR measurements](handoff-moesr.md)

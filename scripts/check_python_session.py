@@ -56,7 +56,15 @@ def digest(array: np.ndarray) -> str:
     return hashlib.sha256(array.tobytes()).hexdigest()
 
 
-def cli_output(cli: Path, model: Path, precision: str, cache: Path, sample: np.ndarray, temp: Path) -> np.ndarray:
+def cli_output(
+    cli: Path,
+    model: Path,
+    precision: str,
+    cache: Path,
+    sample: np.ndarray,
+    temp: Path,
+    output_shape: tuple[int, ...] | None = None,
+) -> np.ndarray:
     batch, _, height, width = sample.shape
     source, target = temp / "cli-input.raw", temp / "cli-output.raw"
     source.write_bytes(sample.tobytes())
@@ -76,7 +84,7 @@ def cli_output(cli: Path, model: Path, precision: str, cache: Path, sample: np.n
         check=True,
         env=env,
     )
-    return np.frombuffer(target.read_bytes(), dtype=sample.dtype).reshape(sample.shape)
+    return np.frombuffer(target.read_bytes(), dtype=sample.dtype).reshape(output_shape or sample.shape)
 
 
 def check_precision(umzi: Any, args: argparse.Namespace, precision: str, temp: Path) -> dict[str, Any]:

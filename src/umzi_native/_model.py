@@ -11,7 +11,7 @@ from typing import BinaryIO
 
 from ._loader import PathArg
 
-__all__ = ["GateRV2Model", "GateRV3Model", "ModelInfo", "ModelSection", "peek_model"]
+__all__ = ["GateRV2Model", "GateRV3Model", "MoESRModel", "ModelInfo", "ModelSection", "peek_model"]
 
 MAGIC = b"UMZINPKG"
 VERSION = 1
@@ -30,8 +30,9 @@ OPERATION = struct.Struct("<11i")
 # family parsers under native/kernels/.
 GATERV3_FAMILY = 1
 GATERV2_FAMILY = 3
-FAMILIES = {GATERV3_FAMILY: "gaterv3", GATERV2_FAMILY: "gaterv2"}
-SCHEMAS = {"gaterv3": 1, "gaterv2": 1}
+MOESR_FAMILY = 4
+FAMILIES = {GATERV3_FAMILY: "gaterv3", GATERV2_FAMILY: "gaterv2", MOESR_FAMILY: "moesr"}
+SCHEMAS = {"gaterv3": 1, "gaterv2": 1, "moesr": 1}
 SECTION_NAMES = {1: "architecture", 2: "schedule", 3: "weights", 4: "checkpoint"}
 # GateRV2 schema 1 architecture: input, output, scale, alignment, base
 # channels, levels, latent blocks, the attention epsilon as float32, four
@@ -41,6 +42,8 @@ GATERV2_ARCHITECTURE = struct.Struct("<7If8I")
 GATERV2_PARAMETER = struct.Struct("<QQ")
 GATERV2_MAX_LEVELS = 4
 GATERV2_MAX_WEIGHT_BYTES = 512 << 20
+MOESR_ARCHITECTURE = struct.Struct("<10I")
+MOESR_CONFIG = (3, 3, 4, 2, 64, 9, 4, 3, 170, 96)
 
 
 class GateRV3Op(IntEnum):
@@ -111,6 +114,45 @@ class GateRV2Model:
     checkpoint: str | None
 
 
+@dataclass(frozen=True)
+class MoESRModel:
+    """The supported direct-shuffle 4x MoESR topology (schema 1)."""
+
+    input_channels: int
+    output_channels: int
+    scale: int
+    alignment: int
+    base_channels: int
+    groups: int
+    full_blocks: int
+    reduced_blocks: int
+    full_hidden: int
+    reduced_hidden: int
+    weight_bytes: int
+    checkpoint: str
+
+
+def moesr_parameter_sizes() -> list[int]:
+    """Packed parameter sizes in bytes, in the order used by the native runner."""
+    _, _, _, _, dim, groups, full, reduced, full_hidden, reduced_hidden = MOESR_CONFIG
+    branch = dim // 8
+
+    def convolution(cin: int, cout: int) -> list[int]:
+        return [cin * cout * 9 * 2, cout * 4]
+
+    def block(hidden: int) -> list[int]:
+        depthwise = [size for taps in (9, 11, 11) for size in (branch * taps * 4, branch * 4)]
+        return [dim * 4, dim * 4, *convolution(dim, 2 * hidden), *depthwise, *convolution(hidden, dim), dim * 4]
+
+    sizes = convolution(3, dim)
+    for _ in range(groups):
+        sizes += block(full_hidden) * full
+        sizes += convolution(dim, dim // 4)
+        sizes += block(reduced_hidden) * reduced
+        sizes += convolution(dim, 4 * dim)
+    return sizes + convolution(dim, 48)
+
+
 def _meta_counts(dim: int) -> list[int]:
     hidden, branch = 3 * dim // 2, dim // 8
     return [
@@ -152,9 +194,8 @@ def gaterv2_parameter_counts(
 class ModelInfo:
     """What a model package declares, and whether this runtime accepts it.
 
-    ``payload`` holds the family-specific metadata; GateRV3 packages return a
-    :class:`GateRV3Model` and GateRV2 packages a :class:`GateRV2Model`. A package from an unsupported family keeps
-    ``payload = None`` because its payload layout is unknown.
+    ``payload`` holds the family-specific metadata. Packages with an unknown
+    payload layout have ``payload = None``.
     """
 
     path: Path
@@ -165,7 +206,7 @@ class ModelInfo:
     schema: int
     digest: str
     sections: tuple[ModelSection, ...]
-    payload: GateRV3Model | GateRV2Model | None = None
+    payload: GateRV3Model | GateRV2Model | MoESRModel | None = None
     problems: tuple[str, ...] = ()
 
     @property
@@ -247,6 +288,8 @@ def peek_model(path: PathArg) -> ModelInfo:
         payload = _read_gaterv3(schema, contents.get(1), contents.get(2), weights, contents.get(4), problems)
     elif family_name == "gaterv2":
         payload = _read_gaterv2(schema, contents.get(1), contents.get(2), weights, contents.get(4), problems)
+    elif family_name == "moesr":
+        payload = _read_moesr(schema, contents.get(1), contents.get(2), weights, contents.get(4), problems)
     return ModelInfo(
         path=model,
         size=size,
@@ -424,3 +467,25 @@ def _read_gaterv2(
         weight_bytes=weight_bytes,
         checkpoint=checkpoint.hex() if checkpoint else None,
     )
+
+
+def _read_moesr(
+    schema: int,
+    architecture: bytes | None,
+    table: bytes | None,
+    weight_bytes: int,
+    checkpoint: bytes | None,
+    problems: list[str],
+) -> MoESRModel | None:
+    if schema != SCHEMAS["moesr"]:
+        problems.append("Unsupported MoESR model payload version")
+    elif architecture != MOESR_ARCHITECTURE.pack(*MOESR_CONFIG) or checkpoint is None or len(checkpoint) != DIGEST_SIZE:
+        problems.append("Unsupported MoESR model architecture or checkpoint metadata")
+    else:
+        expected = 0
+        for size in moesr_parameter_sizes():
+            expected = (expected + 255) // 256 * 256 + size
+        if table is None and expected == weight_bytes:
+            return MoESRModel(*MOESR_CONFIG, weight_bytes, checkpoint.hex())
+        problems.append("Invalid MoESR weight layout")
+    return None

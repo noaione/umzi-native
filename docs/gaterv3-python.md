@@ -28,7 +28,8 @@ Both export as `gaterv3` model packages. IDC uses three encoder levels and
 Inception depthwise convolutions in its latent blocks. The package records
 its required padding alignment.
 
-Use the `exporter` extra to turn a checkpoint into a `.ummodel`. It installs
+The [export guide](export.md) covers every supported family, including
+GateRV2 and MoESR. Use the `exporter` extra to turn a checkpoint into a `.ummodel`. It installs
 Resselt and its dependencies, including Torch. Export runs on the CPU and
 accepts `.safetensors`, `.pth`, `.pt`, and `.ckpt` tensor state dictionaries.
 From the checkout, install `.[exporter]` for the source build. For a published

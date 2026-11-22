@@ -11,7 +11,6 @@ device-resident batch-16 throughput and individual batch-1 tile latency.
 from __future__ import annotations
 
 import argparse
-import ctypes
 import gc
 import hashlib
 import json
@@ -39,11 +38,11 @@ from benchmark_architectures import (
     summarize,
     timed_page,
 )
+from reference.native_session import DeviceSession
 from resselt.archs.gaterv2.arch import GateRV2
 from torch import Tensor
 
 from umzi_native import GateRV2Model, InferenceSession, SessionOptions, peek_model
-from umzi_native._abi import IoABI, ShapeABI, check_status
 from umzi_native._model import GATERV2_ARCHITECTURE, GATERV2_FAMILY, GATERV3_FAMILY, HEADER_SIZE, SECTION
 from umzi_native.exporter import export_model
 from umzi_native.exporter._loader import load_checkpoint
@@ -130,37 +129,6 @@ def check_rejections(model: Path, library: Path, root: Path) -> dict[str, str]:
                 raise RuntimeError(f"{shape} was accepted")
     broken.unlink(missing_ok=True)
     return results
-
-
-class DeviceSession:
-    """Enqueue CUDA tensors on the current Torch stream through the session ABI."""
-
-    def __init__(self, session: InferenceSession):
-        self.session = session
-        self.dtype = torch.float16 if session.get_inputs()[0].type == "tensor(float16)" else torch.float32
-
-    def __call__(self, sample: Tensor) -> Tensor:
-        if sample.dtype != self.dtype or not sample.is_cuda or not sample.is_contiguous():
-            raise ValueError("The session expects a contiguous CUDA tensor of its I/O dtype")
-        dims = ShapeABI.from_dimensions(sample.shape)
-        io = IoABI(ctypes.sizeof(IoABI))
-        dll, handle = self.session._dll, self.session._handle
-        check_status(dll, dll.umzi_session_describe(handle, ctypes.byref(dims), ctypes.byref(io)))
-        result = torch.empty(io.output.shape.dimensions_tuple(), dtype=self.dtype, device="cuda")
-        stream = torch.cuda.current_stream().cuda_stream
-        check_status(
-            dll,
-            dll.umzi_session_enqueue(
-                handle,
-                ctypes.byref(dims),
-                sample.data_ptr(),
-                io.input.bytes,
-                result.data_ptr(),
-                io.output.bytes,
-                stream,
-            ),
-        )
-        return result
 
 
 def consistent(candidate: Tensor, expected: Tensor, graph: dict[str, Any], message: str) -> dict[str, Any]:

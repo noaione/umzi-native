@@ -8,7 +8,7 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
-from ._model import GateRV2Model, GateRV3Model, ModelInfo, peek_model
+from ._model import GateRV2Model, GateRV3Model, ModelInfo, MoESRModel, peek_model
 
 
 def _bytes(count: int) -> str:
@@ -65,6 +65,12 @@ def _summary(info: ModelInfo) -> str:
         lines.append(f"  {payload.parameters} FP32 parameters, {_bytes(payload.weight_bytes)} of weights")
         if payload.checkpoint:
             lines.append(f"  checkpoint: {payload.checkpoint}")
+    elif isinstance(payload, MoESRModel):
+        lines.append(
+            f"  RGB x{payload.scale}, {payload.base_channels} base channels, {payload.groups} groups of "
+            f"{payload.full_blocks} full-resolution and {payload.reduced_blocks} reduced-resolution blocks"
+        )
+        lines.append(f"  checkpoint: {payload.checkpoint}")
     lines.extend(f"  problem: {problem}" for problem in info.problems)
     return "\n".join(lines)
 
@@ -119,7 +125,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     export.add_argument("checkpoint", type=Path, help=".safetensors, .pth, .pt, or .ckpt state dictionary")
     export.add_argument("-o", "--output", type=Path, required=True, help="destination .ummodel file")
-    export.add_argument("--kernel", help="assert the detected native kernel family, such as gaterv3 or gaterv2")
+    export.add_argument("--kernel", help="assert the detected native kernel family, such as gaterv3, gaterv2, or moesr")
     export.set_defaults(handler=_export)
 
     arguments = list(sys.argv[1:] if argv is None else argv)

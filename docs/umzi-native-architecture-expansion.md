@@ -159,12 +159,13 @@ tile context.
 The [CUDA baseline runbook and results](umzi-native-architecture-baselines.md)
 record the reference and backend runs.
 The [GateRV2 handoff](handoff-gaterv2.md) records the validated behavior and
-the remaining package and session work.
+the remaining package and session work. The [MoESR handoff](handoff-moesr.md)
+records the current MoESR state and the next steps.
 
 | Family | CPU checkpoint load | CUDA baselines | Native FP32 parity, export, and session |
 | --- | --- | --- | --- |
 | GateRV2 | Verified | FP32, RTX FP16, and Inductor FP16 with FP32 attention measured | Package (family 3, schema 1) and C++ session in mixed and FP16 validated on Windows and Linux; first tuning pass done |
-| MoESR | Verified, supplied ONNX validated | FP32, Inductor FP16, and RTX FP16 measured | [Private FP32 parity](#moesr-private-fp32-validation), family-4 package and C++ session pending |
+| MoESR | Verified, supplied ONNX validated | FP32, Inductor FP16, and RTX FP16 measured | [Private FP32 parity](#moesr-private-fp32-validation) and [family-4 mixed/FP16 session](#moesr-native-package-and-session) |
 | GFISRv2 | Verified, prior handoff reviewed | FP32, eager FP16, and Inductor FP16 measured, flat-tile fidelity failure traced, RTX skipped | Pending |
 
 ### GateRV2 private FP32 validation
@@ -450,7 +451,122 @@ $env:PYTHONPATH = 'src;scripts'
 
 Page validation uses the saved eager FP32 arrays and PNGs after checking
 the checkpoint digest, sample digests, tile size, submitted batch size,
-overlap, and scale in the baseline report. The next integration step is
-the family-4 packer and C++ session with independent input and 4× output
-buffer sizes. Rerun these checks against that session in FP32 before
-changing accumulation precision.
+overlap, and scale in the baseline report.
+
+### MoESR native package and session
+
+Family `4`, schema `1` covers the RGB 4× direct-shuffle topology
+of `4x_dwtp_ds_moesr_v2.pth`. Section 1 declares the RGB channel counts,
+scale, alignment, base channels, group count, full and reduced block
+counts, and both hidden widths. Section 3 stores parameters in execution
+order with 256-byte alignment. The dense 3×3 filters are FP16 KRSC.
+Biases, LayerNorm parameters, depthwise filters, and residual scales stay
+FP32. Section 4 stores the source checkpoint SHA-256.
+[Packer](../src/umzi_native/exporter/_moesr.py)
+· [Runner](../native/kernels/moesr/runner.cpp)
+
+Both modes use FP16 NHWC features. Mixed uses FP32 RGB input and output
+and FP32 convolution accumulation. FP16 uses FP16 RGB input and output
+and FP16 convolution accumulation. LayerNorm, Mish, depthwise filtering,
+and residual arithmetic use FP32 in both modes before each feature
+store. The session supports asynchronous device enqueue, synchronous
+host inference, and optional CUDA Graph replay. The input and 4× output
+buffers have independently reported sizes. Odd axes reflect-pad by one
+pixel, and the last shuffle crops the output to `4H × 4W`.
+
+The runner times every cuDNN heuristic candidate that fits within the
+`workspace_mib` kernel option during shape preparation. The default
+option is 512 MiB, and its range is 0 to 4096. After selection, the
+runner keeps only the largest selected requirement. The first build took
+the first heuristic plan under a fixed 64 MiB cap. At batch 2 that
+selected a non-tensor-core expansion kernel, which made each tile 2.3×
+slower than at batch 1. The table below was measured on that build.
+The [MoESR handoff](handoff-moesr.md) records the probe and the timed-plan
+results. With `cache_dir`, the selected plans are saved as
+`moesr_<key>.umplan` and verified before reuse.
+
+The Windows package export was byte-identical across runs and produced a
+31.74 MiB file. The Python reader and C++ loader rejected the wrong schema,
+architecture, and weight size. All 16 stress cases were finite and matched
+bit for bit between graph and direct execution. The odd 65×79 check
+matched across Python host, device, an alternate CUDA stream, and the CLI
+in both precisions. It returned 260×316 and rejected an output buffer one
+byte too small. Shapes with a one-pixel axis hit the reflection-padding
+limit. The worst stress tile in both modes was the center of
+`lb-page-005.png`, at 60.552 dB mixed and 56.774 dB FP16.
+
+| Stress input | Mixed raw PSNR dB / SSIMULACRA2 | FP16 raw PSNR dB / SSIMULACRA2 |
+| --- | ---: | ---: |
+| Gray 0.5 | 81.124 / 97.103 | 67.084 / 95.948 |
+| Gray 128/255 | 78.959 / 94.646 | 66.760 / 94.353 |
+| Checkerboard | 77.305 / 93.681 | 64.719 / 93.465 |
+| Noise | 69.370 / 97.085 | 61.769 / 96.734 |
+
+The batch-2 and individually run noise tiles had small differences.
+The lowest cross-batch PSNR was 71.427 dB in mixed and 59.641 dB in FP16.
+Graph and direct dispatch were compared at the same batch size.
+
+Page runs used the three `samples/mscale/` pages at 256×256 tiles, batch 2,
+zero overlap, and graph replay, on an RTX 3050 Laptop GPU with Torch
+2.15.0+cu132. Raw PSNR compares the session output with the saved eager
+FP32 arrays at peak 1 before PNG quantization. Batch-1 latency is the mean
+of 72 synchronized, individually timed tiles. These runs use the
+heuristic build and predate plan timing.
+
+| Page | Mode | Batch-2 inference s | Batch-2 input MPx/s | Batch-1 tile latency ms | Raw PSNR dB | SSIMULACRA2 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| lb-page-003.png | Mixed | 14.390 | 0.0844 | 265.05 | 69.767 | 87.485 |
+| lb-page-004.png | Mixed | 14.472 | 0.0840 | 263.54 | 66.902 | 87.109 |
+| lb-page-005.png | Mixed | 14.632 | 0.0830 | 262.13 | 68.187 | 87.210 |
+| lb-page-003.png | FP16 | 10.645 | 0.1141 | 208.59 | 60.519 | 86.581 |
+| lb-page-004.png | FP16 | 10.506 | 0.1157 | 198.14 | 58.810 | 86.432 |
+| lb-page-005.png | FP16 | 10.021 | 0.1212 | 198.04 | 59.771 | 85.665 |
+
+Overall, mixed took 43.494 s at 0.0838 MPx/s with 263.57 ms batch-1
+latency, 68.131 dB, and a maximum absolute error of 0.0405. FP16 took 31.172 s at
+0.1169 MPx/s with 201.59 ms latency, 59.643 dB, and a maximum absolute error of 0.0751. Fidelity
+matches Inductor FP16 (67.263 dB) and TensorRT-RTX FP16 (60.188 dB).
+Speed does not: Inductor runs at 0.201 MPx/s with 258.6 ms latency, and RTX
+at 0.306 MPx/s with 125.8 ms. The [MoESR handoff](handoff-moesr.md) lists
+the tuning plan. The same build passed the GateRV2 and both GateRV3
+Python session regression checks without problems.
+
+#### Timed and cached plans
+
+The rerun with timed plans, the 512 MiB default cap, and a shared plan cache
+passed every stress, shape, rejection, CLI, alternate-stream, and cache check
+in both precisions. Stress fidelity was unchanged. Page results:
+
+| Page | Mode | Batch-2 inference s | Batch-2 input MPx/s | Batch-1 tile latency ms | Raw PSNR dB | SSIMULACRA2 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| lb-page-003.png | Mixed | 6.771 | 0.1794 | 282.08 | 69.776 | 87.512 |
+| lb-page-004.png | Mixed | 6.802 | 0.1786 | 283.17 | 66.907 | 87.131 |
+| lb-page-005.png | Mixed | 6.793 | 0.1789 | 281.47 | 68.190 | 87.190 |
+| lb-page-003.png | FP16 | 5.455 | 0.2227 | 226.30 | 60.924 | 86.669 |
+| lb-page-004.png | FP16 | 5.443 | 0.2232 | 225.51 | 59.634 | 86.462 |
+| lb-page-005.png | FP16 | 5.427 | 0.2239 | 226.87 | 60.352 | 85.575 |
+
+Overall, mixed took 20.365 s at 0.1790 MPx/s with 282.24 ms batch-1
+latency, 68.136 dB, and a maximum absolute error of 0.0337. FP16 took
+16.326 s at 0.2233 MPx/s with 226.23 ms latency, 60.271 dB, and a maximum
+absolute error of 0.0455. Batch-2 throughput rose 2.14× in mixed and
+1.91× in FP16. FP16 now exceeds Inductor FP16 (0.201 MPx/s) but trails
+TensorRT-RTX (0.306 MPx/s, 125.8 ms). Batch-1 latency was about 7% and
+12% higher than in the heuristic run. Neither batch-1 plan set changed, so
+this is probably run-to-run variation, such as thermal effects on the
+laptop GPU. A rotated comparison should confirm it. The batch-1 timed
+selection matched the heuristic workspace size of 45,486,448 bytes. The
+distinct-batch check's lowest PSNR against individual runs was 62.47 dB
+in mixed. The GateRV2 and both GateRV3 regression checks passed on this
+DLL.
+
+```powershell
+$py = 'C:\Python314\python.exe'
+$env:PYTHONPATH = 'src;scripts'
+$build = 'output/moesr-session/tuned-win'
+& $py scripts/build_native.py --output $build --nvrtc-root output/nvrtc-13.0/nvidia/cu13
+& $py scripts/validate_moesr_session.py --library "$build/umzi_native.dll" --cli "$build/umzi_native.exe" --pages --output output/moesr-session/validated-tuned
+```
+
+[Timed-plan report and per-tile timings](../output/moesr-session/validated-tuned/report.json)
+· [Heuristic-build report](../output/moesr-session/validated/report.json)

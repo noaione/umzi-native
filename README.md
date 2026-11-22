@@ -26,7 +26,7 @@ If you already have a `.ummodel`, inspect it with `read`. To create one from a
 supported SafeTensors or PyTorch checkpoint, install the `exporter` extra.
 For the private wheel, use `"umzi-native[exporter]"` in the install command.
 Export runs on CPU and loads Resselt and Torch on demand.
-[Supported checkpoints and export options](docs/gaterv3-python.md#gaterv3-checkpoints)
+[Supported checkpoints and export options](docs/export.md)
 
 ```powershell
 # From the checkout, if you need to export a checkpoint
@@ -56,6 +56,7 @@ with InferenceSession("model.ummodel") as session:
 ## Documentation
 
 - [Changelog](CHANGELOG.md)
+- [Export a checkpoint to `.ummodel` (all families)](docs/export.md)
 - [GateRV3 installation and model inspection](docs/gaterv3-python.md)
 - [Native CUDA build, verification, and results](docs/gaterv3-native.md)
 - [Kernel tuning, full-FP16 experiment, and VRAM measurements](docs/gaterv3-native-optimization.md)
@@ -63,6 +64,7 @@ with InferenceSession("model.ummodel") as session:
 - [Native runtime refactor plan](docs/gaterv3-native-refactor.md)
 - [Multi-kernel runtime and `.ummodel` plan](docs/umzi-native-runtime-plan.md)
 - [GateRV2, MoESR, and GFISRv2 support plan](docs/umzi-native-architecture-expansion.md)
+- [MoESR handoff and next steps](docs/handoff-moesr.md)
 - [Built-in model exporter plan](docs/umzi-model-exporter-plan.md)
 - [Prepared PyTorch and TensorRT-RTX baseline](docs/gaterv3-baseline.md)
 - [Manga page tiling and batch-size benchmark](docs/gaterv3-manga-tiling.md)

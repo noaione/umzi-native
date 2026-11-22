@@ -14,7 +14,7 @@ from ._loader import load_checkpoint
 
 # Match the Resselt metadata name after case folding. Use module names to keep
 # packers and their dependencies out of the import path until export is needed.
-_PACKERS = {"gaterv3": "._gaterv3", "gaterv2": "._gaterv2"}
+_PACKERS = {"gaterv3": "._gaterv3", "gaterv2": "._gaterv2", "moesr": "._moesr"}
 
 
 def export_model(checkpoint: PathArg, output: PathArg, *, kernel: str | None = None) -> ModelInfo:
