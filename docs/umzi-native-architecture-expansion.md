@@ -494,6 +494,13 @@ batch 2 with 135 ms batch-1 latency and 60.11 dB. TensorRT-RTX FP16 reached
 0.283 MPx/s with 141 ms and 60.19 dB. Native mixed reached 0.268 MPx/s at
 68.13 dB. [Pass 1 details](handoff-moesr.md#optimization-pass-1-2026-11-22)
 
+Pass 2 regroups the expansion output into 16-byte gate groups. It fuses each
+block's residual with the next LayerNorm and times plans on random
+activations. It gained about 3% in same-process A/B runs. In a rotated run,
+native FP16 reached 0.388 MPx/s with 133.8 ms latency and 60.09 dB.
+TensorRT-RTX reached 0.282 MPx/s with 141.8 ms and 60.19 dB.
+[Pass 2 details](handoff-moesr.md#optimization-pass-2-2026-11-22)
+
 The Windows package export was byte-identical across runs and produced a
 31.74 MiB file. The Python reader and C++ loader rejected the wrong schema,
 architecture, and weight size. All 16 stress cases were finite and matched

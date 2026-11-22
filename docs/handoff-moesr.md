@@ -15,7 +15,8 @@ design detail, see the [architecture expansion plan](umzi-native-architecture-ex
 | Timed cuDNN plan selection and `workspace_mib` option | Done in this pass |
 | Plan cache on disk (`cache_dir`, `moesr_<key>.umplan`) | Done in this pass and validated |
 | Optimization pass 1: channel padding, divergence-free gate, backend plans, FP16 accumulation | Done and validated (see below) |
-| Further kernel fusion to approach TensorRT-RTX | **Next** |
+| Optimization pass 2: grouped gate layout, fused residual + LayerNorm, noise-based plan timing, 64-thread gate blocks | Done and validated, small gain (see below) |
+| Further work to widen the lead over TensorRT-RTX | **Next** (see next steps) |
 | Linux build and validation | Not started |
 
 ## Session changes in this pass
@@ -129,6 +130,81 @@ Dead ends recorded so it is not retried:
 - **FP32 accumulation in FP16 mode with legacy plans:** it matched mixed
   speed, so it did not help. The backend's FP16 engines provided the gain.
 
+## Optimization pass 2 (2026-11-22)
+
+Build: `output/moesr-session/p2-win`. Validation: `output/moesr-session/validated-p2/report.json`
+passed all stress, shape, CLI, alternate-stream, cache, and page checks. The
+GateRV2 and both GateRV3 regression checks also passed on this DLL.
+
+What changed:
+
+1. **Grouped gate layout.** The expansion's device output channels are
+   regrouped into blocks of eight, `[gate x4 | value x4]`, for four hidden
+   slots. The 24 depthwise-branch channels come first. One gate thread reads
+   a group with a single 16-byte load and writes 8 bytes. The projection's
+   input channels are permuted to match the slot order (`hidden_slot` and
+   `device_weights` in `runner.cpp`). The expansion is 344 wide (43 groups)
+   at full resolution and 192 (24 groups) in the reduced branch.
+2. **Fused residual + next LayerNorm** (`residual_norm_nhwc`). Inside each
+   chain of gated blocks, the residual of block i and the LayerNorm of block
+   i+1 run as one warp-per-pixel kernel, so the state is read once.
+3. **Plan timing on random activations** (`fill_noise`) instead of zeros.
+   On zero inputs, some tensor-core engines timed faster than they run on
+   real data. Candidates within 2× of the best now get five timed runs.
+4. **64-thread blocks for the gate kernels.** In an isolated probe this cut
+   the batch-2 full-resolution gate from 1.37 to 1.17 ms. The depthwise
+   windows stay in L1.
+
+Measured gain, same process, alternating the pass-1 and pass-2 DLLs, batch
+2, median ms per call: FP16 263.6 → 254.8 (−3.3%), mixed 379.2 → 367.2
+(−3.2%). In the four-way rotated page benchmark, both DLLs used the same
+package with timed plans:
+
+| Build | Mode | Batch-2 inference s | Batch-2 input MPx/s | Batch-1 tile latency ms | Raw PSNR dB | SSIMULACRA2 mean / min |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Pass 1 | FP16 | 9.463 | 0.3852 | 140.2 | 60.113 | 86.099 / 85.385 |
+| **Pass 2** | **FP16** | **9.096** | **0.4007** | **130.6** | 59.993 | 86.094 / 85.420 |
+| Pass 1 | Mixed | 13.641 | 0.2672 | 195.3 | 68.134 | 87.293 / 87.097 |
+| Pass 2 | Mixed | 13.269 | 0.2747 | 184.8 | 68.133 | 87.263 / 87.095 |
+
+Against TensorRT-RTX, in a three-round rotated run: native FP16 reached
+0.3879 MPx/s with 133.8 ms batch-1 latency and 60.09 dB. RTX reached 0.2819
+MPx/s with 141.8 ms and 60.19 dB, so native is 1.38× faster in throughput and
+6% lower in latency. Native mixed reached 0.2739 MPx/s and 190.0 ms at
+68.13 dB, 3% behind RTX in throughput. Reports:
+`output/moesr-session/paired-p2-vs-p1/report.json` and
+`output/moesr-session/paired-p2-rtx/report.json`.
+
+**Measurement warning.** This laptop GPU runs at about 34 W and 70 °C under
+load. Short probes on a cool GPU reported 111 ms per tile for pass 2. Under
+sustained alternating load, the same kernels took 127 ms per tile. Trust
+only same-process alternating A/B runs or the rotated page benchmark.
+`scripts/ab_moesr_builds.py` alternates DLLs:
+
+```powershell
+$env:PYTHONPATH = 'src;scripts'
+& C:\Python314\python.exe scripts/ab_moesr_builds.py --model output/moesr-session/validated-p2/moesr.ummodel p1=output/moesr-session/opt-win/umzi_native.dll p2=output/moesr-session/p2-win/umzi_native.dll
+& C:\Python314\python.exe scripts/benchmark_gaterv2_backends.py --family moesr --library output/moesr-session/p2-win/umzi_native.dll --control-library output/moesr-session/opt-win/umzi_native.dll --model output/moesr-session/validated-p2/moesr.ummodel --output output/moesr-session/paired-p2-vs-p1
+```
+
+Batch-2 FP16 profile after pass 2, cool GPU, 220 ms: the 64→344 expansion
+(cuDNN, FP16 accumulation) takes 38.5%, the 176→64 projection 20%, the
+gate 19%, residual + norm 5.4%, and reduced-branch convolutions about 9%.
+In mixed, the expansion takes 48%.
+
+Dead ends in pass 2:
+
+- **cuDNN fused graphs** (conv + bias, or conv + bias + Mish + scale + add)
+  with FP16 compute: no engine supported them on this cuDNN/GPU. With FP32
+  compute, conv + bias ran 4.76 ms against 4.37 ms for the plain
+  convolution, slower than a separate bias. A Mish pointwise chain was not
+  available in the frontend graph.
+- **A 352-wide expansion** (FP16 accumulation, best backend engine): 2.27 ms
+  against 2.10 ms for 344.
+- **Pixel-major ordering of depthwise threads** for L1 reuse: the branch
+  part of the gate slowed from 0.68 to 0.76 ms, so it was reverted.
+- **Gate block sizes 128 and 512:** 1.44 and 1.31 ms, against 1.17 ms for 64.
+
 ## Page measurements
 
 ### Paired comparison with TensorRT-RTX after pass 1
@@ -196,24 +272,27 @@ GateRV3 regression reports are in the same folder.
 1. ~~Validate the timed and cached build.~~ Done.
 2. ~~Remove channel padding, speed up the gate, and compare with RTX.~~ Done
    in pass 1. Native FP16 beats RTX.
-3. **Commit** the MoESR packer, session, backend plans, docs, and scripts.
-   All of them are still uncommitted. Also add corrupt-file rebuild and
-   `workspace_mib=0` checks to the validator, as in
-   `validate_gaterv2_session.py`.
-4. **Pass 2 candidates**, from the FP16 batch-2 profile (268 ms):
-   - Fuse the expansion bias and Mish gate into the convolution with a
-     cuDNN backend pointwise epilogue (conv → add bias), or use a
-     CUTLASS-style custom expansion. This needs the depthwise branch to
-     stay a separate pass. The expansion takes 37%.
-   - Fuse LayerNorm into the previous `gated_residual` or `expand_residual`
-     so the state is read once (LayerNorm 4.3% + residual 5.5%). A cuDNN
-     backend graph conv → bias → Mish → scale → add could replace
-     `gated_residual` for the projection.
-   - Gate kernel (20%): stage the 11-tap row and column reads through
-     shared memory per tile row.
-   - Mixed mode: the FP32-accumulation expansion takes 45%. Check whether
-     the backend offers a faster FP32-accumulation engine for a 336+8 split.
+3. ~~Commit~~ pass 1 (done by the user in `176c581`). **Pass 2 is
+   uncommitted.** Validator follow-ups: add corrupt-file rebuild and
+   `workspace_mib=0` checks, as in `validate_gaterv2_session.py`.
+4. **Pass 3 candidates**, from the post-pass-2 profile:
+   - **Custom fused expansion + gate kernel** (largest remaining win). The
+     64→344 convolution writes 344 FP16 channels per pixel and the gate
+     reads them back. A tensor-core implicit-GEMM kernel (WMMA/mma.sync,
+     64 input channels × 9 taps) can apply bias and Mish in its epilogue and
+     write only the 176 gated channels. The 24 depthwise channels need a 1-
+     or 5-pixel halo, so either keep that part in a small second kernel or
+     tile spatially with halos. Expect to save most of the gate's 19%, plus
+     about half of the expansion's write traffic.
+   - **Projection + residual + next norm:** a custom 176→64 convolution
+     with a residual and LayerNorm epilogue would remove `residual_norm`
+     (5%) and one state round-trip.
+   - **Mixed mode:** the FP32-accumulation expansion takes 48%. Consider
+     FP16 accumulation for the expansion only, measuring the fidelity cost
+     against the 68 dB target, or a split-K custom kernel.
+   - **Batch 4 and larger tiles:** throughput may scale better, so measure
+     before writing kernels (`--batch` on the benchmark script).
 5. Build and validate on Linux.
-6. Investigate why `tiny-2x2` dropped from 92.8 to 89.2 dB in mixed and why
-   the FP16 checkerboard dropped from 64.7 to 63.4 dB. Both remain far above
-   the page scores, but different engines round differently.
+6. Rounding drift between engines: mixed `tiny-2x2` scored 92.8 dB at first,
+   then 89.2 in pass 1 and 88.3 in pass 2. FP16 checkerboard scored 64.7,
+   then 63.4 and 65.6. All remain far above the page scores (about 59–70 dB).

@@ -25,12 +25,14 @@
 namespace {
 constexpr int channels = 64, scale = 4, full_hidden = 170, reduced_hidden = 96, threads = 256;
 // Device layouts pad channel counts to multiples of 8 so cuDNN's tensor-core
-// kernels need no separate padding pass: RGB to 8, the 170-wide hidden to 176.
+// kernels need no separate padding pass: RGB to 8, the 170-wide hidden to 176,
+// and the expansion to 8 channels per group of four hidden slots (344, 192).
 constexpr int rgb_lanes = 8;
 constexpr int lanes(int count) { return (count + 7) & ~7; }
+constexpr int expand_width(int hidden) { return 8 * ((hidden + 3) / 4); }
 constexpr uint64_t default_workspace_mib = 512, max_workspace_mib = 4096;
 // Bump when plan keys, descriptor semantics, or the choice format change.
-constexpr uint32_t plan_schema = 3;
+constexpr uint32_t plan_schema = 4;
 constexpr std::array<uint32_t, 10> configuration{3, 3, scale, 2, channels, 9, 4, 3, full_hidden, reduced_hidden};
 using Clock = std::chrono::steady_clock;
 
@@ -69,7 +71,7 @@ Shape checked(const UmziShape& shape) {
         throw std::runtime_error("MoESR requires positive RGB NCHW dimensions that fit native indexing");
     if (h == 1 || w == 1)
         throw std::runtime_error("MoESR reflection padding requires both spatial dimensions to be at least two");
-    if (uint64_t(n) * ((h + 1) & ~1u) * ((w + 1) & ~1u) * lanes(2 * full_hidden) > INT_MAX - threads)
+    if (uint64_t(n) * ((h + 1) & ~1u) * ((w + 1) & ~1u) * (8 * ((full_hidden + 3) / 4)) > INT_MAX - threads)
         throw std::runtime_error("Requested MoESR shape exceeds native tensor indexing limits");
     return {int(n), int(h), int(w)};
 }
@@ -119,7 +121,8 @@ struct Network {
         Block block;
         block.norm_weight = take(channels * 4);
         block.norm_bias = take(channels * 4);
-        block.expand = dense(channels, padded ? lanes(2 * hidden) : 2 * hidden);
+        // The expansion writes 8 channels per group of four hidden slots.
+        block.expand = dense(channels, padded ? 8 * ((hidden + 3) / 4) : 2 * hidden);
         block.square = depthwise(9);
         block.row = depthwise(11);
         block.column = depthwise(11);
@@ -130,17 +133,27 @@ struct Network {
 };
 
 // Copy a packed FP16 KRSC filter and its FP32 bias into a zero-filled device
-// layout with more input channels, which stay zero. Expansion outputs are
-// [gate | value] halves; with half set, value rows move to start at to_half.
+// layout. Output channel o moves to out_slot(o) and input channel i to
+// in_slot(i); to_cin is the device input stride. Unmapped slots stay zero.
+template<class OutSlot, class InSlot>
 void copy_dense(std::vector<char>& out, const char* in, Filter to, Filter from, int cin, int cout, int to_cin,
-                int half = 0, int to_half = 0) {
+                OutSlot out_slot, InSlot in_slot) {
     for (int o = 0; o < cout; ++o) {
-        const int target = half && o >= half ? to_half + o - half : o;
+        const int target = out_slot(o);
         for (int tap = 0; tap < 9; ++tap)
-            std::memcpy(out.data() + to.weight + (size_t(target) * 9 + tap) * to_cin * 2,
-                        in + from.weight + (size_t(o) * 9 + tap) * cin * 2, size_t(cin) * 2);
+            for (int i = 0; i < cin; ++i)
+                std::memcpy(out.data() + to.weight + ((size_t(target) * 9 + tap) * to_cin + in_slot(i)) * 2,
+                            in + from.weight + ((size_t(o) * 9 + tap) * cin + i) * 2, 2);
         std::memcpy(out.data() + to.bias + size_t(target) * 4, in + from.bias + size_t(o) * 4, 4);
     }
+}
+
+// Slot of hidden channel k in a gated block's device layout: the 24 depthwise
+// branch channels (the last 24) come first, then the plain ones. Slots form
+// groups of four; see gate_groups in kernels.cu.
+int hidden_slot(int k, int hidden) {
+    const int branch = hidden - 24;
+    return k >= branch ? k - branch : 24 + k;
 }
 
 std::vector<char> device_weights(const Network& from, const Network& to, const char* in) {
@@ -148,23 +161,34 @@ std::vector<char> device_weights(const Network& from, const Network& to, const c
     const auto raw = [&](size_t target, size_t source, size_t size) {
         std::memcpy(out.data() + target, in + source, size);
     };
+    const auto identity = [](int c) { return c; };
     const auto same = [&](Filter target, Filter source, int cin, int cout) {
-        copy_dense(out, in, target, source, cin, cout, cin);
+        copy_dense(out, in, target, source, cin, cout, cin, identity, identity);
     };
     const auto block = [&](const Block& target, const Block& source, int hidden) {
-        const int width = lanes(hidden);
+        const int width = lanes(hidden), groups = (hidden + 3) / 4;
         raw(target.norm_weight, source.norm_weight, channels * 4);
         raw(target.norm_bias, source.norm_bias, channels * 4);
-        same(target.expand, source.expand, channels, 2 * hidden);
+        // Expansion output o < hidden is the gate of hidden channel o, and
+        // o >= hidden is the value of hidden channel o - hidden. Group g
+        // stores [gate x4 | value x4] at device channels 8g .. 8g + 7.
+        const auto expand_slot = [&](int o) {
+            const bool value = o >= hidden;
+            const int slot = hidden_slot(value ? o - hidden : o, hidden);
+            return 8 * (slot / 4) + (value ? 4 : 0) + slot % 4;
+        };
+        static_cast<void>(groups);
+        copy_dense(out, in, target.expand, source.expand, channels, 2 * hidden, channels, expand_slot, identity);
         for (auto [t, s, taps] : {std::tuple{target.square, source.square, 9}, {target.row, source.row, 11},
                                   {target.column, source.column, 11}}) {
             raw(t.weight, s.weight, 8 * taps * 4);
             raw(t.bias, s.bias, 8 * 4);
         }
-        copy_dense(out, in, target.project, source.project, hidden, channels, width);
+        copy_dense(out, in, target.project, source.project, hidden, channels, width, identity,
+                   [&](int i) { return hidden_slot(i, hidden); });
         raw(target.gamma, source.gamma, channels * 4);
     };
-    copy_dense(out, in, to.first, from.first, 3, channels, rgb_lanes);
+    copy_dense(out, in, to.first, from.first, 3, channels, rgb_lanes, identity, identity);
     for (size_t g = 0; g < from.groups.size(); ++g) {
         const auto &source = from.groups[g], &target = to.groups[g];
         for (size_t i = 0; i < source.full.size(); ++i) block(target.full[i], source.full[i], full_hidden);
@@ -187,11 +211,13 @@ struct Convolution {
 
 constexpr const char* kernel_names[] = {
     "pack_rgb_f32", "pack_rgb_f16", "input_bias", "norm_nhwc", "gate_full_nhwc", "gate_reduced_nhwc",
-    "gated_residual_nhwc", "reduce_nhwc", "expand_residual_nhwc", "add_nhwc", "output_nhwc_f32", "output_nhwc_f16",
+    "gated_residual_nhwc", "residual_norm_nhwc", "reduce_nhwc", "expand_residual_nhwc", "add_nhwc",
+    "output_nhwc_f32", "output_nhwc_f16", "fill_noise",
 };
 enum Kernel {
-    PackF32, PackF16, InputBias, Normalize, GateFull, GateReduced, Residual, Reduce, Expand, Add, OutputF32,
-    OutputF16, KernelCount
+    PackF32, PackF16, InputBias, Normalize, GateFull, GateReduced, Residual, ResidualNorm, Reduce, Expand, Add,
+    OutputF32,
+    OutputF16, FillNoise, KernelCount
 };
 static_assert(std::size(kernel_names) == KernelCount);
 
@@ -463,7 +489,7 @@ private:
         }
         const float first = measure(1);
         if (!(first < 2 * best)) return first;
-        return measure(3);
+        return measure(5);
     }
 
     void prepare(Shape requested) {
@@ -479,7 +505,7 @@ private:
             activation(state, pixels * channels);
             activation(reduced, pixels / 4 * channels);
             activation(normalized, pixels * channels);
-            activation(projected, pixels * lanes(2 * full_hidden));
+            activation(projected, pixels * expand_width(full_hidden));
             activation(gated, pixels * lanes(full_hidden));
             const auto input_bytes = shape.rgb_bytes(fp16);
             CHECK(cuMemAlloc(&stage_in, input_bytes));
@@ -488,14 +514,16 @@ private:
 
             start = Clock::now();
             CHECK(cudnnSetStream(cudnn, stream));
-            CHECK(cuMemsetD8Async(gated, 0, pixels * lanes(full_hidden) * 2, stream));
+            // Time plans on random activations: zero inputs make some tensor-core
+            // engines look faster than they run on real images.
+            elementwise(stream, FillNoise, int(pixels * lanes(full_hidden)), gated);
             load_plan_cache();
             const int h = padded.h, w = padded.w;
             make_plan(h, w, rgb_lanes, channels);
-            make_plan(h, w, channels, lanes(2 * full_hidden));
+            make_plan(h, w, channels, expand_width(full_hidden));
             make_plan(h, w, lanes(full_hidden), channels);
             make_plan(h, w, channels, channels / 4);
-            make_plan(h / 2, w / 2, channels, lanes(2 * reduced_hidden));
+            make_plan(h / 2, w / 2, channels, expand_width(reduced_hidden));
             make_plan(h / 2, w / 2, lanes(reduced_hidden), channels);
             make_plan(h / 2, w / 2, channels, 4 * channels);
             make_plan(h, w, channels, 3 * scale * scale);
@@ -541,9 +569,13 @@ private:
 
     template<class... Args>
     void launch(CUstream target, Kernel kernel, int lanes, Args... args) {
+        // The gate kernels read the long depthwise windows from L1; small
+        // blocks keep more of them resident (1.17 ms against 1.37 ms per
+        // batch-2 full-resolution gate on the RTX 3050).
+        const int block = kernel == GateFull || kernel == GateReduced ? 64 : threads;
         void* parameters[] = {&args...};
-        CHECK(cuLaunchKernel(functions[kernel], (lanes + threads - 1) / threads, 1, 1, threads, 1, 1, 0,
-                             target, parameters, nullptr));
+        CHECK(cuLaunchKernel(functions[kernel], (lanes + block - 1) / block, 1, 1, block, 1, 1, 0, target,
+                             parameters, nullptr));
     }
 
     template<class... Args>
@@ -563,20 +595,31 @@ private:
         CHECK(cudnnBackendExecute(cudnn, p.plan->get(), variant->get()));
     }
 
-    void block(CUstream target, const Block& params, CUdeviceptr value, int h, int w, int hidden) {
+    // Runs a chain of gated blocks on value. The first block's LayerNorm runs
+    // separately; every later one is fused into the previous block's residual.
+    template<size_t Count>
+    void blocks(CUstream target, const std::array<Block, Count>& chain, CUdeviceptr value, int h, int w, int hidden) {
         const int pixels = padded.n * h * w;
-        launch(target, Normalize, pixels * 32, normalized, value, weights + params.norm_weight,
-               weights + params.norm_bias, pixels);
-        conv(projected, normalized, h, w, channels, lanes(2 * hidden), params.expand);
-        const int width = lanes(hidden);
-        // gate_pairs uses one thread per output channel pair, ordered by filter type.
-        launch(target, hidden == full_hidden ? GateFull : GateReduced, pixels * (width / 2), gated, projected,
-               weights + params.expand.bias, weights + params.square.weight, weights + params.square.bias,
-               weights + params.row.weight, weights + params.row.bias, weights + params.column.weight,
-               weights + params.column.bias, h, w, pixels);
-        conv(projected, gated, h, w, width, channels, params.project);
-        elementwise(target, Residual, pixels * channels, value, projected, weights + params.project.bias,
-                    weights + params.gamma);
+        launch(target, Normalize, pixels * 32, normalized, value, weights + chain[0].norm_weight,
+               weights + chain[0].norm_bias, pixels);
+        for (size_t i = 0; i < Count; ++i) {
+            const auto& params = chain[i];
+            conv(projected, normalized, h, w, channels, expand_width(hidden), params.expand);
+            // gate_groups uses one thread per group of four hidden slots, ordered by filter type.
+            launch(target, hidden == full_hidden ? GateFull : GateReduced, pixels * ((hidden + 3) / 4), gated,
+                   projected, weights + params.expand.bias, weights + params.square.weight,
+                   weights + params.square.bias, weights + params.row.weight, weights + params.row.bias,
+                   weights + params.column.weight, weights + params.column.bias, h, w, pixels);
+            conv(projected, gated, h, w, lanes(hidden), channels, params.project);
+            if (i + 1 < Count) {
+                const auto& next = chain[i + 1];
+                launch(target, ResidualNorm, pixels * 32, value, normalized, projected, weights + params.project.bias,
+                       weights + params.gamma, weights + next.norm_weight, weights + next.norm_bias, pixels);
+            } else {
+                elementwise(target, Residual, pixels * channels, value, projected, weights + params.project.bias,
+                            weights + params.gamma);
+            }
+        }
     }
 
     void forward(CUdeviceptr input, CUdeviceptr output, CUstream target) {
@@ -586,10 +629,10 @@ private:
         elementwise(target, InputBias, pixels * channels, state, initial, projected,
                     weights + device_model.first.bias);
         for (const auto& group : device_model.groups) {
-            for (const auto& layer : group.full) block(target, layer, state, h, w, full_hidden);
+            blocks(target, group.full, state, h, w, full_hidden);
             conv(projected, state, h, w, channels, channels / 4, group.down);
             elementwise(target, Reduce, pixels / 4 * channels, reduced, projected, weights + group.down.bias, h / 2, w / 2);
-            for (const auto& layer : group.reduced) block(target, layer, reduced, h / 2, w / 2, reduced_hidden);
+            blocks(target, group.reduced, reduced, h / 2, w / 2, reduced_hidden);
             conv(projected, reduced, h / 2, w / 2, channels, 4 * channels, group.up);
             elementwise(target, Expand, pixels * channels, state, projected, weights + group.up.bias, h, w);
         }
