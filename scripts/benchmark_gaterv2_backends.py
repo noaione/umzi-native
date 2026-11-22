@@ -1,4 +1,4 @@
-"""Compare packaged GateRV2 with TensorRT-RTX or a control DLL in paired page runs."""
+"""Compare a packaged GateRV2 or MoESR model with TensorRT-RTX or a control DLL in paired page runs."""
 
 from __future__ import annotations
 
@@ -26,12 +26,18 @@ from benchmark_architectures import (
     timed_page,
 )
 from torch import Tensor
-from validate_gaterv2_session import FAMILY, PRECISIONS, DeviceSession
+from validate_gaterv2_session import FAMILY as GATERV2_FAMILY
+from validate_gaterv2_session import PRECISIONS, DeviceSession
+from validate_moesr import FAMILY as MOESR_FAMILY
 
-from umzi_native import GateRV2Model, InferenceSession, SessionOptions, peek_model
+from umzi_native import GateRV2Model, InferenceSession, MoESRModel, SessionOptions, peek_model
 
 BACKENDS = ("native-mixed", "native-fp16", "rtx")
-BASELINE = ROOT / "output/architecture-baselines/gaterv2/batch-16"
+# Model payload class, benchmark family, samples glob, and saved baseline per family.
+FAMILIES = {
+    "gaterv2": (GateRV2Model, GATERV2_FAMILY, "*.jpg", ROOT / "output/architecture-baselines/gaterv2/batch-16"),
+    "moesr": (MoESRModel, MOESR_FAMILY, "*.png", ROOT / "output/architecture-baselines/moesr/batch-2"),
+}
 TIMING_KEYS = ("batch_inference_seconds", "batch_input_mpx_per_second", "average_batch1_tile_latency_ms")
 
 
@@ -45,6 +51,7 @@ def read_report(path: Path, config: dict[str, Any], backend: str) -> dict[str, A
 
 
 def measure_pages(
+    family: Any,
     sources: list[Path],
     runners: dict[str, dict[int, Runner]],
     references: Path,
@@ -62,7 +69,7 @@ def measure_pages(
         pages: dict[str, list[dict[str, Any]]] = {name: [] for name in backends}
         for label, image in images.items():
             for name in order:
-                row, candidate = timed_page(image, label, runners[name], FAMILY, FAMILY.batch)
+                row, candidate = timed_page(image, label, runners[name], family, family.batch)
                 pages[name].append(row)
                 if round_index == 0:
                     first_results[name, label] = candidate
@@ -115,34 +122,39 @@ def main() -> None:
     parser.add_argument("--library", type=Path, required=True)
     parser.add_argument("--control-library", type=Path, help="Compare two native DLLs using heuristic plans")
     parser.add_argument("--model", type=Path, required=True)
-    parser.add_argument("--reference-report", type=Path, default=BASELINE / "fp32/report.json")
-    parser.add_argument("--rtx-report", type=Path, default=BASELINE / "rtx/report.json")
+    parser.add_argument("--family", choices=FAMILIES, default="gaterv2")
+    parser.add_argument("--reference-report", type=Path, help="Default: the family's saved FP32 report")
+    parser.add_argument("--rtx-report", type=Path, help="Default: the family's saved RTX report")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--rounds", type=int, help="Run a whole number of backend-order rotations")
     args = parser.parse_args()
+    model_class, family, pattern, baseline = FAMILIES[args.family]
+    args.reference_report = args.reference_report or baseline / "fp32/report.json"
+    args.rtx_report = args.rtx_report or baseline / "rtx/report.json"
     libraries = {"native": args.library}
     backends = BACKENDS
     kernel_options: dict[str, int] = {}
     if args.control_library is not None:
         libraries = {"control": args.control_library, **libraries}
         backends = tuple(f"{build}-{precision}" for precision in PRECISIONS for build in libraries)
-        kernel_options["tune_plans"] = 0
+        if args.family == "gaterv2":
+            kernel_options["tune_plans"] = 0
     rounds = len(backends) if args.rounds is None else args.rounds
     if rounds < len(backends) or rounds % len(backends):
         parser.error(f"--rounds must be a positive multiple of {len(backends)}")
     os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
     torch.set_num_threads(2)
     payload = peek_model(args.model).payload
-    if not isinstance(payload, GateRV2Model):
-        raise ValueError("The benchmark requires a packaged GateRV2 model")
-    sources = sorted((ROOT / "samples" / FAMILY.samples).glob("*.jpg"))
+    if not isinstance(payload, model_class):
+        raise ValueError(f"The benchmark requires a packaged {args.family} model")
+    sources = sorted((ROOT / "samples" / family.samples).glob(pattern))
     config = {
         "checkpoint_sha256": payload.checkpoint,
         "images": {path.name: digest(path) for path in sources},
-        "tile": FAMILY.tile,
-        "batch": FAMILY.batch,
-        "overlap": FAMILY.overlap,
-        "scale": FAMILY.scale,
+        "tile": family.tile,
+        "batch": family.batch,
+        "overlap": family.overlap,
+        "scale": family.scale,
     }
     read_report(args.reference_report, config, "fp32")
     rtx = read_report(args.rtx_report, config, "rtx") if "rtx" in backends else None
@@ -150,8 +162,8 @@ def main() -> None:
     setup: dict[str, Any] = {name: {} for name in backends}
     runners: dict[str, dict[int, Runner]] = {name: {} for name in backends}
     with ExitStack() as stack:
-        for batch in (1, FAMILY.batch):
-            shape = (batch, 3, FAMILY.tile, FAMILY.tile)
+        for batch in (1, family.batch):
+            shape = (batch, 3, family.tile, family.tile)
             if rtx is not None:
                 graph_info = rtx["setup"][str(batch)]
                 graph_path = args.rtx_report.parent / graph_info["graph"]
@@ -160,7 +172,7 @@ def main() -> None:
                 graph = onnx.load(graph_path, load_external_data=False)
                 rtx_setup = setup["rtx"][str(batch)] = {"graph_sha256": graph_info["graph_sha256"]}
                 runners["rtx"][batch] = open_rtx_runner(
-                    graph_path, graph.graph.input[0].name, batch, FAMILY, rtx_setup, output_dir=args.output
+                    graph_path, graph.graph.input[0].name, batch, family, rtx_setup, output_dir=args.output
                 )
             for build, library in libraries.items():
                 for precision, dtype in PRECISIONS.items():
@@ -172,8 +184,9 @@ def main() -> None:
                     runner.measure(torch.zeros(shape))
                     runners[name][batch] = runner
                     setup[name][str(batch)] = session.get_session_info()
-        results = measure_pages(sources, runners, args.reference_report.parent, args.output, rounds)
+        results = measure_pages(family, sources, runners, args.reference_report.parent, args.output, rounds)
     report = {
+        "family": args.family,
         "config": config,
         "device": torch.cuda.get_device_name(),
         "torch": torch.__version__,

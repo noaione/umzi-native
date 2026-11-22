@@ -7,6 +7,7 @@
 #include "moesr_images.h"
 #include "../../common/cuda_module.h"
 #include "../../common/cuda_plan_cache.h"
+#include "conv_plan.h"
 #include "../../runtime/binary.h"
 #include "../../runtime/kernel.h"
 
@@ -14,15 +15,22 @@
 #include <array>
 #include <chrono>
 #include <climits>
+#include <cstring>
 #include <map>
 #include <limits>
 #include <memory>
+#include <tuple>
+#include <vector>
 
 namespace {
 constexpr int channels = 64, scale = 4, full_hidden = 170, reduced_hidden = 96, threads = 256;
+// Device layouts pad channel counts to multiples of 8 so cuDNN's tensor-core
+// kernels need no separate padding pass: RGB to 8, the 170-wide hidden to 176.
+constexpr int rgb_lanes = 8;
+constexpr int lanes(int count) { return (count + 7) & ~7; }
 constexpr uint64_t default_workspace_mib = 512, max_workspace_mib = 4096;
 // Bump when plan keys, descriptor semantics, or the choice format change.
-constexpr uint32_t plan_schema = 1;
+constexpr uint32_t plan_schema = 3;
 constexpr std::array<uint32_t, 10> configuration{3, 3, scale, 2, channels, 9, 4, 3, full_hidden, reduced_hidden};
 using Clock = std::chrono::steady_clock;
 
@@ -61,7 +69,7 @@ Shape checked(const UmziShape& shape) {
         throw std::runtime_error("MoESR requires positive RGB NCHW dimensions that fit native indexing");
     if (h == 1 || w == 1)
         throw std::runtime_error("MoESR reflection padding requires both spatial dimensions to be at least two");
-    if (uint64_t(n) * ((h + 1) & ~1u) * ((w + 1) & ~1u) * (2 * full_hidden) > INT_MAX - threads)
+    if (uint64_t(n) * ((h + 1) & ~1u) * ((w + 1) & ~1u) * lanes(2 * full_hidden) > INT_MAX - threads)
         throw std::runtime_error("Requested MoESR shape exceeds native tensor indexing limits");
     return {int(n), int(h), int(w)};
 }
@@ -79,13 +87,17 @@ struct Group {
     Filter down, up;
 };
 
+// With padded = false the offsets match the packer's section 3. With padded =
+// true they describe the device copy, whose first, expand and project filters
+// use the padded channel counts of the device layout.
 struct Network {
     Filter first, last;
     std::array<Group, configuration[5]> groups;
     size_t bytes = 0;
+    bool padded = false;
 
-    Network() {
-        first = dense(3, channels);
+    explicit Network(bool padded_layout = false) : padded(padded_layout) {
+        first = dense(padded ? rgb_lanes : 3, channels);
         for (auto& group : groups) {
             for (auto& block : group.full) block = gated(full_hidden);
             group.down = dense(channels, channels / 4);
@@ -103,44 +115,88 @@ struct Network {
     Filter dense(int cin, int cout) { return {take(size_t(cin) * cout * 9 * 2), take(size_t(cout) * 4)}; }
     Filter depthwise(int taps) { return {take(8 * taps * 4), take(8 * 4)}; }
     Block gated(int hidden) {
+        const int width = padded ? lanes(hidden) : hidden;
         Block block;
         block.norm_weight = take(channels * 4);
         block.norm_bias = take(channels * 4);
-        block.expand = dense(channels, 2 * hidden);
+        block.expand = dense(channels, padded ? lanes(2 * hidden) : 2 * hidden);
         block.square = depthwise(9);
         block.row = depthwise(11);
         block.column = depthwise(11);
-        block.project = dense(hidden, channels);
+        block.project = dense(width, channels);
         block.gamma = take(channels * 4);
         return block;
     }
 };
 
-struct Convolution {
-    cudnnTensorDescriptor_t input = nullptr, output = nullptr;
-    cudnnFilterDescriptor_t filter = nullptr;
-    cudnnConvolutionDescriptor_t convolution = nullptr;
-    cudnnConvolutionFwdAlgo_t algorithm{};
-    size_t workspace = 0;
-    ~Convolution() {
-        if (convolution) cudnnDestroyConvolutionDescriptor(convolution);
-        if (filter) cudnnDestroyFilterDescriptor(filter);
-        if (output) cudnnDestroyTensorDescriptor(output);
-        if (input) cudnnDestroyTensorDescriptor(input);
+// Copy a packed FP16 KRSC filter and its FP32 bias into a zero-filled device
+// layout with more input channels, which stay zero. Expansion outputs are
+// [gate | value] halves; with half set, value rows move to start at to_half.
+void copy_dense(std::vector<char>& out, const char* in, Filter to, Filter from, int cin, int cout, int to_cin,
+                int half = 0, int to_half = 0) {
+    for (int o = 0; o < cout; ++o) {
+        const int target = half && o >= half ? to_half + o - half : o;
+        for (int tap = 0; tap < 9; ++tap)
+            std::memcpy(out.data() + to.weight + (size_t(target) * 9 + tap) * to_cin * 2,
+                        in + from.weight + (size_t(o) * 9 + tap) * cin * 2, size_t(cin) * 2);
+        std::memcpy(out.data() + to.bias + size_t(target) * 4, in + from.bias + size_t(o) * 4, 4);
     }
+}
+
+std::vector<char> device_weights(const Network& from, const Network& to, const char* in) {
+    std::vector<char> out(to.bytes, 0);
+    const auto raw = [&](size_t target, size_t source, size_t size) {
+        std::memcpy(out.data() + target, in + source, size);
+    };
+    const auto same = [&](Filter target, Filter source, int cin, int cout) {
+        copy_dense(out, in, target, source, cin, cout, cin);
+    };
+    const auto block = [&](const Block& target, const Block& source, int hidden) {
+        const int width = lanes(hidden);
+        raw(target.norm_weight, source.norm_weight, channels * 4);
+        raw(target.norm_bias, source.norm_bias, channels * 4);
+        same(target.expand, source.expand, channels, 2 * hidden);
+        for (auto [t, s, taps] : {std::tuple{target.square, source.square, 9}, {target.row, source.row, 11},
+                                  {target.column, source.column, 11}}) {
+            raw(t.weight, s.weight, 8 * taps * 4);
+            raw(t.bias, s.bias, 8 * 4);
+        }
+        copy_dense(out, in, target.project, source.project, hidden, channels, width);
+        raw(target.gamma, source.gamma, channels * 4);
+    };
+    copy_dense(out, in, to.first, from.first, 3, channels, rgb_lanes);
+    for (size_t g = 0; g < from.groups.size(); ++g) {
+        const auto &source = from.groups[g], &target = to.groups[g];
+        for (size_t i = 0; i < source.full.size(); ++i) block(target.full[i], source.full[i], full_hidden);
+        same(target.down, source.down, channels, channels / 4);
+        for (size_t i = 0; i < source.reduced.size(); ++i)
+            block(target.reduced[i], source.reduced[i], reduced_hidden);
+        same(target.up, source.up, channels, 4 * channels);
+    }
+    same(to.last, from.last, channels, 3 * scale * scale);
+    return out;
+}
+
+// One prepared convolution shape: its backend graph, the chosen execution plan
+// and that plan's workspace requirement.
+struct Convolution {
+    std::unique_ptr<moesr::ConvGraph> graph;
+    std::unique_ptr<moesr::Descriptor> plan;
+    size_t workspace = 0;
 };
 
 constexpr const char* kernel_names[] = {
-    "pack_rgb_f32", "pack_rgb_f16", "input_bias", "norm_nhwc", "gate_nhwc", "gated_residual_nhwc",
-    "reduce_nhwc", "expand_residual_nhwc", "add_nhwc", "output_nhwc_f32", "output_nhwc_f16",
+    "pack_rgb_f32", "pack_rgb_f16", "input_bias", "norm_nhwc", "gate_full_nhwc", "gate_reduced_nhwc",
+    "gated_residual_nhwc", "reduce_nhwc", "expand_residual_nhwc", "add_nhwc", "output_nhwc_f32", "output_nhwc_f16",
 };
 enum Kernel {
-    PackF32, PackF16, InputBias, Normalize, Gate, Residual, Reduce, Expand, Add, OutputF32, OutputF16, KernelCount
+    PackF32, PackF16, InputBias, Normalize, GateFull, GateReduced, Residual, Reduce, Expand, Add, OutputF32,
+    OutputF16, KernelCount
 };
 static_assert(std::size(kernel_names) == KernelCount);
 
 class Session final : public umzi::KernelSession {
-    Network model;
+    Network model, device_model{true};
     bool fp16 = false, graph_enabled = false, pending = false;
     CUdevice device = 0;
     CUcontext context = nullptr;
@@ -157,6 +213,10 @@ class Session final : public umzi::KernelSession {
     CUgraph graph = nullptr;
     CUgraphExec executable = nullptr;
     std::map<umzi::PlanShape, std::unique_ptr<Convolution>> plans;
+    std::map<std::array<CUdeviceptr, 4>, std::unique_ptr<moesr::Descriptor>> variants;
+    // ConvChoice.math value marking a backend-plan record (index into the
+    // deduplicated candidate list) rather than a legacy algorithm.
+    static constexpr uint32_t saved_plan_marker = 0x4d42;
     umzi::CudaPlanCache<umzi::moesr_id, plan_schema> plan_cache;
     std::filesystem::path cache_dir;
     umzi::Digest cache_environment{}, plan_key{};
@@ -166,6 +226,7 @@ class Session final : public umzi::KernelSession {
     std::array<CUevent, 2> timing{};
     int timed_plans = 0;
     uint64_t workspace_limit = default_workspace_mib << 20;
+    bool accumulate_fp16 = false;
 
 public:
     void open(const umzi::ModelPackage& package, const UmziSessionOptions& options) {
@@ -184,17 +245,20 @@ public:
         // candidates may use. The fast implicit-GEMM plans need about 45 MB per
         // 256x256 tile, so a small cap forces slow plans at larger batches.
         // Prepare keeps only the selected requirement allocated.
+        bool seen_workspace = false;
         for (uint32_t i = 0; i < options.kernel_option_count; ++i) {
             const auto& option = options.kernel_options[i];
             const std::string name = option.name ? option.name : "";
             if (name != "workspace_mib")
                 throw std::runtime_error("Unknown MoESR option: " + name + " (expected workspace_mib)");
-            if (i) throw std::runtime_error("Duplicate MoESR option: workspace_mib");
+            if (seen_workspace) throw std::runtime_error("Duplicate MoESR option: workspace_mib");
             if (option.value < 0 || uint64_t(option.value) > max_workspace_mib)
                 throw std::runtime_error("MoESR option workspace_mib must be between 0 and 4096");
             workspace_limit = uint64_t(option.value) << 20;
+            seen_workspace = true;
         }
         fp16 = options.precision == UMZI_FP16;
+        accumulate_fp16 = fp16;
         graph_enabled = (options.flags & UMZI_CUDA_GRAPH) != 0;
         CHECK(cuInit(0));
         CHECK(cuDeviceGet(&device, options.device));
@@ -207,8 +271,9 @@ public:
         CHECK(cuEventCreate(&complete, CU_EVENT_DISABLE_TIMING));
         for (auto& event : timing) CHECK(cuEventCreate(&event, CU_EVENT_DEFAULT));
         CHECK(cudnnCreate(&cudnn));
-        CHECK(cuMemAlloc(&weights, data.size()));
-        CHECK(cuMemcpyHtoD(weights, data.data(), data.size()));
+        const auto padded_weights = device_weights(model, device_model, data.data());
+        CHECK(cuMemAlloc(&weights, padded_weights.size()));
+        CHECK(cuMemcpyHtoD(weights, padded_weights.data(), padded_weights.size()));
         initialize_cache(options.cache_dir, package.digest, image);
     }
 
@@ -275,6 +340,7 @@ private:
         if (graph) cuGraphDestroy(graph);
         executable = nullptr;
         graph = nullptr;
+        variants.clear();
         plans.clear();
         plan_cache = {};
         for (auto* buffer : {&stage_in, &stage_out, &scratch, &initial, &state, &reduced, &normalized, &projected, &gated}) {
@@ -302,71 +368,52 @@ private:
     void make_plan(int h, int w, int cin, int cout) {
         auto plan = std::make_unique<Convolution>();
         auto& p = *plan;
-        CHECK(cudnnCreateTensorDescriptor(&p.input));
-        CHECK(cudnnCreateTensorDescriptor(&p.output));
-        CHECK(cudnnCreateFilterDescriptor(&p.filter));
-        CHECK(cudnnCreateConvolutionDescriptor(&p.convolution));
-        CHECK(cudnnSetTensor4dDescriptor(p.input, CUDNN_TENSOR_NHWC, CUDNN_DATA_HALF, padded.n, cin, h, w));
-        CHECK(cudnnSetTensor4dDescriptor(p.output, CUDNN_TENSOR_NHWC, CUDNN_DATA_HALF, padded.n, cout, h, w));
-        CHECK(cudnnSetFilter4dDescriptor(p.filter, CUDNN_DATA_HALF, CUDNN_TENSOR_NHWC, cout, cin, 3, 3));
-        CHECK(cudnnSetConvolution2dDescriptor(p.convolution, 1, 1, 1, 1, 1, 1, CUDNN_CROSS_CORRELATION,
-                                             fp16 ? CUDNN_DATA_HALF : CUDNN_DATA_FLOAT));
+        // Mixed accumulates in FP32. FP16 mode accumulates in FP16, which the
+        // backend engines run about 1.4x faster on Ampere.
+        p.graph = std::make_unique<moesr::ConvGraph>(cudnn, padded.n, h, w, cin, cout, accumulate_fp16);
+        auto candidates = p.graph->candidates(cudnn, workspace_limit);
         const umzi::PlanShape key{padded.n, h, w, cin, cout};
         if (auto saved = plan_cache.convolutions.find(key); saved != plan_cache.convolutions.end()) {
             const auto& choice = saved->second;
-            const auto algorithm = static_cast<cudnnConvolutionFwdAlgo_t>(choice.algorithm);
-            size_t required = 0;
-            if (choice.algorithm < CUDNN_CONVOLUTION_FWD_ALGO_COUNT && choice.math <= CUDNN_FMA_MATH
-                && choice.workspace <= workspace_limit
-                && cudnnSetConvolutionMathType(p.convolution, static_cast<cudnnMathType_t>(choice.math))
-                       == CUDNN_STATUS_SUCCESS
-                && cudnnGetConvolutionForwardWorkspaceSize(cudnn, p.input, p.filter, p.convolution, p.output,
-                                                           algorithm, &required) == CUDNN_STATUS_SUCCESS
-                && required == choice.workspace) {
-                p.algorithm = algorithm;
-                p.workspace = required;
+            if (choice.math == saved_plan_marker && choice.algorithm < candidates.size()
+                && uint64_t(candidates[choice.algorithm].workspace) == choice.workspace) {
+                auto& candidate = candidates[choice.algorithm];
+                p.plan = std::move(candidate.plan);
+                p.workspace = size_t(candidate.workspace);
                 // One run proves the saved plan executes before it is trusted.
                 if (time_plan(p, 0.f) < std::numeric_limits<float>::infinity()) {
                     workspace_bytes = std::max(workspace_bytes, p.workspace);
                     plans.emplace(key, std::move(plan));
                     return;
                 }
+                p.plan.reset();
             }
         }
         plan_cache.record_tuning();
-        CHECK(cudnnSetConvolutionMathType(p.convolution, CUDNN_TENSOR_OP_MATH));
-        std::array<cudnnConvolutionFwdAlgoPerf_t, CUDNN_CONVOLUTION_FWD_ALGO_COUNT> choices{};
-        int count = 0;
-        CHECK(cudnnGetConvolutionForwardAlgorithm_v7(cudnn, p.input, p.filter, p.convolution, p.output,
-                                                    int(choices.size()), &count, choices.data()));
-        // Heuristic order is not reliable for these shapes: at batch 2 the first
-        // choice for one layer was a non-tensor-core kernel 30x slower. Time every
-        // candidate that fits the workspace on the real buffers and keep the fastest.
-        // gated holds at least cin features per pixel and projected at least cout.
+        // Heuristic order is not reliable for these shapes, so time every engine
+        // configuration that fits the workspace on the real buffers. gated holds
+        // at least cin features per pixel and projected at least cout.
         float best = std::numeric_limits<float>::infinity();
-        const cudnnConvolutionFwdAlgoPerf_t* fastest = nullptr;
-        for (int i = 0; i < count; ++i) {
-            const auto& candidate = choices[i];
-            if (candidate.status != CUDNN_STATUS_SUCCESS || candidate.memory > workspace_limit) continue;
-            CHECK(cudnnSetConvolutionMathType(p.convolution, candidate.mathType));
-            p.algorithm = candidate.algo;
-            p.workspace = candidate.memory;
+        size_t fastest = candidates.size();
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            p.plan = std::move(candidates[i].plan);
+            p.workspace = size_t(candidates[i].workspace);
             const float elapsed = time_plan(p, best);
+            candidates[i].plan = std::move(p.plan);
             if (elapsed < best) {
                 best = elapsed;
-                fastest = &candidate;
+                fastest = i;
             }
         }
-        if (!fastest)
+        if (fastest == candidates.size())
             throw std::runtime_error("No cuDNN convolution for MoESR " + std::to_string(cin) + " to "
                                      + std::to_string(cout) + " channels within the workspace limit");
-        CHECK(cudnnSetConvolutionMathType(p.convolution, fastest->mathType));
-        p.algorithm = fastest->algo;
-        p.workspace = fastest->memory;
+        p.plan = std::move(candidates[fastest].plan);
+        p.workspace = size_t(candidates[fastest].workspace);
         workspace_bytes = std::max(workspace_bytes, p.workspace);
         ++timed_plans;
-        plan_cache.convolutions.insert_or_assign(
-            key, umzi::ConvChoice{uint32_t(fastest->algo), uint32_t(fastest->mathType), p.workspace});
+        plan_cache.convolutions.insert_or_assign(key,
+                                                 umzi::ConvChoice{uint32_t(fastest), saved_plan_marker, p.workspace});
         plans.emplace(key, std::move(plan));
     }
 
@@ -391,13 +438,10 @@ private:
     // Time one run. Repeat three times only when it may beat the current
     // best, so very slow candidates cost one run. Infinity means failure.
     float time_plan(const Convolution& p, float best) {
-        const float one = 1.f, zero = 0.f;
-        const auto run = [&] {
-            return cudnnConvolutionForward(cudnn, &one, p.input, reinterpret_cast<void*>(gated), p.filter,
-                                           reinterpret_cast<void*>(weights), p.convolution, p.algorithm,
-                                           reinterpret_cast<void*>(scratch), p.workspace, &zero, p.output,
-                                           reinterpret_cast<void*>(projected)) == CUDNN_STATUS_SUCCESS;
-        };
+        if (!ensure_scratch(p.workspace)) return std::numeric_limits<float>::infinity();
+        const auto variant = moesr::bind(reinterpret_cast<void*>(gated), reinterpret_cast<void*>(weights),
+                                         reinterpret_cast<void*>(projected), reinterpret_cast<void*>(scratch));
+        const auto run = [&] { return cudnnBackendExecute(cudnn, p.plan->get(), variant->get()) == CUDNN_STATUS_SUCCESS; };
         const auto measure = [&](int repeats) {
             CHECK(cuEventRecord(timing[0], stream));
             for (int i = 0; i < repeats; ++i)
@@ -411,7 +455,12 @@ private:
             CHECK(cuEventElapsedTime(&elapsed, timing[0], timing[1]));
             return elapsed / repeats;
         };
-        if (!ensure_scratch(p.workspace)) return std::numeric_limits<float>::infinity();
+        // The first launch of an engine can include lazy kernel loading, so an
+        // untimed warm-up keeps that cost from rejecting a fast candidate.
+        if (!run()) {
+            CHECK(cuStreamSynchronize(stream));
+            return std::numeric_limits<float>::infinity();
+        }
         const float first = measure(1);
         if (!(first < 2 * best)) return first;
         return measure(3);
@@ -430,8 +479,8 @@ private:
             activation(state, pixels * channels);
             activation(reduced, pixels / 4 * channels);
             activation(normalized, pixels * channels);
-            activation(projected, pixels * 2 * full_hidden);
-            activation(gated, pixels * full_hidden);
+            activation(projected, pixels * lanes(2 * full_hidden));
+            activation(gated, pixels * lanes(full_hidden));
             const auto input_bytes = shape.rgb_bytes(fp16);
             CHECK(cuMemAlloc(&stage_in, input_bytes));
             CHECK(cuMemAlloc(&stage_out, input_bytes * scale * scale));
@@ -439,15 +488,15 @@ private:
 
             start = Clock::now();
             CHECK(cudnnSetStream(cudnn, stream));
-            CHECK(cuMemsetD8Async(gated, 0, pixels * full_hidden * 2, stream));
+            CHECK(cuMemsetD8Async(gated, 0, pixels * lanes(full_hidden) * 2, stream));
             load_plan_cache();
             const int h = padded.h, w = padded.w;
-            make_plan(h, w, 3, channels);
-            make_plan(h, w, channels, 2 * full_hidden);
-            make_plan(h, w, full_hidden, channels);
+            make_plan(h, w, rgb_lanes, channels);
+            make_plan(h, w, channels, lanes(2 * full_hidden));
+            make_plan(h, w, lanes(full_hidden), channels);
             make_plan(h, w, channels, channels / 4);
-            make_plan(h / 2, w / 2, channels, 2 * reduced_hidden);
-            make_plan(h / 2, w / 2, reduced_hidden, channels);
+            make_plan(h / 2, w / 2, channels, lanes(2 * reduced_hidden));
+            make_plan(h / 2, w / 2, lanes(reduced_hidden), channels);
             make_plan(h / 2, w / 2, channels, 4 * channels);
             make_plan(h, w, channels, 3 * scale * scale);
             CHECK(cuStreamSynchronize(stream));
@@ -502,34 +551,41 @@ private:
         launch(target, kernel, count, args..., count);
     }
 
+    // Variant packs fix the pointers of one call site. They are built on first use
+    // after the shape is prepared (scratch is final by then) and reused, so CUDA
+    // Graph capture and direct replays record the same backend calls.
     void conv(CUdeviceptr out, CUdeviceptr in, int h, int w, int cin, int cout, Filter filter) {
         const auto& p = *plans.at(umzi::PlanShape{padded.n, h, w, cin, cout});
-        const float one = 1.f, zero = 0.f;
-        CHECK(cudnnConvolutionForward(cudnn, &one, p.input, reinterpret_cast<void*>(in), p.filter,
-            reinterpret_cast<void*>(weights + filter.weight), p.convolution, p.algorithm,
-            reinterpret_cast<void*>(scratch), p.workspace, &zero, p.output, reinterpret_cast<void*>(out)));
+        auto& variant = variants[std::array<CUdeviceptr, 4>{out, in, weights + filter.weight, scratch}];
+        if (!variant)
+            variant = moesr::bind(reinterpret_cast<void*>(in), reinterpret_cast<void*>(weights + filter.weight),
+                                  reinterpret_cast<void*>(out), reinterpret_cast<void*>(scratch));
+        CHECK(cudnnBackendExecute(cudnn, p.plan->get(), variant->get()));
     }
 
     void block(CUstream target, const Block& params, CUdeviceptr value, int h, int w, int hidden) {
         const int pixels = padded.n * h * w;
         launch(target, Normalize, pixels * 32, normalized, value, weights + params.norm_weight,
                weights + params.norm_bias, pixels);
-        conv(projected, normalized, h, w, channels, 2 * hidden, params.expand);
-        elementwise(target, Gate, pixels * hidden, gated, projected, weights + params.expand.bias,
-                    weights + params.square.weight, weights + params.square.bias, weights + params.row.weight,
-                    weights + params.row.bias, weights + params.column.weight, weights + params.column.bias,
-                    hidden, h, w);
-        conv(projected, gated, h, w, hidden, channels, params.project);
+        conv(projected, normalized, h, w, channels, lanes(2 * hidden), params.expand);
+        const int width = lanes(hidden);
+        // gate_pairs uses one thread per output channel pair, ordered by filter type.
+        launch(target, hidden == full_hidden ? GateFull : GateReduced, pixels * (width / 2), gated, projected,
+               weights + params.expand.bias, weights + params.square.weight, weights + params.square.bias,
+               weights + params.row.weight, weights + params.row.bias, weights + params.column.weight,
+               weights + params.column.bias, h, w, pixels);
+        conv(projected, gated, h, w, width, channels, params.project);
         elementwise(target, Residual, pixels * channels, value, projected, weights + params.project.bias,
                     weights + params.gamma);
     }
 
     void forward(CUdeviceptr input, CUdeviceptr output, CUstream target) {
         const int pixels = padded.pixels(), h = padded.h, w = padded.w;
-        elementwise(target, fp16 ? PackF16 : PackF32, pixels * 3, normalized, input, shape.h, shape.w, h, w);
-        conv(projected, normalized, h, w, 3, channels, model.first);
-        elementwise(target, InputBias, pixels * channels, state, initial, projected, weights + model.first.bias);
-        for (const auto& group : model.groups) {
+        elementwise(target, fp16 ? PackF16 : PackF32, pixels * rgb_lanes, normalized, input, shape.h, shape.w, h, w);
+        conv(projected, normalized, h, w, rgb_lanes, channels, device_model.first);
+        elementwise(target, InputBias, pixels * channels, state, initial, projected,
+                    weights + device_model.first.bias);
+        for (const auto& group : device_model.groups) {
             for (const auto& layer : group.full) block(target, layer, state, h, w, full_hidden);
             conv(projected, state, h, w, channels, channels / 4, group.down);
             elementwise(target, Reduce, pixels / 4 * channels, reduced, projected, weights + group.down.bias, h / 2, w / 2);
@@ -538,9 +594,9 @@ private:
             elementwise(target, Expand, pixels * channels, state, projected, weights + group.up.bias, h, w);
         }
         elementwise(target, Add, pixels * channels, state, initial);
-        conv(projected, state, h, w, channels, 3 * scale * scale, model.last);
+        conv(projected, state, h, w, channels, 3 * scale * scale, device_model.last);
         elementwise(target, fp16 ? OutputF16 : OutputF32, shape.pixels() * 3 * scale * scale,
-                    output, projected, weights + model.last.bias, scale * shape.h, scale * shape.w, h, w);
+                    output, projected, weights + device_model.last.bias, scale * shape.h, scale * shape.w, h, w);
     }
 
     void execute(CUdeviceptr input, CUdeviceptr output, CUstream target) {
@@ -613,7 +669,7 @@ public:
         UmziSessionInfo info{};
         info.struct_size = sizeof(info);
         info.cache_status = plan_cache.status;
-        info.buffer_bytes[0] = model.bytes;
+        info.buffer_bytes[0] = device_model.bytes;
         if (shape.n) {
             info.prepared_input = padded.nchw();
             info.buffer_bytes[1] = activation_bytes;

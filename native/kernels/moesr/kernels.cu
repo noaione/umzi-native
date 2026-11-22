@@ -110,7 +110,12 @@ template<class Rgb>
 __device__ void pack_rgb(half* out, const Rgb* in, int h, int w, int ph, int pw, int total) {
     const int index = thread_index();
     if (index >= total) return;
-    const int pixel = index / 3, c = index % 3, n = pixel / (ph * pw);
+    // Eight channels per pixel: RGB, then zeros so cuDNN needs no padding pass.
+    const int pixel = index / 8, c = index % 8, n = pixel / (ph * pw);
+    if (c >= 3) {
+        out[index] = __float2half_rn(0.f);
+        return;
+    }
     int y = pixel / pw % ph, x = pixel % pw;
     if (y >= h) y = h - 2;
     if (x >= w) x = w - 2;
@@ -151,40 +156,95 @@ extern "C" __global__ void norm_nhwc(half* out, const half* in, const float* wei
         __floats2half2_rn(fmaf(lo * inverse, weight[c], bias[c]), fmaf(hi * inverse, weight[c + 1], bias[c + 1]));
 }
 
-extern "C" __global__ void gate_nhwc(half* out, const half* in, const float* bias, const float* square,
-                                      const float* square_bias, const float* row, const float* row_bias,
-                                      const float* column, const float* column_bias, int hidden, int h, int w,
-                                      int total) {
+// x * tanh(softplus(x)) with one exponential: tanh(log(1 + e)) = n / (n + 2)
+// where n = e * (e + 2).
+__device__ float fast_mish(float value) {
+    if (value > 20.f) return value;
+    const float e = __expf(value), n = e * (e + 2.f);
+    return value * __fdividef(n, n + 2.f);
+}
+
+// in is [gate | value | zeros] with Hidden gate and Hidden value channels per
+// pixel, padded to Stride. The last 3 * 8 value channels pass through square,
+// row and column depthwise filters. out has Half channels per pixel: Hidden
+// real ones, then zeros so the projection reads a multiple of 8.
+//
+// Each thread handles one channel pair. Threads are ordered so that no warp
+// mixes plain pairs with depthwise pairs: the first pixels * plain lanes cover
+// pointwise channels and padding, then three regions (square, row, column)
+// of pixels * 4 pairs each, where every warp runs the same filter loop.
+template<int Hidden, int Half, int Stride>
+__device__ void gate_pairs(half* out, const half* in, const float* bias, const float* square,
+                           const float* square_bias, const float* row, const float* row_bias,
+                           const float* column, const float* column_bias, int h, int w, int pixels) {
+    static_assert(Hidden % 2 == 0 && Half % 8 == 0 && Half >= Hidden && Stride >= 2 * Hidden);
+    constexpr int first_branch = Hidden - 3 * branch_channels, branch_pairs = branch_channels / 2;
+    constexpr int plain = first_branch / 2 + (Half - Hidden) / 2;
     const int index = thread_index();
-    if (index >= total) return;
-    const int pixel = index / hidden, c = index % hidden, stride = 2 * hidden;
-    const half* here = in + size_t(pixel) * stride;
-    const int source_channel = hidden + c, branch = c - (hidden - 3 * branch_channels);
-    float value;
-    if (branch < 0) {
-        value = __half2float(here[source_channel]) + bias[source_channel];
+    int pixel, c, type = -1;
+    if (index < pixels * plain) {
+        pixel = index / plain;
+        c = 2 * (index % plain);
+        if (c >= first_branch) c += 3 * branch_channels;  // padding pairs after the branches
     } else {
-        const int channel = branch % branch_channels, type = branch / branch_channels;
+        const int rest = index - pixels * plain;
+        if (rest >= 3 * pixels * branch_pairs) return;
+        type = rest / (pixels * branch_pairs);
+        const int within = rest % (pixels * branch_pairs);
+        pixel = within / branch_pairs;
+        c = first_branch + type * branch_channels + 2 * (within % branch_pairs);
+    }
+    half2* target = reinterpret_cast<half2*>(out + size_t(pixel) * Half + c);
+    if (c >= Hidden) {
+        *target = __float2half2_rn(0.f);
+        return;
+    }
+    const half* here = in + size_t(pixel) * Stride;
+    const int source = Hidden + c;
+    const float2 value_bias = make_float2(bias[source], bias[source + 1]);
+    float2 value;
+    if (type < 0) {
+        const float2 raw = __half22float2(*reinterpret_cast<const half2*>(here + source));
+        value = make_float2(raw.x + value_bias.x, raw.y + value_bias.y);
+    } else {
+        const int channel = c - first_branch - type * branch_channels;
         const int x = pixel % w, y = pixel / w % h;
         const int radius_x = type == 0 ? 1 : type == 1 ? 5 : 0;
         const int radius_y = type == 0 ? 1 : type == 2 ? 5 : 0;
         const int width = 2 * radius_x + 1, taps = width * (2 * radius_y + 1);
         const float* filter = (type == 0 ? square : type == 1 ? row : column) + channel * taps;
         const float* offset = type == 0 ? square_bias : type == 1 ? row_bias : column_bias;
-        float accum = 0.f;
+        float2 accum = make_float2(0.f, 0.f);
         for (int ky = -radius_y; ky <= radius_y; ++ky) {
             if (unsigned(y + ky) >= unsigned(h)) continue;
             for (int kx = -radius_x; kx <= radius_x; ++kx) {
                 if (unsigned(x + kx) >= unsigned(w)) continue;
-                const half* neighbor = here + (ky * w + kx) * stride;
-                const float sample = __half2float(neighbor[source_channel]) + bias[source_channel];
-                accum = fmaf(filter[(ky + radius_y) * width + kx + radius_x], sample, accum);
+                const half* neighbor = here + (ky * w + kx) * Stride;
+                const float2 sample = __half22float2(*reinterpret_cast<const half2*>(neighbor + source));
+                const int tap = (ky + radius_y) * width + kx + radius_x;
+                accum.x = fmaf(filter[tap], sample.x + value_bias.x, accum.x);
+                accum.y = fmaf(filter[taps + tap], sample.y + value_bias.y, accum.y);
             }
         }
-        value = accum + offset[channel];
+        value = make_float2(accum.x + offset[channel], accum.y + offset[channel + 1]);
     }
-    out[index] = __float2half_rn(mish(__half2float(here[c]) + bias[c]) * value);
+    const float2 gate = __half22float2(*reinterpret_cast<const half2*>(here + c));
+    *target = __floats2half2_rn(fast_mish(gate.x + bias[c]) * value.x, fast_mish(gate.y + bias[c + 1]) * value.y);
 }
+
+// Threads needed for gate_pairs over pixels.
+__host__ __device__ constexpr int gate_lanes(int hidden, int half) {
+    return (hidden - 3 * branch_channels) / 2 + (half - hidden) / 2 + 3 * (branch_channels / 2);
+}
+static_assert(gate_lanes(170, 176) == 88 && gate_lanes(96, 96) == 48);
+
+#define GATE_ARGS                                                                                        \
+    half *out, const half *in, const float *bias, const float *square, const float *square_bias,         \
+        const float *row, const float *row_bias, const float *column, const float *column_bias, int h, int w, \
+        int pixels
+#define GATE_PASS out, in, bias, square, square_bias, row, row_bias, column, column_bias, h, w, pixels
+extern "C" __global__ void gate_full_nhwc(GATE_ARGS) { gate_pairs<170, 176, 344>(GATE_PASS); }
+extern "C" __global__ void gate_reduced_nhwc(GATE_ARGS) { gate_pairs<96, 96, 192>(GATE_PASS); }
 
 extern "C" __global__ void gated_residual_nhwc(half* state, const half* projected, const float* bias,
                                                const float* gamma, int total) {
@@ -192,7 +252,7 @@ extern "C" __global__ void gated_residual_nhwc(half* state, const half* projecte
     if (index >= total) return;
     const int c = index % features;
     state[index] = __float2half_rn(
-        fmaf(mish(__half2float(projected[index]) + bias[c]), gamma[c], __half2float(state[index])));
+        fmaf(fast_mish(__half2float(projected[index]) + bias[c]), gamma[c], __half2float(state[index])));
 }
 
 extern "C" __global__ void reduce_nhwc(half* out, const half* in, const float* bias, int h, int w, int total) {

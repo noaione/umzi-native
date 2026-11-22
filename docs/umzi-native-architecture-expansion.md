@@ -485,6 +485,15 @@ The [MoESR handoff](handoff-moesr.md) records the probe and the timed-plan
 results. With `cache_dir`, the selected plans are saved as
 `moesr_<key>.umplan` and verified before reuse.
 
+Optimization pass 1 pads channels to multiples of 8 in a device-only weight
+layout, so the package format is unchanged. It reorders the gate kernel so
+no warp diverges between filter types, and it times every cuDNN backend
+engine configuration instead of the legacy API's few algorithms. In a
+three-round rotated page comparison, native FP16 reached 0.380 MPx/s at
+batch 2 with 135 ms batch-1 latency and 60.11 dB. TensorRT-RTX FP16 reached
+0.283 MPx/s with 141 ms and 60.19 dB. Native mixed reached 0.268 MPx/s at
+68.13 dB. [Pass 1 details](handoff-moesr.md#optimization-pass-1-2026-11-22)
+
 The Windows package export was byte-identical across runs and produced a
 31.74 MiB file. The Python reader and C++ loader rejected the wrong schema,
 architecture, and weight size. All 16 stress cases were finite and matched
