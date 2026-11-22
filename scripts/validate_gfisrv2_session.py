@@ -12,6 +12,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
+os.environ.setdefault("NVIDIA_TF32_OVERRIDE", "0")
+
 import numpy as np
 import torch
 from benchmark import image_tensor

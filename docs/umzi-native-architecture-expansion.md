@@ -168,7 +168,7 @@ records the current MoESR state and the next steps.
 | --- | --- | --- | --- |
 | GateRV2 | Verified | FP32, RTX FP16, and Inductor FP16 with FP32 attention measured | Package (family 3, schema 1) and C++ session in mixed and FP16 validated on Windows and Linux; first tuning pass done |
 | MoESR | Verified, supplied ONNX validated | FP32, Inductor FP16, and RTX FP16 measured | [Private FP32 parity](#moesr-private-fp32-validation) and [family-4 mixed/FP16 session](#moesr-native-package-and-session) validated on Windows and Linux wheels (Pass 4: 1.84× RTX in FP16, 1.14× RTX in 68.2 dB mixed) |
-| GFISRv2 | Verified, prior handoff reviewed | FP32, eager FP16, and Inductor FP16 measured, flat-tile fidelity failure traced, RTX skipped | [Packaged native FP32 session](#gfisrv2-native-fp32-package-and-session) verified on Windows. |
+| GFISRv2 | Verified, prior handoff reviewed | FP32, eager FP16, and Inductor FP16 measured, flat-tile fidelity failure traced, RTX skipped | [Packaged native session](#gfisrv2-native-fp32-package-and-session) validated in FP32, FP16, and Mixed on Windows (Passes 1–3: **1.96× TRT 10** in FP16 at 2.46 s/page, **1.39× TRT 10** in 70.4 dB Mixed at 3.47 s/page) |
 
 ### GateRV2 private FP32 validation
 
@@ -961,5 +961,57 @@ shows the unoptimized NCHW runner spends ~57% of GPU kernel time in cuDNN
 expand/project convolutions), ~34.5% in unfused custom kernels (led by
 `add_bias_half` at 14.6–15.6%, `gate_half` at 7.1%, `rms_norm_half` at 4%,
 `residual_half` at 3.2%, and `depthwise_half` at 2.4%), and only ~6–8% in
-cuFFT itself. Replicate padding remains a separate model-behavior experiment
-for panel edges, halftones and tile overlaps.
+cuFFT itself.
+
+#### GFISRv2 optimization passes 1–3 (2026-11-22)
+
+Three optimization passes replaced the NCHW reduced-precision (`fp16` and
+`mixed`) path while keeping `precision="fp32"` on its untouched bit-exact NCHW
+path and keeping the family-2/schema-1 package format unchanged:
+
+1. **Pass 1 (NHWC layout + cuDNN backend timed plans + plan cache):** canonical
+   per-block channel permutation at session open, NHWC cuDNN backend plans with
+   disk plan cache (`conv_plan.h`, `CudaPlanCache`, `workspace_mib` option),
+   FP16 accumulation in `fp16` mode, fused bias/RMSNorm/residual/gate/pack/unpack
+   kernels, and tiled spatial/spectral depthwise kernels. Matched 128×128 FP16
+   dropped from `6.354 → 3.137 s/page`.
+2. **Pass 2 (custom fused tensor-core expand/project + custom spectral 1×1):**
+   replaced all 24 `expand 48→256` + plain gate + Fourier extraction calls with
+   `expand_gate_f16` / `expand_gate_f32` (`8×16` pixel tile, 2×128 passes,
+   3-tap `swizzle16` weight ring, 18 barriers), replaced all 24 `project 128→48`
+   + bias + SiLU + gamma residual + next-block RMSNorm calls with
+   `project_res_norm_f16` / `project_res_norm_f32` (`16×16` pixel tile, 4 warps,
+   quad-shuffle RMSNorm, 29.3 KB smem), replaced cuDNN spectral 1×1 + unpack
+   with fused `spectral_proj_gelu_unpack_f16` (FP32-acc tensor-core 64→64) and
+   `spectral_proj_gelu_unpack_f32` (pure deterministic FP32 FMA), and aliased
+   compact Fourier/branch buffers inside a 96-ch `projected` buffer, leaving
+   only 4 tiny bookend cuDNN plans (`first`, `tail_expand`, `tail_project`,
+   `last`) with **0 B** retained cuDNN workspace (`fused_conv=1` default).
+3. **Pass 3 (register-tiled FP32 spectral 1×1 + coalesced branch stores):**
+   upgraded `spectral_proj_gelu_unpack_f32` to a `4×8` register-tiled FP32 GEMM
+   (−49% time), coalesced `branch_dw_gate_compact` stores into `1×half2 + 2×uint4`
+   (−37–43% time), and vectorized `spectral_dw_res_nhwc_f16` weight loads.
+   (`16×16` 1-tap `expand_gate` and `float`-smem `spectral_dw_res_nhwc_f16`
+   regressed and were reverted.)
+
+Final multi-arch build (`output/gfisrv2-session/opt-final-win/umzi_native.dll`,
+`sm_86`/`sm_89`/`sm_120`/`compute_86`) passed all 18 stress cases, graph/direct,
+host/device/alternate-stream, and CLI checks in `fp32`, `fp16`, and `mixed`.
+Paired 4-round matched 128×128 full-page comparison
+(`output/gfisrv2-session/opt-final-matched-128/summary.json`) and 256×256
+batch-2 overlap-64 results (`output/gfisrv2-session/opt-final-ov64-*/report.json`):
+
+| Workload & Runner | Time (s) | Input MPx/s | Mean batch-1 tile (ms) | VRAM (MiB) | Raw PSNR (dB) | SSIMULACRA2 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Matched 128×128, Historical ORT TRT 10 FP16 | 4.8052 | 0.2529 | — | 292.49 (NVML steady) | 60.4422 | 87.2950 (gray) |
+| Matched 128×128, Native FP16 baseline (paired) | 6.2988 | 0.1929 | 38.805 dev / 39.860 host | 128.49 (NVML steady) | 64.4828 | 87.3532 (gray) |
+| **Matched 128×128, Native FP16 final (paired)** | **2.4558 (1.96× TRT)** | **0.4948** | **13.740 dev / 14.925 host** | **106.49 (NVML steady)** | 59.4502 | **87.4620** (gray) |
+| Matched 128×128, Native Mixed baseline (paired) | 6.4301 | 0.1890 | 41.302 dev / 42.199 host | 148.49 (NVML steady) | 67.4726 | 87.4351 (gray) |
+| **Matched 128×128, Native Mixed final (paired)** | **3.4668 (1.39× TRT)** | **0.3505** | **20.322 dev / 22.235 host** | **118.49 (NVML steady)** | **70.3614** | **87.5083** (gray) |
+| 256×256 b2 ov64 (3 pages), Native FP16 final | **4.989 (3.28× base)** | **0.7307** | **48.159** | **166** (warmed b2 delta, 0 B ws) | 56.878 | 86.235 mean |
+| 256×256 b2 ov64 (3 pages), Native Mixed final | **7.424 (2.32× base)** | **0.4910** | **69.631** | **220** (warmed b2 delta, 0 B ws) | **65.798** | **86.612** mean |
+| 256×256 b2 ov64 (3 pages), Native FP32 final | 22.634 | 0.1610 | 213.498 | 362 (warmed b2 delta) | ∞ (bit-exact) | 100.000 mean |
+
+Full pass logs, per-page tables, and dead ends are recorded in the
+[GFISRv2 tuning handoff](handoff-gfisrv2.md). Replicate padding remains a
+separate model-behavior experiment for panel edges, halftones and tile overlaps.

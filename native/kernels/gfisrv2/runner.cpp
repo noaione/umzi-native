@@ -32,7 +32,7 @@ constexpr int rgb_lanes = 8, freq_lanes = 64;
 constexpr int expand_shared_bytes = (3 * 180 * 16 + 2 * 3 * 128 * 16) * 2; // 41,856 B
 constexpr int project_shared_bytes = (2 * 324 * 16 + 2 * 3 * 48 * 16) * 2; // 29,952 B
 constexpr uint64_t default_workspace_mib = 512, max_workspace_mib = 4096;
-constexpr uint32_t plan_schema = 2;
+constexpr uint32_t plan_schema = 4;
 constexpr uint32_t saved_plan_marker = 0x4742;
 constexpr std::array<uint32_t, 7> configuration{3, 3, scale, channels, blocks, hidden, fourier};
 constexpr int r2c = 0x2a, c2r = 0x2c;
@@ -1109,15 +1109,10 @@ private:
             launch_grid(target, half_io() ? SpectralDwResF16 : SpectralDwResF32, shape.n * spec_tx * spec_ty, threads,
                         0, freq_b, freq_a, dev_ptr(block.fft.position.weight), dev_ptr(block.fft.position.bias),
                         h, w_freq, spec_tx, spec_ty);
-            if (half_io()) {
-                launch_grid(target, SpectralProjGeluUnpackF16, shape.n * bin_tiles_64, 128, 0,
-                            spectrum, freq_b, dev_ptr(block.fft.project.weight), dev_ptr(block.fft.project.bias),
-                            bins, bin_tiles_64);
-            } else {
-                launch_grid(target, SpectralProjGeluUnpackF32, shape.n * bin_tiles_32, 128, 0,
-                            spectrum, freq_b, dev_ptr(block.fft.project.weight), dev_ptr(block.fft.project.bias),
-                            bins, bin_tiles_32);
-            }
+            launch_grid(target, half_io() ? SpectralProjGeluUnpackF16 : SpectralProjGeluUnpackF32,
+                        shape.n * bin_tiles_64, 128, 0,
+                        spectrum, freq_b, dev_ptr(block.fft.project.weight), dev_ptr(block.fft.project.bias),
+                        bins, bin_tiles_64);
             FFT_CHECK(fft->c2r(inverse_fft.handle, reinterpret_cast<void*>(spectrum), reinterpret_cast<void*>(fft_buf)));
 
             if (fused_conv) {

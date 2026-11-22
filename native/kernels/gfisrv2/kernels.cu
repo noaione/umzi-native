@@ -613,14 +613,19 @@ extern "C" __global__ void branch_dw_gate_nhwc(half* gated, const half* projecte
 
         half* dst = gated + out_pix * 128 + 110;
         *reinterpret_cast<half2*>(dst + 0) = r0[0];
-        *reinterpret_cast<half2*>(dst + 2) = r0[1];
-        *reinterpret_cast<half2*>(dst + 4) = r0[2];
-        *reinterpret_cast<half2*>(dst + 6) = r1[0];
-        *reinterpret_cast<half2*>(dst + 8) = r1[1];
-        *reinterpret_cast<half2*>(dst + 10) = r1[2];
-        *reinterpret_cast<half2*>(dst + 12) = r2[0];
-        *reinterpret_cast<half2*>(dst + 14) = r2[1];
-        *reinterpret_cast<half2*>(dst + 16) = r2[2];
+        uint4 v0, v1;
+        half2* p0 = reinterpret_cast<half2*>(&v0);
+        half2* p1 = reinterpret_cast<half2*>(&v1);
+        p0[0] = r0[1];
+        p0[1] = r0[2];
+        p0[2] = r1[0];
+        p0[3] = r1[1];
+        p1[0] = r1[2];
+        p1[1] = r2[0];
+        p1[2] = r2[1];
+        p1[3] = r2[2];
+        *reinterpret_cast<uint4*>(dst + 2) = v0;
+        *reinterpret_cast<uint4*>(dst + 10) = v1;
     }
 }
 
@@ -701,7 +706,7 @@ extern "C" __global__ void pack_rms_fft_nhwc_f32(float* out, const float2* spect
 
 // Tiled 8x8 NHWC 60-channel 3x3 spectral depthwise + bias + residual.
 // Input/output: [N, H, W_freq, 64] (ch 60..63 = 0). Block = 256 threads (4 threads/pixel x 64 pixels).
-// Weights (64x9) and biases (64) are cached in shared memory with channels 60..63 zeroed.
+// Keeps tile_in in storage type T (12.8 KB for FP16 -> high occupancy) and caches 64x9 weights in smem.
 template<class T>
 __device__ void spectral_dw_res_nhwc_impl(T* out, const T* in, const float* weight, const float* bias, int h, int w,
                                           int tiles_x, int tiles_y) {
@@ -713,7 +718,6 @@ __device__ void spectral_dw_res_nhwc_impl(T* out, const T* in, const float* weig
     const int tx = tile % tiles_x, ty = tile / tiles_x % tiles_y, image = tile / (tiles_x * tiles_y);
     const int x0 = tx * 8, y0 = ty * 8;
 
-    // Load 60x9 weights transposed to [tap][channel] in shared memory (zeroing ch 60..63).
     for (int idx = tid; idx < 9 * 64; idx += 256) {
         const int tap = idx >> 6, c = idx & 63;
         w_smem[tap][c] = c < 60 ? weight[c * 9 + tap] : 0.f;
@@ -752,7 +756,13 @@ __device__ void spectral_dw_res_nhwc_impl(T* out, const T* in, const float* weig
     const int c0 = q * 16;
     float acc[16];
 #pragma unroll
-    for (int j = 0; j < 16; ++j) acc[j] = b_smem[c0 + j];
+    for (int grp = 0; grp < 4; ++grp) {
+        const float4 bv = *reinterpret_cast<const float4*>(b_smem + c0 + grp * 4);
+        acc[grp * 4 + 0] = bv.x;
+        acc[grp * 4 + 1] = bv.y;
+        acc[grp * 4 + 2] = bv.z;
+        acc[grp * 4 + 3] = bv.w;
+    }
 
     if constexpr (sizeof(T) == 2) {
 #pragma unroll
@@ -766,18 +776,30 @@ __device__ void spectral_dw_res_nhwc_impl(T* out, const T* in, const float* weig
                 const half2* p0 = reinterpret_cast<const half2*>(&u0);
                 const half2* p1 = reinterpret_cast<const half2*>(&u1);
                 const float* wt = w_smem[tap] + c0;
-#pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    const float2 f = __half22float2(p0[j]);
-                    acc[2 * j] = fmaf(wt[2 * j], f.x, acc[2 * j]);
-                    acc[2 * j + 1] = fmaf(wt[2 * j + 1], f.y, acc[2 * j + 1]);
-                }
-#pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    const float2 f = __half22float2(p1[j]);
-                    acc[8 + 2 * j] = fmaf(wt[8 + 2 * j], f.x, acc[8 + 2 * j]);
-                    acc[8 + 2 * j + 1] = fmaf(wt[8 + 2 * j + 1], f.y, acc[8 + 2 * j + 1]);
-                }
+                const float4 w0 = *reinterpret_cast<const float4*>(wt);
+                const float4 w1 = *reinterpret_cast<const float4*>(wt + 4);
+                const float4 w2 = *reinterpret_cast<const float4*>(wt + 8);
+                const float4 w3 = *reinterpret_cast<const float4*>(wt + 12);
+                const float2 f0 = __half22float2(p0[0]), f1 = __half22float2(p0[1]);
+                const float2 f2 = __half22float2(p0[2]), f3 = __half22float2(p0[3]);
+                const float2 f4 = __half22float2(p1[0]), f5 = __half22float2(p1[1]);
+                const float2 f6 = __half22float2(p1[2]), f7 = __half22float2(p1[3]);
+                acc[0] = fmaf(w0.x, f0.x, acc[0]);
+                acc[1] = fmaf(w0.y, f0.y, acc[1]);
+                acc[2] = fmaf(w0.z, f1.x, acc[2]);
+                acc[3] = fmaf(w0.w, f1.y, acc[3]);
+                acc[4] = fmaf(w1.x, f2.x, acc[4]);
+                acc[5] = fmaf(w1.y, f2.y, acc[5]);
+                acc[6] = fmaf(w1.z, f3.x, acc[6]);
+                acc[7] = fmaf(w1.w, f3.y, acc[7]);
+                acc[8] = fmaf(w2.x, f4.x, acc[8]);
+                acc[9] = fmaf(w2.y, f4.y, acc[9]);
+                acc[10] = fmaf(w2.z, f5.x, acc[10]);
+                acc[11] = fmaf(w2.w, f5.y, acc[11]);
+                acc[12] = fmaf(w3.x, f6.x, acc[12]);
+                acc[13] = fmaf(w3.y, f6.y, acc[13]);
+                acc[14] = fmaf(w3.z, f7.x, acc[14]);
+                acc[15] = fmaf(w3.w, f7.y, acc[15]);
             }
         }
         const T* center = tile_in + ((ly + 1) * 10 + (lx + 1)) * 64 + c0;
@@ -796,8 +818,7 @@ __device__ void spectral_dw_res_nhwc_impl(T* out, const T* in, const float* weig
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             const float2 cf = __half22float2(cp1[j]);
-            const int ca = c0 + 8 + 2 * j;
-            if (ca < 60) {
+            if (c0 + 8 + 2 * j < 60) {
                 h1[j] = __floats2half2_rn(acc[8 + 2 * j] + cf.x, acc[8 + 2 * j + 1] + cf.y);
             } else {
                 h1[j] = __floats2half2_rn(0.f, 0.f);
@@ -1129,7 +1150,7 @@ extern __shared__ __align__(16) half gfi_shared[];
 // Fused 48 -> 256 expansion + 80-ch plain SiLU gate + FP32 planar Fourier extraction
 // + compact branch value/gate packing.
 // 8x16 pixel tile (10x18 = 180 halo pixels, 3 K-slices of 16 -> 17,280 B),
-// 2 uniform passes of 128 output channels, 2-stage 3-tap weight ring (24,576 B).
+// 2 uniform passes of 128 output channels, 2-stage 3-tap weight ring (24,576 B, 18 barriers total).
 // Total shared memory: 41,856 B -> 2 active blocks/SM on sm_86.
 // 8 warps (256 threads): 4x2 warp grid (each warp: 2 rows x 64 ch = 2 x 8 m16n8 tiles).
 template<bool HalfAccumulate>
@@ -1147,7 +1168,6 @@ __device__ void expand_gate_impl(half* gated, float* fft_buf, half* fourier_gate
     const int tx = tile % tiles_x, ty = tile / tiles_x % tiles_y, image = tile / (tiles_x * tiles_y);
     const int y0 = ty * 8, x0 = tx * 16;
 
-    // Load entire 180 x 48 input halo into 3 swizzle16 K-slices once, reused across both passes.
     for (int idx = thread; idx < halo_count * 6; idx += 256) {
         const int p = idx / 6, ch_chunk = idx % 6;
         const int ks = ch_chunk >> 1, chunk = ch_chunk & 1;
@@ -1170,7 +1190,6 @@ __device__ void expand_gate_impl(half* gated, float* fft_buf, half* fourier_gate
     const int q = lane & 3;
     int step_g = 0;
 
-    // Pass 0 (groups 0..15, ALL PLAIN) and Pass 1 (groups 16..31: 4 plain + 12 Fourier/branch).
 #pragma unroll
     for (int pass = 0; pass < 2; ++pass) {
         Accumulator<HalfAccumulate> acc[2][8];
@@ -1219,7 +1238,6 @@ __device__ void expand_gate_impl(half* gated, float* fft_buf, half* fourier_gate
 
         const int base_group = pass * 16 + 8 * warp_n;
         if (pass == 0) {
-            // All 8 groups in this warp are plain: coalesce 4 groups -> uint4 stores (16 B).
 #pragma unroll
             for (int mt = 0; mt < 2; ++mt) {
                 const int y = y0 + warp_m * 2 + mt;
@@ -1262,7 +1280,6 @@ __device__ void expand_gate_impl(half* gated, float* fft_buf, half* fourier_gate
                 }
             }
         } else {
-            // Pass 1: groups 16..19 are plain (warp_n==0, nt=0..3); groups 20..31 are Fourier (0..29) + branch (30..47).
 #pragma unroll
             for (int mt = 0; mt < 2; ++mt) {
                 const int y = y0 + warp_m * 2 + mt;
@@ -1289,13 +1306,11 @@ __device__ void expand_gate_impl(half* gated, float* fft_buf, half* fourier_gate
                                 *reinterpret_cast<half2*>(row_gated + size_t(x) * 128 + 4 * g + 2 * q) = r;
                             }
                         } else if (x < w) {
-                            // Non-plain group g in 20..31: q<2 are gates, q>=2 are values.
                             const int sub0 = 2 * (q & 1);
                             const int slot0 = 4 * (g - 20) + sub0;
                             const float* bp = bias + 8 * g + 2 * q;
                             const float v0 = own.x + bp[0], v1 = own.y + bp[1];
                             if (q < 2) {
-                                // Gate channels -> fourier_gate[32] or branch_gate[24].
                                 const half2 h2 = __floats2half2_rn(v0, v1);
                                 if (slot0 < 30) {
                                     *reinterpret_cast<half2*>(fourier_gate + global_pix * 32 + slot0) = h2;
@@ -1304,7 +1319,6 @@ __device__ void expand_gate_impl(half* gated, float* fft_buf, half* fourier_gate
                                     *reinterpret_cast<half2*>(branch_gate + global_pix * 24 + type * 8 + ch) = h2;
                                 }
                             } else {
-                                // Value channels -> FP32 planar fft_buf[N, 30, pixels] or compact branch_val[3, N*pixels, 8].
                                 if (slot0 < 30) {
                                     fft_buf[(size_t(image) * 30 + slot0) * pixels_per_image + pix_in_image] = v0;
                                     fft_buf[(size_t(image) * 30 + slot0 + 1) * pixels_per_image + pix_in_image] = v1;
@@ -1433,14 +1447,19 @@ extern "C" __global__ void branch_dw_gate_compact(half* gated, const half* branc
 
         half* dst = gated + out_pix * 128 + 110;
         *reinterpret_cast<half2*>(dst + 0) = r0[0];
-        *reinterpret_cast<half2*>(dst + 2) = r0[1];
-        *reinterpret_cast<half2*>(dst + 4) = r0[2];
-        *reinterpret_cast<half2*>(dst + 6) = r1[0];
-        *reinterpret_cast<half2*>(dst + 8) = r1[1];
-        *reinterpret_cast<half2*>(dst + 10) = r1[2];
-        *reinterpret_cast<half2*>(dst + 12) = r2[0];
-        *reinterpret_cast<half2*>(dst + 14) = r2[1];
-        *reinterpret_cast<half2*>(dst + 16) = r2[2];
+        uint4 v0, v1;
+        half2* p0 = reinterpret_cast<half2*>(&v0);
+        half2* p1 = reinterpret_cast<half2*>(&v1);
+        p0[0] = r0[1];
+        p0[1] = r0[2];
+        p0[2] = r1[0];
+        p0[3] = r1[1];
+        p1[0] = r1[2];
+        p1[1] = r2[0];
+        p1[2] = r2[1];
+        p1[3] = r2[2];
+        *reinterpret_cast<uint4*>(dst + 2) = v0;
+        *reinterpret_cast<uint4*>(dst + 10) = v1;
     }
 }
 
@@ -1759,80 +1778,99 @@ extern "C" __global__ void __launch_bounds__(128, 4) spectral_proj_gelu_unpack_f
     spectral_proj_gelu_unpack_f16_impl<true>(spectrum, in, weight, bias, bins, tiles_per_image);
 }
 
-// Fused FP32 spectral 1x1 (60 -> 60 in 64-padded NHWC) + bias + GELU + adjacent-pair unpack.
+// Register-tiled 4x8 FP32 spectral 1x1 (60 -> 60 in 64-padded NHWC) + bias + GELU + adjacent-pair unpack.
 // Pure FP32 FMA (zero TF32, 100% deterministic across Python and CLI).
-// Block = 128 threads, 32 bins per block (4 threads/bin x 16 out channels/thread).
+// Block = 128 threads (16 pixel-quads x 8 channel-octets), 64 bins per block.
+// Each thread computes 4 bins x 8 output channels (32 FMAs from 3 float4 LDS loads per k-step).
 template<bool unexact>
 __device__ void spectral_proj_gelu_unpack_f32_impl(float2* spectrum, const float* in, const float* weight,
                                                    const float* bias, int bins, int tiles_per_image) {
-    __shared__ __align__(16) float w_smem[60][64];
     __shared__ __align__(16) union {
-        float a[32][64];
-        float2 out[30][33];
-    } buf;
+        struct {
+            float w[60][64]; // transposed [kc][o] for conflict-free float4 loads along o
+            float a[60][64]; // transposed [kc][p] for conflict-free float4 loads along p
+        } gemm;
+        float2 out[30][65];
+    } smem;
 
     const int tid = threadIdx.x;
     const int tile = blockIdx.x;
     const int image = tile / tiles_per_image, t_local = tile % tiles_per_image;
-    const int bin0 = t_local * 32;
+    const int bin0 = t_local * 64;
 
-    // Load 60 x 64 weights (15,360 B) and 32 x 64 input bins (8,192 B).
-    for (int idx = tid; idx < 60 * 16; idx += 128) {
-        const int row = idx >> 4, grp = idx & 15;
-        *reinterpret_cast<float4*>(w_smem[row] + grp * 4) =
-            *reinterpret_cast<const float4*>(weight + size_t(row) * 64 + grp * 4);
+    // Load weight [60, 64] (row = o, col = kc) transposed into gemm.w[kc][o], zeroing o in 60..63.
+    for (int idx = tid; idx < 60 * 64; idx += 128) {
+        const int o = idx >> 6, kc = idx & 63;
+        if (kc < 60) smem.gemm.w[kc][o] = weight[size_t(o) * 64 + kc];
     }
-    for (int idx = tid; idx < 32 * 16; idx += 128) {
-        const int p = idx >> 4, grp = idx & 15;
+    for (int idx = tid; idx < 60 * 4; idx += 128) {
+        smem.gemm.w[idx >> 2][60 + (idx & 3)] = 0.f;
+    }
+
+    // Load 64 input bins [64, 64] (row = p, col = kc) transposed into gemm.a[kc][p].
+    for (int idx = tid; idx < 64 * 60; idx += 128) {
+        const int p = idx / 60, kc = idx % 60;
         const int bin = bin0 + p;
-        *reinterpret_cast<float4*>(buf.a[p] + grp * 4) =
-            bin < bins ? *reinterpret_cast<const float4*>(in + (size_t(image) * bins + bin) * 64 + grp * 4)
-                       : make_float4(0.f, 0.f, 0.f, 0.f);
+        smem.gemm.a[kc][p] = bin < bins ? in[(size_t(image) * bins + bin) * 64 + kc] : 0.f;
     }
     __syncthreads();
 
-    const int p = tid >> 2, q = tid & 3;
-    const int c0 = q * 16;
-    float acc[16];
+    const int py = tid >> 3, cx = tid & 7; // 16 pixel quads (4 bins each) x 8 channel octets (8 ch each)
+    const int p0 = py * 4, c0 = cx * 8;
+    float acc[4][8];
+    float b_reg[8];
 #pragma unroll
-    for (int j = 0; j < 16; ++j) acc[j] = (c0 + j < 60) ? bias[c0 + j] : 0.f;
-    const float* ap = buf.a[p];
-    for (int kc = 0; kc < 60; kc += 4) {
-        const float4 av = *reinterpret_cast<const float4*>(ap + kc);
+    for (int j = 0; j < 8; ++j) b_reg[j] = (c0 + j < 60) ? bias[c0 + j] : 0.f;
 #pragma unroll
-        for (int j = 0; j < 16; ++j) {
-            const int o = c0 + j;
-            if (o < 60) {
-                const float4 wv = *reinterpret_cast<const float4*>(w_smem[o] + kc);
-                acc[j] = fmaf(av.x, wv.x, acc[j]);
-                acc[j] = fmaf(av.y, wv.y, acc[j]);
-                acc[j] = fmaf(av.z, wv.z, acc[j]);
-                acc[j] = fmaf(av.w, wv.w, acc[j]);
+    for (int m = 0; m < 4; ++m)
+#pragma unroll
+        for (int j = 0; j < 8; ++j) acc[m][j] = b_reg[j];
+
+    for (int kc = 0; kc < 60; ++kc) {
+        const float4 av = *reinterpret_cast<const float4*>(smem.gemm.a[kc] + p0);
+        const float4 w0 = *reinterpret_cast<const float4*>(smem.gemm.w[kc] + c0);
+        const float4 w1 = *reinterpret_cast<const float4*>(smem.gemm.w[kc] + c0 + 4);
+        const float a[4] = {av.x, av.y, av.z, av.w};
+#pragma unroll
+        for (int m = 0; m < 4; ++m) {
+            acc[m][0] = fmaf(a[m], w0.x, acc[m][0]);
+            acc[m][1] = fmaf(a[m], w0.y, acc[m][1]);
+            acc[m][2] = fmaf(a[m], w0.z, acc[m][2]);
+            acc[m][3] = fmaf(a[m], w0.w, acc[m][3]);
+            acc[m][4] = fmaf(a[m], w1.x, acc[m][4]);
+            acc[m][5] = fmaf(a[m], w1.y, acc[m][5]);
+            acc[m][6] = fmaf(a[m], w1.z, acc[m][6]);
+            acc[m][7] = fmaf(a[m], w1.w, acc[m][7]);
+        }
+    }
+
+    float2 pairs[4][4];
+#pragma unroll
+    for (int m = 0; m < 4; ++m) {
+#pragma unroll
+        for (int pair = 0; pair < 4; ++pair) {
+            if (4 * cx + pair < 30) {
+                pairs[m][pair] = make_float2(gelu<unexact>(acc[m][2 * pair]), gelu<unexact>(acc[m][2 * pair + 1]));
             }
         }
     }
+    __syncthreads();
 
-    float2 pairs[8];
 #pragma unroll
-    for (int pair = 0; pair < 8; ++pair) {
-        if (8 * q + pair < 30) {
-            pairs[pair] = make_float2(gelu<unexact>(acc[2 * pair]), gelu<unexact>(acc[2 * pair + 1]));
+    for (int m = 0; m < 4; ++m) {
+#pragma unroll
+        for (int pair = 0; pair < 4; ++pair) {
+            const int k = 4 * cx + pair;
+            if (k < 30) smem.out[k][p0 + m] = pairs[m][pair];
         }
     }
     __syncthreads();
 
-#pragma unroll
-    for (int pair = 0; pair < 8; ++pair) {
-        const int k = 8 * q + pair;
-        if (k < 30) buf.out[k][p] = pairs[pair];
-    }
-    __syncthreads();
-
-    const int warp = tid >> 5, lane = tid & 31;
-    const int bin_w = bin0 + lane;
+    const int p = tid & 63, half_idx = tid >> 6;
+    const int bin_w = bin0 + p;
     if (bin_w < bins) {
-        for (int k = warp; k < 30; k += 4) {
-            spectrum[(size_t(image) * 30 + k) * bins + bin_w] = buf.out[k][lane];
+        for (int k = half_idx; k < 30; k += 2) {
+            spectrum[(size_t(image) * 30 + k) * bins + bin_w] = smem.out[k][p];
         }
     }
 }

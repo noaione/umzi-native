@@ -146,6 +146,99 @@ fixing the Pass 1 Mixed TF32/CLI mismatch). Only the four bookend convolutions
   3.77 ms at 128×128 b1), and repeated `half→float` conversion in
   `spectral_dw_res_nhwc_f16` (5.95 ms at 256×256 b2). Addressed in Pass 3.
 
+### Optimization pass 3 and final multi-arch validation (2026-11-22)
+
+Final multi-arch build (`sm_86`, `sm_89`, `sm_120`, `compute_86` PTX):
+`output/gfisrv2-session/opt-final-win/umzi_native.dll` (SHA-256
+`ee5f8a1dfc85e03ff8ce486c3083d1bab1f53f576ec7c070b20d42ad25408744`), package
+SHA-256 `36e829d2f1e4e334a48bc4295ee14a26283b929d46c841c9446761fc5a74bae1`.
+
+What changed in Pass 3:
+
+- **Kept — register-tiled `4×8` FP32 `spectral_proj_gelu_unpack_f32`:**
+  processes 64 bins × 60 channels per 128-thread block with transposed
+  `w[60][64]` and `a[60][64]` shared memory (32 FMAs per 3 `float4` LDS loads,
+  pure deterministic FP32 FMA with zero TF32). Cut Mixed spectral 1×1 + GELU +
+  unpack by **49%** (`3.768 → 1.688 ms` at 128×128 b1; `27.156 → 13.621 ms` at
+  256×256 b2).
+- **Kept — 3-store coalesced `branch_dw_gate_compact`:** replaced 9 scalar
+  `half2` writes to `gated[110..127]` with one `half2` (`110..111`) plus two
+  16-byte aligned `uint4` writes (`112..127`), cutting spatial depthwise branch
+  time by **37–43%** (`1.065 → 0.665 ms` at 128×128 b1; `7.186 → 4.074 ms` at
+  256×256 b2).
+- **Kept — vectorized `float4` weight loads in `spectral_dw_res_nhwc_f16`**
+  while keeping `tile_in` in `half` shared memory (12.8 KB, high SM occupancy),
+  dropping 128×128 b1 time from `1.034 → 0.742 ms` and 256×256 b2 from
+  `5.951 → 4.338 ms`.
+- **Dead ends tested and reverted (`p3-win`):**
+  - `16×16` 1-tap `expand_gate` (54 barriers in FP16 / 108 in Mixed vs 18
+    barriers in Pass 2's `8×16` 3-tap): regressed 128×128 FP16 (`6.18 → 6.79 ms`)
+    and 256×256 Mixed (`52.8 → 68.0 ms`). Reverted to Pass 2's `8×16` 3-tap.
+  - `float`-shared-memory `spectral_dw_res_nhwc_f16` (25.6 KB vs 12.8 KB):
+    halved SM occupancy and regressed (`1.03 → 1.28 ms` at 128×128, `5.95 → 8.10 ms`
+    at 256×256). Reverted to `half`-smem.
+
+#### Final matched 128×128 full-page paired comparison (`lb-page-003.png`, 4 alternating rounds)
+
+Report: `output/gfisrv2-session/opt-final-matched-128/summary.json`. All four
+runners paired in alternating forward/reverse order in isolated GPU workers
+with CUDA Graph replay, separate NVML 5 ms VRAM workers, and 150 individual
+synchronized batch-1 tile calls.
+
+| Runner | Median s/page | Range (s/page) | Input MPx/s | Mean batch-1 dev / host (ms/tile) | NVML steady peak above idle (MiB) | Buffers (ws) / warmed delta (MiB) | Raw PSNR vs FP32 (dB) | Gray / RGB16 SSIMULACRA2 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Historical ORT TRT 10 FP16 (target) | **4.8052** | 4.7665–4.9099 | 0.2529 | — | 292.49 | — | 60.4422 | 87.2950 / — |
+| Native FP16 baseline (`pickup-win`) | 6.2988 | 5.6658–6.3251 | 0.1929 | 38.805 / 39.860 | 128.49 | 39.7 (9.7) / 66.0 | 64.4828 | 87.3532 / 87.1839 |
+| **Native FP16 final (`opt-final-win`)** | **2.4558** | **2.2708–2.5963** | **0.4948** | **13.740 / 14.925** | **106.49** | **27.1 (0.0) / 44.0** | 59.4502 | **87.4620** / 86.9910 |
+| Native Mixed baseline (`pickup-win`) | 6.4301 | 6.0144–6.7487 | 0.1890 | 41.302 / 42.199 | 148.49 | 62.3 (9.7) / 86.0 | 67.4726 | 87.4351 / 87.3302 |
+| **Native Mixed final (`opt-final-win`)** | **3.4668** | **3.2385–3.6379** | **0.3505** | **20.322 / 22.235** | **118.49** | **33.9 (0.0) / 56.0** | **70.3614** | **87.5083** / 87.2938 |
+
+- **Native FP16** beats the historical 4.8052 s/page ORT TRT 10 FP16 target by
+  **1.96×** (`2.4558 s/page`, non-overlapping ranges) and baseline native FP16
+  by **2.56×**, at **2.75× lower steady VRAM** than TRT 10 (`106.49` vs
+  `292.49 MiB`, 0.0 MiB cuDNN workspace) and higher grayscale SSIMULACRA2
+  (`87.4620` vs `87.2950`).
+- **Native Mixed** beats the TRT 10 FP16 target by **1.39×** (`3.4668 s/page`)
+  and baseline native Mixed by **1.85×**, while **increasing** raw PSNR by
+  `+2.89 dB` to **70.3614 dB** (`max_abs 0.0289`, grayscale SSIMULACRA2
+  `87.5083`) at **2.47× lower steady VRAM** than TRT 10 (`118.49 MiB`).
+- All runners matched CUDA Graph vs direct bit-for-bit on the full page.
+
+#### Final 256×256 batch-2 64 px overlap suite (all 3 pages, 105 real tiles)
+
+Reports: `output/gfisrv2-session/opt-final-ov64-{fp32,fp16,mixed}/report.json`.
+All 18 stress cases, graph/direct, host/device/alternate-stream, and CLI checks
+passed for all three precisions.
+
+| Precision | Build | Batch-2 time, 3 pages (s) | Input MPx/s | Mean batch-1 tile (ms) | Batch-1 / Batch-2 buffers (ws MiB) | Batch-1 / Batch-2 warmed delta (MiB) | Raw PSNR (dB) | Mean / Min SSIMULACRA2 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| FP32 | Baseline → Final | 22.734 → 22.634 | 0.1603 → 0.1610 | 212.987 → 213.498 | 184.7 / 352.1 (1.2) | 186 / 362 | ∞ (bit-exact) | 100.000 / 100.000 |
+| FP16 | Baseline | 16.388 | 0.2224 | 153.243 | 133.8 / 259.2 (76.2) | 138 / 270 | 60.716 | 86.425 / 85.534 |
+| **FP16** | **Final (`opt-final-win`)** | **4.989 (3.28×)** | **0.7307** | **48.159 (3.18×)** | **83.7 / 159.2 (0.0)** | **90 / 166 (−39%)** | 56.878 | 86.235 / 85.326 |
+| Mixed | Baseline | 17.221 | 0.2117 | 161.076 | 175.8 / 327.2 (76.2) | 182 / 342 | 63.993 | 86.581 / 85.658 |
+| **Mixed** | **Final (`opt-final-win`)** | **7.424 (2.32×)** | **0.4910** | **69.631 (2.31×)** | **110.3 / 212.2 (0.0)** | **116 / 220 (−36%)** | **65.798 (+1.81)** | **86.612 / 85.656** |
+
+Per-page 256×256 batch-2 overlap-64 final results:
+
+| Precision | Page | Batch-2 time (s) | Input MPx/s | Mean batch-1 tile (ms) | Raw PSNR (dB) | SSIMULACRA2 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| FP16 | `lb-page-003.png` | 1.672 | 0.7266 | 49.088 | 59.405 | 86.928 |
+| FP16 | `lb-page-004.png` | 1.678 | 0.7241 | 48.581 | 55.190 | 86.452 |
+| FP16 | `lb-page-005.png` | 1.638 | 0.7416 | 46.807 | 57.026 | 85.326 |
+| Mixed | `lb-page-003.png` | 2.479 | 0.4900 | 69.604 | 70.802 | 87.329 |
+| Mixed | `lb-page-004.png` | 2.481 | 0.4897 | 69.620 | 65.558 | 86.852 |
+| Mixed | `lb-page-005.png` | 2.464 | 0.4932 | 69.668 | 63.684 | 85.656 |
+
+Final same-process alternating A/B probes (`pickup-win` → `opt-final-win`):
+- **128×128 batch 1**: FP16 `40.5 → 13.9 ms/tile` (**2.91×**), Mixed `43.1 → 21.5 ms/tile` (**2.00×**).
+- **256×256 batch 2**: FP16 `298.1 → 104.2 ms` (`52.1 ms/tile`, **2.86×**), Mixed `296.4 → 140.6 ms` (`70.3 ms/tile`, **2.11×**).
+
+Final CUPTI profiles (`output/gfisrv2-session/opt-final-profile-{128,256}.json`):
+- **128×128 b1 FP16 (15.41 ms total GPU kernels):** `expand_gate_f16` 6.02 ms (39.0%), `project_res_norm_f16` 3.20 ms (20.8%), cuFFT 2.21 ms (14.3%), `spectral_proj_gelu_unpack_f16` 0.85 ms, `spectral_dw_res_nhwc_f16` 0.74 ms, `scale_post_rms_gate_compact` 0.68 ms, `branch_dw_gate_compact` 0.67 ms, `pack_rms_fft_nhwc_f16` 0.43 ms.
+- **128×128 b1 Mixed (18.49 ms total GPU kernels):** `expand_gate_f32` 6.98 ms (37.7%), `project_res_norm_f32` 4.15 ms (22.4%), cuFFT 2.14 ms (11.6%), `spectral_proj_gelu_unpack_f32` 1.69 ms, `spectral_dw_res_nhwc_f32` 1.12 ms, `scale_post_rms_gate_compact` 0.64 ms, `branch_dw_gate_compact` 0.57 ms, `pack_rms_fft_nhwc_f32` 0.53 ms.
+- **256×256 b2 FP16 (96.76 ms total GPU kernels):** `expand_gate_f16` 38.71 ms (40.0%), cuFFT 17.68 ms (18.3%), `project_res_norm_f16` 16.74 ms (17.3%), `scale_post_rms_gate_compact` 4.73 ms, `spectral_dw_res_nhwc_f16` 4.34 ms, `branch_dw_gate_compact` 4.07 ms, `spectral_proj_gelu_unpack_f16` 3.40 ms, `pack_rms_fft_nhwc_f16` 3.38 ms.
+- **256×256 b2 Mixed (155.65 ms total GPU kernels):** `expand_gate_f32` 59.20 ms (38.0%), `project_res_norm_f32` 33.98 ms (21.8%), cuFFT 20.37 ms (13.1%), `spectral_proj_gelu_unpack_f32` 13.62 ms, `spectral_dw_res_nhwc_f32` 8.29 ms, `scale_post_rms_gate_compact` 4.93 ms, `pack_rms_fft_nhwc_f32` 4.68 ms, `branch_dw_gate_compact` 4.51 ms.
+
 - FP32 matched all three untouched eager FP32 pages bit for bit.
 - FP16 matched eager FP16 on all 72 raw batch-2 page tiles and all three
   rendered pages. Of 18 stress cases, only 1×7, 2×2, and 3×5 differed. The
