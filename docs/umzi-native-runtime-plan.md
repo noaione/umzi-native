@@ -199,7 +199,7 @@ specified byte offsets.
 | ---: | ---: | --- |
 | 0 | 8 | `UMZINPKG` |
 | 8 | 4 | Container version |
-| 12 | 4 | Kernel family ID. Assign `1` to GateRV3 and `3` to GateRV2, and reserve `2` for GFISRv2 and `4` for MoESR. |
+| 12 | 4 | Kernel family ID. Assign `1` to GateRV3, `3` to GateRV2, and `4` to MoESR; reserve `2` for GFISRv2. |
 | 16 | 4 | Kernel payload schema version |
 | 20 | 4 | Section count |
 | 24 | 8 | Total package size in bytes |

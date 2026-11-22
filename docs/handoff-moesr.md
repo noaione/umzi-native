@@ -18,7 +18,7 @@ design detail, see the [architecture expansion plan](umzi-native-architecture-ex
 | Optimization pass 2: grouped gate layout, fused residual + LayerNorm, noise-based plan timing, 64-thread gate blocks | Done (committed in `3460ba5`) |
 | Optimization pass 3: fused all-channel expansion + Mish gate (`expand_gate_*`), tiled depthwise branch (`gate_branch_tiled_*`), validator follow-ups | Done (committed in `dce9d94`) |
 | Optimization pass 4: fused `176→64` / `96→64` projection + Mish + residual + LayerNorm (`project_*`), unified float-smem `gate_branch_tiled_*`, fused `input_bias_norm` / `reduce_norm` / `expand_residual_norm` / `expand_residual_add` | Done and validated, not committed (see below) |
-| Linux build and validation | **Next** |
+| Linux build, wheel packaging (Windows & Linux), and cross-OS validation | Done and validated (2026-11-22, see below) |
 
 ## Session changes in this pass
 
@@ -383,6 +383,39 @@ Dead ends recorded in pass 4:
   quad-shuffle LayerNorm + `half2` writes in both FP16 and FP32 (extra sync
   and smem round-trip).
 
+## Wheel packaging and Linux validation (2026-11-22)
+
+Both platform wheels were built from the pass-4 source tree with embedded
+`sm_86`, `sm_89`, `sm_120`, and `compute_86` images:
+
+- **Windows wheel:** `output/moesr-session/wheels-win/umzi_native-0.0.2-py3-none-win_amd64.whl`
+  (2.53 MiB). Installed into an isolated target directory and verified via
+  `scripts/check_python_session.py` (with `--import-torch` and `--cli`) across
+  MoESR, GateRV2, GateRV3 digital, and GateRV3 IDC — all four reported
+  `"problems": []` and loaded the bundled `umzi_native.dll` automatically.
+  Reports: `output/moesr-session/validated-p4-win-wheel/`.
+- **Linux wheel (WSL Ubuntu 24.04, Python 3.12, standalone non-Torch CUDA libs):**
+  `output/moesr-session/wheels-linux/umzi_native-0.0.2-py3-none-linux_x86_64.whl`
+  (2.57 MiB). Installed into an isolated target directory and verified via
+  `scripts/check_python_session.py` (with `--cuda-dir` and the Linux CLI)
+  across MoESR, GateRV2, GateRV3 digital, and GateRV3 IDC — all four reported
+  `"problems": []`. Additional Linux MoESR checks passed on `rect-65x79`,
+  `tiny-2x2`, `tiny-3x5`, and `tile-128` (graph == direct bitwise,
+  `workspace_mib=0`, `fused_gate=0` agreement 70.37 dB mixed / 60.77 dB FP16,
+  and corrupt plan-file `rebuilt → hit` recovery).
+  Reports: `output/moesr-session/validated-p4-linux/` and build/check scripts
+  `output/moesr-session/p4-linux-validate.sh`.
+- **Cross-OS parity** on the same `2×3×65×79` input
+  (`output/moesr-session/validated-p4-win-wheel/cross-os-parity.json`):
+  - **FP16:** Windows and Linux outputs are **bitwise identical** (`max_abs = 0`);
+    both score **61.422 dB** against eager CUDA FP32.
+  - **Mixed:** Windows vs Linux scores **71.453 dB** (`max_abs = 1.71e-3`,
+    differing only in cuDNN plan choice on the 4 remaining small convs);
+    Windows vs FP32 scores **68.906 dB** and Linux vs FP32 scores **68.909 dB**.
+- Note: `scripts/check_python_session.py` was updated to check output shapes
+  using `session.scale_factor` (and pass `output_shape` to `cli_output`) so it
+  works for non-1× models like MoESR.
+
 ## Page measurements
 
 ### Paired comparison with TensorRT-RTX after pass 1
@@ -459,8 +492,11 @@ GateRV3 regression reports are in the same folder.
    pass 4 done and validated (uncommitted). Native FP16 is **1.84× faster**
    than TensorRT-RTX FP16 (27.1% lower batch-1 latency), and Native Mixed
    (68.22 dB) beats TensorRT-RTX FP16 by **13.8%** in batch-2 throughput.
-5. **Commit pass 4**, then build and validate on Linux (and verify on
-   `sm_89` / `sm_120` if available).
+5. ~~Linux build, wheel packaging (Windows & Linux), and cross-OS parity.~~
+   Done and validated on pass 4 (FP16 bitwise identical across Windows and
+   Linux; mixed 68.91 dB vs eager FP32 on both).
+6. **Commit pass 4**, then move on to GFISRv2 (family `2`) or physical
+   `sm_89` / `sm_120` checks if available.
 6. Rounding drift between engines: mixed `tiny-2x2` scored 92.8 dB at first,
    then 89.2 in pass 1, 88.3 in pass 2, 89.4 in pass 3, and 83.8 in pass 4.
    FP16 checkerboard scored 64.7, then 63.4, 65.6, 65.6, and 65.3. All remain

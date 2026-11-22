@@ -105,10 +105,12 @@ def check_precision(umzi: Any, args: argparse.Namespace, precision: str, temp: P
             sample = rng.random(shape, dtype=np.float32).astype(dtype)
             (restored,) = session.run(None, {session.get_inputs()[0].name: sample})
             info = session.get_session_info()
+            scale = session.scale_factor
+            expected_shape = (shape[0], shape[1], shape[2] * scale, shape[3] * scale)
             rows["x".join(map(str, shape))] = {
                 "dtype": str(restored.dtype),
                 "finite": bool(np.isfinite(restored).all()),
-                "shape_match": restored.shape == shape and restored.dtype == dtype,
+                "shape_match": restored.shape == expected_shape and restored.dtype == dtype,
                 "first_session_cache_status": info["cache_status"],
                 "first_session_stages_ms": info["stages_ms"],
                 "padded_shape": list(info["padded_shape"]),
@@ -124,7 +126,7 @@ def check_precision(umzi: Any, args: argparse.Namespace, precision: str, temp: P
             row["reopened_bitwise_match"] = np.array_equal(first, again)
     if args.cli is not None:
         for shape, (sample, first) in samples.items():
-            expected = cli_output(args.cli, args.model, precision, cache, sample, temp)
+            expected = cli_output(args.cli, args.model, precision, cache, sample, temp, tuple(first.shape))
             rows["x".join(map(str, shape))]["bitwise_cli_match"] = np.array_equal(first, expected)
     return {"library_path": str(library), "cases": rows}
 

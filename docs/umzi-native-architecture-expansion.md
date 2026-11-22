@@ -165,8 +165,8 @@ records the current MoESR state and the next steps.
 | Family | CPU checkpoint load | CUDA baselines | Native FP32 parity, export, and session |
 | --- | --- | --- | --- |
 | GateRV2 | Verified | FP32, RTX FP16, and Inductor FP16 with FP32 attention measured | Package (family 3, schema 1) and C++ session in mixed and FP16 validated on Windows and Linux; first tuning pass done |
-| MoESR | Verified, supplied ONNX validated | FP32, Inductor FP16, and RTX FP16 measured | [Private FP32 parity](#moesr-private-fp32-validation) and [family-4 mixed/FP16 session](#moesr-native-package-and-session) |
-| GFISRv2 | Verified, prior handoff reviewed | FP32, eager FP16, and Inductor FP16 measured, flat-tile fidelity failure traced, RTX skipped | Pending |
+| MoESR | Verified, supplied ONNX validated | FP32, Inductor FP16, and RTX FP16 measured | [Private FP32 parity](#moesr-private-fp32-validation) and [family-4 mixed/FP16 session](#moesr-native-package-and-session) validated on Windows and Linux wheels (Pass 4: 1.84× RTX in FP16, 1.14× RTX in 68.2 dB mixed) |
+| GFISRv2 | Verified, prior handoff reviewed | FP32, eager FP16, and Inductor FP16 measured, flat-tile fidelity failure traced, RTX skipped | [Implementation planned](#gfisrv2-implementation-plan) |
 
 ### GateRV2 private FP32 validation
 
@@ -501,6 +501,30 @@ native FP16 reached 0.388 MPx/s with 133.8 ms latency and 60.09 dB.
 TensorRT-RTX reached 0.282 MPx/s with 141.8 ms and 60.19 dB.
 [Pass 2 details](handoff-moesr.md#optimization-pass-2-2026-11-22)
 
+Pass 3 replaces both the full-resolution (`64→344`) and reduced-resolution
+(`64→192`) cuDNN expansions with custom 8-warp `8×16` tensor-core kernels that
+fuse the plain Mish gate (`expand_gate_*`) and write the 48 depthwise-branch
+channels in planar form for a tiled 16×16 depthwise branch kernel
+(`gate_branch_tiled_*`), enabled by default via `fused_gate=1`. In a
+three-round rotated comparison, native FP16 reached 0.469 MPx/s (1.61× RTX)
+with 109.1 ms batch-1 latency and 60.06 dB, while native mixed reached
+0.306 MPx/s (+5.0% over RTX) at 68.09 dB.
+[Pass 3 details](handoff-moesr.md#optimization-pass-3-2026-11-22)
+
+Pass 4 replaces both the `176→64` and `96→64` cuDNN projections plus
+`residual_norm_nhwc` / `gated_residual_nhwc` with 4-warp `16×16` `K=16`
+tensor-core kernels (`project_*`) that fuse bias, Mish, gamma residual, and
+quad-shuffle LayerNorm, unifies `gate_branch_tiled_*` into a single-block
+float-shared-memory kernel, and fuses the 18 chain-entry `norm_nhwc` launches
+into `input_bias_norm`, `reduce_norm_nhwc`, and `expand_residual_norm_nhwc`.
+Only four small cuDNN plans remain (`first`, `down`, `up`, `last`), with 0 B
+retained workspace and 158 / 172 MiB batch-2 device memory delta (FP16 /
+mixed). In a three-round rotated comparison against TensorRT-RTX (0.293 MPx/s,
+134.5 ms, 60.19 dB), native FP16 reached **0.538 MPx/s (1.84× RTX)** with
+**98.0 ms** batch-1 latency (27.1% lower) at 60.15 dB, and native mixed
+reached **0.333 MPx/s (1.14× RTX)** with 154.5 ms latency at **68.22 dB**.
+[Pass 4 details](handoff-moesr.md#optimization-pass-4-2026-11-22)
+
 The Windows package export was byte-identical across runs and produced a
 31.74 MiB file. The Python reader and C++ loader rejected the wrong schema,
 architecture, and weight size. All 16 stress cases were finite and matched
@@ -586,3 +610,41 @@ $build = 'output/moesr-session/tuned-win'
 
 [Timed-plan report and per-tile timings](../output/moesr-session/validated-tuned/report.json)
 · [Heuristic-build report](../output/moesr-session/validated/report.json)
+
+### GFISRv2 implementation plan
+
+1. **Validate one Fourier unit in FP32.** Add a private validator using
+   the untouched checkpoint as the reference and Torch CUDA FFTs for the
+   first replica. Record the forward and inverse transform axes and
+   lengths, orthonormal scaling, packed real/imaginary channel order on
+   both sides of the learned spectral layers, and RMSNorm epsilon
+   placement. Compare the intermediate tensors on channel-distinct, flat,
+   impulse, checkerboard, and odd rectangular inputs.
+2. **Bring up the native FP32 graph.** Use **cuFFT** for the Fourier unit's
+   forward and inverse transforms. CUDA kernels handle packing, unpacking,
+   and the reference's scaling. Match the isolated unit first, then
+   assemble all 24 gated blocks, the convolutional tail and feature
+   residual, and the 4× RGB shuffle and crop. Trace the first Fourier
+   unit, several body blocks, the residual tail, and the final output.
+3. **Add the package and session.** Use family ID `2` and schema `1`
+   in the shared `.ummodel` format. Size the input and output buffers
+   independently. Load cuFFT when opening a GFISRv2 session so the other
+   families can load without it. Prepare FFT plans for the padded shape
+   and batch, bind them to the execution stream, and allocate reusable
+   workspace before CUDA Graph capture. Check deterministic export,
+   malformed package rejection, shape changes, cleanup, and host/device
+   and graph/direct parity. Rerun GateRV2, GateRV3, and MoESR session
+   regressions.
+4. **Establish mixed and FP16 controls.** Keep the FFTs and normalization
+   in FP32 initially. Test narrower precision at the learned spectral
+   layers and residual boundaries one change at a time. Compare raw PSNR
+   and max error before quantization, and SSIMULACRA2 on rendered stress
+   tiles and pages. The existing eager FP16 baseline scored 5.556 dB on
+   flat gray, so keep the gray and checkerboard checks alongside the page
+   results. [Archived flat-tile results](umzi-native-architecture-baselines.md#gfisrv2-flat-tile-fidelity)
+
+Use the three `samples/mscale/` pages with 256×256 input tiles, batch 2,
+and 32 input pixels of overlap. Keep per-page and overall batch-2 time
+and throughput, and time individual synchronized batch-1 tiles separately.
+The first implementation milestone is the isolated Fourier validator
+with a trace that identifies the first diverging stage.
