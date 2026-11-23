@@ -32,5 +32,6 @@ std::unique_ptr<KernelSession> make_gaterv3(const ModelPackage& package, const U
 std::unique_ptr<KernelSession> make_gfisrv2(const ModelPackage& package, const UmziSessionOptions& options);
 std::unique_ptr<KernelSession> make_gaterv2(const ModelPackage& package, const UmziSessionOptions& options);
 std::unique_ptr<KernelSession> make_moesr(const ModelPackage& package, const UmziSessionOptions& options);
+std::unique_ptr<KernelSession> make_smosr(const ModelPackage& package, const UmziSessionOptions& options);
 KernelFactory kernel_factory(uint32_t family);
 }

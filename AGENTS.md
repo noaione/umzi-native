@@ -1,5 +1,8 @@
 # Repository instructions
 
+Follow [Adding new model kernels](docs/adding-new-kernels.md) for new model
+support and benchmarks. The GateRV3 settings below apply to that model.
+
 ## Environment and GateRV3 baseline
 
 - Use `C:\Python314\python.exe` for Python commands in this checkout. The

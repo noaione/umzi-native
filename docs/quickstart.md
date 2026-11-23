@@ -124,8 +124,8 @@ standalone = umzi.SessionOptions(
 ## 4. Model-specific `kernel_options`
 
 The `.ummodel` header automatically selects the kernel family (`gaterv3`,
-`gaterv2`, `moesr`, or `gfisrv2`). Each family accepts its own `kernel_options` keys as
-integers.
+`gaterv2`, `moesr`, `gfisrv2`, or `smosr`). Families with kernel options accept
+their own `kernel_options` keys as integers.
 
 ### GateRV3
 
@@ -236,6 +236,13 @@ options = umzi.SessionOptions(precision="fp32", kernel_options={"unexact_erf": 1
 
 See the [GFISRv2 validation and gray renders](umzi-native-architecture-expansion.md#gfisrv2-native-fp32-package-and-session).
 
+### SMoSR
+
+SMoSR returns 2× RGB output for inputs at least three pixels high and wide.
+Use `np.float32` arrays with `precision="mixed"` and `np.float16` arrays with
+`precision="fp16"`. SMoSR uses cuDNN heuristic plans and accepts the common
+`enable_cuda_graph` setting. See [SMoSR implementation and measurements](handoff-smosr.md).
+
 ## 5. Inspecting models and sessions
 
 ### Before opening a session (`peek_model`)
@@ -249,7 +256,7 @@ print(info.family_name, info.supported, info.problems)
 
 ### On an open session
 
-- **Metadata properties:** `session.kernel` (`"gaterv3"`, `"gaterv2"`, `"moesr"`, or `"gfisrv2"`),
+- **Metadata properties:** `session.kernel` (`"gaterv3"`, `"gaterv2"`, `"moesr"`, `"gfisrv2"`, or `"smosr"`),
   `session.scale_factor`, `session.context`,
   `session.library_path`, `session.closed`.
 - **Runtime diagnostics (`session.get_session_info()`):** Call after

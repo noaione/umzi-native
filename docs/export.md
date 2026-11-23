@@ -48,6 +48,7 @@ info = export_model("models/4x_dwtp_ds_moesr_v2.pth", "output/moesr.ummodel", ke
 | `gaterv2` | `1x_umzi_dehalftone_gater2_v1_smooth.safetensors` | 1× | Dehalftone, 16-pixel alignment |
 | `moesr` | `4x_dwtp_ds_moesr_v2.pth` | 4× | DWTP DS direct-shuffle topology only |
 | `gfisrv2` | `4x_wtp_MangaScale_GfisrV2.pth` | 4× | FP32 weights, MangaScale 24-block topology |
+| `smosr` | `2x_enhancr_da_smosr_v1.safetensors` | 2× | 48 features, six blocks, direct pixel shuffle |
 
 For example:
 
@@ -56,6 +57,7 @@ python -m umzi_native export models/1x_umzi_digital_decompress_gaterv3_1.pth -o 
 python -m umzi_native export models/1x_umzi_dehalftone_gater2_v1_smooth.safetensors -o output/native/gaterv2.ummodel --kernel gaterv2
 python -m umzi_native export models/4x_dwtp_ds_moesr_v2.pth -o output/native/moesr.ummodel --kernel moesr
 python -m umzi_native export models/4x_wtp_MangaScale_GfisrV2.pth -o output/native/gfisrv2.ummodel --kernel gfisrv2
+python -m umzi_native export models/2x_enhancr_da_smosr_v1.safetensors -o output/native/smosr.ummodel --kernel smosr
 ```
 
 A checkpoint with a different architecture or configuration is rejected

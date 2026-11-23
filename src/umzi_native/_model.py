@@ -11,7 +11,16 @@ from typing import BinaryIO
 
 from ._loader import PathArg
 
-__all__ = ["GFISRv2Model", "GateRV2Model", "GateRV3Model", "MoESRModel", "ModelInfo", "ModelSection", "peek_model"]
+__all__ = [
+    "GFISRv2Model",
+    "GateRV2Model",
+    "GateRV3Model",
+    "MoESRModel",
+    "ModelInfo",
+    "ModelSection",
+    "SMoSRModel",
+    "peek_model",
+]
 
 MAGIC = b"UMZINPKG"
 VERSION = 1
@@ -32,8 +41,15 @@ GATERV3_FAMILY = 1
 GFISRV2_FAMILY = 2
 GATERV2_FAMILY = 3
 MOESR_FAMILY = 4
-FAMILIES = {GATERV3_FAMILY: "gaterv3", GFISRV2_FAMILY: "gfisrv2", GATERV2_FAMILY: "gaterv2", MOESR_FAMILY: "moesr"}
-SCHEMAS = {"gaterv3": 1, "gfisrv2": 1, "gaterv2": 1, "moesr": 1}
+SMOSR_FAMILY = 5
+FAMILIES = {
+    GATERV3_FAMILY: "gaterv3",
+    GFISRV2_FAMILY: "gfisrv2",
+    GATERV2_FAMILY: "gaterv2",
+    MOESR_FAMILY: "moesr",
+    SMOSR_FAMILY: "smosr",
+}
+SCHEMAS = {"gaterv3": 1, "gfisrv2": 1, "gaterv2": 1, "moesr": 1, "smosr": 1}
 SECTION_NAMES = {1: "architecture", 2: "schedule", 3: "weights", 4: "checkpoint"}
 # GateRV2 schema 1 architecture: input, output, scale, alignment, base
 # channels, levels, latent blocks, the attention epsilon as float32, four
@@ -47,6 +63,19 @@ MOESR_ARCHITECTURE = struct.Struct("<10I")
 MOESR_CONFIG = (3, 3, 4, 2, 64, 9, 4, 3, 170, 96)
 GFISRV2_ARCHITECTURE = struct.Struct("<7I")
 GFISRV2_CONFIG = (3, 3, 4, 48, 24, 128, 30)
+SMOSR_ARCHITECTURE = struct.Struct("<8I")
+SMOSR_CONFIG = (3, 3, 2, 2, 48, 2, 3, 1)
+# Input channels, output channels, kernel width after padding lanes for cuDNN.
+SMOSR_FILTERS = (
+    (8, 16, 1),
+    (8, 48, 1),
+    (8, 48, 3),
+    (48, 48, 3),
+    (48, 96, 3),
+    *((48, 48, 3), (48, 48, 3), (48, 96, 3)) * 5,
+    (48, 48, 3),
+    (64, 16, 3),
+)
 
 
 class GateRV3Op(IntEnum):
@@ -146,6 +175,22 @@ class GFISRv2Model:
     blocks: int
     hidden_channels: int
     fourier_channels: int
+    weight_bytes: int
+    checkpoint: str
+
+
+@dataclass(frozen=True)
+class SMoSRModel:
+    """Direct-shuffle 2x SMoSR payload (schema 1)."""
+
+    input_channels: int
+    output_channels: int
+    scale: int
+    reflection_padding: int
+    base_channels: int
+    first_blocks: int
+    middle_blocks: int
+    end_blocks: int
     weight_bytes: int
     checkpoint: str
 
@@ -252,7 +297,7 @@ class ModelInfo:
     schema: int
     digest: str
     sections: tuple[ModelSection, ...]
-    payload: GateRV3Model | GateRV2Model | MoESRModel | GFISRv2Model | None = None
+    payload: GateRV3Model | GateRV2Model | MoESRModel | GFISRv2Model | SMoSRModel | None = None
     problems: tuple[str, ...] = ()
 
     @property
@@ -338,6 +383,8 @@ def peek_model(path: PathArg) -> ModelInfo:
         payload = _read_moesr(schema, contents.get(1), contents.get(2), weights, contents.get(4), problems)
     elif family_name == "gfisrv2":
         payload = _read_gfisrv2(schema, contents.get(1), contents.get(2), weights, contents.get(4), problems)
+    elif family_name == "smosr":
+        payload = _read_smosr(schema, contents.get(1), contents.get(2), weights, contents.get(4), problems)
     return ModelInfo(
         path=model,
         size=size,
@@ -536,6 +583,29 @@ def _read_moesr(
         if table is None and expected == weight_bytes:
             return MoESRModel(*MOESR_CONFIG, weight_bytes, checkpoint.hex())
         problems.append("Invalid MoESR weight layout")
+    return None
+
+
+def _read_smosr(
+    schema: int,
+    architecture: bytes | None,
+    table: bytes | None,
+    weight_bytes: int,
+    checkpoint: bytes | None,
+    problems: list[str],
+) -> SMoSRModel | None:
+    if schema != SCHEMAS["smosr"]:
+        problems.append("Unsupported SMoSR model payload version")
+    elif architecture != SMOSR_ARCHITECTURE.pack(*SMOSR_CONFIG) or checkpoint is None or len(checkpoint) != DIGEST_SIZE:
+        problems.append("Unsupported SMoSR model architecture or checkpoint metadata")
+    else:
+        expected = 0
+        for cin, cout, k in SMOSR_FILTERS:
+            for size in (cin * cout * k * k * 2, cout * 4):
+                expected = (expected + 255) // 256 * 256 + size
+        if table is None and expected == weight_bytes:
+            return SMoSRModel(*SMOSR_CONFIG, weight_bytes, checkpoint.hex())
+        problems.append("Invalid SMoSR weight layout")
     return None
 
 

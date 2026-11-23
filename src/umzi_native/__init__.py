@@ -3,7 +3,16 @@
 from __future__ import annotations
 
 from ._loader import load_cuda_libraries
-from ._model import GateRV2Model, GateRV3Model, GFISRv2Model, ModelInfo, ModelSection, MoESRModel, peek_model
+from ._model import (
+    GateRV2Model,
+    GateRV3Model,
+    GFISRv2Model,
+    ModelInfo,
+    ModelSection,
+    MoESRModel,
+    SMoSRModel,
+    peek_model,
+)
 from ._session import InferenceSession, SessionOptions, TensorInfo
 
 __all__ = [
@@ -14,6 +23,7 @@ __all__ = [
     "MoESRModel",
     "ModelInfo",
     "ModelSection",
+    "SMoSRModel",
     "SessionOptions",
     "TensorInfo",
     "load_cuda_libraries",

@@ -14,6 +14,7 @@ kernels, and CUDA Graph replay.
 | **GateRV2** | `mixed`, `fp16` | Tuned cuBLASLt/cuDNN plans with optional fast cold start |
 | **MoESR** | `mixed`, `fp16` | Custom fused tensor-core gate and depthwise kernels |
 | **GFISRv2** | `fp32`, `mixed`, `fp16` | Also requires cuFFT 12 at runtime |
+| **SMoSR** | `mixed`, `fp16` | 2× direct pixel shuffle with CUDA Graph support |
 
 See [Supported checkpoints and export options](docs/export.md) for the exact
 checkpoint topologies accepted by the exporter, and the
@@ -117,6 +118,8 @@ with umzi.InferenceSession("model.ummodel", sess_options=options) as session:
 - [Changelog](CHANGELOG.md)
 
 ### Runtime & architecture design
+- [Adding new model kernels](docs/adding-new-kernels.md)
+- [SMoSR implementation and baseline](docs/handoff-smosr.md)
 - [Multi-kernel runtime and `.ummodel` format spec](docs/umzi-native-runtime-plan.md)
 - [GateRV2, MoESR, and GFISRv2 architecture expansion](docs/umzi-native-architecture-expansion.md)
 - [Built-in model exporter design](docs/umzi-model-exporter-plan.md)

@@ -13,7 +13,6 @@ Follows the umzi-bench unified-matrix contract on samples/mscale/lb-page-003.png
 from __future__ import annotations
 
 import argparse
-import ctypes
 import gc
 import hashlib
 import json
@@ -25,7 +24,6 @@ import statistics
 import struct
 import subprocess
 import sys
-import threading
 import time
 import zlib
 from collections.abc import Callable
@@ -38,6 +36,7 @@ import torch
 from benchmark_architectures import METRIC, ROOT, digest, ssimulacra2
 from PIL import Image
 from reference.native_session import DeviceSession
+from reference.nvml import MIB, Nvml, NvmlSampler
 from torch import Tensor
 from torch.nn import functional
 
@@ -51,7 +50,6 @@ EXPECTED_PAGE_SHA256 = "528addf2f7cbe2de28fe1ae8f17135779c96ac7b62e5ed4322c69737
 TILE = 128
 OVERLAP = 32
 SCALE = 4
-MIB = 2**20
 
 
 @dataclass(frozen=True)
@@ -237,80 +235,6 @@ class TorchHostRunner:
     @torch.inference_mode()
     def __call__(self, tensor: Tensor) -> Tensor:
         return self.model(tensor.to(device="cuda", dtype=self.dtype)).float().cpu()
-
-
-class _MemoryInfo(ctypes.Structure):
-    _fields_ = [(name, ctypes.c_ulonglong) for name in ("total", "free", "used")]
-
-
-class Nvml:
-    def __init__(self) -> None:
-        self.library = ctypes.CDLL("C:/Windows/System32/nvml.dll")
-        self.library.nvmlInit_v2.restype = ctypes.c_int
-        self.library.nvmlDeviceGetHandleByIndex_v2.argtypes = [ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p)]
-        self.library.nvmlDeviceGetMemoryInfo.argtypes = [ctypes.c_void_p, ctypes.POINTER(_MemoryInfo)]
-        self._check(self.library.nvmlInit_v2())
-        self.handle = ctypes.c_void_p()
-        self._check(self.library.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(self.handle)))
-
-    @staticmethod
-    def _check(status: int) -> None:
-        if status:
-            raise RuntimeError(f"NVML memory query failed: {status}")
-
-    def read(self) -> dict[str, float]:
-        info = _MemoryInfo()
-        self._check(self.library.nvmlDeviceGetMemoryInfo(self.handle, ctypes.byref(info)))
-        return {"used_mib": info.used / MIB, "total_mib": info.total / MIB}
-
-    def close(self) -> None:
-        self._check(self.library.nvmlShutdown())
-
-
-class NvmlSampler:
-    def __init__(self, nvml: Nvml, interval: float = 0.005) -> None:
-        self.nvml = nvml
-        self.interval = interval
-        self.samples: list[list[float]] = []
-        self.done = threading.Event()
-        self.error: Exception | None = None
-        self.start = 0.0
-        self.thread: threading.Thread | None = None
-
-    def _sample(self) -> None:
-        self.samples.append([time.perf_counter() - self.start, self.nvml.read()["used_mib"]])
-
-    def _loop(self) -> None:
-        try:
-            while not self.done.wait(self.interval):
-                self._sample()
-        except Exception as error:
-            self.error = error
-
-    def __enter__(self) -> NvmlSampler:
-        self.start = time.perf_counter()
-        self._sample()
-        self.thread = threading.Thread(target=self._loop, daemon=True)
-        self.thread.start()
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        self.done.set()
-        if self.thread is not None:
-            self.thread.join()
-        self._sample()
-        if self.error is not None:
-            raise self.error
-
-    def report(self, background: float) -> dict[str, Any]:
-        values = [value for _, value in self.samples]
-        return {
-            "device_peak_mib": max(values),
-            "device_median_mib": statistics.median(values),
-            "peak_above_pre_context_background_mib": max(values) - background,
-            "samples": len(values),
-            "requested_sampling_interval_ms": self.interval * 1000,
-        }
 
 
 def configure_runtime() -> None:

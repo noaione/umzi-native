@@ -11,6 +11,7 @@ KernelFactory kernel_factory(uint32_t family) {
         case gfisrv2_id: return make_gfisrv2;
         case gaterv2_id: return make_gaterv2;
         case moesr_id: return make_moesr;
+        case smosr_id: return make_smosr;
 #ifdef UMZI_TEST_KERNEL
         case 0xffff0001u: return make_test_kernel;
 #endif

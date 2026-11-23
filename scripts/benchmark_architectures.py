@@ -14,6 +14,7 @@ import subprocess
 import time
 import traceback
 from collections.abc import Callable, Iterator
+from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from hashlib import file_digest
 from importlib.metadata import version
@@ -25,14 +26,18 @@ import torch
 from benchmark import IMAGE_EXTS, ROOT, image_tensor, tensor_image
 from PIL import Image
 from reference.gaterv2 import use_fp32_attention
+from reference.native_session import DeviceSession
+from reference.nvml import Nvml, NvmlSampler
 from rtx_session import create_rtx_session
 from torch import Tensor
 from torch.nn import functional
 
+from umzi_native import InferenceSession, SessionOptions, peek_model
 from umzi_native.exporter._loader import load_checkpoint
 
 METRIC = Path(r"C:\Tools\imaging\ssimulacra2.exe")
-BACKENDS = ("fp32", "inductor", "inductor-attention-fp32", "rtx", "supplied", "eager-fp16")
+NATIVE_BACKENDS = ("native-mixed", "native-fp16")
+BACKENDS = ("fp32", "inductor", "inductor-attention-fp32", "rtx", "supplied", "eager-fp16", *NATIVE_BACKENDS)
 RTX_WORKSPACE_BYTES = 512 * 2**20
 
 
@@ -51,6 +56,7 @@ FAMILIES = {
     "gaterv2": Family("1x_umzi_dehalftone_gater2_v1_smooth.safetensors", "GateRV2", "halftone", 1, 128, 16),
     "moesr": Family("4x_dwtp_ds_moesr_v2.pth", "MoESR", "mscale", 4, 256, 2),
     "gfisrv2": Family("4x_wtp_MangaScale_GfisrV2.pth", "GFISRV2", "mscale", 4, 256, 2, 32),
+    "smosr": Family("2x_enhancr_da_smosr_v1.safetensors", "SMoSR", "2x-test", 2, 256, 1),
 }
 
 
@@ -288,7 +294,10 @@ def timed_page(
             stitch(output, part, top, left, scale, feather)
     latencies: list[dict[str, Any]] = []
     for index, (top, left) in enumerate(coords):
-        _, elapsed = runners[1].measure(extract(image, top, left, tile))
+        if batch == 1:
+            elapsed = calls[index]
+        else:
+            _, elapsed = runners[1].measure(extract(image, top, left, tile))
         latencies.append({
             "image": label,
             "tile_index": index,
@@ -305,6 +314,7 @@ def timed_page(
         "real_tiles": len(coords),
         "submitted_tiles": len(calls) * batch,
         "batch_inference_seconds": seconds,
+        "image_inference_ms": seconds * 1000,
         "batch_input_mpx_per_second": height * width / seconds / 1e6,
         "batch_call_seconds": calls,
         "average_batch1_tile_latency_ms": statistics.mean(sample["milliseconds"] for sample in latencies),
@@ -552,6 +562,10 @@ def summarize(pages: list[dict[str, Any]]) -> dict[str, Any]:
         "real_tiles": len(latencies),
         "submitted_tiles": sum(page["submitted_tiles"] for page in pages),
         "average_batch1_tile_latency_ms": statistics.mean(latencies),
+        "median_image_inference_ms": statistics.median(page["batch_inference_seconds"] * 1000 for page in pages),
+        "median_image_average_batch1_tile_latency_ms": statistics.median(
+            page["average_batch1_tile_latency_ms"] for page in pages
+        ),
     }
     if all("ssimulacra2" in page for page in pages):
         values = sum(page["values"] for page in pages)
@@ -562,6 +576,11 @@ def summarize(pages: list[dict[str, Any]]) -> dict[str, Any]:
             max_abs=max(page["max_abs"] for page in pages),
             ssimulacra2_mean=statistics.mean(page["ssimulacra2"] for page in pages),
             ssimulacra2_min=min(page["ssimulacra2"] for page in pages),
+        )
+    if all("vram" in page for page in pages):
+        summary["peak_page_device_used_mib"] = max(page["vram"]["device_peak_mib"] for page in pages)
+        summary["peak_page_above_background_mib"] = max(
+            page["vram"]["peak_above_setup_background_mib"] for page in pages
         )
     return summary
 
@@ -575,6 +594,8 @@ def main() -> None:
     parser.add_argument("--overlap", type=int, help="Override the family's default tile overlap in input pixels")
     parser.add_argument("--input", type=Path, help="Override the family's default sample directory")
     parser.add_argument("--output", type=Path, default=ROOT / "output/architecture-baselines")
+    parser.add_argument("--native-model", type=Path, help="Exported SMoSR .ummodel")
+    parser.add_argument("--native-library", type=Path, help="Umzi session library for the native backend")
     args = parser.parse_args()
     family = FAMILIES[args.family]
     if args.overlap is not None:
@@ -590,6 +611,9 @@ def main() -> None:
         parser.error("Only MoESR has a supplied graph")
     if args.backend == "inductor-attention-fp32" and args.family != "gaterv2":
         parser.error("The FP32 attention candidate requires GateRV2")
+    native = args.backend in NATIVE_BACKENDS
+    if native and (args.family != "smosr" or batch != 1 or not args.native_model or not args.native_library):
+        parser.error("Native baselines require SMoSR batch 1, --native-model, and --native-library")
     os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
     torch.set_num_threads(2)
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -645,6 +669,8 @@ def main() -> None:
         "vram": {"free_before_bytes": torch.cuda.mem_get_info()[0]},
     }
     reference = args.backend == "fp32"
+    stack = ExitStack()
+    session = None
 
     def save() -> None:
         path = directory / "report.json"
@@ -654,6 +680,12 @@ def main() -> None:
 
     save()
     try:
+        # Match the CUDA device even when CUDA_VISIBLE_DEVICES remaps its index.
+        device_uuid = str(torch.cuda.get_device_properties(0).uuid)
+        nvml = Nvml(device_uuid if device_uuid.startswith("GPU-") else f"GPU-{device_uuid}")
+        stack.callback(nvml.close)
+        background = nvml.read()
+        report["vram"]["before_backend_setup"] = background
         if not reference:
             previous = json.loads((base / "fp32" / "report.json").read_text(encoding="utf-8"))
             if previous["status"] != "complete" or previous["config"] != signature:
@@ -666,6 +698,24 @@ def main() -> None:
             return
         if args.backend == "rtx":
             runners = rtx_runners(checkpoint, directory, family, batch, report)
+        elif native:
+            packaged = peek_model(args.native_model)
+            if (
+                not packaged.supported
+                or packaged.family_name != args.family
+                or getattr(packaged.payload, "checkpoint", None) != signature["checkpoint_sha256"]
+            ):
+                raise ValueError("The native package must match the benchmark checkpoint")
+            _, precision = args.backend.split("-", 1)
+            report["native"] = {
+                "precision": precision,
+                "package_sha256": packaged.digest,
+                "library_sha256": digest(args.native_library),
+            }
+            options = SessionOptions(precision=precision, dll_path=args.native_library)
+            session = stack.enter_context(InferenceSession(args.native_model, options))
+            device_runner = DeviceSession(session)
+            runners = {1: Runner(device_runner, device_runner.dtype)}
         else:
             runners = torch_runners(checkpoint, family, batch, args.backend, report)
         if reference:
@@ -674,9 +724,18 @@ def main() -> None:
         stress_comparisons = {label: row for label, row in report["stress"].items() if row.get("mse") is not None}
         if stress_comparisons:
             report["worst_stress_psnr"] = max(stress_comparisons, key=lambda label: stress_comparisons[label]["mse"])
+        if session is not None:
+            shape = (1, 3, family.tile, family.tile)
+            session.prepare(shape)
+            runners[1].measure(torch.zeros(shape))
+            report["setup"]["1"] = session.get_session_info()
         save()
         for path in paths:
-            row, output = timed_page(read_image(path), path.name, runners, family, batch)
+            image = read_image(path)
+            with NvmlSampler(nvml) as memory:
+                row, output = timed_page(image, path.name, runners, family, batch)
+            row["vram"] = memory.report(background["used_mib"])
+            row["vram"]["peak_above_setup_background_mib"] = row["vram"].pop("peak_above_pre_context_background_mib")
             png = directory / f"{path.stem}.png"
             if reference:
                 if not torch.isfinite(output).all():
@@ -714,6 +773,7 @@ def main() -> None:
             torch_peak_reserved_bytes=torch.cuda.max_memory_reserved(),
             free_after_bytes=torch.cuda.mem_get_info()[0],
         )
+        stack.close()
         save()
         print(f"{report['status']}: {directory / 'report.json'}", flush=True)
     if report["status"] != "complete":
