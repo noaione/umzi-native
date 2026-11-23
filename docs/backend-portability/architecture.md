@@ -3,6 +3,17 @@
 **Status:** Long-term design sketch. See the [GateRV3 prototype](gaterv3-mac.md) for the current ABI, runtime, and tested behavior.
 **Companion:** [roadmap](README.md) · [validation](validation.md)
 
+## Current Vulkan source layout
+
+| Path | Responsibility |
+| --- | --- |
+| `native/vulkan/runtime/` | Host C ABI and model-family registry. Dispatches packages to a Vulkan kernel session. |
+| `native/vulkan/common/` | Vulkan devices and buffers, compute commands and pipelines, and reusable GLSL buffer and math helpers. |
+| `native/vulkan/kernels/gaterv3/` | GateRV3 runner, option handling, schedule, stage profiling, and shaders. Its CMake file builds the family's embedded SPIR-V. |
+| `native/kernels/gaterv3/model_file.h` | GateRV3 package and schedule parsing shared with CUDA. |
+
+Add each Vulkan model family under `native/vulkan/kernels/` and register its factory in `native/vulkan/runtime/registry.cpp`. Keep model-specific push constants and shader dispatch in the family directory. [GateRV3 kernel options](gaterv3-vulkan-optimization.md#gaterv3-kernel-options)
+
 ## 1. Architectural principles
 
 1. **Preserve the `.ummodel` contract.** Family IDs, section metadata, checkpoint digests, weights and exported schedules remain readable on CPU without a GPU runtime.

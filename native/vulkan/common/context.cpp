@@ -117,7 +117,7 @@ std::vector<Adapter> Context::adapters() const {
     return supported;
 }
 
-void Context::open_device(const Adapter& adapter, bool enable_half) {
+void Context::open_device(const Adapter& adapter, bool storage16, bool arithmetic16) {
     vkGetPhysicalDeviceMemoryProperties(adapter.handle, &memory);
     VkPhysicalDeviceProperties props{};
     vkGetPhysicalDeviceProperties(adapter.handle, &props);
@@ -131,9 +131,9 @@ void Context::open_device(const Adapter& adapter, bool enable_half) {
     VkDeviceCreateInfo info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     VkPhysicalDeviceVulkan12Features features12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     VkPhysicalDeviceVulkan11Features features11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &features12};
-    if (enable_half) {
-        features12.shaderFloat16 = VK_TRUE;
-        features11.storageBuffer16BitAccess = VK_TRUE;
+    if (storage16 || arithmetic16) {
+        features12.shaderFloat16 = arithmetic16;
+        features11.storageBuffer16BitAccess = storage16;
         info.pNext = &features11;
     }
     info.queueCreateInfoCount = 1;

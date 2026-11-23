@@ -6,9 +6,35 @@ GateRV3 Original and IDC use the same `.ummodel` files and FP32 NumPy input and 
 | --- | --- | --- |
 | `fp32` | FP32 | FP32 throughout, using packed FP16 checkpoint weights |
 | `mixed` | FP16 on capable devices | FP32 arithmetic, with FP16 rounding at the same operation boundaries as the reference |
-| `fp16` | FP16 | Native FP16 fused multiply-add for 16-term partial sums in dense convolutions and projections, merged in FP32 |
+| `fp16` | FP16 on capable devices | Native FP16 fused multiply-add for 16-term partial sums in dense convolutions and projections, merged in FP32 |
 
-The FP16 path leaves normalization, pooling, attention, and gate accumulation in FP32. It requires `shaderFloat16` and `storageBuffer16BitAccess`. Mixed mode uses FP32 storage with explicit FP16 rounding on devices without those features. The default precision is mixed. Use `kernel_options={"reference": 1}` to select the original FP32 or mixed Vulkan kernels.
+The FP16 path requires `shaderFloat16` and keeps normalization, pooling, attention, and gate accumulation in FP32. Native FP16 storage additionally uses `storageBuffer16BitAccess`. Without native half storage, mixed and FP16 modes store rounded intermediates in FP32. The default precision is mixed.
+
+## GateRV3 kernel options
+
+Set any optimization to `0` in `SessionOptions.kernel_options` to disable it for one session. Each option accepts `0` or `1`. `session.get_session_info()["diagnostics"]` reports the effective settings after checking the precision and device capabilities.
+
+| Option | Default | Behavior |
+| --- | ---: | --- |
+| `fast_convolution` | 1 | Uses the specialized 1×1 and 3×3 shaders. Set to 0 for the reference convolution in mixed or FP32 mode. The FP16 arithmetic path requires the specialized shader. |
+| `fp16_storage` | 1 | Packs activations in FP16 in mixed and FP16 modes on devices with half storage support. Set to 0 for FP32 activation storage with FP16 rounding. The session's selected arithmetic mode still applies. |
+| `fuse_silu` | 1 | Fuses eligible 3×3 convolutions with SiLU when `fast_convolution` is enabled. |
+| `subgroup_norm` | 1 | Uses subgroup RMSNorm on devices with 32-lane compute subgroup arithmetic. Set to 0 for shared-memory RMSNorm. |
+| `fuse_residual_norm` | 1 | Fuses eligible residual operations with RMSNorm when `subgroup_norm` is active. |
+| `chunked_mean` | 1 | Splits spatial pooling over chunks. Set to 0 for the original spatial reduction. |
+| `paired_gates` | 1 | Processes local and Inception gates in channel pairs. Set to 0 for scalar gate shaders. |
+| `reference` | 0 | Set to 1 to disable the optimizations as a group and select the original mixed or FP32 path. |
+| `profile` | 0 | Set to 1 to collect per-operation GPU timestamps on queues that support them. |
+
+```python
+options = SessionOptions(
+    backend="vulkan",
+    precision="fp16",
+    kernel_options={"fuse_silu": 0, "fp16_storage": 0},
+)
+```
+
+For an A/B benchmark, repeat `--vulkan-option NAME=0` for each option you want to disable. The JSON report saves the requested settings and the effective diagnostics.
 
 ## Gains to carry forward
 

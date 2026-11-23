@@ -66,7 +66,7 @@ def main() -> None:
     for index in args.device or list(range(len(devices))):
         precision_outputs = []
         precisions = ["fp32", "mixed"]
-        if devices[index]["shader_float16"] and devices[index]["storage_buffer16"]:
+        if devices[index]["shader_float16"]:
             precisions.append("fp16")
         for precision in precisions:
             options = SessionOptions(backend="vulkan", precision=precision, device_id=index, dll_path=args.library)

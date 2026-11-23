@@ -1,60 +1,75 @@
-#include "session.h"
+#include "../../common/compute.h"
+#include "../../runtime/kernel.h"
+#include "../../../kernels/gaterv3/model_file.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <span>
+#include <string_view>
 
 namespace {
+using umzi::vk::barrier;
+using umzi::vk::begin;
 using umzi::vk::Buffer;
+using umzi::vk::create_pipeline;
+using umzi::vk::dispatch;
 using umzi::vk::check;
 using umzi::vk::Context;
 
 constexpr uint32_t conv_code[]{
-#include "conv_spv.h"
+#include "gaterv3_conv_spv.h"
+};
+constexpr uint32_t conv_half_code[]{
+#include "gaterv3_conv_half_spv.h"
 };
 constexpr uint32_t element_code[]{
-#include "element_spv.h"
+#include "gaterv3_element_spv.h"
 };
 constexpr uint32_t reduce_code[]{
-#include "reduce_spv.h"
+#include "gaterv3_reduce_spv.h"
 };
 constexpr uint32_t attention_code[]{
-#include "attention_spv.h"
+#include "gaterv3_attention_spv.h"
 };
 constexpr uint32_t conv_fast_code[]{
-#include "conv_fast_spv.h"
+#include "gaterv3_conv_fast_spv.h"
 };
 constexpr uint32_t conv_fast_half_code[]{
-#include "conv_fast_half_spv.h"
+#include "gaterv3_conv_fast_half_spv.h"
 };
 constexpr uint32_t conv_native_half_code[]{
-#include "conv_native_half_spv.h"
+#include "gaterv3_conv_native_half_spv.h"
+};
+constexpr uint32_t conv_native_half_fp32_storage_code[]{
+#include "gaterv3_conv_native_half_fp32_storage_spv.h"
 };
 constexpr uint32_t element_half_code[]{
-#include "element_half_spv.h"
+#include "gaterv3_element_half_spv.h"
 };
 constexpr uint32_t reduce_half_code[]{
-#include "reduce_half_spv.h"
+#include "gaterv3_reduce_half_spv.h"
 };
 constexpr uint32_t attention_half_code[]{
-#include "attention_half_spv.h"
+#include "gaterv3_attention_half_spv.h"
 };
 constexpr uint32_t mean_fast_code[]{
-#include "mean_fast_spv.h"
+#include "gaterv3_mean_fast_spv.h"
 };
 constexpr uint32_t mean_fast_half_code[]{
-#include "mean_fast_half_spv.h"
+#include "gaterv3_mean_fast_half_spv.h"
 };
 constexpr uint32_t norm_fast_code[]{
-#include "norm_fast_spv.h"
+#include "gaterv3_norm_fast_spv.h"
 };
 constexpr uint32_t norm_fast_half_code[]{
-#include "norm_fast_half_spv.h"
+#include "gaterv3_norm_fast_half_spv.h"
 };
 constexpr uint32_t gates_code[]{
-#include "gates_spv.h"
+#include "gaterv3_gates_spv.h"
 };
 constexpr uint32_t gates_half_code[]{
-#include "gates_half_spv.h"
+#include "gaterv3_gates_half_spv.h"
 };
 
 struct Push {
@@ -66,8 +81,62 @@ static_assert(sizeof(Push) == 96);
 
 enum PipelineIndex {
     convolution, convolution_spatial, convolution_silu, elementwise, reduction, attention,
-    spatial_mean, norm, local_gate, inception_gate,
+    spatial_mean, norm, local_gate, inception_gate, pipeline_count,
 };
+
+struct KernelOptions {
+    bool reference = false;
+    bool profile = false;
+    bool fast_convolution = true;
+    bool fp16_storage = true;
+    bool fuse_silu = true;
+    bool subgroup_norm = true;
+    bool fuse_residual_norm = true;
+    bool chunked_mean = true;
+    bool paired_gates = true;
+};
+
+struct KernelOption {
+    const char* name;
+    bool KernelOptions::*field;
+};
+constexpr KernelOption kernel_options[] = {
+    {"reference", &KernelOptions::reference},
+    {"profile", &KernelOptions::profile},
+    {"fast_convolution", &KernelOptions::fast_convolution},
+    {"fp16_storage", &KernelOptions::fp16_storage},
+    {"fuse_silu", &KernelOptions::fuse_silu},
+    {"subgroup_norm", &KernelOptions::subgroup_norm},
+    {"fuse_residual_norm", &KernelOptions::fuse_residual_norm},
+    {"chunked_mean", &KernelOptions::chunked_mean},
+    {"paired_gates", &KernelOptions::paired_gates},
+};
+
+KernelOptions read_options(const UmziSessionOptions& config) {
+    KernelOptions options;
+    uint32_t seen = 0;
+    for (uint32_t i = 0; i < config.kernel_option_count; ++i) {
+        const auto& option = config.kernel_options[i];
+        const std::string_view name(option.name ? option.name : "");
+        const auto match = std::find_if(std::begin(kernel_options), std::end(kernel_options),
+                                        [&](const auto& item) { return name == item.name; });
+        if (match == std::end(kernel_options))
+            throw std::runtime_error("Unknown Vulkan GateRV3 option: " + std::string(name));
+        const uint32_t bit = 1u << (match - std::begin(kernel_options));
+        if ((seen & bit) || (option.value != 0 && option.value != 1))
+            throw std::runtime_error("Duplicate or invalid Vulkan GateRV3 option: " + std::string(name));
+        seen |= bit;
+        options.*match->field = option.value != 0;
+    }
+    if (options.reference) {
+        for (const auto& option : kernel_options) {
+            if (option.field != &KernelOptions::reference && option.field != &KernelOptions::profile)
+                options.*option.field = false;
+        }
+    }
+    return options;
+}
+
 constexpr int mean_projection = 18;
 constexpr int conv3_stage = 19;
 constexpr int fused_norm_stage = 20;
@@ -92,59 +161,51 @@ bool equal(gt::Shape a, gt::Shape b) {
     return a.n == b.n && a.h == b.h && a.w == b.w;
 }
 
-void begin(VkCommandBuffer command, VkCommandBufferUsageFlags flags = 0) {
-    VkCommandBufferBeginInfo info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    info.flags = flags;
-    check(vkBeginCommandBuffer(command, &info), "Begin Vulkan command buffer");
-}
-
-void barrier(VkCommandBuffer command, VkPipelineStageFlags src, VkPipelineStageFlags dst,
-             VkAccessFlags read_from, VkAccessFlags write_to) {
-    VkMemoryBarrier dependency{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, read_from, write_to};
-    vkCmdPipelineBarrier(command, src, dst, 0, 1, &dependency, 0, nullptr, 0, nullptr);
-}
-
 int ceil_div(int value, int divisor) {
     return (value - 1) / divisor + 1;
-}
-
-void dispatch(const Context& context, VkCommandBuffer command, int groups) {
-    const auto width = std::min<uint32_t>(groups, context.limits.maxComputeWorkGroupCount[0]);
-    const auto height = (groups - 1) / width + 1;
-    if (height > context.limits.maxComputeWorkGroupCount[1])
-        throw std::runtime_error("GateRV3 dispatch exceeds Vulkan workgroup count limits");
-    vkCmdDispatch(command, width, height, 1);
-}
-
-VkPipeline create_pipeline(VkDevice device, VkPipelineLayout layout, VkPipelineCache cache,
-                           std::span<const uint32_t> code, const VkSpecializationInfo* specialization = nullptr) {
-    VkShaderModuleCreateInfo shader{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    shader.codeSize = code.size_bytes();
-    shader.pCode = code.data();
-    VkShaderModule module{};
-    check(vkCreateShaderModule(device, &shader, nullptr, &module), "Create GateRV3 shader module");
-    VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-    info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-    info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    info.stage.module = module;
-    info.stage.pName = "main";
-    info.stage.pSpecializationInfo = specialization;
-    info.layout = layout;
-    VkPipeline pipeline{};
-    auto result = vkCreateComputePipelines(device, cache, 1, &info, nullptr, &pipeline);
-    vkDestroyShaderModule(device, module, nullptr);
-    if (result != VK_SUCCESS && pipeline) vkDestroyPipeline(device, pipeline, nullptr);
-    check(result, "Create GateRV3 Vulkan pipeline");
-    return pipeline;
 }
 
 int padding_index(int i, int original, int padded) {
     if (i < original) return i;
     return padded - original < original ? 2 * original - 2 - i : original - 1;
 }
-}
 
-struct UmziSession::Prepared {
+class GateRV3Session final : public umzi::vk::KernelSession {
+public:
+    GateRV3Session();
+    ~GateRV3Session() override;
+
+    void open(const umzi::ModelPackage& package, const UmziSessionOptions& config);
+    UmziModelInfo model_info() const override;
+    UmziIo tensors() const override;
+    UmziIo describe(const UmziShape& shape) const override;
+    void prepare_shape(const UmziShape& shape) override;
+    void run_host(const UmziShape& shape, const void* input, void* output) override;
+    UmziSessionInfo session_info() const override;
+    uint32_t diagnostic_count() const override;
+    UmziDiagnostic diagnostic(uint32_t index) const override;
+    const char* kernel_message() const override { return device_description.c_str(); }
+
+private:
+    struct Prepared;
+    Context context;
+    gt::ModelFile model;
+    Buffer weights;
+    VkDescriptorSetLayout descriptor_layout{};
+    VkPipelineLayout pipeline_layout{};
+    VkPipelineCache pipeline_cache{};
+    std::array<VkPipeline, pipeline_count> pipelines{};
+    std::unique_ptr<Prepared> prepared;
+    std::string device_description;
+    uint32_t precision{};
+    uint32_t timestamp_bits{};
+    KernelOptions options;
+
+    void prepare(gt::Shape shape);
+    void run(gt::Shape shape, const float* input, float* output);
+};
+
+struct GateRV3Session::Prepared {
     const Context& context;
     gt::Shape shape;
     Buffer arena, staging;
@@ -167,8 +228,8 @@ struct UmziSession::Prepared {
     }
 };
 
-UmziSession::UmziSession() = default;
-UmziSession::~UmziSession() {
+GateRV3Session::GateRV3Session() = default;
+GateRV3Session::~GateRV3Session() {
     prepared.reset();
     if (context.device) {
         for (auto pipeline : pipelines) vkDestroyPipeline(context.device, pipeline, nullptr);
@@ -178,42 +239,36 @@ UmziSession::~UmziSession() {
     }
 }
 
-void UmziSession::open(const char* path, const UmziSessionOptions& options) {
-    const auto started = Clock::now();
-    const std::string_view utf8_path(path);
-    const umzi::ModelPackage package(std::filesystem::path(std::u8string(utf8_path.begin(), utf8_path.end())));
-    if (package.family != umzi::gaterv3_id)
-        throw std::runtime_error("The Vulkan backend currently supports only GateRV3");
+void GateRV3Session::open(const umzi::ModelPackage& package, const UmziSessionOptions& config) {
     model.parse(package);
-    precision = options.precision;
-    for (uint32_t i = 0; i < options.kernel_option_count; ++i) {
-        const auto& option = options.kernel_options[i];
-        const std::string_view name(option.name ? option.name : "");
-        if ((name != "profile" && name != "reference") || (option.value != 0 && option.value != 1))
-            throw std::runtime_error("Vulkan kernel options are 'reference' and 'profile' (0 or 1)");
-        if (name == "profile") profile = option.value != 0;
-        if (name == "reference") reference = option.value != 0;
-    }
+    precision = config.precision;
+    options = read_options(config);
+    const bool fp16_math = precision == UMZI_FP16;
+    if (fp16_math && !options.fast_convolution)
+        throw std::runtime_error("Vulkan FP16 arithmetic requires the fast_convolution option");
 
     context.open_instance();
     const auto adapters = context.adapters();
-    if (options.device < 0 || size_t(options.device) >= adapters.size())
+    if (config.device < 0 || size_t(config.device) >= adapters.size())
         throw std::runtime_error("Vulkan device index is out of range; enumerate Vulkan GPU devices first");
-    const auto& selected = adapters[options.device];
+    const auto& selected = adapters[config.device];
     timestamp_bits = selected.timestamp_bits;
-    if (profile && !timestamp_bits) throw std::runtime_error("Selected Vulkan queue does not support timestamps");
+    if (options.profile && !timestamp_bits) throw std::runtime_error("Selected Vulkan queue does not support timestamps");
     const auto& device = selected.info;
-    half_storage = !reference && precision != UMZI_FP32 && device.shader_float16 && device.storage_buffer16;
-    subgroup_norm = !reference && selected.subgroup32_arithmetic;
-    if (precision == UMZI_FP16 && !half_storage)
-        throw std::runtime_error("Vulkan FP16 needs shaderFloat16 and storageBuffer16BitAccess with optimized kernels");
-    context.open_device(selected, half_storage);
+    options.fp16_storage &= precision != UMZI_FP32 && device.shader_float16 && device.storage_buffer16;
+    options.subgroup_norm &= selected.subgroup32_arithmetic;
+    options.fuse_residual_norm &= options.subgroup_norm;
+    options.fuse_silu &= options.fast_convolution;
+    if (fp16_math && !device.shader_float16)
+        throw std::runtime_error("Vulkan FP16 arithmetic requires shaderFloat16");
+    context.open_device(selected, options.fp16_storage, fp16_math || options.fp16_storage);
     device_description = std::string(device.device_name) + " / " + device.driver_name + " " + device.driver_info;
     const auto& limits = context.limits;
     if (limits.maxComputeWorkGroupInvocations < 64 || limits.maxComputeWorkGroupSize[0] < 64
-        || limits.maxComputeWorkGroupSize[1] < 8 || limits.maxComputeSharedMemorySize < (reference ? 4096u : 4224u)
+        || limits.maxComputeWorkGroupSize[1] < 8
+        || limits.maxComputeSharedMemorySize < (options.fast_convolution ? 4224u : 4096u)
         || limits.maxPushConstantsSize < sizeof(Push)
-        || limits.maxPerStageDescriptorStorageBuffers < (half_storage ? 3u : 2u))
+        || limits.maxPerStageDescriptorStorageBuffers < (options.fp16_storage ? 3u : 2u))
         throw std::runtime_error("Vulkan GPU does not meet GateRV3 compute limits");
 
     const size_t bytes = (model.weight_bytes + 3) & ~size_t(3);
@@ -243,7 +298,7 @@ void UmziSession::open(const char* path, const UmziSessionOptions& options) {
         {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
     };
     VkDescriptorSetLayoutCreateInfo descriptor{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    descriptor.bindingCount = half_storage ? 3 : 2;
+    descriptor.bindingCount = options.fp16_storage ? 3 : 2;
     descriptor.pBindings = bindings;
     check(vkCreateDescriptorSetLayout(context.device, &descriptor, nullptr, &descriptor_layout),
           "Create Vulkan descriptor layout");
@@ -264,10 +319,12 @@ void UmziSession::open(const char* path, const UmziSessionOptions& options) {
     auto build = [&](PipelineIndex index, Code code, const VkSpecializationInfo* specialize = nullptr) {
         pipelines[index] = create_pipeline(context.device, pipeline_layout, pipeline_cache, code, specialize);
     };
-    if (reference) {
-        build(convolution, conv_code);
+    const bool half_storage = options.fp16_storage;
+    if (!options.fast_convolution) {
+        build(convolution, half_storage ? Code(conv_half_code) : Code(conv_code));
     } else {
-        const Code code = precision == UMZI_FP16 ? Code(conv_native_half_code)
+        const Code code = fp16_math
+            ? (half_storage ? Code(conv_native_half_code) : Code(conv_native_half_fp32_storage_code))
             : (half_storage ? Code(conv_fast_half_code) : Code(conv_fast_code));
         const VkSpecializationMapEntry entries[]{
             {0, 0, sizeof(VkBool32)}, {1, sizeof(VkBool32), sizeof(VkBool32)},
@@ -278,33 +335,60 @@ void UmziSession::open(const char* path, const UmziSessionOptions& options) {
         const VkSpecializationInfo specialize_silu{2, entries, sizeof(silu), silu};
         build(convolution, code);
         build(convolution_spatial, code, &specialize);
-        build(convolution_silu, code, &specialize_silu);
-        build(spatial_mean, half_storage ? Code(mean_fast_half_code) : Code(mean_fast_code));
+        if (options.fuse_silu) build(convolution_silu, code, &specialize_silu);
+    }
+    if (options.chunked_mean) build(spatial_mean, half_storage ? Code(mean_fast_half_code) : Code(mean_fast_code));
+    if (options.paired_gates) {
         const Code gates = half_storage ? Code(gates_half_code) : Code(gates_code);
+        const VkSpecializationMapEntry entry{0, 0, sizeof(VkBool32)};
         const VkBool32 inception = VK_TRUE;
-        const VkSpecializationInfo specialize_inception{1, entries, sizeof(inception), &inception};
+        const VkSpecializationInfo specialize_inception{1, &entry, sizeof(inception), &inception};
         build(local_gate, gates);
         build(inception_gate, gates, &specialize_inception);
     }
-    if (subgroup_norm) build(norm, half_storage ? Code(norm_fast_half_code) : Code(norm_fast_code));
+    if (options.subgroup_norm) build(norm, half_storage ? Code(norm_fast_half_code) : Code(norm_fast_code));
     build(elementwise, half_storage ? Code(element_half_code) : Code(element_code));
     build(reduction, half_storage ? Code(reduce_half_code) : Code(reduce_code));
     build(attention, half_storage ? Code(attention_half_code) : Code(attention_code));
-    model_ms = elapsed(started);
 }
 
-void UmziSession::prepare(gt::Shape shape) {
+gt::Shape image_shape(const UmziShape& shape) {
+    if (shape.rank != 4 || shape.dimensions[1] != 3) throw std::runtime_error("GateRV3 expects RGB NCHW input");
+    return gt::Shape::checked(shape.dimensions[0], shape.dimensions[2], shape.dimensions[3]);
+}
+
+UmziIo rgb_tensors(const UmziShape& shape, uint64_t bytes) {
+    return {sizeof(UmziIo), {"input", shape, UMZI_FLOAT32, bytes}, {"output", shape, UMZI_FLOAT32, bytes}};
+}
+
+UmziModelInfo GateRV3Session::model_info() const { return {sizeof(UmziModelInfo), "gaterv3", 1, 0}; }
+
+UmziIo GateRV3Session::tensors() const { return rgb_tensors({4, {0, 3, 0, 0}}, 0); }
+
+UmziIo GateRV3Session::describe(const UmziShape& shape) const {
+    const auto dims = image_shape(shape);
+    model.check_shape(model.padded(dims));
+    return rgb_tensors(shape, dims.rgb_bytes(false));
+}
+
+void GateRV3Session::prepare_shape(const UmziShape& shape) { prepare(image_shape(shape)); }
+
+void GateRV3Session::run_host(const UmziShape& shape, const void* input, void* output) {
+    run(image_shape(shape), static_cast<const float*>(input), static_cast<float*>(output));
+}
+
+void GateRV3Session::prepare(gt::Shape shape) {
     const auto padded = model.padded(shape);
     if (prepared && equal(prepared->shape, padded)) return;
     const auto started = Clock::now();
-    const size_t element_bytes = half_storage ? sizeof(uint16_t) : sizeof(float);
+    const size_t element_bytes = options.fp16_storage ? sizeof(uint16_t) : sizeof(float);
     const auto resolved = model.resolve(padded, element_bytes);
     auto plan = std::make_unique<Prepared>(context, padded);
     const size_t rgb_bytes = padded.rgb_bytes(false);
-    size_t scratch_bytes = reference ? size_t(padded.n) * 256 * element_bytes : 0;
+    size_t scratch_bytes = options.chunked_mean ? 0 : size_t(padded.n) * 256 * element_bytes;
     std::vector<int> uses(resolved.tensors.size());
     for (const auto& op : model.ops) {
-        if (!reference && op.kind == gt::MeanProject) {
+        if (options.chunked_mean && op.kind == gt::MeanProject) {
             const auto& in = resolved.tensors[op.input[0]];
             scratch_bytes = std::max(scratch_bytes,
                 size_t(padded.n) * ceil_div(in.pixels(), mean_chunk) * in.c * sizeof(float));
@@ -322,7 +406,7 @@ void UmziSession::prepare(gt::Shape shape) {
     plan->arena.allocate(context, bytes, storage | src_transfer | dst_transfer, false);
     plan->staging.allocate(context, rgb_bytes * 2, src_transfer | dst_transfer, true);
 
-    const uint32_t descriptor_count = half_storage ? 3 : 2;
+    const uint32_t descriptor_count = options.fp16_storage ? 3 : 2;
     VkDescriptorPoolSize storage_size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, descriptor_count};
     VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pool.maxSets = 1;
@@ -356,7 +440,7 @@ void UmziSession::prepare(gt::Shape shape) {
     const auto recording = Clock::now();
     auto command = plan->command = context.allocate_command();
     begin(command);
-    if (profile) {
+    if (options.profile) {
         const auto count = uint32_t(model.ops.size() * 2 + 1);
         VkQueryPoolCreateInfo query{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
         query.queryType = VK_QUERY_TYPE_TIMESTAMP;
@@ -422,14 +506,14 @@ void UmziSession::prepare(gt::Shape shape) {
         push.kernel_size = op.x;
         push.channel_offset = op.y;
         push.mixed = precision != UMZI_FP32;
-        push.scratch = int(scratch_offset / (reference ? element_bytes : sizeof(float)));
+        push.scratch = int(scratch_offset / (options.chunked_mean ? sizeof(float) : element_bytes));
         const int pixels = padded.n * out.pixels();
         switch (op.kind) {
         case gt::Conv: {
             auto pipeline = convolution;
-            if (op.x == 3 && !reference) {
+            if (op.x == 3 && options.fast_convolution) {
                 pipeline = convolution_spatial;
-                if (next && next->kind == gt::Silu && uses[op.out] == 1) {
+                if (options.fuse_silu && next && next->kind == gt::Silu && uses[op.out] == 1) {
                     pipeline = convolution_silu;
                     push.output_offset = offset(next->out);
                     ++index;
@@ -439,15 +523,15 @@ void UmziSession::prepare(gt::Shape shape) {
             break;
         }
         case gt::Rms:
-            if (subgroup_norm) record(norm, push, ceil_div(pixels, 2));
+            if (options.subgroup_norm) record(norm, push, ceil_div(pixels, 2));
             else record(reduction, push, pixels);
             break;
         case gt::MeanProject: {
-            const auto pipeline = reference ? reduction : spatial_mean;
-            const int chunks = reference ? 1 : ceil_div(in.pixels(), mean_chunk);
+            const auto pipeline = options.chunked_mean ? spatial_mean : reduction;
+            const int chunks = options.chunked_mean ? ceil_div(in.pixels(), mean_chunk) : 1;
             record(pipeline, push, padded.n * (out.c / 8) * chunks);
             push.kind = mean_projection;
-            record(pipeline, push, reference ? ceil_div(padded.n * out.c, 64) : padded.n);
+            record(pipeline, push, options.chunked_mean ? padded.n : ceil_div(padded.n * out.c, 64));
             break;
         }
         case gt::Attention:
@@ -455,7 +539,7 @@ void UmziSession::prepare(gt::Shape shape) {
             break;
         case gt::Local:
         case gt::Inception:
-            if (!reference) {
+            if (options.paired_gates) {
                 record(op.kind == gt::Local ? local_gate : inception_gate, push,
                        ceil_div(padded.n * out.elements() / 2, 64));
                 break;
@@ -464,7 +548,7 @@ void UmziSession::prepare(gt::Shape shape) {
             break;
         case gt::LocalSkip:
         case gt::GlobalSkip:
-            if (subgroup_norm && next && next->kind == gt::Rms && next->input[1] >= 0) {
+            if (options.fuse_residual_norm && next && next->kind == gt::Rms && next->input[1] >= 0) {
                 push.offsets[3] = push.output_offset;
                 push.output_offset = offset(next->out);
                 push.weights[1] = next->weight[0];
@@ -492,7 +576,7 @@ void UmziSession::prepare(gt::Shape shape) {
     prepared = std::move(plan);
 }
 
-void UmziSession::run(gt::Shape shape, const float* input, float* output) {
+void GateRV3Session::run(gt::Shape shape, const float* input, float* output) {
     prepare(shape);
     auto& plan = *prepared;
     const auto padded = plan.shape;
@@ -552,11 +636,10 @@ void UmziSession::run(gt::Shape shape, const float* input, float* output) {
     }
 }
 
-void UmziSession::info(UmziSessionInfo& result) const {
-    result = {sizeof(result), UMZI_CACHE_DISABLED};
-    result.model_load_ms = model_ms;
+UmziSessionInfo GateRV3Session::session_info() const {
+    UmziSessionInfo result{sizeof(result), UMZI_CACHE_DISABLED};
     result.buffer_bytes[0] = weights.bytes;
-    if (!prepared) return;
+    if (!prepared) return result;
     const auto& plan = *prepared;
     const auto [n, h, w] = plan.shape;
     result.prepared_input = {4, {uint32_t(n), 3, uint32_t(h), uint32_t(w)}};
@@ -565,13 +648,31 @@ void UmziSession::info(UmziSessionInfo& result) const {
     result.buffer_bytes[3] = 2 * plan.rgb_bytes + plan.staging.bytes;
     result.shape_setup_ms[0] = plan.allocation_ms;
     result.shape_setup_ms[3] = plan.recording_ms;
+    return result;
 }
 
-uint32_t UmziSession::diagnostic_count() const { return profile ? 2 + uint32_t(profile_names.size()) : 1; }
+uint32_t GateRV3Session::diagnostic_count() const {
+    return 1 + uint32_t(std::size(kernel_options)) + (options.profile ? 1 + uint32_t(profile_names.size()) : 0);
+}
 
-UmziDiagnostic UmziSession::diagnostic(uint32_t index) const {
+UmziDiagnostic GateRV3Session::diagnostic(uint32_t index) const {
     if (index == 0) return {sizeof(UmziDiagnostic), "dispatches", prepared ? prepared->dispatch_count : 0};
-    if (index == 1) return {sizeof(UmziDiagnostic), "gpu_timestamps_valid", prepared && prepared->durations_valid};
-    const auto stage = index - 2;
-    return {sizeof(UmziDiagnostic), profile_names[stage], prepared ? prepared->durations[stage] : 0};
+    --index;
+    if (options.profile) {
+        if (index == 0) return {sizeof(UmziDiagnostic), "gpu_timestamps_valid", prepared && prepared->durations_valid};
+        --index;
+        if (index < profile_names.size())
+            return {sizeof(UmziDiagnostic), profile_names[index], prepared ? prepared->durations[index] : 0};
+        index -= uint32_t(profile_names.size());
+    }
+    const auto& option = kernel_options[index];
+    return {sizeof(UmziDiagnostic), option.name, options.*option.field};
+}
+} // namespace
+
+std::unique_ptr<umzi::vk::KernelSession> umzi::vk::make_gaterv3(
+    const umzi::ModelPackage& package, const UmziSessionOptions& options) {
+    auto kernel = std::make_unique<GateRV3Session>();
+    kernel->open(package, options);
+    return kernel;
 }

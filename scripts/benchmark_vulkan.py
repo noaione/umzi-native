@@ -205,7 +205,7 @@ def open_runner(args: argparse.Namespace, case: Case, batch: int) -> Generator[t
             device_id=case.device_index,
             precision=case.precision,
             dll_path=args.library,
-            kernel_options={"reference": 1} if args.vulkan_reference else {},
+            kernel_options=args.vulkan_options,
         )
         with InferenceSession(args.model, options) as session:
             session.prepare((batch, 3, TILE, TILE))
@@ -419,6 +419,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vulkan-device", type=int, action="append", help="Repeat for multiple Vulkan drivers")
     parser.add_argument("--vulkan-precision", choices=("mixed", "fp32", "fp16"), action="append")
     parser.add_argument("--vulkan-reference", action="store_true", help="Run the original Vulkan shader schedule")
+    parser.add_argument(
+        "--vulkan-option",
+        action="append",
+        default=[],
+        metavar="NAME=0|1",
+        help="Pass a Vulkan kernel option. Repeat to set multiple options.",
+    )
     parser.add_argument("--webgpu-precision", choices=("fp32", "fp16"), action="append")
     parser.add_argument("--skip-gpu-memory", action="store_true", help="Skip separate Metal memory runs")
     parser.add_argument("--torch-device", choices=("mps", "cuda"), default="mps")
@@ -432,8 +439,19 @@ def parse_args() -> argparse.Namespace:
         parser.error("--output is required for benchmarking")
     if args.warmup < 1:
         parser.error("--warmup must be positive")
-    if args.vulkan_reference and "fp16" in (args.vulkan_precision or ()):
-        parser.error("The Vulkan reference kernels support mixed and FP32")
+    options: dict[str, int] = {}
+    for entry in args.vulkan_option:
+        name, separator, value = entry.partition("=")
+        if not name or not separator or value not in ("0", "1") or name in options:
+            parser.error(f"Expected a unique Vulkan option in NAME=0|1 form, got {entry!r}")
+        options[name] = int(value)
+    if args.vulkan_reference:
+        if options.get("reference", 1) != 1:
+            parser.error("--vulkan-reference conflicts with reference=0")
+        options["reference"] = 1
+    args.vulkan_options = options
+    if "fp16" in (args.vulkan_precision or ()) and (options.get("reference") or not options.get("fast_convolution", 1)):
+        parser.error("Vulkan FP16 arithmetic requires fast_convolution and the optimized schedule")
     if not args.devices and "vulkan" in args.backends and args.model is None:
         parser.error("--model is required for Vulkan")
     return args
@@ -500,13 +518,18 @@ def main() -> int:
         args.library = find_session_library(args.model.resolve(), args.library, backend="vulkan")
         devices = {device["index"]: device for device in vulkan_devices(args.library)}
         report["vulkan_devices"] = list(devices.values())
-        report["vulkan_kernels"] = "reference" if args.vulkan_reference else "optimized"
+        report["vulkan_kernel_options"] = args.vulkan_options
+        report["vulkan_kernels"] = "reference" if args.vulkan_options.get("reference") else "optimized"
         for index in dict.fromkeys(args.vulkan_device or [0]):
             if index not in devices:
                 raise ValueError(f"Unavailable Vulkan device index {index}")
             precisions = ["mixed", "fp32"]
             info = devices[index]
-            if info["shader_float16"] and info["storage_buffer16"] and not args.vulkan_reference:
+            if (
+                info["shader_float16"]
+                and not args.vulkan_options.get("reference")
+                and args.vulkan_options.get("fast_convolution", 1)
+            ):
                 precisions.append("fp16")
             cases.extend(
                 Case("vulkan", precision, index) for precision in dict.fromkeys(args.vulkan_precision or precisions)

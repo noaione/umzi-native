@@ -16,7 +16,7 @@ float sampleInput(int pixel, int k, int cin) {
     if (x < 0 || x >= op.w || y < 0 || y >= op.h) return 0.0;
     int image = pixel / (op.h * op.w);
     int index = ((image * op.h + y) * op.w + x) * op.channels.x + op.channelOffset + k % cin;
-    return data[op.offsets.x + index];
+    return loadActivation(op.offsets.x + index);
 }
 
 void main() {
@@ -56,8 +56,8 @@ void main() {
         for (int j = 0; j < 4; ++j) {
             int channel = baseChannel + lx + 8 * j;
             if (channel < op.outputChannels)
-                data[op.outputOffset + pixel * op.outputChannels + channel] =
-                    rounded(sum[r][j] + weight(op.weights.y, channel));
+                storeActivation(op.outputOffset + pixel * op.outputChannels + channel,
+                                sum[r][j] + weight(op.weights.y, channel));
         }
     }
 }

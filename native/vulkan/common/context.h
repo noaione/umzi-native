@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../include/umzi_native_vulkan.h"
+#include "../../include/umzi_native_vulkan.h"
 #include <vulkan/vulkan.h>
 
 #include <stdexcept>
@@ -36,7 +36,7 @@ public:
 
     void open_instance();
     std::vector<Adapter> adapters() const;
-    void open_device(const Adapter& adapter, bool enable_half = false);
+    void open_device(const Adapter& adapter, bool storage16, bool arithmetic16);
     VkCommandBuffer allocate_command() const;
     void submit(VkCommandBuffer command) const;
 };

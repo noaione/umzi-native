@@ -1,4 +1,12 @@
-#include "session.h"
+#include "kernel.h"
+#include "../common/context.h"
+
+#include <chrono>
+
+struct UmziSession {
+    std::unique_ptr<umzi::vk::KernelSession> kernel;
+    double model_load_ms = 0;
+};
 
 namespace {
 thread_local std::string last_error;
@@ -27,15 +35,20 @@ int protect(Function invoke) noexcept {
     return last_status;
 }
 
-gt::Shape image_shape(const UmziShape* shape) {
-    require(shape && shape->rank == 4 && shape->dimensions[1] == 3, "GateRV3 expects RGB NCHW input");
-    return gt::Shape::checked(shape->dimensions[0], shape->dimensions[2], shape->dimensions[3]);
+umzi::vk::KernelSession& kernel(const UmziSession* session) {
+    require(session, "Missing Vulkan session");
+    return *session->kernel;
 }
 
-void fill_io(UmziIo* io, const UmziShape& shape, uint64_t bytes) {
-    require(io && io->struct_size == sizeof(*io), "Invalid Umzi I/O metadata structure");
-    io->input = {"input", shape, UMZI_FLOAT32, bytes};
-    io->output = {"output", shape, UMZI_FLOAT32, bytes};
+template<class T>
+void write(T* target, T value, const char* error) {
+    require(target && target->struct_size == sizeof(T), error);
+    *target = value;
+}
+
+const UmziShape& checked_shape(const UmziShape* shape) {
+    require(shape, "Missing Vulkan input shape");
+    return *shape;
 }
 }
 
@@ -73,8 +86,13 @@ UmziSession* umzi_session_open(const char* path, const UmziSessionOptions* optio
         require(options->flags == 0 && options->reserved == 0 && !options->cache_dir,
                 "Vulkan sessions do not accept CUDA graphs or disk caches");
         require(!options->kernel_option_count || options->kernel_options, "Missing Vulkan kernel options");
+        const auto started = std::chrono::steady_clock::now();
+        const std::string_view utf8_path(path);
+        const umzi::ModelPackage package(std::filesystem::path(std::u8string(utf8_path.begin(), utf8_path.end())));
         auto session = std::make_unique<UmziSession>();
-        session->open(path, *options);
+        session->kernel = umzi::vk::kernel_factory(package.family)(package, *options);
+        session->model_load_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - started).count();
         handle = session.release();
     });
     return handle;
@@ -83,68 +101,57 @@ UmziSession* umzi_session_open(const char* path, const UmziSessionOptions* optio
 void umzi_session_close(UmziSession* session) { delete session; }
 
 int umzi_session_model(const UmziSession* session, UmziModelInfo* info) {
-    return protect([&] {
-        require(session && info && info->struct_size == sizeof(*info), "Invalid Umzi model metadata request");
-        *info = {sizeof(*info), "gaterv3", 1, 0};
-    });
+    return protect([&] { write(info, kernel(session).model_info(), "Invalid Umzi model metadata request"); });
 }
 
 int umzi_session_tensors(const UmziSession* session, UmziIo* io) {
-    return protect([&] {
-        require(session, "Missing Vulkan session");
-        fill_io(io, {4, {0, 3, 0, 0}}, 0);
-    });
+    return protect([&] { write(io, kernel(session).tensors(), "Invalid Umzi I/O metadata structure"); });
 }
 
 int umzi_session_describe(const UmziSession* session, const UmziShape* shape, UmziIo* io) {
     return protect([&] {
-        require(session, "Missing Vulkan session");
-        const auto dims = image_shape(shape);
-        session->model.check_shape(session->model.padded(dims));
-        fill_io(io, *shape, dims.rgb_bytes(false));
+        write(io, kernel(session).describe(checked_shape(shape)), "Invalid Umzi I/O metadata structure");
     });
 }
 
 int umzi_session_prepare(UmziSession* session, const UmziShape* shape) {
-    return protect([&] {
-        require(session, "Missing Vulkan session");
-        session->prepare(image_shape(shape));
-    });
+    return protect([&] { kernel(session).prepare_shape(checked_shape(shape)); });
 }
 
 int umzi_session_run(UmziSession* session, const UmziShape* shape, const void* input, uint64_t input_bytes,
                      void* output, uint64_t output_bytes) {
     return protect([&] {
-        require(session && input && output, "Missing Vulkan session or host buffer");
-        const auto dims = image_shape(shape);
-        session->model.check_shape(session->model.padded(dims));
-        const auto bytes = dims.rgb_bytes(false);
-        require(input_bytes == bytes && output_bytes == bytes, "Invalid GateRV3 input or output byte count");
-        session->run(dims, static_cast<const float*>(input), static_cast<float*>(output));
+        require(input && output, "Missing Vulkan host buffer");
+        auto& implementation = kernel(session);
+        const auto& dimensions = checked_shape(shape);
+        const auto io = implementation.describe(dimensions);
+        require(input_bytes == io.input.bytes && output_bytes == io.output.bytes,
+                "Invalid Vulkan input or output byte count");
+        implementation.run_host(dimensions, input, output);
     });
 }
 
 int umzi_session_info(const UmziSession* session, UmziSessionInfo* info) {
     return protect([&] {
-        require(session && info && info->struct_size == sizeof(*info), "Invalid Umzi session information request");
-        session->info(*info);
+        auto value = kernel(session).session_info();
+        value.model_load_ms = session->model_load_ms;
+        write(info, value, "Invalid Umzi session information request");
     });
 }
 
 uint32_t umzi_session_diagnostic_count(const UmziSession* session) {
-    return session ? session->diagnostic_count() : 0;
+    return session ? session->kernel->diagnostic_count() : 0;
 }
 
 int umzi_session_diagnostic(const UmziSession* session, uint32_t index, UmziDiagnostic* diagnostic) {
     return protect([&] {
-        require(session && index < session->diagnostic_count() && diagnostic
-                && diagnostic->struct_size == sizeof(*diagnostic),
-                "Invalid Vulkan diagnostic request");
-        *diagnostic = session->diagnostic(index);
+        const auto& implementation = kernel(session);
+        require(index < implementation.diagnostic_count(), "Invalid Vulkan diagnostic index");
+        write(diagnostic, implementation.diagnostic(index), "Invalid Vulkan diagnostic request");
     });
 }
 
 const char* umzi_session_cache_message(const UmziSession*) { return "In-memory Vulkan pipeline cache per session"; }
 const char* umzi_session_kernel_message(const UmziSession* session) {
-    return session ? session->device_description.c_str() : "";
+    return session ? session->kernel->kernel_message() : "";
 }
