@@ -35,6 +35,7 @@ Shape checked(const UmziShape& input) {
 struct Filter {
     int cin, cout, k;
     size_t weight = 0, bias = 0;
+    size_t elements() const { return size_t(cin) * cout * k * k; }
 };
 
 struct Network {
@@ -43,29 +44,64 @@ struct Network {
     Filter end{features, features, 3}, tail{64, 16, 3};
     size_t bytes = 0;
 
-    Network() {
-        pack(rgb);
-        pack(first_skip);
+    explicit Network(size_t element_bytes = 2) {
+        pack(rgb, element_bytes);
+        pack(first_skip, element_bytes);
         for (size_t i = 0; i < blocks.size(); ++i) {
             auto& block = blocks[i];
             block = {{{i ? features : 8, features, 3}, {features, features, 3}, {features, 2 * features, 3}}};
-            for (auto& filter : block) pack(filter);
+            for (auto& filter : block) pack(filter, element_bytes);
         }
-        pack(end);
-        pack(tail);
+        pack(end, element_bytes);
+        pack(tail, element_bytes);
     }
 
-    void pack(Filter& f) {
+    void pack(Filter& f, size_t element_bytes) {
         f.weight = (bytes + 255) & ~size_t(255);
-        const auto end = f.weight + size_t(f.cin) * f.cout * f.k * f.k * 2;
+        const auto end = f.weight + f.elements() * element_bytes;
         f.bias = (end + 255) & ~size_t(255);
         bytes = f.bias + f.cout * sizeof(float);
     }
+
+    std::vector<char> device_weights(const Network& source, std::string_view data, bool fp32) const {
+        std::vector<char> result(bytes);
+        auto convert = [&](const Filter& from, const Filter& to) {
+            if (fp32) {
+                const int taps = to.k * to.k;
+                for (int out = 0; out < to.cout; ++out)
+                    for (int in = 0; in < to.cin; ++in)
+                        for (int tap = 0; tap < taps; ++tap) {
+                            const auto src = (out * taps + tap) * to.cin + in;
+                            const auto dst = (out * to.cin + in) * taps + tap;
+                            std::memcpy(result.data() + to.weight + dst * sizeof(float),
+                                        data.data() + from.weight + src * sizeof(float), sizeof(float));
+                        }
+            } else {
+                for (size_t i = 0; i < to.elements(); ++i) {
+                    float value;
+                    std::memcpy(&value, data.data() + from.weight + i * sizeof(float), sizeof(float));
+                    const auto half = umzi::float_to_half(value);
+                    if ((half & 0x7fff) >= 0x7c00) throw std::runtime_error("SMoSR weights exceed the finite FP16 range");
+                    std::memcpy(result.data() + to.weight + i * sizeof(half), &half, sizeof(half));
+                }
+            }
+            std::memcpy(result.data() + to.bias, data.data() + from.bias, to.cout * sizeof(float));
+        };
+        convert(source.rgb, rgb);
+        convert(source.first_skip, first_skip);
+        for (size_t i = 0; i < blocks.size(); ++i)
+            for (size_t j = 0; j < blocks[i].size(); ++j) convert(source.blocks[i][j], blocks[i][j]);
+        convert(source.end, end);
+        convert(source.tail, tail);
+        return result;
+    }
 };
 
-enum Kernel { PackF32, PackF16, InitActivations, Silu, Gate, Concat, ShuffleF32, ShuffleF16, KernelCount };
+enum Kernel { PackF32, PackF16, InitActivations, Silu, Gate, Concat, ShuffleF32, ShuffleF16,
+              PackFull, SiluFull, GateFull, ConcatFull, ShuffleFull, KernelCount };
 constexpr std::array<const char*, KernelCount> names{
-    "pack_f32", "pack_f16", "init_activations", "silu", "gated_residual", "concat", "shuffle_f32", "shuffle_f16"};
+    "pack_f32", "pack_f16", "init_activations", "silu", "gated_residual", "concat", "shuffle_f32", "shuffle_f16",
+    "pack_full", "silu_full", "gate_full", "concat_full", "shuffle_full"};
 enum Buffer { RgbInput, RgbSkip, Saved, State, Hidden, Activated, Projection, Joined, BufferCount };
 // Eager and captured dispatch share one stream, so dead activations can overlap.
 constexpr int rgb_offset = 0, saved_offset = 16, state_offset = saved_offset + features;
@@ -77,7 +113,7 @@ constexpr std::array<int, BufferCount> buffer_offsets{
 
 class Session final : public umzi::KernelSession {
     Network net;
-    bool fp16 = false, graph = false, pending = false;
+    bool fp16 = false, fp32 = false, graph = false, pending = false;
     CUdevice device{};
     CUcontext context = nullptr;
     CUmodule module = nullptr;
@@ -129,7 +165,8 @@ class Session final : public umzi::KernelSession {
         if (plans.find(key) != plans.end()) return;
         umzi::CudnnBackendPlan plan;
         plan.graph = std::make_unique<umzi::CudnnConvGraph>(
-            cudnn, padded.n, padded.h, padded.w, f.cin, f.cout, f.k, CUDNN_DATA_HALF, fp16);
+            cudnn, padded.n, padded.h, padded.w, f.cin, f.cout, f.k, fp32 ? CUDNN_DATA_FLOAT : CUDNN_DATA_HALF, fp16,
+            fp32 ? CUDNN_TENSOR_NCHW : CUDNN_TENSOR_NHWC);
         const bool tune = tune_convolutions && f.cin == features && f.k == 3;
         auto candidates = plan.graph->candidates(cudnn, tune ? 0 : limit, !tune);
         size_t selected = 0;
@@ -183,10 +220,17 @@ class Session final : public umzi::KernelSession {
     }
 
     void forward(CUdeviceptr input, CUdeviceptr output, CUstream target) {
-        const int pixels = shape.padded().pixels(), pairs = pixels * features / 2;
+        const auto padded = shape.padded();
+        const int area = padded.h * padded.w, pixels = padded.pixels(), elements = pixels * features;
+        const int pairs = elements / 2;
         const CUdeviceptr table = fp16 ? weights + net.bytes : 0;
+        auto activate = [&](CUdeviceptr out, CUdeviceptr bias) {
+            if (fp32) launch(target, SiluFull, elements, out, bias, area, elements);
+            else launch(target, Silu, pairs, out, bias, table, pairs);
+        };
         auto state = buffer[State], saved = buffer[Saved];
-        launch(target, fp16 ? PackF16 : PackF32, pixels * 8, buffer[RgbInput], input, shape.h, shape.w, pixels * 8);
+        launch(target, fp32 ? PackFull : fp16 ? PackF16 : PackF32,
+               pixels * 8, buffer[RgbInput], input, shape.h, shape.w, pixels * 8);
         conv(buffer[RgbSkip], buffer[RgbInput], net.rgb);
         conv(saved, buffer[RgbInput], net.first_skip);
         for (size_t i = 0; i < net.blocks.size(); ++i) {
@@ -194,21 +238,28 @@ class Session final : public umzi::KernelSession {
             const bool ends_middle = i + 1 == configuration[5] + configuration[6];
             const auto& block = net.blocks[i];
             conv(buffer[Hidden], i ? state : buffer[RgbInput], block[0]);
-            launch(target, Silu, pairs, buffer[Hidden], weights + block[0].bias, table, pairs);
+            activate(buffer[Hidden], weights + block[0].bias);
             conv(buffer[Activated], buffer[Hidden], block[1]);
-            launch(target, Silu, pairs, buffer[Activated], weights + block[1].bias, table, pairs);
+            activate(buffer[Activated], weights + block[1].bias);
             conv(buffer[Projection], buffer[Activated], block[2]);
-            launch(target, Gate, pairs, starts_middle ? saved : state, buffer[Projection], i ? state : saved,
-                   weights + block[2].bias, i ? CUdeviceptr(0) : weights + net.first_skip.bias,
-                   ends_middle ? saved : CUdeviceptr(0), table, pairs);
+            const auto out = starts_middle ? saved : state, shortcut = i ? state : saved;
+            const auto bias = weights + block[2].bias, shortcut_bias = i ? 0 : weights + net.first_skip.bias;
+            const auto middle = ends_middle ? saved : 0;
+            if (fp32) launch(target, GateFull, elements, out, buffer[Projection], shortcut, bias, shortcut_bias,
+                             middle, area, elements);
+            else launch(target, Gate, pairs, out, buffer[Projection], shortcut, bias, shortcut_bias,
+                        middle, table, pairs);
             if (starts_middle) std::swap(state, saved);
         }
         conv(buffer[Hidden], state, net.end);
-        launch(target, Concat, pixels * 32, buffer[Joined], buffer[RgbSkip], weights + net.rgb.bias,
-               buffer[Hidden], weights + net.end.bias, pixels * 32, fp16);
+        if (fp32) launch(target, ConcatFull, pixels * 64, buffer[Joined], buffer[RgbSkip], weights + net.rgb.bias,
+                         buffer[Hidden], weights + net.end.bias, area, pixels * 64);
+        else launch(target, Concat, pixels * 32, buffer[Joined], buffer[RgbSkip], weights + net.rgb.bias,
+                    buffer[Hidden], weights + net.end.bias, pixels * 32, fp16);
         conv(buffer[RgbSkip], buffer[Joined], net.tail);
         const int count = shape.pixels() * 3 * scale * scale;
-        launch(target, fp16 ? ShuffleF16 : ShuffleF32, count, output, buffer[RgbSkip], weights + net.tail.bias,
+        launch(target, fp32 ? ShuffleFull : fp16 ? ShuffleF16 : ShuffleF32,
+               count, output, buffer[RgbSkip], weights + net.tail.bias,
                shape.h, shape.w, count);
     }
 
@@ -220,7 +271,7 @@ class Session final : public umzi::KernelSession {
             const auto padded = requested.padded();
             auto start = umzi::Clock::now();
             device_used[0] = umzi::device_used_bytes();
-            const auto lane_bytes = size_t(padded.pixels()) * 2;
+            const auto lane_bytes = size_t(padded.pixels()) * (fp32 ? 4 : 2);
             activation_bytes = lane_bytes * arena_channels;
             CHECK(cuMemAlloc(&arena, activation_bytes));
             for (size_t i = 0; i < buffer.size(); ++i)
@@ -281,16 +332,20 @@ class Session final : public umzi::KernelSession {
 
 public:
     void open(const umzi::ModelPackage& package, const UmziSessionOptions& options) {
-        if (package.schema != 1) throw std::runtime_error("Unsupported SMoSR model payload version");
+        if (package.schema != 1 && package.schema != 2) throw std::runtime_error("Unsupported SMoSR model payload version");
+        fp16 = options.precision == UMZI_FP16;
+        fp32 = options.precision == UMZI_FP32;
+        if (fp32 && package.schema == 1)
+            throw std::runtime_error("SMoSR FP32 requires a schema 2 package. Export the checkpoint again.");
+        const Network source(package.schema == 1 ? 2 : 4);
+        net = Network(fp32 ? 4 : 2);
         umzi::BinaryReader architecture(package.section(1));
         for (auto value : configuration)
             if (architecture.number<uint32_t>() != value) throw std::runtime_error("Unsupported SMoSR architecture");
         const auto data = package.section(3);
         if (architecture.size() || !package.section(2).empty() || package.section(4).size() != 32
-            || data.size() != net.bytes)
+            || data.size() != source.bytes)
             throw std::runtime_error("Invalid SMoSR metadata or weights");
-        if (options.precision != UMZI_MIXED && options.precision != UMZI_FP16)
-            throw std::runtime_error("SMoSR supports mixed and FP16 precision");
         if (options.kernel_option_count) {
             const auto& option = options.kernel_options[0];
             if (options.kernel_option_count != 1 || !option.name || std::string_view(option.name) != "tune_convolutions"
@@ -298,7 +353,7 @@ public:
                 throw std::runtime_error("Specify SMoSR tune_convolutions once with a value of 0 or 1");
             tune_convolutions = option.value != 0;
         }
-        fp16 = options.precision == UMZI_FP16;
+        if (fp32 && tune_convolutions) throw std::runtime_error("SMoSR tune_convolutions requires mixed or FP16 precision");
         graph = (options.flags & UMZI_CUDA_GRAPH) != 0;
         CHECK(cuInit(0));
         CHECK(cuDeviceGet(&device, options.device));
@@ -313,7 +368,12 @@ public:
             for (auto& event : timing) CHECK(cuEventCreate(&event, CU_EVENT_DEFAULT));
         CHECK(cudnnCreate(&cudnn));
         CHECK(cuMemAlloc(&weights, persistent_bytes()));
-        CHECK(cuMemcpyHtoD(weights, data.data(), net.bytes));
+        if (package.schema == 2) {
+            const auto packed = net.device_weights(source, data, fp32);
+            CHECK(cuMemcpyHtoD(weights, packed.data(), packed.size()));
+        } else {
+            CHECK(cuMemcpyHtoD(weights, data.data(), data.size()));
+        }
         if (fp16) {
             launch(stream, InitActivations, half_values, weights + net.bytes);
             CHECK(cuStreamSynchronize(stream));
@@ -388,7 +448,9 @@ public:
         }
     }
 
-    const char* kernel_message() const override { return fp16 ? "SMoSR NHWC FP16" : "SMoSR NHWC mixed precision"; }
+    const char* kernel_message() const override {
+        return fp32 ? "SMoSR NCHW FP32" : fp16 ? "SMoSR NHWC FP16" : "SMoSR NHWC mixed precision";
+    }
 
     uint32_t diagnostic_count() const override { return 1; }
     UmziDiagnostic diagnostic(uint32_t index) const override {

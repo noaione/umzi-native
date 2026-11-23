@@ -36,7 +36,7 @@ from umzi_native import InferenceSession, SessionOptions, peek_model
 from umzi_native.exporter._loader import load_checkpoint
 
 METRIC = Path(r"C:\Tools\imaging\ssimulacra2.exe")
-NATIVE_BACKENDS = ("native-mixed", "native-fp16")
+NATIVE_BACKENDS = ("native-mixed", "native-fp16", "native-fp32")
 BACKENDS = ("fp32", "inductor", "inductor-attention-fp32", "rtx", "supplied", "eager-fp16", *NATIVE_BACKENDS)
 RTX_WORKSPACE_BYTES = 512 * 2**20
 
@@ -618,8 +618,8 @@ def main() -> None:
         parser.error("Native baselines require SMoSR batch 1, --native-model, and --native-library")
     if args.native_tag is not None and (not native or not re.fullmatch(r"[a-zA-Z0-9_-]+", args.native_tag)):
         parser.error("--native-tag requires a native backend and a name using letters, digits, underscores, or hyphens")
-    if args.tune_convolutions and not native:
-        parser.error("--tune-convolutions requires a native backend")
+    if args.tune_convolutions and (not native or args.backend == "native-fp32"):
+        parser.error("--tune-convolutions requires a native mixed or FP16 backend")
     os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
     torch.set_num_threads(2)
     torch.backends.cuda.matmul.allow_tf32 = False

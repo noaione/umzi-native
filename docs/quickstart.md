@@ -239,15 +239,15 @@ See the [GFISRv2 validation and gray renders](umzi-native-architecture-expansion
 ### SMoSR
 
 SMoSR returns 2× RGB output for inputs at least three pixels high and wide.
-Use `np.float32` arrays with `precision="mixed"` and `np.float16` arrays with
-`precision="fp16"`. SMoSR uses cuDNN heuristic plans and accepts the common
-`enable_cuda_graph` setting.
+Use `np.float32` arrays with `precision="fp32"` or `"mixed"` and `np.float16`
+arrays with `precision="fp16"`. FP32 inference uses schema 2 packages.
+Re-export the original checkpoint if you have a schema 1 package. Both
+schemas support mixed and FP16. SMoSR accepts `enable_cuda_graph`.
 
-Set `kernel_options={"tune_convolutions": 1}` to time zero-workspace cuDNN
-plans for the 48→48 and 48→96 convolutions at shape preparation. This option
-adds setup time and can change rounding. It improved mixed-precision latency
-on the RTX 3050 Laptop. The default uses the first supported plan. The native
-CLI accepts `--option tune_convolutions=1`.
+For mixed and FP16, set `kernel_options={"tune_convolutions": 1}` to time
+zero-workspace cuDNN plans for the 48→48 and 48→96 convolutions at shape
+preparation. This option adds setup time and can change rounding. The default
+uses the first supported plan. The native CLI accepts `--option tune_convolutions=1`.
 
 See [SMoSR implementation and measurements](handoff-smosr.md).
 

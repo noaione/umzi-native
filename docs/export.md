@@ -48,7 +48,7 @@ info = export_model("models/4x_dwtp_ds_moesr_v2.pth", "output/moesr.ummodel", ke
 | `gaterv2` | `1x_umzi_dehalftone_gater2_v1_smooth.safetensors` | 1× | Dehalftone, 16-pixel alignment |
 | `moesr` | `4x_dwtp_ds_moesr_v2.pth` | 4× | DWTP DS direct-shuffle topology only |
 | `gfisrv2` | `4x_wtp_MangaScale_GfisrV2.pth` | 4× | FP32 weights, MangaScale 24-block topology |
-| `smosr` | `2x_enhancr_da_smosr_v1.safetensors` | 2× | 48 features, six blocks, direct pixel shuffle |
+| `smosr` | `2x_enhancr_da_smosr_v1.safetensors` | 2× | 48 features, six blocks, direct pixel shuffle. Schema 2 stores FP32 weights |
 
 For example:
 

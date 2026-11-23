@@ -11,7 +11,7 @@ import torch
 from benchmark_architectures import FAMILIES, ROOT, comparison, extract, grid, read_image, stress_inputs
 from reference.native_session import DeviceSession
 
-from umzi_native import InferenceSession, SessionOptions
+from umzi_native import InferenceSession, SessionOptions, peek_model
 from umzi_native.exporter._loader import load_checkpoint
 
 
@@ -30,6 +30,7 @@ def main() -> None:
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--library", type=Path, required=True)
     parser.add_argument("--baseline-library", type=Path, help="Compare bitwise with the original native build")
+    parser.add_argument("--baseline-model", type=Path, help="Package used by the control build")
     args = parser.parse_args()
     torch.set_num_threads(2)
     torch.backends.cudnn.allow_tf32 = False
@@ -40,7 +41,10 @@ def main() -> None:
     sample = read_image(image)[:, :, :65, :79].contiguous()
     reference, _ = load_checkpoint(ROOT / "models" / family.checkpoint)
     expected = reference.eval().cuda()(sample.cuda()).cpu().numpy()
-    for precision in ("mixed", "fp16"):
+    model = peek_model(args.model)
+    baseline_model = args.baseline_model or args.model
+    baseline_schema = peek_model(baseline_model).schema if args.baseline_library else None
+    for precision in ("mixed", "fp16", "fp32") if model.schema == 2 else ("mixed", "fp16"):
         options = SessionOptions(precision=precision, dll_path=args.library)
         direct_options = SessionOptions(precision=precision, dll_path=args.library, enable_cuda_graph=False)
         with ExitStack() as stack:
@@ -62,7 +66,8 @@ def main() -> None:
             alternate.synchronize()
             np.testing.assert_array_equal(result.cpu().numpy(), actual)
             metrics = comparison(actual, expected)
-            if not metrics["finite"] or (metrics["psnr_db"] is not None and metrics["psnr_db"] < 45):
+            min_psnr = 100 if precision == "fp32" else 45
+            if not metrics["finite"] or (metrics["psnr_db"] is not None and metrics["psnr_db"] < min_psnr):
                 raise AssertionError(f"Poor SMoSR {precision} parity on {image.name}: {metrics}")
             try:
                 graph.prepare((1, 3, 2, 5))
@@ -71,9 +76,9 @@ def main() -> None:
                     raise
             else:
                 raise AssertionError("SMoSR accepted an input smaller than its reflection padding permits")
-            if args.baseline_library:
+            if args.baseline_library and (precision != "fp32" or baseline_schema == 2):
                 baseline_options = SessionOptions(precision=precision, dll_path=args.baseline_library)
-                baseline = DeviceSession(stack.enter_context(InferenceSession(args.model, baseline_options)))
+                baseline = DeviceSession(stack.enter_context(InferenceSession(baseline_model, baseline_options)))
                 for label, fixture in stress_inputs(family.tile, paths, family.batch):
                     check_baseline(captured, baseline, fixture, label)
                 tiles = 0

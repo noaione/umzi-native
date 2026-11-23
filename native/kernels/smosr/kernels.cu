@@ -125,3 +125,54 @@ extern "C" __global__ void shuffle_f32(float* output, const half* input, const f
 extern "C" __global__ void shuffle_f16(half* output, const half* input, const float* bias, int h, int w, int count) {
     shuffle(output, input, bias, h, w, count, true);
 }
+
+extern "C" __global__ void pack_full(float* output, const float* input, int h, int w, int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const int padded_w = w + 2 * context, padded_h = h + 2 * context;
+    const int row = i / padded_w, plane = row / padded_h;
+    const int c = plane % 8, n = plane / 8;
+    const int x = reflected(i % padded_w - context, w), y = reflected(row % padded_h - context, h);
+    output[i] = c < 3 ? input[((n * 3 + c) * h + y) * w + x] : 0.f;
+}
+
+extern "C" __global__ void silu_full(float* output, const float* bias, int area, int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    output[i] = silu_value(output[i] + bias[i / area % features]);
+}
+
+extern "C" __global__ void gate_full(float* output, const float* projection, const float* shortcut,
+                                     const float* bias, const float* shortcut_bias, const float* middle_skip,
+                                     int area, int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const int plane = i / area, c = plane % features, span = features * area;
+    const int src = i + plane / features * span;
+    const float value = projection[src] + bias[c];
+    const float gate = projection[src + span] + bias[c + features];
+    float skip = shortcut[i];
+    if (shortcut_bias) skip += shortcut_bias[c];
+    const float result = __fmul_rn(value + skip, tanhf(gate));
+    output[i] = middle_skip ? result + middle_skip[i] : result;
+}
+
+extern "C" __global__ void concat_full(float* output, const float* rgb, const float* rgb_bias, const float* body,
+                                       const float* body_bias, int area, int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const int pixel = i % area, plane = i / area, c = plane % 64, n = plane / 64;
+    if (c < 12) output[i] = rgb[(n * 16 + c) * area + pixel] + rgb_bias[c];
+    else if (c < 60) output[i] = body[(n * features + c - 12) * area + pixel] + body_bias[c - 12];
+    else output[i] = 0.f;
+}
+
+extern "C" __global__ void shuffle_full(float* output, const float* input, const float* bias, int h, int w, int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const int x = i % (2 * w), row = i / (2 * w), y = row % (2 * h);
+    const int n = row / (6 * h), c = row / (2 * h) % 3;
+    const int lane = c * 4 + (y % 2) * 2 + x % 2;
+    const int src = ((n * 16 + lane) * (h + 2 * context) + y / 2 + context) * (w + 2 * context) + x / 2 + context;
+    output[i] = input[src] + bias[lane];
+}

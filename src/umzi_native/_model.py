@@ -49,7 +49,7 @@ FAMILIES = {
     MOESR_FAMILY: "moesr",
     SMOSR_FAMILY: "smosr",
 }
-SCHEMAS = {"gaterv3": 1, "gfisrv2": 1, "gaterv2": 1, "moesr": 1, "smosr": 1}
+SCHEMAS = {"gaterv3": 1, "gfisrv2": 1, "gaterv2": 1, "moesr": 1, "smosr": 2}
 SECTION_NAMES = {1: "architecture", 2: "schedule", 3: "weights", 4: "checkpoint"}
 # GateRV2 schema 1 architecture: input, output, scale, alignment, base
 # channels, levels, latent blocks, the attention epsilon as float32, four
@@ -181,7 +181,7 @@ class GFISRv2Model:
 
 @dataclass(frozen=True)
 class SMoSRModel:
-    """Direct-shuffle 2x SMoSR payload (schema 1)."""
+    """Direct-shuffle 2x SMoSR payload."""
 
     input_channels: int
     output_channels: int
@@ -594,14 +594,14 @@ def _read_smosr(
     checkpoint: bytes | None,
     problems: list[str],
 ) -> SMoSRModel | None:
-    if schema != SCHEMAS["smosr"]:
+    if schema not in (1, SCHEMAS["smosr"]):
         problems.append("Unsupported SMoSR model payload version")
     elif architecture != SMOSR_ARCHITECTURE.pack(*SMOSR_CONFIG) or checkpoint is None or len(checkpoint) != DIGEST_SIZE:
         problems.append("Unsupported SMoSR model architecture or checkpoint metadata")
     else:
         expected = 0
         for cin, cout, k in SMOSR_FILTERS:
-            for size in (cin * cout * k * k * 2, cout * 4):
+            for size in (cin * cout * k * k * (2 if schema == 1 else 4), cout * 4):
                 expected = (expected + 255) // 256 * 256 + size
         if table is None and expected == weight_bytes:
             return SMoSRModel(*SMOSR_CONFIG, weight_bytes, checkpoint.hex())

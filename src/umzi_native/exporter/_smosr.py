@@ -81,7 +81,7 @@ def build_schedule(model: nn.Module, _state: Mapping[str, Tensor], weights: Path
             weight = functional.pad(
                 layer.weight, (0, 0, 0, 0, 0, inputs - layer.in_channels, 0, outputs - bias.numel())
             )
-            for tensor in (weight.permute(0, 2, 3, 1).half(), functional.pad(bias, (0, outputs - bias.numel()))):
+            for tensor in (weight.permute(0, 2, 3, 1), functional.pad(bias, (0, outputs - bias.numel()))):
                 if not torch.isfinite(tensor).all():
                     raise ValueError("Non-finite SMoSR parameter after conversion")
                 file.write(bytes(-file.tell() % 256))

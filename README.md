@@ -14,7 +14,7 @@ kernels, and CUDA Graph replay.
 | **GateRV2** | `mixed`, `fp16` | Tuned cuBLASLt/cuDNN plans with optional fast cold start |
 | **MoESR** | `mixed`, `fp16` | Custom fused tensor-core gate and depthwise kernels |
 | **GFISRv2** | `fp32`, `mixed`, `fp16` | Also requires cuFFT 12 at runtime |
-| **SMoSR** | `mixed`, `fp16` | 2× direct pixel shuffle with CUDA Graph support |
+| **SMoSR** | `fp32`, `mixed`, `fp16` | 2× direct pixel shuffle with CUDA Graph support |
 
 See [Supported checkpoints and export options](docs/export.md) for the exact
 checkpoint topologies accepted by the exporter, and the

@@ -15,9 +15,10 @@ feature channels, six multiplicative residual blocks arranged as 2 + 3 + 1,
 and a 2× direct pixel-shuffle tail.
 
 The exporter calls Resselt's FP32 eval-mode weight folding and writes family
-5, schema 1. The weight section stores 22 padded OHWI filters in execution
-order with FP16 weights and FP32 biases, each starting on a 256-byte boundary.
-The architecture and checkpoint SHA-256 are separate sections.
+5, schema 2. The weight section stores 22 padded OHWI filters and their biases
+in FP32, each starting on a 256-byte boundary. The architecture and checkpoint
+SHA-256 are separate sections. Legacy schema 1 packages stored FP16 weights
+with FP32 biases and still run in mixed and FP16 sessions.
 
 The native session in `native/kernels/smosr/` reflects two input pixels on each
 edge, runs the RGB shortcut and six convolutional blocks, adds the skip over
@@ -362,3 +363,86 @@ Use the optimized default as the bitwise control for further changes. The
 largest remaining latency target is the FP16 48→48 and 48→96 3×3 convolution
 pair. The engine sweep gave no FP16 speed gain. A convolution epilogue that
 applies SiLU at the same rounding points is the next fusion experiment.
+
+## Native FP32 and further optimization
+
+Export the folded weights as FP32 in SMoSR schema 2. Preserve inference from
+schema 1 in mixed and FP16, and convert schema 2 weights at session open for
+those two modes. Use the same activation arena and forward schedule with
+FP32 storage and cuDNN engines that preserve FP32 inputs and accumulation.
+Measure this baseline before testing alternate engine selection and fusion.
+
+The initial NHWC native FP32 baseline ran at 26.89 ms/tile, scored 141.90 dB
+raw PSNR, and reserved 37.73 MiB of cuDNN workspace. Timing only zero-workspace
+engines for the two hot convolution shapes slowed it to 51.83 ms/tile.
+Those full runs are `native-fp32-strict` and `native-fp32-strict-tuned` under
+`output/architecture-baselines/smosr/batch-1/`.
+
+The NCHW layout, following the GFISRv2 FP32 path, reached 20.56 ms/tile
+in the center-tile screen and used 0.44 MiB of workspace. Timing FP32 engines
+within the heuristic workspace budget took 20.86 ms/tile. The final FP32
+path uses the NCHW heuristic plans and rejects engines marked as Tensor Core,
+input down-conversion, or reduced-precision reduction. See the [cuDNN engine
+numerical notes](https://docs.nvidia.com/deeplearning/cudnn/backend/latest/api/cudnn-graph-library.html).
+
+Bias and SiLU fusion found no zero-workspace FP32 plan. Mixed fusion ran at
+11.43 ms/tile versus 10.92 ms unfused. With convolution tuning active, it
+ran at 10.18 ms versus 9.26 ms unfused. The fused experiment and FP32 tuning
+are recorded in `output/smosr-session/screen-native-fp32-nchw.json`.
+
+### Reproduce the native FP32 run
+
+Run from the repository root with the same Torch FP32 reference from the
+original benchmark. The `--baseline-model` argument points at the original
+schema 1 package for bytewise validation of mixed and FP16.
+
+```powershell
+$env:PYTHONPATH = 'src'
+$smosrPython = 'C:/Python314/python.exe'
+$model = 'output/smosr-session/smosr-schema2.ummodel'
+$legacyModel = 'output/smosr-session/smosr-benchmark.ummodel'
+$library = 'output/smosr-session/native-fp32-final/umzi_native.dll'
+$legacyLibrary = 'output/smosr-session/native-optimized-final/umzi_native.dll'
+& $smosrPython -m umzi_native export models/2x_enhancr_da_smosr_v1.safetensors -o $model --kernel smosr
+& $smosrPython scripts/build_native.py --arch sm_86 --nvrtc-root output/nvrtc-13.0/nvidia/cu13 --output output/smosr-session/native-fp32-final
+& $smosrPython scripts/validate_smosr_session.py --model $model --library $library --baseline-model $legacyModel --baseline-library $legacyLibrary
+& $smosrPython scripts/benchmark_architectures.py smosr native-fp32 --native-model $model --native-library $library --native-tag nchw
+```
+
+In the Windows sandbox, testing used the byte-identical copy
+`output/smosr-session/smosr-schema2-benchmark.ummodel`. The package digest is
+`5719c5a1ebb6eb06752a51542655e98531f327c5eca60d0b7f8cd7700df90181`.
+
+### Full-page FP32 results
+
+All runs used the same three `samples/2x-test` images, batch 1, 256×256
+input tiles, and zero overlap. The final native NCHW session used strictly
+FP32 convolution and pointwise math. Its raw output had zero error on all
+three pages and its rendered PNG files were byte-identical to the Torch
+FP32 renders.
+
+| Backend | Total ms | Median ms/image | Median ms/tile | PSNR (dB) | Mean SSIMULACRA2 | cuDNN workspace (MiB) | Native buffers (MiB) | NVML peak (MiB) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Torch CUDA FP32 | 6504.79 | 2092.00 | 26.96 | Reference | Reference | — | — | 1598.52 |
+| Native FP32 NHWC control | 6508.67 | 2083.34 | 26.89 | 141.90 | 90.91 | 37.73 | 109.45 | 1566.94 |
+| Native FP32 NCHW | 4969.09 | 1589.23 | 20.52 | ∞ (zero error) | 100.00 | 0.44 | 72.16 | 1553.50 |
+
+The NCHW path reduced median tile latency 23.7% from the NHWC control.
+On the 8-bit PNGs, the NHWC control differed from Torch in 507–682 pixels
+per image, each by at most one channel level. Raw PSNR and rendered
+SSIMULACRA2 use separate representations.
+
+| Image | NCHW inference ms | NCHW ms/tile | PSNR (dB) | SSIMULACRA2 | NVML peak (MiB) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `9798855404661.jpg` | 1574.15 | 20.44 | ∞ (zero error) | 100.00 | 1553.50 |
+| `9798855424195.jpg` | 1589.23 | 20.64 | ∞ (zero error) | 100.00 | 1553.50 |
+| `9798855444216.jpg` | 1805.71 | 20.52 | ∞ (zero error) | 100.00 | 1553.50 |
+
+The graph, direct, host, and alternate-stream paths agreed on the 65×79
+crop. The 3×3 minimum input returned a 6×6 image. The three center tiles and
+checkerboard matched Torch byte for byte with `NVIDIA_TF32_OVERRIDE` unset.
+Mixed and FP16 from schema 2 matched the prior native schema 1
+build bitwise on all 242 benchmark tiles and all stress fixtures.
+The 128×160 FP32 stress tensor scored 131.95 dB. See
+`output/architecture-baselines/smosr/batch-1/native-fp32-nchw/report.json`
+for every tile timing, per-image scores, and plan setup measurements.

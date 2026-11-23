@@ -1,6 +1,6 @@
 #pragma once
 
-// Shared cuDNN backend (graph API) helpers for NHWC convolutions and fused graphs.
+// Shared cuDNN backend (graph API) helpers for convolutions and fused graphs.
 //
 // Used by MoESR, GFISRv2, and GateRV3 SiLU fusion. Enumerates candidate engine
 // configurations from heuristics A and fallback, deduplicates them by JSON
@@ -63,6 +63,26 @@ struct CudnnCandidate {
 
 class CudnnConvGraph {
     std::vector<std::unique_ptr<CudnnDescriptor>> descriptors;
+    const bool strict_float;
+    const cudnnTensorFormat_t format;
+
+    static bool preserves_float(cudnnBackendDescriptor_t config) {
+        CudnnDescriptor engine(CUDNN_BACKEND_ENGINE_DESCRIPTOR);
+        auto descriptor = engine.get();
+        int64_t count = 0;
+        if (cudnnBackendGetAttribute(config, CUDNN_ATTR_ENGINECFG_ENGINE, CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                     1, &count, &descriptor) != CUDNN_STATUS_SUCCESS || count != 1)
+            return false;
+        std::array<cudnnBackendNumericalNote_t, CUDNN_NUMERICAL_NOTE_TYPE_COUNT> notes{};
+        if (cudnnBackendGetAttribute(engine.get(), CUDNN_ATTR_ENGINE_NUMERICAL_NOTE, CUDNN_TYPE_NUMERICAL_NOTE,
+                                     notes.size(), &count, notes.data()) != CUDNN_STATUS_SUCCESS)
+            return false;
+        for (int64_t i = 0; i < count; ++i)
+            if (notes[i] == CUDNN_NUMERICAL_NOTE_TENSOR_CORE || notes[i] == CUDNN_NUMERICAL_NOTE_DOWN_CONVERT_INPUTS
+                || notes[i] == CUDNN_NUMERICAL_NOTE_REDUCED_PRECISION_REDUCTION)
+                return false;
+        return true;
+    }
 
     CudnnDescriptor& make(cudnnBackendDescriptorType_t type) {
         return *descriptors.emplace_back(std::make_unique<CudnnDescriptor>(type));
@@ -72,12 +92,14 @@ class CudnnConvGraph {
         auto& desc = make(CUDNN_BACKEND_TENSOR_DESCRIPTOR);
         constexpr int64_t alignment = 16;
         const int64_t dimensions[] = {n, c, h, w};
-        const int64_t strides[] = {h * w * c, 1, w * c, c};
+        const auto strides = format == CUDNN_TENSOR_NCHW
+            ? std::array<int64_t, 4>{c * h * w, h * w, w, 1}
+            : std::array<int64_t, 4>{h * w * c, 1, w * c, c};
         const bool is_virtual = false;
         desc.set(CUDNN_ATTR_TENSOR_UNIQUE_ID, CUDNN_TYPE_INT64, &uid);
         desc.set(CUDNN_ATTR_TENSOR_DATA_TYPE, CUDNN_TYPE_DATA_TYPE, &type);
         desc.set(CUDNN_ATTR_TENSOR_DIMENSIONS, CUDNN_TYPE_INT64, dimensions, 4);
-        desc.set(CUDNN_ATTR_TENSOR_STRIDES, CUDNN_TYPE_INT64, strides, 4);
+        desc.set(CUDNN_ATTR_TENSOR_STRIDES, CUDNN_TYPE_INT64, strides.data(), 4);
         desc.set(CUDNN_ATTR_TENSOR_BYTE_ALIGNMENT, CUDNN_TYPE_INT64, &alignment);
         desc.set(CUDNN_ATTR_TENSOR_IS_VIRTUAL, CUDNN_TYPE_BOOLEAN, &is_virtual);
         desc.finalize();
@@ -88,7 +110,8 @@ public:
     CudnnDescriptor* graph = nullptr;
 
     CudnnConvGraph(cudnnHandle_t handle, int n, int h, int w, int cin, int cout, int k, cudnnDataType_t io_type,
-                   bool fp16_compute) {
+                   bool fp16_compute, cudnnTensorFormat_t layout = CUDNN_TENSOR_NHWC)
+        : strict_float(io_type == CUDNN_DATA_FLOAT), format(layout) {
         auto& x = tensor(1, n, cin, h, w, io_type);
         auto& filter = tensor(2, cout, cin, k, k, io_type);
         auto& y = tensor(3, n, cout, h, w, io_type);
@@ -152,6 +175,7 @@ public:
                 != CUDNN_STATUS_SUCCESS)
                 continue;
             for (int64_t i = 0; i < found; ++i) {
+                if (strict_float && !preserves_float(raw[i])) continue;
                 auto plan = std::make_unique<CudnnDescriptor>(CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR);
                 plan->set(CUDNN_ATTR_EXECUTION_PLAN_HANDLE, CUDNN_TYPE_HANDLE, &handle);
                 plan->set(CUDNN_ATTR_EXECUTION_PLAN_ENGINE_CONFIG, CUDNN_TYPE_BACKEND_DESCRIPTOR, &raw[i]);
