@@ -1,5 +1,7 @@
 # GateRV3 Vulkan on Apple M4
 
+This report records the original Vulkan shader baseline. The [optimization report](gaterv3-vulkan-optimization.md) covers the current kernels and native FP16 mode.
+
 The standalone Vulkan runtime reads the existing 1× RGB GateRV3 `.ummodel` packages for Original and IDC. It uses a Vulkan 1.2 compute queue, two storage-buffer bindings, 64-invocation workgroups, and 4 KiB of shared memory for tiled convolution. The loader enumerates portability devices and enables the portability subset on devices that advertise it. The macOS run used MoltenVK and KosmicKrisp through the LunarG SDK. [Vulkan portability enumeration](https://docs.vulkan.org/refpages/latest/refpages/source/VK_KHR_portability_enumeration.html) · [KosmicKrisp requirements](https://docs.mesa3d.org/drivers/kosmickrisp.html)
 
 The Vulkan library exposes a versioned host C ABI and uses the existing GateRV3 schedule and weight validation. Weights stay on the GPU and the session replays one prepared shape's command buffer. Each call synchronously stages NCHW NumPy input and output. The CUDA library remains the default for Python sessions.
@@ -9,7 +11,7 @@ The Vulkan library exposes a versioned host C ABI and uses the existing GateRV3 
 | `mixed` | Existing packed FP16 weights | FP32 storage and accumulation with FP16 rounding at intermediate outputs |
 | `fp32` | Existing packed FP16 weights | FP32 storage and arithmetic throughout |
 
-Both modes accept and return NumPy `float32` arrays. FP16 arithmetic and FP16 activation storage are future optimizations. Saturating or clipping the output is left to the caller. The current implementation reports Vulkan buffer allocation sizes and dispatch counts. It supports host I/O, in-memory pipeline caching, and one prepared shape per session.
+Both reference modes accept and return NumPy `float32` arrays. The session reports Vulkan buffer allocation sizes and dispatch counts. It supports host I/O, in-memory pipeline caching, and one prepared shape per session.
 
 ## Build and run
 
@@ -30,13 +32,13 @@ library=build/vulkan/libumzi_native_vulkan.dylib
 python3 scripts/benchmark_vulkan.py --devices --library "$library"
 python3 scripts/benchmark_vulkan.py --model output/vulkan/original.ummodel \
   --library "$library" --output output/vulkan/original-matrix \
-  --vulkan-device 0 --vulkan-device 1 --ssimulacra2 /opt/homebrew/bin/ssimulacra2
+  --vulkan-reference --vulkan-device 0 --vulkan-device 1 --ssimulacra2 /opt/homebrew/bin/ssimulacra2
 python3 scripts/benchmark_vulkan.py --checkpoint models/1x_umzi_idc_gaterv3.safetensors \
   --model output/vulkan/idc.ummodel --library "$library" --output output/vulkan/idc-matrix \
-  --vulkan-device 0 --vulkan-device 1 --ssimulacra2 /opt/homebrew/bin/ssimulacra2
+  --vulkan-reference --vulkan-device 0 --vulkan-device 1 --ssimulacra2 /opt/homebrew/bin/ssimulacra2
 ```
 
-Use the enumerated indices on your machine. The default matrix includes eager PyTorch FP32 and FP16, ONNX Runtime WebGPU FP32 and FP16, and Vulkan FP32 and mixed. Use `--vulkan-precision` or `--webgpu-precision` to select one mode. Use `--torch-device cuda` for the CUDA Torch reference on an NVIDIA host. The existing Windows TensorRT-RTX and TorchInductor protocol is documented separately. [GateRV3 CUDA baseline](../gaterv3-baseline.md)
+Use the enumerated indices on your machine. The reference matrix includes eager PyTorch FP32 and FP16, ONNX Runtime WebGPU FP32 and FP16, and Vulkan FP32 and mixed. Use `--vulkan-precision` or `--webgpu-precision` to select one mode. Use `--torch-device cuda` for the CUDA Torch reference on an NVIDIA host. The existing Windows TensorRT-RTX and TorchInductor protocol is documented separately. [GateRV3 CUDA baseline](../gaterv3-baseline.md)
 
 To run the shape, replay, and validation-layer checks for a package:
 
@@ -52,7 +54,12 @@ Use `PYTHONPATH=src` for imports from the source checkout. The library can be se
 import numpy as np
 from umzi_native import InferenceSession, SessionOptions
 
-options = SessionOptions(backend="vulkan", device_id=0, dll_path="build/vulkan/libumzi_native_vulkan.dylib")
+options = SessionOptions(
+    backend="vulkan",
+    device_id=0,
+    dll_path="build/vulkan/libumzi_native_vulkan.dylib",
+    kernel_options={"reference": 1},
+)
 with InferenceSession("output/vulkan/original.ummodel", options) as session:
     shape = (1, 3, 128, 128)
     session.prepare(shape)

@@ -13,7 +13,7 @@ void main() {
         int inBase = op.offsets.x + group * op.outputChannels;
         float sum = 0.0;
         for (int c = lane; c < op.outputChannels; c += 64) {
-            float value = data[inBase + c];
+            float value = loadActivation(inBase + c);
             sum = fma(value, value, sum);
         }
         partial[lane] = sum;
@@ -24,8 +24,7 @@ void main() {
         }
         float inverse = 1.0 / (sqrt(partial[0] / float(op.outputChannels)) + 1e-6);
         for (int c = lane; c < op.outputChannels; c += 64)
-            data[op.outputOffset + group * op.outputChannels + c] =
-                rounded(fma(data[inBase + c] * inverse, weight(op.weights.x, c), weight(op.weights.y, c)));
+            storeActivation(op.outputOffset + group * op.outputChannels + c, fma(loadActivation(inBase + c) * inverse, weight(op.weights.x, c), weight(op.weights.y, c)));
         return;
     }
     if (op.kind == 4) { // Spatial mean. Eight lanes per channel.
@@ -36,12 +35,12 @@ void main() {
         int pixels = op.inputH * op.inputW;
         float sum = 0.0;
         for (int p = lane / 8; p < pixels; p += 8)
-            sum += data[op.offsets.x + (n * pixels + p) * op.outputChannels + c];
+            sum += loadActivation(op.offsets.x + (n * pixels + p) * op.outputChannels + c);
         partial[lane] = sum;
         barrier();
         if (lane < 8) {
             for (int row = 1; row < 8; ++row) sum += partial[lane + 8 * row];
-            data[op.scratch + n * op.outputChannels + c] = rounded(sum / float(pixels));
+            storeActivation(op.scratch + n * op.outputChannels + c, sum / float(pixels));
         }
         return;
     }
@@ -52,7 +51,7 @@ void main() {
     int c = index % op.outputChannels;
     float sum = 0.0;
     for (int k = 0; k < op.outputChannels; ++k)
-        sum = fma(data[op.scratch + n * op.outputChannels + k],
+        sum = fma(loadActivation(op.scratch + n * op.outputChannels + k),
                   weight(op.weights.x, c * op.outputChannels + k), sum);
-    data[op.outputOffset + index] = rounded(sum + weight(op.weights.y, c));
+    storeActivation(op.outputOffset + index, sum + weight(op.weights.y, c));
 }

@@ -1,4 +1,13 @@
-layout(set = 0, binding = 0, std430) buffer Activations { float data[]; };
+#ifdef HALF_STORAGE
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#define Activation float16_t
+layout(set = 0, binding = 2, std430) buffer PlanarRgb { float rgb[]; };
+#else
+#define Activation float
+#define rgb data
+#endif
+layout(set = 0, binding = 0, std430) buffer Activations { Activation data[]; };
 layout(set = 0, binding = 1, std430) readonly buffer Weights { uint packed[]; };
 layout(push_constant, std430) uniform Schedule {
     ivec4 offsets;
@@ -43,6 +52,22 @@ float rounded(float value) {
     // Round the 13 discarded mantissa bits to nearest, with ties to even.
     magnitude = (magnitude + 0xfffu + ((magnitude >> 13) & 1u)) & 0xffffe000u;
     return uintBitsToFloat(signBit | (magnitude >= 0x47800000u ? 0x7f800000u : magnitude));
+}
+
+float loadActivation(int index) {
+    return float(data[index]);
+}
+
+void storeActivation(int index, float value) {
+#ifdef HALF_STORAGE
+    data[index] = float16_t(value);
+#else
+    data[index] = rounded(value);
+#endif
+}
+
+vec2 weightPair(int offset, int index) {
+    return unpackHalf2x16(packed[(offset >> 2) + (index >> 1)]);
 }
 
 float sigmoid(float x) {

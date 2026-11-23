@@ -65,7 +65,10 @@ def main() -> None:
     square = patterns["random_square"]
     for index in args.device or list(range(len(devices))):
         precision_outputs = []
-        for precision in ("fp32", "mixed"):
+        precisions = ["fp32", "mixed"]
+        if devices[index]["shader_float16"] and devices[index]["storage_buffer16"]:
+            precisions.append("fp16")
+        for precision in precisions:
             options = SessionOptions(backend="vulkan", precision=precision, device_id=index, dll_path=args.library)
             with InferenceSession(args.model, options) as session:
                 session.prepare(square.shape)
@@ -98,6 +101,10 @@ def main() -> None:
         assert not np.array_equal(precision_outputs[0], precision_outputs[1]), (
             "Mixed mode lost its FP16 rounding boundaries"
         )
+        if len(precision_outputs) == 3:
+            assert not np.array_equal(precision_outputs[1], precision_outputs[2]), (
+                "FP16 mode and mixed mode returned the same seeded output"
+            )
     with TemporaryDirectory() as temp:
         invalid = Path(temp) / "invalid.ummodel"
         invalid.write_bytes(bytes(64))

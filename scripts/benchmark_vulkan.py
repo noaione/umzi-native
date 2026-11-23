@@ -201,7 +201,11 @@ def psnr(mse: float) -> float | None:
 def open_runner(args: argparse.Namespace, case: Case, batch: int) -> Generator[tuple[Call, dict]]:
     if case.backend == "vulkan":
         options = SessionOptions(
-            backend="vulkan", device_id=case.device_index, precision=case.precision, dll_path=args.library
+            backend="vulkan",
+            device_id=case.device_index,
+            precision=case.precision,
+            dll_path=args.library,
+            kernel_options={"reference": 1} if args.vulkan_reference else {},
         )
         with InferenceSession(args.model, options) as session:
             session.prepare((batch, 3, TILE, TILE))
@@ -413,7 +417,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--library", type=Path)
     parser.add_argument("--devices", action="store_true", help="List Vulkan compute GPUs and exit")
     parser.add_argument("--vulkan-device", type=int, action="append", help="Repeat for multiple Vulkan drivers")
-    parser.add_argument("--vulkan-precision", choices=("mixed", "fp32"), action="append")
+    parser.add_argument("--vulkan-precision", choices=("mixed", "fp32", "fp16"), action="append")
+    parser.add_argument("--vulkan-reference", action="store_true", help="Run the original Vulkan shader schedule")
     parser.add_argument("--webgpu-precision", choices=("fp32", "fp16"), action="append")
     parser.add_argument("--skip-gpu-memory", action="store_true", help="Skip separate Metal memory runs")
     parser.add_argument("--torch-device", choices=("mps", "cuda"), default="mps")
@@ -427,6 +432,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--output is required for benchmarking")
     if args.warmup < 1:
         parser.error("--warmup must be positive")
+    if args.vulkan_reference and "fp16" in (args.vulkan_precision or ()):
+        parser.error("The Vulkan reference kernels support mixed and FP32")
     if not args.devices and "vulkan" in args.backends and args.model is None:
         parser.error("--model is required for Vulkan")
     return args
@@ -491,12 +498,19 @@ def main() -> int:
         )
     if "vulkan" in args.backends:
         args.library = find_session_library(args.model.resolve(), args.library, backend="vulkan")
-        report["vulkan_devices"] = vulkan_devices(args.library)
-        cases.extend(
-            Case("vulkan", precision, index)
-            for index in dict.fromkeys(args.vulkan_device or [0])
-            for precision in dict.fromkeys(args.vulkan_precision or ["mixed", "fp32"])
-        )
+        devices = {device["index"]: device for device in vulkan_devices(args.library)}
+        report["vulkan_devices"] = list(devices.values())
+        report["vulkan_kernels"] = "reference" if args.vulkan_reference else "optimized"
+        for index in dict.fromkeys(args.vulkan_device or [0]):
+            if index not in devices:
+                raise ValueError(f"Unavailable Vulkan device index {index}")
+            precisions = ["mixed", "fp32"]
+            info = devices[index]
+            if info["shader_float16"] and info["storage_buffer16"] and not args.vulkan_reference:
+                precisions.append("fp16")
+            cases.extend(
+                Case("vulkan", precision, index) for precision in dict.fromkeys(args.vulkan_precision or precisions)
+            )
 
     metal = sys.platform == "darwin" and device.type == "mps"
     first_image = args.images / pages[0].name

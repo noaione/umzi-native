@@ -14,6 +14,8 @@ void check(VkResult result, const char* operation);
 struct Adapter {
     VkPhysicalDevice handle;
     uint32_t family;
+    uint32_t timestamp_bits;
+    bool subgroup32_arithmetic;
     UmziVulkanDevice info;
 };
 
@@ -34,7 +36,7 @@ public:
 
     void open_instance();
     std::vector<Adapter> adapters() const;
-    void open_device(const Adapter& adapter);
+    void open_device(const Adapter& adapter, bool enable_half = false);
     VkCommandBuffer allocate_command() const;
     void submit(VkCommandBuffer command) const;
 };

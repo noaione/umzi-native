@@ -16,7 +16,7 @@ void main() {
     int head = g / tokens % 16;
     int lane = int(gl_LocalInvocationIndex);
     int base = op.offsets.x + n * tokens * 1536 + head * 32;
-    if (lane < 32) queryVector[lane] = data[base + query * 1536 + lane];
+    if (lane < 32) queryVector[lane] = loadActivation(base + query * 1536 + lane);
     barrier();
     float previousMax = uintBitsToFloat(0xff800000u);
     float numerator = 0.0;
@@ -26,7 +26,7 @@ void main() {
         if (start + lane < tokens) {
             int key = base + (start + lane) * 1536 + 512;
             float sum = 0.0;
-            for (int k = 0; k < 32; ++k) sum = fma(queryVector[k], data[key + k], sum);
+            for (int k = 0; k < 32; ++k) sum = fma(queryVector[k], loadActivation(key + k), sum);
             score = sum * 0.1767766952966369;
         }
         maximums[lane] = score;
@@ -43,7 +43,7 @@ void main() {
             numerator *= factor;
             denominator *= factor;
             for (int i = 0; i < min(tokens - start, 64); ++i) {
-                numerator = fma(scores[i], data[base + (start + i) * 1536 + 1024 + lane], numerator);
+                numerator = fma(scores[i], loadActivation(base + (start + i) * 1536 + 1024 + lane), numerator);
                 denominator += scores[i];
             }
         }
@@ -51,5 +51,5 @@ void main() {
         barrier();
     }
     if (lane < 32)
-        data[op.outputOffset + (n * tokens + query) * 512 + head * 32 + lane] = rounded(numerator / denominator);
+        storeActivation(op.outputOffset + (n * tokens + query) * 512 + head * 32 + lane, numerator / denominator);
 }

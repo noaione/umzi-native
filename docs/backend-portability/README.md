@@ -1,11 +1,11 @@
 # Portable GPU backend roadmap (Vulkan first)
 
-**Status:** GateRV3 Vulkan prototype tested on Apple M4
+**Status:** Optimized GateRV3 Vulkan with native FP16 tested on Apple M4
 **Last reviewed:** 2026-11-23  
 **Repository:** [`noaione/umzi-native`](https://github.com/noaione/umzi-native)
 
 The GateRV3 prototype runs the Original and IDC packages through a standalone Vulkan library.
-See the [macOS build, validation, and comparison](gaterv3-mac.md) for the measured configurations.
+See the [macOS baseline](gaterv3-mac.md) and the [Vulkan optimization report](gaterv3-vulkan-optimization.md) for measured configurations.
 The remaining phases describe work still to be tested or implemented.
 
 ## Objective
@@ -94,11 +94,11 @@ Work in order; each phase should be a mergeable, testable deliverable.
 
 ### P3 — Performance passes
 
-- [ ] Reuse recorded compute command buffers and pre-allocate descriptor sets, device buffers, and scratch.
-- [ ] Fuse frequent elementwise/norm/gate operations only after the unfused version passes.
+- [x] Reuse recorded compute command buffers and pre-allocate descriptor sets, device buffers, and scratch.
+- [x] Fuse GateRV3 convolution/SiLU and residual/RMSNorm operations.
 - [ ] Tune workgroup/subgroup configurations **per actual device limits**; do not assume 32-lane NVIDIA warps.
 - [ ] Add channel-padded convolution/GEMM kernels and optional `VK_KHR_cooperative_matrix` path where advertised and profitable.
-- [ ] Benchmark FP16/mixed quality separately; reject modes with non-finite or unacceptable output differences.
+- [x] Benchmark GateRV3 FP16 and mixed quality separately on Apple M4.
 - [ ] Add key-isolated tuning/pipeline cache records; never load CUDA-specific `.umplan` payloads as Vulkan plans.
 
 **Exit:** For at least one declared GateRV3 workload, show a stable, repeatable improvement over the unfused Vulkan path; evaluate the three target baselines rather than assuming success.

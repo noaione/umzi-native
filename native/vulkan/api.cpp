@@ -69,10 +69,10 @@ UmziSession* umzi_session_open(const char* path, const UmziSessionOptions* optio
     protect([&] {
         require(path && *path, "Missing Umzi model package path");
         require(options && options->struct_size == sizeof(*options), "Invalid Umzi session options");
-        require(options->precision == UMZI_MIXED || options->precision == UMZI_FP32,
-                "GateRV3 Vulkan supports 'mixed' and 'fp32' arithmetic with packed FP16 weights");
-        require(options->flags == 0 && options->reserved == 0 && !options->cache_dir && !options->kernel_option_count,
-                "Vulkan sessions do not accept CUDA graphs, disk caches, or kernel options");
+        require(options->precision <= UMZI_FP32, "Vulkan precision must be 'mixed', 'fp16', or 'fp32'");
+        require(options->flags == 0 && options->reserved == 0 && !options->cache_dir,
+                "Vulkan sessions do not accept CUDA graphs or disk caches");
+        require(!options->kernel_option_count || options->kernel_options, "Missing Vulkan kernel options");
         auto session = std::make_unique<UmziSession>();
         session->open(path, *options);
         handle = session.release();
@@ -131,13 +131,16 @@ int umzi_session_info(const UmziSession* session, UmziSessionInfo* info) {
     });
 }
 
-uint32_t umzi_session_diagnostic_count(const UmziSession* session) { return session ? 1 : 0; }
+uint32_t umzi_session_diagnostic_count(const UmziSession* session) {
+    return session ? session->diagnostic_count() : 0;
+}
 
 int umzi_session_diagnostic(const UmziSession* session, uint32_t index, UmziDiagnostic* diagnostic) {
     return protect([&] {
-        require(session && index == 0 && diagnostic && diagnostic->struct_size == sizeof(*diagnostic),
+        require(session && index < session->diagnostic_count() && diagnostic
+                && diagnostic->struct_size == sizeof(*diagnostic),
                 "Invalid Vulkan diagnostic request");
-        *diagnostic = {sizeof(*diagnostic), "dispatches", session->dispatches()};
+        *diagnostic = session->diagnostic(index);
     });
 }
 

@@ -89,7 +89,11 @@ std::vector<Adapter> Context::adapters() const {
         VkPhysicalDeviceVulkan11Features features11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &features12};
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &features11};
         vkGetPhysicalDeviceFeatures2(handle, &features);
-        Adapter adapter{handle, static_cast<uint32_t>(family - families.begin()), {}};
+        const bool subgroup32 = subgroup.subgroupSize == 32
+            && (subgroup.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT)
+            && (subgroup.supportedOperations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT);
+        Adapter adapter{handle, static_cast<uint32_t>(family - families.begin()), family->timestampValidBits,
+                        subgroup32, {}};
         auto& info = adapter.info;
         info.struct_size = sizeof(info);
         info.api_version = properties.apiVersion;
@@ -113,7 +117,7 @@ std::vector<Adapter> Context::adapters() const {
     return supported;
 }
 
-void Context::open_device(const Adapter& adapter) {
+void Context::open_device(const Adapter& adapter, bool enable_half) {
     vkGetPhysicalDeviceMemoryProperties(adapter.handle, &memory);
     VkPhysicalDeviceProperties props{};
     vkGetPhysicalDeviceProperties(adapter.handle, &props);
@@ -125,6 +129,13 @@ void Context::open_device(const Adapter& adapter) {
     queue_info.queueCount = 1;
     queue_info.pQueuePriorities = &priority;
     VkDeviceCreateInfo info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+    VkPhysicalDeviceVulkan12Features features12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    VkPhysicalDeviceVulkan11Features features11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &features12};
+    if (enable_half) {
+        features12.shaderFloat16 = VK_TRUE;
+        features11.storageBuffer16BitAccess = VK_TRUE;
+        info.pNext = &features11;
+    }
     info.queueCreateInfoCount = 1;
     info.pQueueCreateInfos = &queue_info;
     const char* subset = portability_subset;

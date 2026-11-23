@@ -13,10 +13,12 @@ struct UmziSession {
     VkDescriptorSetLayout descriptor_layout{};
     VkPipelineLayout pipeline_layout{};
     VkPipelineCache pipeline_cache{};
-    std::array<VkPipeline, 4> pipelines{};
+    std::array<VkPipeline, 10> pipelines{};
     std::unique_ptr<Prepared> prepared;
     std::string device_description;
     uint32_t precision{};
+    uint32_t timestamp_bits{};
+    bool profile{}, reference{}, half_storage{}, subgroup_norm{};
     double model_ms{};
 
     UmziSession();
@@ -25,5 +27,6 @@ struct UmziSession {
     void prepare(gt::Shape shape);
     void run(gt::Shape shape, const float* input, float* output);
     void info(UmziSessionInfo& result) const;
-    int64_t dispatches() const;
+    uint32_t diagnostic_count() const;
+    UmziDiagnostic diagnostic(uint32_t index) const;
 };

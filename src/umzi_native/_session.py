@@ -62,8 +62,8 @@ class InferenceSession:
         if self._backend not in ("cuda", "vulkan"):
             raise ValueError("backend must be 'cuda' or 'vulkan'")
         vulkan = self._backend == "vulkan"
-        if vulkan and (options.dll_dirs or options.cache_dir or options.kernel_options):
-            raise ValueError("Vulkan sessions do not accept CUDA library directories, disk caches, or kernel options")
+        if vulkan and (options.dll_dirs or options.cache_dir):
+            raise ValueError("Vulkan sessions do not accept CUDA library directories or disk caches")
         if options.precision not in ("mixed", "fp16", "fp32"):
             raise ValueError("precision must be 'mixed', 'fp16', or 'fp32'")
         device_id = operator.index(options.device_id)

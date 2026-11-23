@@ -1,0 +1,56 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "schedule.glsl"
+
+layout(local_size_x = 64) in;
+
+const int chunkSize = 256;
+shared float partial[64];
+shared float average[256];
+
+void main() {
+    int lane = int(gl_LocalInvocationIndex);
+    int group = groupIndex();
+    int pixels = op.inputH * op.inputW;
+    int chunks = (pixels + chunkSize - 1) / chunkSize;
+    int channels = op.outputChannels;
+
+    if (op.kind == 4) { // Spatial sum of one chunk, with eight lanes per channel.
+        int blocks = channels / 8;
+        int image = group / (blocks * chunks);
+        if (image >= op.batch) return;
+        int chunk = group / blocks % chunks;
+        int c = group % blocks * 8 + lane % 8;
+        int start = chunk * chunkSize;
+        int end = min(start + chunkSize, pixels);
+        float sum = 0.0;
+        for (int p = start + lane / 8; p < end; p += 8)
+            sum += loadActivation(op.offsets.x + (image * pixels + p) * channels + c);
+        partial[lane] = sum;
+        barrier();
+        if (lane < 8) {
+            for (int j = 1; j < 8; ++j) sum += partial[lane + j * 8];
+            rgb[op.scratch + (image * chunks + chunk) * channels + c] = sum;
+        }
+        return;
+    }
+
+    if (group >= op.batch) return;
+    int scratch = op.scratch + group * chunks * channels;
+    for (int c = lane; c < channels; c += 64) {
+        float sum = 0.0;
+        for (int j = 0; j < chunks; ++j)
+            sum += rgb[scratch + j * channels + c];
+        average[c] = rounded(sum / float(pixels));
+    }
+    barrier();
+    for (int c = lane; c < channels; c += 64) {
+        float sum = 0.0;
+        for (int k = 0; k < channels; k += 2) {
+            vec2 b = weightPair(op.weights.x, c * channels + k);
+            sum = fma(average[k], b.x, sum);
+            sum = fma(average[k + 1], b.y, sum);
+        }
+        storeActivation(op.outputOffset + group * channels + c, sum + weight(op.weights.y, c));
+    }
+}

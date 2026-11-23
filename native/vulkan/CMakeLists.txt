@@ -8,18 +8,26 @@ if(NOT WIN32)
 endif()
 
 set(shader_headers)
-foreach(shader conv element reduce attention)
-    set(source "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${shader}.comp")
-    set(spv "${CMAKE_CURRENT_BINARY_DIR}/${shader}.spv")
-    set(header "${CMAKE_CURRENT_BINARY_DIR}/${shader}_spv.h")
+function(add_shader name source_name)
+    set(source "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${source_name}.comp")
+    set(spv "${CMAKE_CURRENT_BINARY_DIR}/${name}.spv")
+    set(header "${CMAKE_CURRENT_BINARY_DIR}/${name}_spv.h")
     add_custom_command(OUTPUT "${header}"
-        COMMAND Vulkan::glslc --target-env=vulkan1.2 -O "${source}" -o "${spv}"
+        COMMAND Vulkan::glslc --target-env=vulkan1.2 -O ${ARGN} "${source}" -o "${spv}"
         COMMAND "${SPIRV_VAL}" --target-env vulkan1.2 "${spv}"
-        COMMAND Vulkan::glslc --target-env=vulkan1.2 -O -mfmt=num "${source}" -o "${header}"
+        COMMAND Vulkan::glslc --target-env=vulkan1.2 -O ${ARGN} -mfmt=num "${source}" -o "${header}"
         DEPENDS "${source}" shaders/schedule.glsl
         VERBATIM)
-    list(APPEND shader_headers "${header}")
+    set(shader_headers ${shader_headers} "${header}" PARENT_SCOPE)
+endfunction()
+
+foreach(shader conv element reduce attention conv_fast mean_fast norm_fast gates)
+    add_shader(${shader} ${shader})
 endforeach()
+foreach(shader element reduce attention conv_fast mean_fast norm_fast gates)
+    add_shader(${shader}_half ${shader} -DHALF_STORAGE)
+endforeach()
+add_shader(conv_native_half conv_fast -DHALF_STORAGE -DHALF_MATH)
 
 add_library(umzi_native_vulkan SHARED api.cpp session.cpp context.cpp ../runtime/model_package.cpp ${shader_headers})
 target_compile_features(umzi_native_vulkan PRIVATE cxx_std_20)

@@ -1,0 +1,50 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#include "schedule.glsl"
+
+layout(local_size_x = 64) in;
+
+float residual(int p, int c) {
+    int index = p * op.outputChannels + c;
+    float value = loadActivation(op.offsets.x + index);
+    if (op.kind == 5) { // LocalSkip
+        int image = p / (op.h * op.w);
+        float scale = loadActivation(op.offsets.y + image * op.outputChannels + c);
+        return rounded(fma(value * scale, weight(op.weights.x, c), loadActivation(op.offsets.z + index)));
+    }
+    if (op.kind == 7) { // GlobalSkip
+        value = mish(value);
+        if (op.offsets.y >= 0)
+            value = fma(value, weight(op.weights.x, c), loadActivation(op.offsets.y + index));
+        return rounded(value);
+    }
+    return value;
+}
+
+void main() {
+    int pixel = groupIndex() * 2 + int(gl_SubgroupID);
+    if (pixel >= op.batch * op.h * op.w) return;
+    int lane = int(gl_SubgroupInvocationID);
+    int base = pixel * op.outputChannels;
+    bool fused = op.kind != 2;
+    float values[16]; // A 32-lane subgroup handles at most 512 channels.
+    float sum = 0.0;
+    int count = op.outputChannels / 32;
+    for (int i = 0; i < count; ++i) {
+        int c = lane + i * 32;
+        float value = residual(pixel, c);
+        if (fused) storeActivation(op.offsets.w + base + c, value);
+        values[i] = value;
+        sum = fma(value, value, sum);
+    }
+    float inverse = 1.0 / (sqrt(subgroupAdd(sum) / float(op.outputChannels)) + 1e-6);
+    int scale = fused ? op.weights.y : op.weights.x;
+    int shift = fused ? op.weights.z : op.weights.y;
+    for (int i = 0; i < count; ++i) {
+        int c = lane + i * 32;
+        storeActivation(op.outputOffset + base + c,
+                        fma(values[i] * inverse, weight(scale, c), weight(shift, c)));
+    }
+}

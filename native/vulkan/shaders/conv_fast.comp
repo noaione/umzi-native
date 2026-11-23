@@ -1,0 +1,110 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "schedule.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(constant_id = 0) const bool spatialKernel = false;
+layout(constant_id = 1) const bool applySilu = false;
+
+#ifdef HALF_MATH
+#define Operand float16_t
+#define Operand4 f16vec4
+#else
+#define Operand float
+#define Operand4 vec4
+#endif
+
+const int tile = 32;
+const int depth = 16;
+// Padding changes the shared-memory bank of consecutive reduction rows.
+shared Operand imageTile[depth][tile + 1];
+shared Operand weightTile[depth][tile + 1];
+
+void main() {
+    int outputBlocks = (op.outputChannels + tile - 1) / tile;
+    int group = groupIndex();
+    int basePixel = group / outputBlocks * tile;
+    int baseChannel = group % outputBlocks * tile;
+    int totalPixels = op.batch * op.h * op.w;
+    if (basePixel >= totalPixels) return;
+
+    int lx = int(gl_LocalInvocationID.x);
+    int ly = int(gl_LocalInvocationID.y);
+    int cin = op.channels.x - op.channelOffset;
+    int weightStride = (spatialKernel ? 9 : 1) * cin;
+    int k = lx * 2;
+    vec4 sum[4] = vec4[4](vec4(0), vec4(0), vec4(0), vec4(0));
+    for (int tap = 0; tap < (spatialKernel ? 9 : 1); ++tap) {
+        int inputBase[4];
+        int filterBase[4];
+        int dx = spatialKernel ? tap % 3 - 1 : 0;
+        int dy = spatialKernel ? tap / 3 - 1 : 0;
+        for (int i = 0; i < 4; ++i) {
+            int row = ly + i * 8;
+            int pixel = basePixel + row;
+            int channel = baseChannel + row;
+            bool valid = pixel < totalPixels;
+            if (spatialKernel) {
+                int x = pixel % op.w + dx;
+                int y = pixel / op.w % op.h + dy;
+                valid = valid && x >= 0 && x < op.w && y >= 0 && y < op.h;
+            }
+            inputBase[i] = valid
+                ? op.offsets.x + (pixel + dy * op.w + dx) * op.channels.x + op.channelOffset : -1;
+            filterBase[i] = channel < op.outputChannels ? channel * weightStride + tap * cin : -1;
+        }
+        for (int start = 0; start < cin; start += depth) {
+            int coordinate = start + k;
+            for (int i = 0; i < 4; ++i) {
+                int row = ly + i * 8;
+                vec2 a = vec2(0);
+                if (inputBase[i] >= 0 && coordinate < cin) {
+                    int source = inputBase[i] + coordinate;
+                    a = vec2(loadActivation(source), loadActivation(source + 1));
+                }
+                vec2 b = filterBase[i] >= 0 && coordinate < cin
+                    ? weightPair(op.weights.x, filterBase[i] + coordinate) : vec2(0);
+                imageTile[k][row] = Operand(a.x);
+                imageTile[k + 1][row] = Operand(a.y);
+                weightTile[k][row] = Operand(b.x);
+                weightTile[k + 1][row] = Operand(b.y);
+            }
+            barrier();
+#ifdef HALF_MATH
+            // Sum a short dot product in binary16 and merge the partials in FP32.
+            Operand4 partial[4] = Operand4[4](Operand4(0), Operand4(0), Operand4(0), Operand4(0));
+#endif
+            for (int inner = 0; inner < depth; ++inner) {
+                Operand4 b = Operand4(weightTile[inner][lx], weightTile[inner][lx + 8],
+                                     weightTile[inner][lx + 16], weightTile[inner][lx + 24]);
+                for (int r = 0; r < 4; ++r) {
+                    Operand4 a = Operand4(imageTile[inner][ly + r * 8]);
+#ifdef HALF_MATH
+                    partial[r] = fma(a, b, partial[r]);
+#else
+                    sum[r] = fma(a, b, sum[r]);
+#endif
+                }
+            }
+#ifdef HALF_MATH
+            for (int r = 0; r < 4; ++r) sum[r] += vec4(partial[r]);
+#endif
+            barrier();
+        }
+    }
+    for (int r = 0; r < 4; ++r) {
+        int pixel = basePixel + ly + r * 8;
+        if (pixel >= totalPixels) break;
+        for (int j = 0; j < 4; ++j) {
+            int channel = baseChannel + lx + j * 8;
+            if (channel < op.outputChannels) {
+                float value = sum[r][j] + weight(op.weights.y, channel);
+                if (applySilu) {
+                    value = rounded(value);
+                    value *= sigmoid(value);
+                }
+                storeActivation(op.outputOffset + pixel * op.outputChannels + channel, value);
+            }
+        }
+    }
+}
