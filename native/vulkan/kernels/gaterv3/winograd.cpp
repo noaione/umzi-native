@@ -32,7 +32,7 @@ std::array<float, 4> transform_filter(float a, float b, float c) {
 }
 }
 
-void transform_winograd_filters(const char* source, char* destination) {
+void transform_winograd_filters(const char* source, char* destination, bool row_major_output) {
     for (int out = 0; out < channels; ++out) {
         for (int in = 0; in < channels; ++in) {
             std::array<float, 4> rows[3];
@@ -41,12 +41,14 @@ void transform_winograd_filters(const char* source, char* destination) {
                 const size_t stride = channels * sizeof(uint16_t);
                 rows[y] = transform_filter(unpack_half(row), unpack_half(row + stride), unpack_half(row + 2 * stride));
             }
-            char* transformed = destination + sizeof(uint16_t) * (out * channels + in) * 16;
             for (int x = 0; x < 4; ++x) {
                 const auto column = transform_filter(rows[0][x], rows[1][x], rows[2][x]);
                 for (int y = 0; y < 4; ++y) {
                     const uint16_t half = float_to_half(column[y]);
-                    std::memcpy(transformed + sizeof(uint16_t) * (y * 4 + x), &half, sizeof(half));
+                    const size_t index = row_major_output
+                        ? size_t(((y * channels + in) * channels + out) * 4 + x)
+                        : size_t((out * channels + in) * 16 + y * 4 + x);
+                    std::memcpy(destination + sizeof(uint16_t) * index, &half, sizeof(half));
                 }
             }
         }

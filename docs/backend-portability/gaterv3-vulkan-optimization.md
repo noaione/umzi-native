@@ -25,7 +25,8 @@ Set any optimization to `0` in `SessionOptions.kernel_options` to disable it for
 | `paired_gates` | 1 | Processes local and Inception gates in channel pairs. Set to 0 for scalar gate shaders. |
 | `half2_convolution` | 1 | Uses aligned FP16 pairs and unrolled loops in the direct convolution shader when FP16 arithmetic and storage are active. Set to 0 for the prior direct FP16 kernel. |
 | `tiled_projection` | 1 | Uses a dedicated FP16 1×1 kernel for full 32-pixel by 32-output-channel tiles and 16-input-channel reduction blocks. Requires `half2_convolution`. Set to 0 to use the pass 2 direct kernel for all 1×1 operations. |
-| `winograd_convolution` | 0 | Set to 1 to try Winograd for 32-input, 32-output 3×3 operations in FP16 mode with FP16 storage. The kernel needs 128 workgroup invocations and 13 KiB of shared memory. |
+| `winograd_convolution` | 0 | Set to 1 to try Winograd for 32-input, 32-output 3×3 operations in FP16 mode with FP16 storage. Uses 32 invocations and 4 KiB of shared memory with `winograd_input_reuse=1`, or 128 invocations and 13 KiB with `winograd_input_reuse=0`. |
+| `winograd_input_reuse` | 1 | Uses a single 32-invocation workgroup across all 32 output channels and 4 spatial tiles (`conv_winograd_reuse.comp`) with row-major `f16vec4` pretransformed filters when `winograd_convolution=1`. Set to 0 for the pass 2 Winograd kernel. |
 | `reference` | 0 | Set to 1 to disable the optimizations as a group and select the original mixed or FP32 path. |
 | `profile` | 0 | Set to 1 to collect per-operation GPU timestamps on queues that support them. |
 
@@ -43,7 +44,7 @@ For an A/B benchmark, repeat `--vulkan-option NAME=0` for each option you want t
 
 The alternating mixed-mode benchmark measured **1.71–2.19×** speedups across both checkpoints, drivers, and batch sizes. On MoltenVK, the full-page mixed runs roughly halved tile latency and more than doubled batch-16 throughput. Sampled batch-16 GPU allocation fell from **338.3 to 210.7 MiB** for Original and **278.0 to 150.3 MiB** for IDC. Pooled mixed-mode PSNR moved by under **0.01 dB** on both drivers. [Same-precision full-page comparison](#same-precision-speedup-over-the-original-vulkan-kernels) · [Alternating mixed-mode checks](#alternating-mixed-mode-checks)
 
-Native FP16 continued the speed gains and beat WebGPU FP16 in both latency and throughput for both models on both drivers. Mixed mode retained the higher raw PSNR. [Pass 1 full-page results](#full-page-results) · [Pass 2 full-page results](#pass-2-full-page-results) · [Pass 3 projection kernel](#pass-3-fp16-projections)
+Native FP16 continued the speed gains and beat WebGPU FP16 in both latency and throughput for both models on both drivers. Mixed mode retained the higher raw PSNR. [Pass 1 full-page results](#full-page-results) · [Pass 2 full-page results](#pass-2-full-page-results) · [Pass 3 projection kernel](#pass-3-fp16-projections) · [Pass 4 Winograd input reuse](#pass-4-winograd-input-reuse)
 
 ### What each pass changed
 
@@ -320,7 +321,102 @@ The local `output/vulkan/optimization/pass3/projection/{original,idc}/report.jso
 
 ### Reproduce the projection comparison
 
-Re-run the page comparison with the pass 2 command above. Remove `--vulkan-option tiled_projection=0` to enable the new 1×1 shader. Add `--vulkan-option winograd_convolution=1` to both runs to compare with Winograd also enabled. Use a separate output directory per configuration.
+Re-run the page comparison with the pass 2 command above. Remove `--vulkan-option tiled_projection=0` to enable the new 1×1 shader. Add `--vulkan-option winograd_convolution=1 --vulkan-option winograd_input_reuse=0` to both runs to compare with the pass 2 Winograd shader also enabled. Use a separate output directory per configuration.
+
+## Pass 4 Winograd input reuse
+
+The new Winograd shader (`native/vulkan/kernels/gaterv3/shaders/conv_winograd_reuse.comp`) computes all 32 output channels for a group of four spatial tiles in a single 32×1 workgroup, sharing one input transform across all 32 output channels. Transformed input tiles are stored as `shared f16vec4 imageTile[4][4][32]` (4 KiB, down from 13 KiB), giving conflict-free 32-lane writes and hardware-broadcast reads with a single workgroup barrier. Pretransformed filters (`winograd.cpp`) keep the same 0.59 MiB footprint per session but use a row-major `(row, in_channel, out_channel)` layout aligned to 8 bytes so each lane loads coalesced `f16vec4` filter quartets directly from the read-only weights buffer and reuses every load across all four tiles without a shared weight tile. The shader preserves the exact 16-term FP16 FMA partial order, FP32 partial merge, and left-associative `A^T m A` reconstruction. Pass `winograd_input_reuse=0` with `winograd_convolution=1` to select the prior two-workgroup Winograd shader for A/B testing.
+
+Controlled sweeps compared 128-invocation (2 output channels/lane) and 256-invocation (1 output channel/lane) designs with shared weight tiles, direct filter reads, 4–16 tiles per workgroup, and 1–4 tiles per lane. Unrolling the 16-term reduction loop regressed MoltenVK 3×3 GPU time by ~17 ms, and retaining a shared weight tile at 21–26 KiB constrained occupancy. Dropping the shared weight tile in favor of coalesced direct `f16vec4` filter loads cut 3×3 GPU time by 11 ms on 16×8 (2 outputs/lane), and switching to 1 output channel × 4 tiles per lane in a 32×1 workgroup with 4 KiB shared memory delivered the strongest and most consistent gains across both drivers and batch sizes. Scalar row registers in the interior input transform also avoid a KosmicKrisp codegen mismatch on local arrays inside nested branches, and keeping the explicit `sum[0..3]` reconstruction order preserves strict bitwise identity across random inputs on both Metal drivers.
+
+In matched five-run MoltenVK batch-16 GPU timestamp profiles, total 3×3 convolution GPU time fell from **76.70 to 54.25 ms** (-22.45 ms, -29.3%) for Original and **70.79 to 47.90 ms** (-22.89 ms, -32.3%) for IDC.
+
+The following synchronized host call medians use the first tile or first 16 tiles of `page-001.jpg`, two warmups, and six timed calls per variant in alternating order. Every pair compares `winograd_input_reuse=0` with `winograd_input_reuse=1` (`winograd_convolution=1`, FP16).
+
+| Checkpoint | Driver | Batch | Prior Winograd (ms) | Input-reuse Winograd (ms) | Reduction |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Original | MoltenVK | 1 | 20.12 | 18.82 | 6.5% |
+| Original | MoltenVK | 16 | 205.63 | 182.61 | 11.2% |
+| Original | KosmicKrisp | 1 | 20.36 | 18.72 | 8.1% |
+| Original | KosmicKrisp | 16 | 240.75 | 210.17 | 12.7% |
+| IDC | MoltenVK | 1 | 13.51 | 12.32 | 8.8% |
+| IDC | MoltenVK | 16 | 153.12 | 130.38 | 14.9% |
+| IDC | KosmicKrisp | 1 | 14.26 | 12.63 | 11.4% |
+| IDC | KosmicKrisp | 16 | 184.01 | 152.18 | 17.3% |
+
+Both drivers passed Vulkan validation and synchronization validation (`UMZI_VULKAN_VALIDATION=1 VK_LAYER_VALIDATE_SYNC=1`) with zero errors across both checkpoints, the standard `validate_vulkan.py` suite, and 24 bitwise comparisons (`1×3`, `15×17`, `2×41×65`, `129×94`, `128×128`, and `16×128×128`) against both the pass 3 library and `winograd_input_reuse=0`. Twenty fallback checks confirmed `winograd_input_reuse` reports `0` in `fp32`, `mixed`, `reference=1`, `fp16_storage=0`, and default `winograd_convolution=0` sessions.
+
+### Pass 4 full-page results
+
+Measured on the same Apple M4 with three pages per checkpoint, 128×128 tiles, tiled projections enabled, and both Vulkan drivers. Batch-16 timing sums 11 synchronized calls per image. Mean tile latency uses 528 individually timed batch-1 calls per configuration. Raw peak-1 PSNR uses the matching Torch MPS FP32 output. SSIMULACRA2 scores use the rendered PNGs.
+
+| Checkpoint | Driver | Winograd kernel | Batch-16 s | Batch-16 MPx/s | Batch-1 total s | Batch-1 ms/tile | Peak GPU MiB, batch 1 / 16 | Raw PSNR dB | SSIMULACRA2 |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Original | MoltenVK | Prior Winograd | 6.764 | 1.245 | 11.368 | 21.53 | 79.9 / 211.3 | 80.81 | 92.14 |
+| Original | MoltenVK | Input-reuse Winograd | 6.001 | 1.404 | 11.135 | 21.09 | 79.9 / 211.3 | 80.81 | 92.14 |
+| Original | KosmicKrisp | Prior Winograd | 7.972 | 1.057 | 10.785 | 20.43 | 82.0 / 213.3 | 80.81 | 92.21 |
+| Original | KosmicKrisp | Input-reuse Winograd | 6.914 | 1.218 | 9.836 | 18.63 | 82.0 / 213.3 | 80.81 | 92.21 |
+| IDC | MoltenVK | Prior Winograd | 5.041 | 1.671 | 8.164 | 15.46 | 19.6 / 150.9 | 68.50 | 92.00 |
+| IDC | MoltenVK | Input-reuse Winograd | 4.292 | 1.963 | 8.175 | 15.48 | 19.6 / 150.9 | 68.50 | 92.00 |
+| IDC | KosmicKrisp | Prior Winograd | 6.083 | 1.385 | 7.575 | 14.35 | 20.9 / 152.2 | 68.50 | 92.06 |
+| IDC | KosmicKrisp | Input-reuse Winograd | 5.051 | 1.668 | 6.680 | 12.65 | 21.4 / 152.2 | 68.50 | 92.06 |
+
+Input-reuse Winograd increased batch-16 throughput by **12.8–20.4%** across all four model and driver combinations, pushing Original MoltenVK to **1.404 MPx/s** (vs. 1.18 target) and IDC MoltenVK to **1.963 MPx/s** (vs. 1.60 target). KosmicKrisp reached **1.218 MPx/s** / **18.63 ms/tile** on Original and **1.668 MPx/s** / **12.65 ms/tile** on IDC. Every matched pair produced bit-identical page PNGs, identical raw PSNR and SSIMULACRA2, and identical MoltenVK peak GPU allocations.
+
+As in pass 3, the sequential MoltenVK batch-1 pass drifted upward across pages after the batch-16 run (15.46 vs. 15.48 ms/tile on IDC). A paired back-to-back check timing both Winograd kernels in alternating order on all 528 tiles lowered the MoltenVK mean from **21.12 to 20.09 ms/tile** (-4.9%) for Original and from **14.74 to 13.58 ms/tile** (-7.8%) for IDC, clearing the **15.00 ms/tile** target on every page (13.28, 13.47, and 14.00 ms/tile) with bit-identical outputs on all 1,056 paired tiles. The paired records are in `molten-latency-ab.ndjson` and `{original,idc}-molten-latency-paired.json` under `output/vulkan/optimization/pass4/`.
+
+<details>
+<summary>Original per image</summary>
+
+| Image | Driver | Winograd kernel | Batch-16 s | Batch-16 MPx/s | Batch-1 total s | Batch-1 ms/tile | Raw PSNR dB | SSIMULACRA2 |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| page-001.jpg | MoltenVK | Prior Winograd | 2.262 | 1.241 | 3.701 | 21.03 | 80.39 | 94.28 |
+| page-005.jpg | MoltenVK | Prior Winograd | 2.246 | 1.250 | 3.832 | 21.77 | 84.39 | 90.86 |
+| page-009.jpg | MoltenVK | Prior Winograd | 2.255 | 1.245 | 3.835 | 21.79 | 79.16 | 91.26 |
+| page-001.jpg | MoltenVK | Input-reuse Winograd | 1.999 | 1.405 | 3.816 | 21.68 | 80.39 | 94.28 |
+| page-005.jpg | MoltenVK | Input-reuse Winograd | 2.003 | 1.402 | 3.655 | 20.77 | 84.39 | 90.86 |
+| page-009.jpg | MoltenVK | Input-reuse Winograd | 2.000 | 1.404 | 3.663 | 20.81 | 79.16 | 91.26 |
+| page-001.jpg | KosmicKrisp | Prior Winograd | 2.669 | 1.052 | 3.591 | 20.40 | 80.39 | 94.44 |
+| page-005.jpg | KosmicKrisp | Prior Winograd | 2.649 | 1.060 | 3.598 | 20.44 | 84.40 | 90.85 |
+| page-009.jpg | KosmicKrisp | Prior Winograd | 2.653 | 1.058 | 3.596 | 20.43 | 79.16 | 91.35 |
+| page-001.jpg | KosmicKrisp | Input-reuse Winograd | 2.305 | 1.218 | 3.282 | 18.65 | 80.39 | 94.44 |
+| page-005.jpg | KosmicKrisp | Input-reuse Winograd | 2.300 | 1.221 | 3.274 | 18.60 | 84.40 | 90.85 |
+| page-009.jpg | KosmicKrisp | Input-reuse Winograd | 2.310 | 1.216 | 3.280 | 18.64 | 79.16 | 91.35 |
+
+</details>
+
+<details>
+<summary>IDC per image</summary>
+
+| Image | Driver | Winograd kernel | Batch-16 s | Batch-16 MPx/s | Batch-1 total s | Batch-1 ms/tile | Raw PSNR dB | SSIMULACRA2 |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| page-001.jpg | MoltenVK | Prior Winograd | 1.678 | 1.673 | 2.676 | 15.21 | 69.29 | 94.05 |
+| page-005.jpg | MoltenVK | Prior Winograd | 1.680 | 1.671 | 2.721 | 15.46 | 68.34 | 90.66 |
+| page-009.jpg | MoltenVK | Prior Winograd | 1.683 | 1.668 | 2.767 | 15.72 | 67.97 | 91.28 |
+| page-001.jpg | MoltenVK | Input-reuse Winograd | 1.422 | 1.975 | 2.660 | 15.11 | 69.29 | 94.05 |
+| page-005.jpg | MoltenVK | Input-reuse Winograd | 1.439 | 1.952 | 2.728 | 15.50 | 68.34 | 90.66 |
+| page-009.jpg | MoltenVK | Input-reuse Winograd | 1.431 | 1.963 | 2.787 | 15.83 | 67.97 | 91.28 |
+| page-001.jpg | KosmicKrisp | Prior Winograd | 2.030 | 1.383 | 2.528 | 14.36 | 69.29 | 94.09 |
+| page-005.jpg | KosmicKrisp | Prior Winograd | 2.032 | 1.382 | 2.522 | 14.33 | 68.33 | 90.83 |
+| page-009.jpg | KosmicKrisp | Prior Winograd | 2.021 | 1.389 | 2.526 | 14.35 | 67.97 | 91.28 |
+| page-001.jpg | KosmicKrisp | Input-reuse Winograd | 1.683 | 1.669 | 2.221 | 12.62 | 69.29 | 94.09 |
+| page-005.jpg | KosmicKrisp | Input-reuse Winograd | 1.690 | 1.662 | 2.222 | 12.63 | 68.33 | 90.83 |
+| page-009.jpg | KosmicKrisp | Input-reuse Winograd | 1.678 | 1.674 | 2.237 | 12.71 | 67.97 | 91.28 |
+
+</details>
+
+The local `output/vulkan/optimization/pass4/{original,idc}/report.json` files contain every tile's elapsed time, image, index, and coordinates. The same directory contains the variant sweeps, alternating host comparisons, GPU timestamp profiles, paired MoltenVK tile timings, and validation logs.
+
+### Reproduce the Winograd input-reuse comparison
+
+Run the pass 2 page comparison command with `--vulkan-option winograd_convolution=1` (omitting `--vulkan-option tiled_projection=0`) for the new input-reuse Winograd shader, and repeat with `--vulkan-option winograd_convolution=1 --vulkan-option winograd_input_reuse=0` in a separate output directory for the prior Winograd shader.
+
+## Next pass: Inception gate and wider 3×3 coverage
+
+With tiled projections and input-reuse Winograd enabled, five MoltenVK FP16 profiles at batch 16 break down as **56.6 ms** 1×1, **54.2 ms** 3×3, **14.9 ms** Inception gate, **12.6 ms** fused residual/RMSNorm, **9.3 ms** attention, and **7.9 ms** local gate for Original (host median **183.9 ms**); and **47.9 ms** 3×3, **30.2 ms** 1×1, **15.2 ms** Inception gate, **10.5 ms** fused residual/RMSNorm, and **7.0 ms** local gate for IDC (host median **131.9 ms**). All pass 2 throughput and latency targets are now met.
+
+1. Start in `native/vulkan/kernels/gaterv3/shaders/gates.comp`. The Inception gate is now the largest non-convolution GPU cost shared across both checkpoints (~15 ms). Prototype vectorized `f16vec4` / `f16vec2` channel loads, unrolled fixed tap loops, or spatial-tile staging in shared memory to reduce redundant neighbor reads while preserving FP32 accumulation and exact output.
+2. Evaluate extending Winograd input reuse (or a dedicated direct 3×3 FP16 kernel) to the remaining non-32-channel 3×3 stage transitions, which now represent more than half of remaining 3×3 GPU time (~26–32 ms across both models). Compare added transformed-filter memory and PSNR/SSIMULACRA2 before broadening Winograd coverage.
 
 ## Reproduce
 

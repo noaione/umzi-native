@@ -1,0 +1,162 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "schedule.glsl"
+
+layout(local_size_x = 32, local_size_y = 1) in;
+layout(constant_id = 1) const bool applySilu = false;
+layout(set = 0, binding = 1, std430) readonly buffer WeightQuartets { f16vec4 filters[]; };
+
+const int channels = 32;
+const int tiles = 4;
+// Indexed [tile][row][inChannel] for conflict-free 32-lane writes and broadcast reads.
+shared f16vec4 imageTile[tiles][4][channels];
+
+// B^T d B, applied in one dimension at a time.
+vec4 transformInputRow(vec4 v) {
+    return vec4(v.x - v.z, v.y + v.z, v.z - v.y, v.y - v.w);
+}
+
+float readImage(int image, int y, int x, int c) {
+    if (y < 0 || y >= op.h || x < 0 || x >= op.w) return 0.0;
+    return loadActivation(op.offsets.x + ((image * op.h + y) * op.w + x) * channels + c);
+}
+
+void transformSingleTile(int image, int py, int px, int c, int slot) {
+    // Keep rows in scalar registers rather than a local array inside the branch.
+    vec4 d0 = vec4(0), d1 = vec4(0), d2 = vec4(0), d3 = vec4(0);
+    if (image < op.batch) {
+        if (px > 0 && px + 2 < op.w && py > 0 && py + 2 < op.h) {
+            int r = op.offsets.x + ((image * op.h + py - 1) * op.w + px - 1) * channels + c;
+            int stride = op.w * channels;
+            d0 = transformInputRow(vec4(loadActivation(r), loadActivation(r + channels),
+                                        loadActivation(r + 2 * channels), loadActivation(r + 3 * channels)));
+            r += stride;
+            d1 = transformInputRow(vec4(loadActivation(r), loadActivation(r + channels),
+                                        loadActivation(r + 2 * channels), loadActivation(r + 3 * channels)));
+            r += stride;
+            d2 = transformInputRow(vec4(loadActivation(r), loadActivation(r + channels),
+                                        loadActivation(r + 2 * channels), loadActivation(r + 3 * channels)));
+            r += stride;
+            d3 = transformInputRow(vec4(loadActivation(r), loadActivation(r + channels),
+                                        loadActivation(r + 2 * channels), loadActivation(r + 3 * channels)));
+        } else {
+            d0 = transformInputRow(vec4(readImage(image, py - 1, px - 1, c), readImage(image, py - 1, px, c),
+                                        readImage(image, py - 1, px + 1, c), readImage(image, py - 1, px + 2, c)));
+            d1 = transformInputRow(vec4(readImage(image, py, px - 1, c), readImage(image, py, px, c),
+                                        readImage(image, py, px + 1, c), readImage(image, py, px + 2, c)));
+            d2 = transformInputRow(vec4(readImage(image, py + 1, px - 1, c), readImage(image, py + 1, px, c),
+                                        readImage(image, py + 1, px + 1, c), readImage(image, py + 1, px + 2, c)));
+            d3 = transformInputRow(vec4(readImage(image, py + 2, px - 1, c), readImage(image, py + 2, px, c),
+                                        readImage(image, py + 2, px + 1, c), readImage(image, py + 2, px + 2, c)));
+        }
+    }
+    imageTile[slot][0][c] = f16vec4(d0 - d2);
+    imageTile[slot][1][c] = f16vec4(d1 + d2);
+    imageTile[slot][2][c] = f16vec4(d2 - d1);
+    imageTile[slot][3][c] = f16vec4(d1 - d3);
+}
+
+float finishValue(float value) {
+    if (applySilu) {
+        value = rounded(value);
+        value *= sigmoid(value);
+    }
+    return value;
+}
+
+void writeOut(int image, int py, int px, int ch, vec4 first, vec4 second, float bias) {
+    if (image >= op.batch) return;
+    if (py + 1 < op.h && px + 1 < op.w) {
+        int base0 = op.outputOffset + ((image * op.h + py) * op.w + px) * channels + ch;
+        int base1 = base0 + op.w * channels;
+        storeActivation(base0, finishValue((first.x + first.y + first.z) + bias));
+        storeActivation(base0 + channels, finishValue((first.y - first.z - first.w) + bias));
+        storeActivation(base1, finishValue((second.x + second.y + second.z) + bias));
+        storeActivation(base1 + channels, finishValue((second.y - second.z - second.w) + bias));
+    } else {
+        for (int dy = 0; dy < 2 && py + dy < op.h; ++dy) {
+            vec4 row = dy == 0 ? first : second;
+            int base = op.outputOffset + ((image * op.h + py + dy) * op.w + px) * channels + ch;
+            for (int dx = 0; dx < 2 && px + dx < op.w; ++dx) {
+                float value = (dx == 0 ? row.x + row.y + row.z : row.y - row.z - row.w) + bias;
+                storeActivation(base + dx * channels, finishValue(value));
+            }
+        }
+    }
+}
+
+void main() {
+    int group = groupIndex();
+    int tilesWide = (op.w + 1) / 2;
+    int tilesHigh = (op.h + 1) / 2;
+    int tileCount = tilesWide * tilesHigh;
+    int tile0 = group * tiles;
+    if (tile0 >= op.batch * tileCount) return;
+
+    int ch = int(gl_LocalInvocationID.x);
+    int wBase = op.weights.x >> 3;
+    int img0 = tile0 / tileCount;
+    int rem0 = tile0 - img0 * tileCount;
+    int tx0 = rem0 % tilesWide;
+    int ty0 = rem0 / tilesWide;
+    int px0 = 2 * tx0;
+    int py0 = 2 * ty0;
+
+    for (int t = 0; t < tiles; ++t) {
+        int tile = tile0 + t;
+        int img = tile / tileCount;
+        int rem = tile - img * tileCount;
+        transformSingleTile(img, 2 * (rem / tilesWide), 2 * (rem % tilesWide), ch, t);
+    }
+    barrier();
+
+    // Process one Winograd row at a time, preserving 16-term FP16 partials merged in FP32.
+    vec4 sum0[4], sum1[4], sum2[4], sum3[4];
+    for (int row = 0; row < 4; ++row) {
+        int rowBase = wBase + row * channels * channels + ch;
+        f16vec4 pa0 = f16vec4(0), pa1 = f16vec4(0), pa2 = f16vec4(0), pa3 = f16vec4(0);
+        for (int c = 0; c < 16; ++c) {
+            f16vec4 w = filters[rowBase + c * channels];
+            pa0 = fma(imageTile[0][row][c], w, pa0);
+            pa1 = fma(imageTile[1][row][c], w, pa1);
+            pa2 = fma(imageTile[2][row][c], w, pa2);
+            pa3 = fma(imageTile[3][row][c], w, pa3);
+        }
+        f16vec4 pb0 = f16vec4(0), pb1 = f16vec4(0), pb2 = f16vec4(0), pb3 = f16vec4(0);
+        for (int c = 16; c < 32; ++c) {
+            f16vec4 w = filters[rowBase + c * channels];
+            pb0 = fma(imageTile[0][row][c], w, pb0);
+            pb1 = fma(imageTile[1][row][c], w, pb1);
+            pb2 = fma(imageTile[2][row][c], w, pb2);
+            pb3 = fma(imageTile[3][row][c], w, pb3);
+        }
+        sum0[row] = vec4(pa0) + vec4(pb0);
+        sum1[row] = vec4(pa1) + vec4(pb1);
+        sum2[row] = vec4(pa2) + vec4(pb2);
+        sum3[row] = vec4(pa3) + vec4(pb3);
+    }
+
+    // A^T m A row reconstruction, matching the prior Winograd FP32 expression order.
+    vec4 f0 = sum0[0] + sum0[1] + sum0[2], s0 = sum0[1] - sum0[2] - sum0[3];
+    vec4 f1 = sum1[0] + sum1[1] + sum1[2], s1 = sum1[1] - sum1[2] - sum1[3];
+    vec4 f2 = sum2[0] + sum2[1] + sum2[2], s2 = sum2[1] - sum2[2] - sum2[3];
+    vec4 f3 = sum3[0] + sum3[1] + sum3[2], s3 = sum3[1] - sum3[2] - sum3[3];
+
+    float bias = weight(op.weights.y, ch);
+    bool fullStrip = img0 < op.batch && tx0 + 3 < tilesWide && px0 + 7 < op.w && py0 + 1 < op.h;
+    if (fullStrip) {
+        writeOut(img0, py0, px0, ch, f0, s0, bias);
+        writeOut(img0, py0, px0 + 2, ch, f1, s1, bias);
+        writeOut(img0, py0, px0 + 4, ch, f2, s2, bias);
+        writeOut(img0, py0, px0 + 6, ch, f3, s3, bias);
+    } else {
+        for (int t = 0; t < tiles; ++t) {
+            int tile = tile0 + t;
+            int img = tile / tileCount;
+            int rem = tile - img * tileCount;
+            vec4 ff = t == 0 ? f0 : (t == 1 ? f1 : (t == 2 ? f2 : f3));
+            vec4 ss = t == 0 ? s0 : (t == 1 ? s1 : (t == 2 ? s2 : s3));
+            writeOut(img, 2 * (rem / tilesWide), 2 * (rem % tilesWide), ch, ff, ss, bias);
+        }
+    }
+}

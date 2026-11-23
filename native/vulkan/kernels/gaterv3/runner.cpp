@@ -54,6 +54,9 @@ constexpr uint32_t projection_code[]{
 constexpr uint32_t conv_winograd_code[]{
 #include "gaterv3_conv_winograd_spv.h"
 };
+constexpr uint32_t conv_winograd_reuse_code[]{
+#include "gaterv3_conv_winograd_reuse_spv.h"
+};
 constexpr uint32_t element_half_code[]{
 #include "gaterv3_element_half_spv.h"
 };
@@ -107,6 +110,7 @@ struct KernelOptions {
     bool half2_convolution = true;
     bool tiled_projection = true;
     bool winograd_convolution = false;
+    bool winograd_input_reuse = true;
 };
 
 struct KernelOption {
@@ -126,6 +130,7 @@ constexpr KernelOption kernel_options[] = {
     {"half2_convolution", &KernelOptions::half2_convolution},
     {"tiled_projection", &KernelOptions::tiled_projection},
     {"winograd_convolution", &KernelOptions::winograd_convolution},
+    {"winograd_input_reuse", &KernelOptions::winograd_input_reuse},
 };
 
 KernelOptions read_options(const UmziSessionOptions& config) {
@@ -160,7 +165,9 @@ constexpr int mean_chunk = 256;
 constexpr int projection_tile = 32;
 constexpr int projection_depth = 16;
 constexpr int winograd_tiles_per_group = 8;
+constexpr int winograd_reuse_tiles_per_group = 4;
 constexpr uint32_t winograd_shared_bytes = 16 * 4 * (9 + 17) * (4 * sizeof(uint16_t));
+constexpr uint32_t winograd_reuse_shared_bytes = 4 * 4 * 32 * (4 * sizeof(uint16_t));
 constexpr size_t winograd_filter_bytes = 32 * 32 * 16 * sizeof(uint16_t);
 constexpr std::array profile_names{
     "gpu_pack_ns", "gpu_conv1_ns", "gpu_rms_ns", "gpu_local_ns", "gpu_mean_ns",
@@ -295,9 +302,16 @@ void GateRV3Session::open(const umzi::ModelPackage& package, const UmziSessionOp
         || limits.maxPerStageDescriptorStorageBuffers < (options.fp16_storage ? 3u : 2u))
         throw std::runtime_error("Vulkan GPU does not meet GateRV3 compute limits");
 
-    options.winograd_convolution &= fp16_math && options.fp16_storage
-        && limits.maxComputeWorkGroupInvocations >= 128 && limits.maxComputeSharedMemorySize >= winograd_shared_bytes;
-    const size_t packed_bytes = (model.weight_bytes + 3) & ~size_t(3);
+    const bool winograd_base_ok = fp16_math && options.fp16_storage;
+    const bool winograd_reuse_ok = winograd_base_ok && options.winograd_input_reuse
+        && limits.maxComputeWorkGroupInvocations >= 32
+        && limits.maxComputeSharedMemorySize >= winograd_reuse_shared_bytes;
+    const bool winograd_legacy_ok = winograd_base_ok
+        && limits.maxComputeWorkGroupInvocations >= 128
+        && limits.maxComputeSharedMemorySize >= winograd_shared_bytes;
+    options.winograd_convolution &= winograd_reuse_ok || winograd_legacy_ok;
+    options.winograd_input_reuse = options.winograd_convolution && winograd_reuse_ok;
+    const size_t packed_bytes = (model.weight_bytes + 7) & ~size_t(7);
     size_t bytes = packed_bytes;
     if (options.winograd_convolution) {
         winograd_weights.resize(model.ops.size(), -1);
@@ -311,6 +325,7 @@ void GateRV3Session::open(const umzi::ModelPackage& package, const UmziSessionOp
             bytes += winograd_filter_bytes;
         }
         options.winograd_convolution = bytes > packed_bytes;
+        options.winograd_input_reuse &= options.winograd_convolution;
     }
     if (bytes > limits.maxStorageBufferRange)
         throw umzi::vk::AllocationError("GateRV3 weights exceed the Vulkan storage buffer limit");
@@ -326,7 +341,8 @@ void GateRV3Session::open(const umzi::ModelPackage& package, const UmziSessionOp
             for (size_t i = 0; i < winograd_weights.size(); ++i) {
                 if (winograd_weights[i] >= 0)
                     umzi::vk::transform_winograd_filters(source + model.ops[i].weight[0],
-                                                         destination + winograd_weights[i]);
+                                                         destination + winograd_weights[i],
+                                                         options.winograd_input_reuse);
             }
         }
         upload.flush();
@@ -387,9 +403,11 @@ void GateRV3Session::open(const umzi::ModelPackage& package, const UmziSessionOp
         if (options.fuse_silu) build(convolution_silu, code, &specialize_silu);
         if (options.tiled_projection) build(projection, projection_code);
         if (options.winograd_convolution) {
-            build(winograd, conv_winograd_code);
+            const Code winograd_code = options.winograd_input_reuse
+                ? Code(conv_winograd_reuse_code) : Code(conv_winograd_code);
+            build(winograd, winograd_code);
             const VkSpecializationInfo epilogue{1, entries + 1, sizeof(silu), silu};
-            if (options.fuse_silu) build(winograd_silu, conv_winograd_code, &epilogue);
+            if (options.fuse_silu) build(winograd_silu, winograd_code, &epilogue);
         }
     }
     if (options.chunked_mean) build(spatial_mean, half_storage ? Code(mean_fast_half_code) : Code(mean_fast_code));
@@ -584,8 +602,10 @@ void GateRV3Session::prepare(gt::Shape shape) {
             if (transformed >= 0) {
                 push.weights[0] = transformed;
                 const int tiles = padded.n * ceil_div(out.h, 2) * ceil_div(out.w, 2);
-                record(pipeline == convolution_silu ? winograd_silu : winograd, push,
-                       2 * ceil_div(tiles, winograd_tiles_per_group));
+                const int groups = options.winograd_input_reuse
+                    ? ceil_div(tiles, winograd_reuse_tiles_per_group)
+                    : 2 * ceil_div(tiles, winograd_tiles_per_group);
+                record(pipeline == convolution_silu ? winograd_silu : winograd, push, groups);
             } else {
                 record(pipeline, push, ceil_div(pixels, 32) * ceil_div(out.c, 32));
             }
