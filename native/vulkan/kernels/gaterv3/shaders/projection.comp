@@ -1,0 +1,76 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : require
+#include "schedule.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0, std430) buffer ActivationQuartets { f16vec4 activations[]; };
+layout(set = 0, binding = 1, std430) readonly buffer WeightQuartets { f16vec4 filters[]; };
+
+const int tile = 32;
+const int depth = 16;
+const int quartets = depth / 4;
+const int rows = tile / 8;
+// Keep consecutive reduction terms together. Padding shifts successive rows across banks.
+shared f16vec4 imageTile[tile][quartets + 1];
+shared f16vec4 weightTile[tile][quartets + 1];
+
+void main() {
+    int outputTiles = op.outputChannels / tile;
+    int group = groupIndex();
+    int pixelBase = group / outputTiles * tile;
+    if (pixelBase >= op.batch * op.h * op.w) return;
+
+    int lane = int(gl_LocalInvocationIndex);
+    int channel = 4 * int(gl_LocalInvocationID.x);
+    int pixel = int(gl_LocalInvocationID.y);
+    int channelBase = group % outputTiles * tile;
+    int cin = op.channels.x - op.channelOffset;
+    int inputStride = op.channels.x / 4;
+    int inputBase = (op.offsets.x + pixelBase * op.channels.x + op.channelOffset) / 4;
+    int weightBase = op.weights.x / 8 + channelBase * (cin / 4);
+    vec4 sum[rows] = vec4[rows](vec4(0), vec4(0), vec4(0), vec4(0));
+
+    for (int start = 0; start < cin; start += depth) {
+        [[unroll]]
+        for (int i = lane; i < tile * quartets; i += 64) {
+            int row = i / quartets;
+            int k = i % quartets;
+            imageTile[row][k] = activations[inputBase + row * inputStride + start / 4 + k];
+        }
+        [[unroll]]
+        for (int i = lane; i < tile * quartets; i += 64) {
+            int row = i / quartets;
+            int k = i % quartets;
+            weightTile[row][k] = filters[weightBase + row * (cin / 4) + start / 4 + k];
+        }
+        barrier();
+
+        f16vec4 partial[rows] = f16vec4[rows](f16vec4(0), f16vec4(0), f16vec4(0), f16vec4(0));
+        [[unroll]]
+        for (int k = 0; k < quartets; ++k) {
+            f16vec4 b0 = weightTile[channel][k];
+            f16vec4 b1 = weightTile[channel + 1][k];
+            f16vec4 b2 = weightTile[channel + 2][k];
+            f16vec4 b3 = weightTile[channel + 3][k];
+            [[unroll]]
+            for (int row = 0; row < rows; ++row) {
+                f16vec4 a = imageTile[pixel + 8 * row][k];
+                [[unroll]]
+                for (int j = 0; j < 4; ++j)
+                    partial[row] = fma(f16vec4(a[j]), f16vec4(b0[j], b1[j], b2[j], b3[j]), partial[row]);
+            }
+        }
+        [[unroll]]
+        for (int row = 0; row < rows; ++row) sum[row] += vec4(partial[row]);
+        barrier();
+    }
+
+    int outputQuartet = (channelBase + channel) / 4;
+    vec4 bias = op.weights.y < 0 ? vec4(0) : vec4(filters[op.weights.y / 8 + outputQuartet]);
+    [[unroll]]
+    for (int row = 0; row < rows; ++row) {
+        int p = pixelBase + pixel + 8 * row;
+        activations[op.outputOffset / 4 + p * (op.outputChannels / 4) + outputQuartet] = f16vec4(sum[row] + bias);
+    }
+}

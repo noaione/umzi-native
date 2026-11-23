@@ -48,6 +48,9 @@ constexpr uint32_t conv_native_half_fp32_storage_code[]{
 constexpr uint32_t conv_half2_code[]{
 #include "gaterv3_conv_half2_spv.h"
 };
+constexpr uint32_t projection_code[]{
+#include "gaterv3_projection_spv.h"
+};
 constexpr uint32_t conv_winograd_code[]{
 #include "gaterv3_conv_winograd_spv.h"
 };
@@ -88,7 +91,7 @@ static_assert(sizeof(Push) == 96);
 
 enum PipelineIndex {
     convolution, convolution_spatial, convolution_silu, elementwise, reduction, attention,
-    spatial_mean, norm, local_gate, inception_gate, winograd, winograd_silu, pipeline_count,
+    spatial_mean, norm, local_gate, inception_gate, winograd, winograd_silu, projection, pipeline_count,
 };
 
 struct KernelOptions {
@@ -102,6 +105,7 @@ struct KernelOptions {
     bool chunked_mean = true;
     bool paired_gates = true;
     bool half2_convolution = true;
+    bool tiled_projection = true;
     bool winograd_convolution = false;
 };
 
@@ -120,6 +124,7 @@ constexpr KernelOption kernel_options[] = {
     {"chunked_mean", &KernelOptions::chunked_mean},
     {"paired_gates", &KernelOptions::paired_gates},
     {"half2_convolution", &KernelOptions::half2_convolution},
+    {"tiled_projection", &KernelOptions::tiled_projection},
     {"winograd_convolution", &KernelOptions::winograd_convolution},
 };
 
@@ -152,6 +157,8 @@ constexpr int mean_projection = 18;
 constexpr int conv3_stage = 19;
 constexpr int fused_norm_stage = 20;
 constexpr int mean_chunk = 256;
+constexpr int projection_tile = 32;
+constexpr int projection_depth = 16;
 constexpr int winograd_tiles_per_group = 8;
 constexpr uint32_t winograd_shared_bytes = 16 * 4 * (9 + 17) * (4 * sizeof(uint16_t));
 constexpr size_t winograd_filter_bytes = 32 * 32 * 16 * sizeof(uint16_t);
@@ -272,6 +279,7 @@ void GateRV3Session::open(const umzi::ModelPackage& package, const UmziSessionOp
     const auto& device = selected.info;
     options.fp16_storage &= precision != UMZI_FP32 && device.shader_float16 && device.storage_buffer16;
     options.half2_convolution &= fp16_math && options.fp16_storage;
+    options.tiled_projection &= options.half2_convolution;
     options.subgroup_norm &= selected.subgroup32_arithmetic;
     options.fuse_residual_norm &= options.subgroup_norm;
     options.fuse_silu &= options.fast_convolution;
@@ -377,6 +385,7 @@ void GateRV3Session::open(const umzi::ModelPackage& package, const UmziSessionOp
         build(convolution, code);
         build(convolution_spatial, code, &specialize);
         if (options.fuse_silu) build(convolution_silu, code, &specialize_silu);
+        if (options.tiled_projection) build(projection, projection_code);
         if (options.winograd_convolution) {
             build(winograd, conv_winograd_code);
             const VkSpecializationInfo epilogue{1, entries + 1, sizeof(silu), silu};
@@ -556,6 +565,12 @@ void GateRV3Session::prepare(gt::Shape shape) {
         const int pixels = padded.n * out.pixels();
         switch (op.kind) {
         case gt::Conv: {
+            const int cin = in.c - op.y;
+            if (options.tiled_projection && op.x == 1 && pixels % projection_tile == 0
+                && out.c % projection_tile == 0 && cin % projection_depth == 0) {
+                record(projection, push, (pixels / projection_tile) * (out.c / projection_tile));
+                break;
+            }
             const int transformed = options.winograd_convolution ? winograd_weights[index] : -1;
             auto pipeline = convolution;
             if (op.x == 3 && options.fast_convolution) {
