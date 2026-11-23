@@ -1,9 +1,11 @@
 #pragma once
 
-#include "plan_cache.h"
+#include "../../runtime/model_package.h"
+#include "../../runtime/binary.h"
 
 #include <algorithm>
 #include <climits>
+#include <cstring>
 #include <limits>
 
 namespace gt {
@@ -209,7 +211,7 @@ class ModelFile {
     }
 
 public:
-    Digest content_digest{};
+    umzi::Digest content_digest{};
     size_t weight_bytes = 0;
     std::vector<Op> ops;
 
@@ -263,14 +265,14 @@ public:
         validate(tensor_shapes({1, 128, 128}));
     }
 
-    ResolvedModel resolve(const Shape& shape) const {
+    ResolvedModel resolve(const Shape& shape, size_t element_bytes = 2) const {
         ResolvedModel plan{tensor_shapes(shape)};
         struct Lifetime { size_t id, first, last, bytes; };
         std::vector<Lifetime> tensors;
         for (size_t i = 1; i + 1 < plan.tensors.size(); ++i) {
             size_t first = i - 1;
             if (ops[first].kind == Rms && ops[first].input[1] >= 0) --first;
-            size_t bytes = (size_t(plan.tensors[i].elements()) * 2 + 255) & ~size_t(255);
+            size_t bytes = (size_t(plan.tensors[i].elements()) * element_bytes + 255) & ~size_t(255);
             tensors.push_back({i, first, last_use[i], bytes});
         }
         std::stable_sort(tensors.begin(), tensors.end(), [](const auto& a, const auto& b) {

@@ -33,7 +33,7 @@ CUDA_NAMES = (
 def loaded_cuda_libraries() -> dict[str, str]:
     """Return the file each CUDA dependency was loaded from in this process."""
     found = {}
-    if WINDOWS:
+    if sys.platform == "win32":
         kernel = ctypes.WinDLL("kernel32")
         kernel.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
         kernel.GetModuleHandleW.restype = ctypes.c_void_p

@@ -1,6 +1,6 @@
 # Proposed Vulkan backend architecture
 
-**Status:** Design sketch; interfaces below are illustrative, **not yet implemented**.  
+**Status:** Long-term design sketch. See the [GateRV3 prototype](gaterv3-mac.md) for the current ABI, runtime, and tested behavior.
 **Companion:** [roadmap](README.md) · [validation](validation.md)
 
 ## 1. Architectural principles
@@ -90,7 +90,7 @@ with umzi.InferenceSession("model.ummodel", sess_options=options) as session:
     (output,) = session.run(None, {"input": tiles})
 ```
 
-**Compatibility rule:** `SessionOptions` currently has no `backend` field; this is a proposed addition. On installed CUDA builds, omitting the field must retain current semantics. An `auto` backend policy should never silently pick a different GPU on a system with multiple devices; document selection order and report the chosen backend/device.
+**Compatibility rule:** `SessionOptions.backend` accepts `cuda` and `vulkan`. Omitting it selects CUDA. Any future `auto` policy needs a documented selection order and a way to report the chosen backend and device.
 
 ### C ABI proposal
 

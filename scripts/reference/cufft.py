@@ -17,11 +17,12 @@ CUFFT_C2R = 0x2C
 
 
 def _load_library(path: Path | None) -> ct.CDLL:
-    windows = sys.platform == "win32"
-    name = "cufft64_12.dll" if windows else "libcufft.so.12"
-    relative = Path("bin/x86_64" if windows else "lib") / name
-    installed = Path(torch.__file__).resolve().parents[1] / "nvidia/cu13" / relative
-    return (ct.WinDLL if windows else ct.CDLL)(str(path or (installed if installed.is_file() else name)))
+    if sys.platform == "win32":
+        name, directory, loader = "cufft64_12.dll", "bin/x86_64", ct.WinDLL
+    else:
+        name, directory, loader = "libcufft.so.12", "lib", ct.CDLL
+    installed = Path(torch.__file__).resolve().parents[1] / "nvidia/cu13" / directory / name
+    return loader(str(path or (installed if installed.is_file() else name)))
 
 
 class Cufft:

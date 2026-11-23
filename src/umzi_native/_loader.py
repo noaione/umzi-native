@@ -13,6 +13,10 @@ from ._abi import bind_session_api
 PathArg = str | os.PathLike[str]
 WINDOWS = sys.platform == "win32"
 LIBRARY_NAME = "umzi_native.dll" if WINDOWS else "libumzi_native.so"
+VULKAN_LIBRARY_NAME = {
+    "win32": "umzi_native_vulkan.dll",
+    "darwin": "libumzi_native_vulkan.dylib",
+}.get(sys.platform, "libumzi_native_vulkan.so")
 PACKAGE_DIR = Path(__file__).resolve().parent
 # The session library links these directly. cuDNN loads its remaining
 # components by name at run time, so the explicit loader preloads them too.
@@ -20,7 +24,7 @@ CUDA_LIBRARIES = ("cublasLt64_13.dll", "cudnn64_9.dll") if WINDOWS else ("libcub
 CUDNN_COMPONENTS = "cudnn_*64_9.dll" if WINDOWS else "libcudnn_*.so.9"
 CUFFT_LIBRARY = "cufft64_12.dll" if WINDOWS else "libcufft.so.12"
 _load_lock = Lock()
-_session_libraries: dict[Path, ctypes.CDLL] = {}
+_session_libraries: dict[tuple[Path, str], ctypes.CDLL] = {}
 _cuda_libraries: dict[Path, ctypes.CDLL] = {}
 
 
@@ -87,34 +91,40 @@ def load_cuda_libraries(*directories: PathArg, include_cufft: bool = False) -> d
     return loaded
 
 
-def find_session_library(model: Path, explicit: PathArg | None = None) -> Path:
+def find_session_library(model: Path, explicit: PathArg | None = None, *, backend: str = "cuda") -> Path:
     """Select the explicit library, the installed package copy, or the one beside the model."""
     if explicit is not None:
         path = Path(explicit).resolve()
         if not path.is_file():
             raise FileNotFoundError(f"Umzi library not found: {path}")
         return path
+    name = VULKAN_LIBRARY_NAME if backend == "vulkan" else LIBRARY_NAME
     for directory in (PACKAGE_DIR, model.parent):
-        path = directory / LIBRARY_NAME
+        path = directory / name
         if path.is_file():
             return path.resolve()
     raise FileNotFoundError(
-        f"{LIBRARY_NAME} was not found in the installed package ({PACKAGE_DIR}) or beside "
-        f"the model ({model.parent}). Install a platform wheel or set SessionOptions(dll_path=...)."
+        f"{name} was not found in the installed package ({PACKAGE_DIR}) or beside "
+        f"the model ({model.parent}). Set SessionOptions(dll_path=...) to your {backend} build."
     )
 
 
-def load_session_library(path: Path) -> ctypes.CDLL:
+def load_session_library(path: Path, *, backend: str = "cuda") -> ctypes.CDLL:
     """Load and bind a Umzi session library once per process."""
     if not path.is_file():
         raise FileNotFoundError(f"Umzi library not found: {path}")
     with _load_lock:
-        library = _session_libraries.get(path)
+        key = (path, backend)
+        library = _session_libraries.get(key)
         if library is not None:
             return library
         try:
             library = _load(path)
         except OSError as error:
+            if backend == "vulkan":
+                raise OSError(
+                    f"Could not load {path}. Check the Vulkan loader and library dependencies: {error}"
+                ) from error
             libraries = " and ".join(CUDA_LIBRARIES)
             raise OSError(
                 f"Could not load {path} or one of its dependencies. It needs the CUDA driver, {libraries}. "
@@ -122,8 +132,8 @@ def load_session_library(path: Path) -> ctypes.CDLL:
                 "with the directories that contain them."
             ) from error
         try:
-            bind_session_api(library)
+            bind_session_api(library, vulkan=backend == "vulkan")
         except AttributeError as error:
-            raise OSError(f"{path} does not expose the Umzi session API") from error
-        _session_libraries[path] = library
+            raise OSError(f"{path} does not expose the Umzi {backend} session API") from error
+        _session_libraries[key] = library
     return library

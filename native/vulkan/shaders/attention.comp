@@ -1,0 +1,55 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "schedule.glsl"
+
+layout(local_size_x = 64) in;
+shared float queryVector[32];
+shared float scores[64];
+shared float maximums[64];
+
+void main() {
+    int tokens = op.h * op.w;
+    int g = groupIndex();
+    int n = g / (tokens * 16);
+    if (n >= op.batch) return;
+    int query = g % tokens;
+    int head = g / tokens % 16;
+    int lane = int(gl_LocalInvocationIndex);
+    int base = op.offsets.x + n * tokens * 1536 + head * 32;
+    if (lane < 32) queryVector[lane] = data[base + query * 1536 + lane];
+    barrier();
+    float previousMax = uintBitsToFloat(0xff800000u);
+    float numerator = 0.0;
+    float denominator = 0.0;
+    for (int start = 0; start < tokens; start += 64) {
+        float score = uintBitsToFloat(0xff800000u);
+        if (start + lane < tokens) {
+            int key = base + (start + lane) * 1536 + 512;
+            float sum = 0.0;
+            for (int k = 0; k < 32; ++k) sum = fma(queryVector[k], data[key + k], sum);
+            score = sum * 0.1767766952966369;
+        }
+        maximums[lane] = score;
+        barrier();
+        for (int stride = 32; stride > 0; stride /= 2) {
+            if (lane < stride) maximums[lane] = max(maximums[lane], maximums[lane + stride]);
+            barrier();
+        }
+        float nextMax = max(previousMax, maximums[0]);
+        scores[lane] = exp(score - nextMax);
+        barrier();
+        if (lane < 32) {
+            float factor = exp(previousMax - nextMax);
+            numerator *= factor;
+            denominator *= factor;
+            for (int i = 0; i < min(tokens - start, 64); ++i) {
+                numerator = fma(scores[i], data[base + (start + i) * 1536 + 1024 + lane], numerator);
+                denominator += scores[i];
+            }
+        }
+        previousMax = nextMax;
+        barrier();
+    }
+    if (lane < 32)
+        data[op.outputOffset + (n * tokens + query) * 512 + head * 32 + lane] = rounded(numerator / denominator);
+}

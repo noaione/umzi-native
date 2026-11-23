@@ -1,0 +1,135 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "schedule.glsl"
+
+layout(local_size_x = 64) in;
+
+float neighborhood(int pixel, int x, int y, int channel, int stride, int bias, int branch,
+                   int kw, int kh) {
+    float value = weight(op.weights.y, bias);
+    for (int dy = -kh / 2; dy <= kh / 2; ++dy) {
+        for (int dx = -kw / 2; dx <= kw / 2; ++dx) {
+            if (x + dx < 0 || x + dx >= op.w || y + dy < 0 || y + dy >= op.h) continue;
+            int src = pixel + dy * op.w + dx;
+            int tap = (dy + kh / 2) * kw + dx + kw / 2;
+            value = fma(data[op.offsets.x + src * op.channels.x + channel],
+                        weight(op.weights.x, branch + tap * stride), value);
+        }
+    }
+    return value;
+}
+
+float localGate(int pixel, int x, int y, int c, int halfIndex) {
+    int channels = 2 * op.outputChannels;
+    int dst = c + halfIndex * op.outputChannels;
+    int src = (c & ~1) + halfIndex * op.outputChannels;
+    float sum = weight(op.weights.y, dst);
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            if (x + dx < 0 || x + dx >= op.w || y + dy < 0 || y + dy >= op.h) continue;
+            int p = pixel + dy * op.w + dx;
+            int tap = ((dy + 1) * 3 + dx + 1) * 2 * channels;
+            sum = fma(data[op.offsets.x + p * channels + src], weight(op.weights.x, tap + dst), sum);
+            sum = fma(data[op.offsets.x + p * channels + src + 1],
+                      weight(op.weights.x, tap + channels + dst), sum);
+        }
+    }
+    return sum;
+}
+
+void main() {
+    int i = 64 * groupIndex() + int(gl_LocalInvocationIndex);
+    int pixels = op.h * op.w;
+    int c = i % op.outputChannels;
+    int p = i / op.outputChannels;
+    int n = p / pixels;
+    if (n >= op.batch) return;
+    int x = p % op.w;
+    int y = p / op.w % op.h;
+    int a = op.offsets.x + p * op.channels.x;
+    int b = op.offsets.y + p * op.channels.y;
+    float value = 0.0;
+    switch (op.kind) {
+    case 0: // Pack
+        if (c < 3) value = data[op.offsets.x + (n * 3 + c) * pixels + p % pixels];
+        break;
+    case 3: // Local
+        value = localGate(p, x, y, c, 0) * localGate(p, x, y, c, 1);
+        break;
+    case 5: // LocalSkip
+        value = fma(data[a + c] * data[op.offsets.y + n * op.channels.y + c],
+                    weight(op.weights.x, c), data[op.offsets.z + p * op.channels.z + c]);
+        break;
+    case 6: { // Inception
+        int hidden = op.outputChannels;
+        int band = hidden / 12;
+        if (c < hidden - 3 * band) value = data[a + hidden + c];
+        else {
+            int part = (c - (hidden - 3 * band)) / band;
+            int bias = part * band + c % band;
+            int offset = (part == 0 ? 0 : (part == 1 ? 9 : 20)) * band + c % band;
+            value = neighborhood(p, x, y, hidden + c, band, bias, offset,
+                                 part == 0 ? 3 : (part == 1 ? 11 : 1),
+                                 part == 0 ? 3 : (part == 1 ? 1 : 11));
+        }
+        value = mish(data[a + c]) * value;
+        break;
+    }
+    case 7: // GlobalSkip
+        value = mish(data[a + c]);
+        if (op.offsets.y >= 0) value = fma(value, weight(op.weights.x, c), data[b + c]);
+        break;
+    case 8: { // Shuffle (space to depth)
+        int src = ((n * op.inputH + y * 2 + (c % 4) / 2) * op.inputW + x * 2 + c % 2);
+        value = data[op.offsets.x + src * op.channels.x + c / 4];
+        break;
+    }
+    case 9: { // Concat
+        int channel = c;
+        for (int j = 0; j < 4 && op.offsets[j] >= 0; ++j) {
+            if (channel < op.channels[j]) {
+                value = data[op.offsets[j] + p * op.channels[j] + channel];
+                break;
+            }
+            channel -= op.channels[j];
+        }
+        break;
+    }
+    case 10: // Silu
+        value = data[a + c] * sigmoid(data[a + c]);
+        break;
+    case 11: // Span
+        value = (data[a + c] + data[b + c]) * (sigmoid(data[a + c]) - 0.5);
+        break;
+    case 12: // Depthwise
+        value = neighborhood(p, x, y, op.channels.x - op.outputChannels + c,
+                             op.outputChannels, c, c, 3, 3);
+        break;
+    case 14: { // Gate
+        float v = c < 256 ? data[a + op.outputChannels + c] : data[b + c - 256];
+        value = mish(data[a + c]) * v;
+        break;
+    }
+    case 15: // Add
+        value = data[a + c] + data[b + c];
+        break;
+    case 16: { // Rgb. The original input and output are planar FP32.
+        int nc = i / pixels;
+        int pix = i % pixels;
+        float gamma = uintBitsToFloat(packed[(op.weights.x >> 2) + nc % 3]);
+        data[op.outputOffset + i] = fma(gamma, data[op.offsets.y + i],
+            data[op.offsets.x + (nc / 3 * pixels + pix) * 8 + nc % 3]);
+        return;
+    }
+    case 17: { // ShuffleConcat (depth to space followed by a skip)
+        int skip = op.outputChannels / 2;
+        if (c >= skip) value = data[b + c - skip];
+        else {
+            int src = ((n * op.inputH + y / 2) * op.inputW + x / 2) * op.channels.x;
+            value = data[op.offsets.x + src + 4 * c + 2 * (y % 2) + x % 2];
+        }
+        break;
+    }
+    }
+    data[op.outputOffset + i] = rounded(value);
+}

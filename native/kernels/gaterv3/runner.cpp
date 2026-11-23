@@ -6,6 +6,7 @@
 
 #define UMZI_BUILD
 #include "model_file.h"
+#include "plan_cache.h"
 #include "gaterv3_images.h"
 #include "silu_plan.h"
 #include "../../common/cuda_helpers.h"

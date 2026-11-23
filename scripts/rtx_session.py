@@ -18,7 +18,7 @@ def create_rtx_session(
     workspace_bytes: int | None = None,
 ):
     import onnxruntime as ort
-    import onnxruntime_ep_nv_tensorrt_rtx as rtx
+    import onnxruntime_ep_nv_tensorrt_rtx as rtx  # pyrefly: ignore[missing-import]  # RTX-only benchmark dependency.
 
     ort.disable_telemetry_events()
     ep = rtx.get_ep_name()

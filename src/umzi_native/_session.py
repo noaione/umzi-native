@@ -33,6 +33,7 @@ class SessionOptions:
     dll_path: PathArg | None = None
     dll_dirs: Sequence[PathArg] = ()
     kernel_options: Mapping[str, int] = field(default_factory=dict)
+    backend: str = "cuda"
 
 
 @dataclass(frozen=True)
@@ -53,15 +54,21 @@ def _tensor_info(tensor: TensorABI) -> TensorInfo:
 
 
 class InferenceSession:
-    """Run an Umzi model on CUDA with host NumPy arrays."""
+    """Run an Umzi model with host NumPy arrays."""
 
-    def __init__(self, model_path: PathArg, sess_options: SessionOptions | None = None):
+    def __init__(self, model_path: PathArg, sess_options: SessionOptions | None = None, *, backend: str | None = None):
         options = sess_options if sess_options is not None else SessionOptions()
+        self._backend = options.backend if backend is None else backend
+        if self._backend not in ("cuda", "vulkan"):
+            raise ValueError("backend must be 'cuda' or 'vulkan'")
+        vulkan = self._backend == "vulkan"
+        if vulkan and (options.dll_dirs or options.cache_dir or options.kernel_options):
+            raise ValueError("Vulkan sessions do not accept CUDA library directories, disk caches, or kernel options")
         if options.precision not in ("mixed", "fp16", "fp32"):
             raise ValueError("precision must be 'mixed', 'fp16', or 'fp32'")
         device_id = operator.index(options.device_id)
         if not 0 <= device_id < 2**31:
-            raise ValueError("device_id must be a non-negative CUDA device index")
+            raise ValueError(f"device_id must be a non-negative {self._backend} device index")
         model = Path(model_path).resolve()
         if not model.is_file():
             raise FileNotFoundError(f"Umzi model package not found: {model}")
@@ -74,7 +81,7 @@ class InferenceSession:
                 raise ValueError(f"Kernel option {name} exceeds the int64 range")
             kernel_options[name] = number
         cache = str(Path(options.cache_dir).resolve()).encode("utf-8") if options.cache_dir else None
-        self._library = find_session_library(model, options.dll_path)
+        self._library = find_session_library(model, options.dll_path, backend=self._backend)
         self._lock = Lock()
         if options.dll_dirs:
             with model.open("rb") as file:
@@ -83,9 +90,15 @@ class InferenceSession:
                 len(header) == PREFIX.size and header[:8] == MAGIC and PREFIX.unpack(header)[2] == GFISRV2_FAMILY
             )
             load_cuda_libraries(*options.dll_dirs, include_cufft=is_gfisrv2)
-        self._dll = load_session_library(self._library)
+        self._dll = load_session_library(self._library, backend=self._backend)
         self._handle = open_session(
-            self._dll, model, device_id, options.precision, options.enable_cuda_graph, cache, kernel_options
+            self._dll,
+            model,
+            device_id,
+            options.precision,
+            options.enable_cuda_graph and not vulkan,
+            cache,
+            kernel_options,
         )
         self._finalize = weakref.finalize(self, self._dll.umzi_session_close, self._handle)
         try:
@@ -132,6 +145,10 @@ class InferenceSession:
     @property
     def library_path(self) -> Path:
         return self._library
+
+    @property
+    def backend(self) -> str:
+        return self._backend
 
     @property
     def kernel(self) -> str:

@@ -9,7 +9,7 @@ from typing import Any, Self
 
 import torch
 from build_native import load_build_module
-from cuda.bindings import driver
+from cuda.bindings import driver  # pyrefly: ignore[missing-import]  # CUDA-only validation dependency.
 from torch import Tensor
 
 THREADS = 128

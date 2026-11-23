@@ -79,7 +79,7 @@ class DiagnosticABI(ctypes.Structure):
     _fields_ = [("struct_size", ctypes.c_uint32), ("name", ctypes.c_char_p), ("value", ctypes.c_int64)]
 
 
-def bind_session_api(dll: ctypes.CDLL) -> None:
+def bind_session_api(dll: ctypes.CDLL, *, vulkan: bool = False) -> None:
     pointer = ctypes.c_void_p
     shape = ctypes.POINTER(ShapeABI)
     bindings = (
@@ -93,20 +93,27 @@ def bind_session_api(dll: ctypes.CDLL) -> None:
         ("umzi_session_describe", [pointer, shape, ctypes.POINTER(IoABI)], ctypes.c_int),
         ("umzi_session_prepare", [pointer, shape], ctypes.c_int),
         ("umzi_session_run", [pointer, shape, pointer, ctypes.c_uint64, pointer, ctypes.c_uint64], ctypes.c_int),
-        ("umzi_session_enqueue", [pointer, shape, *([ctypes.c_uint64] * 4), pointer], ctypes.c_int),
         ("umzi_session_info", [pointer, ctypes.POINTER(InfoABI)], ctypes.c_int),
         ("umzi_session_diagnostic_count", [pointer], ctypes.c_uint32),
         ("umzi_session_diagnostic", [pointer, ctypes.c_uint32, ctypes.POINTER(DiagnosticABI)], ctypes.c_int),
         ("umzi_session_cache_message", [pointer], ctypes.c_char_p),
         ("umzi_session_kernel_message", [pointer], ctypes.c_char_p),
-        ("umzi_session_profile", [pointer, ctypes.POINTER(ctypes.c_float), ctypes.c_uint32], ctypes.c_int),
     )
+    if vulkan:
+        bindings += (("umzi_vulkan_abi_version", [], ctypes.c_uint32),)
+    else:
+        bindings += (
+            ("umzi_session_enqueue", [pointer, shape, *([ctypes.c_uint64] * 4), pointer], ctypes.c_int),
+            ("umzi_session_profile", [pointer, ctypes.POINTER(ctypes.c_float), ctypes.c_uint32], ctypes.c_int),
+        )
     for name, args, result in bindings:
         function = getattr(dll, name)
         function.argtypes = args
         function.restype = result
     if dll.umzi_abi_version() != 1:
         raise OSError("Unsupported Umzi native ABI version")
+    if vulkan and dll.umzi_vulkan_abi_version() != 1:
+        raise OSError("Unsupported Umzi Vulkan ABI version")
 
 
 def check_status(dll: ctypes.CDLL, status: int) -> None:

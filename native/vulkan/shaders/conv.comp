@@ -1,0 +1,63 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "schedule.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// Each workgroup computes 32 pixels by 32 output channels, 4x4 per lane.
+const int tile = 32;
+const int depth = 16;
+shared float inputs[tile][depth];
+shared float filters[depth][tile];
+
+float sampleInput(int pixel, int k, int cin) {
+    int x = pixel % op.w + k / cin % op.kernelSize - op.kernelSize / 2;
+    int y = pixel / op.w % op.h + k / cin / op.kernelSize - op.kernelSize / 2;
+    if (x < 0 || x >= op.w || y < 0 || y >= op.h) return 0.0;
+    int image = pixel / (op.h * op.w);
+    int index = ((image * op.h + y) * op.w + x) * op.channels.x + op.channelOffset + k % cin;
+    return data[op.offsets.x + index];
+}
+
+void main() {
+    int outputBlocks = (op.outputChannels + tile - 1) / tile;
+    int group = groupIndex();
+    int basePixel = group / outputBlocks * tile;
+    int baseChannel = group % outputBlocks * tile;
+    int totalPixels = op.batch * op.h * op.w;
+    if (basePixel >= totalPixels) return;
+    int lx = int(gl_LocalInvocationID.x);
+    int ly = int(gl_LocalInvocationID.y);
+    int cin = op.channels.x - op.channelOffset;
+    int length = cin * op.kernelSize * op.kernelSize;
+    vec4 sum[4] = vec4[4](vec4(0), vec4(0), vec4(0), vec4(0));
+    for (int start = 0; start < length; start += depth) {
+        for (int i = 0; i < 8; ++i) {
+            int linear = int(gl_LocalInvocationIndex) + 64 * i;
+            int spatial = linear / depth;
+            int k = linear % depth;
+            int coordinate = start + k;
+            int pixel = basePixel + spatial;
+            int channel = baseChannel + spatial;
+            inputs[spatial][k] = pixel < totalPixels && coordinate < length ? sampleInput(pixel, coordinate, cin) : 0.0;
+            filters[k][spatial] = channel < op.outputChannels && coordinate < length
+                ? weight(op.weights.x, channel * length + coordinate) : 0.0;
+        }
+        barrier();
+        for (int k = 0; k < depth; ++k) {
+            vec4 b = vec4(filters[k][lx], filters[k][lx + 8], filters[k][lx + 16], filters[k][lx + 24]);
+            for (int r = 0; r < 4; ++r) sum[r] = fma(vec4(inputs[ly + 8 * r][k]), b, sum[r]);
+        }
+        barrier();
+    }
+    for (int r = 0; r < 4; ++r) {
+        int pixel = basePixel + ly + 8 * r;
+        if (pixel >= totalPixels) break;
+        for (int j = 0; j < 4; ++j) {
+            int channel = baseChannel + lx + 8 * j;
+            if (channel < op.outputChannels)
+                data[op.outputOffset + pixel * op.outputChannels + channel] =
+                    rounded(sum[r][j] + weight(op.weights.y, channel));
+        }
+    }
+}

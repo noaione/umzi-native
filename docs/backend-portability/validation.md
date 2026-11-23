@@ -1,6 +1,6 @@
 # Vulkan validation and benchmarking plan
 
-**Status:** Proposed test protocol; does not contain Vulkan measurements.  
+**Status:** Test protocol. See the [GateRV3 macOS report](gaterv3-mac.md) for the first Vulkan measurements.
 **Companion:** [roadmap](README.md) · [architecture](architecture.md)
 
 ## Goals

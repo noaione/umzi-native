@@ -1,0 +1,58 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "schedule.glsl"
+
+layout(local_size_x = 64) in;
+shared float partial[64];
+
+void main() {
+    int lane = int(gl_LocalInvocationIndex);
+    int group = groupIndex();
+    if (op.kind == 2) { // RMS across channels, for one pixel.
+        if (group >= op.batch * op.h * op.w) return;
+        int inBase = op.offsets.x + group * op.outputChannels;
+        float sum = 0.0;
+        for (int c = lane; c < op.outputChannels; c += 64) {
+            float value = data[inBase + c];
+            sum = fma(value, value, sum);
+        }
+        partial[lane] = sum;
+        barrier();
+        for (int stride = 32; stride > 0; stride /= 2) {
+            if (lane < stride) partial[lane] += partial[lane + stride];
+            barrier();
+        }
+        float inverse = 1.0 / (sqrt(partial[0] / float(op.outputChannels)) + 1e-6);
+        for (int c = lane; c < op.outputChannels; c += 64)
+            data[op.outputOffset + group * op.outputChannels + c] =
+                rounded(fma(data[inBase + c] * inverse, weight(op.weights.x, c), weight(op.weights.y, c)));
+        return;
+    }
+    if (op.kind == 4) { // Spatial mean. Eight lanes per channel.
+        int blocks = op.outputChannels / 8;
+        int n = group / blocks;
+        if (n >= op.batch) return;
+        int c = (group % blocks) * 8 + lane % 8;
+        int pixels = op.inputH * op.inputW;
+        float sum = 0.0;
+        for (int p = lane / 8; p < pixels; p += 8)
+            sum += data[op.offsets.x + (n * pixels + p) * op.outputChannels + c];
+        partial[lane] = sum;
+        barrier();
+        if (lane < 8) {
+            for (int row = 1; row < 8; ++row) sum += partial[lane + 8 * row];
+            data[op.scratch + n * op.outputChannels + c] = rounded(sum / float(pixels));
+        }
+        return;
+    }
+    // Channel projection of the spatial mean.
+    int index = 64 * group + lane;
+    int n = index / op.outputChannels;
+    if (n >= op.batch) return;
+    int c = index % op.outputChannels;
+    float sum = 0.0;
+    for (int k = 0; k < op.outputChannels; ++k)
+        sum = fma(data[op.scratch + n * op.outputChannels + k],
+                  weight(op.weights.x, c * op.outputChannels + k), sum);
+    data[op.outputOffset + index] = rounded(sum + weight(op.weights.y, c));
+}

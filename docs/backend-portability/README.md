@@ -1,10 +1,12 @@
 # Portable GPU backend roadmap (Vulkan first)
 
-**Status:** Proposal / not implemented  
+**Status:** GateRV3 Vulkan prototype tested on Apple M4
 **Last reviewed:** 2026-11-23  
 **Repository:** [`noaione/umzi-native`](https://github.com/noaione/umzi-native)
 
-> This is a future implementation plan, **not** a claim that the models already run on Vulkan or HIP. Recheck upstream API/driver support before starting work.
+The GateRV3 prototype runs the Original and IDC packages through a standalone Vulkan library.
+See the [macOS build, validation, and comparison](gaterv3-mac.md) for the measured configurations.
+The remaining phases describe work still to be tested or implemented.
 
 ## Objective
 
@@ -61,29 +63,29 @@ Work in order; each phase should be a mergeable, testable deliverable.
 - [ ] Freeze test checkpoints and test-input hashes for all four model families; record model variants (e.g., GateRV3 Original/IDC).
 - [ ] Record source CUDA measurements for the **exact** chosen shapes and precision modes; separate device-resident from host-to-host timing.
 - [ ] Add a backend capability report (GPU, driver, Vulkan API version, FP16 storage/arithmetic, subgroup size, cooperative matrix shapes, limits).
-- [ ] Decide shared-library naming and backend discovery, preserving existing CUDA users.
-- [ ] Define a versioned ABI for backend selection and leave old CUDA ABI entry points operational.
-- [ ] Decide minimum Vulkan API/features and tested macOS implementation(s). Never infer feature availability from OS/vendor alone.
+- [x] Decide shared-library naming and backend discovery, preserving existing CUDA users.
+- [x] Define a versioned Vulkan host ABI and retain the CUDA ABI.
+- [x] Decide minimum Vulkan API/features and tested macOS implementation(s).
 
 **Exit:** A written compatibility contract, golden test fixtures, benchmark commands, and a Vulkan device enumeration smoke test.
 
 ### P1 — Vulkan runtime foundation
 
-- [ ] Implement instance/device/compute queue selection, validation layers in debug, resource lifetime, and error mapping.
-- [ ] Add staging and device-local storage buffers; allocate persistent model weights and activation arena.
-- [ ] Implement host-copy-in → compute dispatch → host-copy-out without importing CUDA libraries.
-- [ ] Compile SPIR-V at build time; load pipelines, descriptor sets, specialization constants, and pipeline caches at runtime.
-- [ ] Implement reusable command buffer recording for fixed prepared shapes. Record correct intra-graph barriers.
+- [x] Implement instance/device/compute queue selection, opt-in validation layers, resource lifetime, and error mapping.
+- [x] Add staging and device-local storage buffers, persistent model weights, and an activation arena.
+- [x] Implement host-copy-in → compute dispatch → host-copy-out without importing CUDA libraries.
+- [x] Compile and validate SPIR-V at build time. Load pipelines, descriptor sets, and an in-memory pipeline cache at runtime.
+- [x] Record reusable command buffers and intra-graph barriers for prepared shapes.
 - [ ] Port a few test primitives (`copy`, FP32→FP16, bias/activation, pixel shuffle) and run in debug validation mode.
-- [ ] Add initial Python `backend="vulkan"` routing while keeping default CUDA behavior unchanged on existing installs.
+- [x] Add Python `backend="vulkan"` routing and retain CUDA as the default.
 
 **Exit:** At least one synthetic graph runs correctly with no CUDA runtime, multiple calls work, reprepare/reopen works, and validation reports no GPU hazards.
 
 ### P2 — GateRV3 correctness-first
 
-- [ ] Read the existing `.ummodel` GateRV3 schedule and weight metadata rather than creating a second on-disk format.
-- [ ] Port all required operations in **unfused, easily validated** form: convolution, GEMM/1×1 convolution, padding, normalization, attention, local/global gates, shuffle/concat, skip and output transforms.
-- [ ] Implement portable convolution/GEMM reference paths first. No cooperative-matrix dependency yet.
+- [x] Read the existing `.ummodel` GateRV3 schedule and weight metadata.
+- [x] Run the required convolutions, projections, padding, normalization, attention, gates, shuffle/concat, skip and output transforms on the Vulkan path.
+- [x] Implement portable convolution and projections with tiled GLSL compute.
 - [ ] Preserve FP32 accumulation and FP16 rounding boundaries as determined from CUDA/PyTorch stage traces.
 - [ ] Verify the Original and IDC variants, batch 1 and throughput batch, odd/rectangular shapes, and malformed inputs.
 - [ ] Record model output, stage differences, shader dispatch count, latency, throughput, and peak memory.

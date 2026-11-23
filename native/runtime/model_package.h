@@ -1,6 +1,10 @@
 #pragma once
 
-#include "../common/platform.h"
+#include "../common/sha256.h"
+
+#include <cstdint>
+#include <filesystem>
+#include <vector>
 
 #include <map>
 #include <string_view>
