@@ -25,3 +25,5 @@ tmp_*
 *.ummodel
 *.umplan
 models/
+
+.DS_Store
