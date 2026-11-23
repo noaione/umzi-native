@@ -128,7 +128,7 @@ public:
 
     // Every engine configuration from heuristics A and fallback that finalizes
     // into a plan within the workspace limit, in heuristic order, deduplicated.
-    std::vector<CudnnCandidate> candidates(cudnnHandle_t handle, uint64_t limit) {
+    std::vector<CudnnCandidate> candidates(cudnnHandle_t handle, uint64_t limit, bool first_only = false) {
         std::vector<CudnnCandidate> result;
         for (auto mode : {CUDNN_HEUR_MODE_A, CUDNN_HEUR_MODE_FALLBACK}) {
             CudnnDescriptor heuristic(CUDNN_BACKEND_ENGINEHEUR_DESCRIPTOR);
@@ -161,6 +161,10 @@ public:
                                              CUDNN_TYPE_INT64, 1, &count, &bytes) != CUDNN_STATUS_SUCCESS
                     || bytes < 0 || uint64_t(bytes) > limit)
                     continue;
+                if (first_only) {
+                    result.push_back({std::move(plan), bytes, {}});
+                    return result;
+                }
                 std::string name = plan_json(*plan);
                 if (name.empty()) name = std::to_string(result.size()) + "/" + std::to_string(i);
                 const bool duplicate = std::any_of(result.begin(), result.end(),

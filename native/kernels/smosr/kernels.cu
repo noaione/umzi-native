@@ -3,6 +3,8 @@
 namespace {
 constexpr int context = 2;
 constexpr int features = 48;
+constexpr int pairs = features / 2;
+constexpr int half_values = 1 << 16;
 
 __device__ int reflected(int coord, int extent) {
     if (coord < 0) return -coord;
@@ -11,6 +13,12 @@ __device__ int reflected(int coord, int extent) {
 
 __device__ float rounded(float value, bool fp16) {
     return fp16 ? __half2float(__float2half_rn(value)) : value;
+}
+
+__device__ float silu_value(float x) { return x / (1.f + expf(-x)); }
+
+__device__ half2 lookup(half2 input, const half* table) {
+    return __halves2half2(table[__half_as_ushort(__low2half(input))], table[__half_as_ushort(__high2half(input))]);
 }
 
 template<class T>
@@ -45,39 +53,69 @@ extern "C" __global__ void pack_f16(half* output, const half* input, int h, int 
     pack(output, input, h, w, count);
 }
 
-extern "C" __global__ void silu(half* output, const float* bias, int count, bool fp16) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= count) return;
-    const float x = rounded(__half2float(output[i]) + rounded(bias[i % features], fp16), fp16);
-    output[i] = __float2half_rn(x / (1.f + expf(-x)));
+extern "C" __global__ void init_activations(half* table) {
+    const auto i = static_cast<unsigned short>(blockIdx.x * blockDim.x + threadIdx.x);
+    const float x = __half2float(__ushort_as_half(i));
+    table[i] = __float2half_rn(silu_value(x));
+    table[half_values + i] = __float2half_rn(tanhf(x));
 }
 
-extern "C" __global__ void gated_residual(half* output, const half* projection, const half* shortcut,
-                                          const float* bias, const float* shortcut_bias, int count, bool fp16) {
+extern "C" __global__ void silu(half2* output, const float2* bias, const half* table, int count) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
-    const int c = i % features, src = i / features * 2 * features + c;
-    const float value = rounded(__half2float(projection[src]) + rounded(bias[c], fp16), fp16);
-    const float gate = rounded(__half2float(projection[src + features]) + rounded(bias[c + features], fp16), fp16);
-    float skip = __half2float(shortcut[i]);
-    if (shortcut_bias) skip = rounded(skip + rounded(shortcut_bias[c], fp16), fp16);
-    output[i] = __float2half_rn(rounded(value + skip, fp16) * rounded(tanhf(gate), fp16));
+    const float2 b = bias[i % pairs];
+    if (table) {
+        output[i] = lookup(__hadd2(output[i], __float22half2_rn(b)), table);
+    } else {
+        const float2 x = __half22float2(output[i]);
+        output[i] = __floats2half2_rn(silu_value(x.x + b.x), silu_value(x.y + b.y));
+    }
 }
 
-extern "C" __global__ void residual(half* output, const half* skip, int count) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < count) output[i] = __hadd(output[i], skip[i]);
-}
-
-extern "C" __global__ void concat(half* output, const half* rgb, const float* rgb_bias, const half* body,
-                                  const float* body_bias, int count, bool fp16) {
+extern "C" __global__ void gated_residual(half2* output, const half2* projection, const half2* shortcut,
+                                          const float2* bias, const float2* shortcut_bias, const half2* middle_skip,
+                                          const half* table, int count) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
-    const int pixel = i / 64, c = i % 64;
-    float value = 0.f;
-    if (c < 12) value = __half2float(rgb[pixel * 16 + c]) + rounded(rgb_bias[c], fp16);
-    else if (c < 60) value = __half2float(body[pixel * features + c - 12]) + rounded(body_bias[c - 12], fp16);
-    output[i] = __float2half_rn(value);
+    const int c = i % pairs, src = i / pairs * 2 * pairs + c;
+    half2 result;
+    if (table) {
+        const half2 value = __hadd2(projection[src], __float22half2_rn(bias[c]));
+        const half2 gate = __hadd2(projection[src + pairs], __float22half2_rn(bias[c + pairs]));
+        half2 skip = shortcut[i];
+        if (shortcut_bias) skip = __hadd2(skip, __float22half2_rn(shortcut_bias[c]));
+        result = __hmul2_rn(__hadd2(value, skip), lookup(gate, table + half_values));
+    } else {
+        const float2 value = __half22float2(projection[src]), b = bias[c];
+        const float2 gate = __half22float2(projection[src + pairs]), g = bias[c + pairs];
+        float2 skip = __half22float2(shortcut[i]);
+        if (shortcut_bias) {
+            const float2 s = shortcut_bias[c];
+            skip = {skip.x + s.x, skip.y + s.y};
+        }
+        result = __floats2half2_rn((value.x + b.x + skip.x) * tanhf(gate.x + g.x),
+                                   (value.y + b.y + skip.y) * tanhf(gate.y + g.y));
+    }
+    output[i] = middle_skip ? __hadd2(result, middle_skip[i]) : result;
+}
+
+extern "C" __global__ void concat(half2* output, const half2* rgb, const float2* rgb_bias, const half2* body,
+                                  const float2* body_bias, int count, bool fp16) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const int pixel = i / 32, c = i % 32;
+    if (c >= 30) {
+        output[i] = __float2half2_rn(0.f);
+        return;
+    }
+    const half2 value = c < 6 ? rgb[pixel * 8 + c] : body[pixel * pairs + c - 6];
+    const float2 bias = c < 6 ? rgb_bias[c] : body_bias[c - 6];
+    if (fp16) {
+        output[i] = __hadd2(value, __float22half2_rn(bias));
+    } else {
+        const float2 x = __half22float2(value);
+        output[i] = __floats2half2_rn(x.x + bias.x, x.y + bias.y);
+    }
 }
 
 extern "C" __global__ void shuffle_f32(float* output, const half* input, const float* bias, int h, int w, int count) {

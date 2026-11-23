@@ -596,6 +596,8 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=ROOT / "output/architecture-baselines")
     parser.add_argument("--native-model", type=Path, help="Exported SMoSR .ummodel")
     parser.add_argument("--native-library", type=Path, help="Umzi session library for the native backend")
+    parser.add_argument("--native-tag", help="Suffix for a named native benchmark run")
+    parser.add_argument("--tune-convolutions", action="store_true", help="Time the dominant zero-workspace SMoSR plans")
     args = parser.parse_args()
     family = FAMILIES[args.family]
     if args.overlap is not None:
@@ -614,6 +616,10 @@ def main() -> None:
     native = args.backend in NATIVE_BACKENDS
     if native and (args.family != "smosr" or batch != 1 or not args.native_model or not args.native_library):
         parser.error("Native baselines require SMoSR batch 1, --native-model, and --native-library")
+    if args.native_tag is not None and (not native or not re.fullmatch(r"[a-zA-Z0-9_-]+", args.native_tag)):
+        parser.error("--native-tag requires a native backend and a name using letters, digits, underscores, or hyphens")
+    if args.tune_convolutions and not native:
+        parser.error("--tune-convolutions requires a native backend")
     os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
     torch.set_num_threads(2)
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -628,7 +634,7 @@ def main() -> None:
     if nvidia_smi is None:
         raise RuntimeError("nvidia-smi is required to record the CUDA driver and device memory")
     base = args.output.resolve() / args.family / f"batch-{batch}"
-    directory = base / args.backend
+    directory = base / (f"{args.backend}-{args.native_tag}" if args.native_tag else args.backend)
     directory.mkdir(parents=True, exist_ok=True)
     signature = {
         "checkpoint": family.checkpoint,
@@ -707,13 +713,17 @@ def main() -> None:
             ):
                 raise ValueError("The native package must match the benchmark checkpoint")
             _, precision = args.backend.split("-", 1)
+            kernel_options = {"tune_convolutions": 1} if args.tune_convolutions else {}
             report["native"] = {
                 "precision": precision,
                 "package_sha256": packaged.digest,
                 "library_sha256": digest(args.native_library),
+                "kernel_options": kernel_options,
             }
-            options = SessionOptions(precision=precision, dll_path=args.native_library)
+            options = SessionOptions(precision=precision, dll_path=args.native_library, kernel_options=kernel_options)
             session = stack.enter_context(InferenceSession(args.native_model, options))
+            session.prepare((1, 3, family.tile, family.tile))
+            report["setup"]["first_tile"] = session.get_session_info()
             device_runner = DeviceSession(session)
             runners = {1: Runner(device_runner, device_runner.dtype)}
         else:

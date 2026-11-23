@@ -3,15 +3,25 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 from pathlib import Path
 
 import numpy as np
 import torch
-from benchmark_architectures import FAMILIES, ROOT, comparison, read_image
+from benchmark_architectures import FAMILIES, ROOT, comparison, extract, grid, read_image, stress_inputs
 from reference.native_session import DeviceSession
 
 from umzi_native import InferenceSession, SessionOptions
 from umzi_native.exporter._loader import load_checkpoint
+
+
+def check_baseline(candidate: DeviceSession, baseline: DeviceSession, sample: torch.Tensor, label: str) -> None:
+    sample = sample.to(device="cuda", dtype=candidate.dtype)
+    np.testing.assert_array_equal(
+        candidate(sample).cpu().numpy().view(np.uint8),
+        baseline(sample).cpu().numpy().view(np.uint8),
+        err_msg=label,
+    )
 
 
 @torch.inference_mode()
@@ -19,19 +29,23 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--library", type=Path, required=True)
+    parser.add_argument("--baseline-library", type=Path, help="Compare bitwise with the original native build")
     args = parser.parse_args()
     torch.set_num_threads(2)
     torch.backends.cudnn.allow_tf32 = False
     torch.backends.cuda.matmul.allow_tf32 = False
     family = FAMILIES["smosr"]
-    image = sorted((ROOT / "samples" / family.samples).glob("*.jpg"))[0]
+    paths = sorted((ROOT / "samples" / family.samples).glob("*.jpg"))
+    image = paths[0]
     sample = read_image(image)[:, :, :65, :79].contiguous()
     reference, _ = load_checkpoint(ROOT / "models" / family.checkpoint)
     expected = reference.eval().cuda()(sample.cuda()).cpu().numpy()
     for precision in ("mixed", "fp16"):
         options = SessionOptions(precision=precision, dll_path=args.library)
         direct_options = SessionOptions(precision=precision, dll_path=args.library, enable_cuda_graph=False)
-        with InferenceSession(args.model, options) as graph, InferenceSession(args.model, direct_options) as direct:
+        with ExitStack() as stack:
+            graph = stack.enter_context(InferenceSession(args.model, options))
+            direct = stack.enter_context(InferenceSession(args.model, direct_options))
             assert (graph.kernel, graph.scale_factor, graph.context) == ("smosr", 2, 0)
             captured, uncaptured = DeviceSession(graph), DeviceSession(direct)
             converted = sample.to(device="cuda", dtype=captured.dtype)
@@ -57,6 +71,21 @@ def main() -> None:
                     raise
             else:
                 raise AssertionError("SMoSR accepted an input smaller than its reflection padding permits")
+            if args.baseline_library:
+                baseline_options = SessionOptions(precision=precision, dll_path=args.baseline_library)
+                baseline = DeviceSession(stack.enter_context(InferenceSession(args.model, baseline_options)))
+                for label, fixture in stress_inputs(family.tile, paths, family.batch):
+                    check_baseline(captured, baseline, fixture, label)
+                tiles = 0
+                for path in paths:
+                    rgb = read_image(path)
+                    height, width = rgb.shape[-2:]
+                    for top, left in grid(height, width, family.tile, family.overlap):
+                        check_baseline(
+                            captured, baseline, extract(rgb, top, left, family.tile), f"{path.name} ({top}, {left})"
+                        )
+                        tiles += 1
+                print(f"{precision}: stress cases and {tiles} image tiles matched the native baseline bitwise")
             print(f"{precision}: graph, direct, host, and alternate-stream outputs matched. {metrics}")
 
 
