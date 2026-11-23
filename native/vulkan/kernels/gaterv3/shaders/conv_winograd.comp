@@ -1,0 +1,85 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "schedule.glsl"
+
+layout(local_size_x = 16, local_size_y = 8) in;
+layout(constant_id = 1) const bool applySilu = false;
+const int tiles = 8;
+const int kDepth = 16;
+const int channels = 32;
+const int outBlock = 16;
+// Each subgroup reads adjacent output channels at the same coefficient.
+shared f16vec4 imageTile[kDepth][4][tiles + 1];
+shared f16vec4 weightTile[kDepth][4][outBlock + 1];
+
+// B^T d B, applied in one dimension at a time.
+vec4 transformInputRow(vec4 v) {
+    return vec4(v.x - v.z, v.y + v.z, v.z - v.y, v.y - v.w);
+}
+
+float readImage(int image, int y, int x, int c) {
+    if (y < 0 || y >= op.h || x < 0 || x >= op.w) return 0.0;
+    return loadActivation(op.offsets.x + ((image * op.h + y) * op.w + x) * channels + c);
+}
+
+void main() {
+    int group = groupIndex();
+    int channelBlocks = channels / outBlock;
+    int tile = group / channelBlocks * tiles + int(gl_LocalInvocationID.y);
+    int tilesWide = (op.w + 1) / 2;
+    int tilesHigh = (op.h + 1) / 2;
+    int tileCount = tilesWide * tilesHigh;
+    if (group / channelBlocks * tiles >= op.batch * tileCount) return;
+    int image = tile / tileCount;
+    int px = 2 * (tile % tilesWide);
+    int py = 2 * (tile / tilesWide % tilesHigh);
+    int laneX = int(gl_LocalInvocationID.x);
+    int laneY = int(gl_LocalInvocationID.y);
+    int channelBase = group % channelBlocks * outBlock;
+    int channel = channelBase + laneX;
+    vec4 sum[4] = vec4[4](vec4(0), vec4(0), vec4(0), vec4(0));
+    for (int start = 0; start < channels; start += kDepth) {
+        vec4 d[4];
+        for (int row = 0; row < 4; ++row) {
+            int y = py + row - 1;
+            int c = start + laneX;
+            d[row] = image < op.batch ? transformInputRow(vec4(
+                readImage(image, y, px - 1, c), readImage(image, y, px, c),
+                readImage(image, y, px + 1, c), readImage(image, y, px + 2, c))) : vec4(0);
+        }
+        imageTile[laneX][0][laneY] = f16vec4(d[0] - d[2]);
+        imageTile[laneX][1][laneY] = f16vec4(d[1] + d[2]);
+        imageTile[laneX][2][laneY] = f16vec4(d[2] - d[1]);
+        imageTile[laneX][3][laneY] = f16vec4(d[1] - d[3]);
+        for (int co = laneY; co < outBlock; co += tiles) {
+            int base = ((channelBase + co) * channels + start + laneX) * 16;
+            for (int row = 0; row < 4; ++row)
+                weightTile[laneX][row][co] = f16vec4(weightPair(op.weights.x, base + row * 4),
+                                                      weightPair(op.weights.x, base + row * 4 + 2));
+        }
+        barrier();
+        f16vec4 partial[4] = f16vec4[4](f16vec4(0), f16vec4(0), f16vec4(0), f16vec4(0));
+        for (int c = 0; c < kDepth; ++c)
+            for (int row = 0; row < 4; ++row)
+                partial[row] = fma(imageTile[c][row][laneY], weightTile[c][row][laneX], partial[row]);
+        for (int row = 0; row < 4; ++row) sum[row] += vec4(partial[row]);
+        barrier();
+    }
+    if (image >= op.batch) return;
+    // A^T m A reconstructs the four output pixels.
+    vec4 first = sum[0] + sum[1] + sum[2];
+    vec4 second = sum[1] - sum[2] - sum[3];
+    float bias = weight(op.weights.y, channel);
+    for (int dy = 0; dy < 2 && py + dy < op.h; ++dy) {
+        vec4 row = dy == 0 ? first : second;
+        int base = ((image * op.h + py + dy) * op.w + px) * channels + channel;
+        for (int dx = 0; dx < 2 && px + dx < op.w; ++dx) {
+            float value = (dx == 0 ? row.x + row.y + row.z : row.y - row.z - row.w) + bias;
+            if (applySilu) {
+                value = rounded(value);
+                value *= sigmoid(value);
+            }
+            storeActivation(op.outputOffset + base + dx * channels, value);
+        }
+    }
+}

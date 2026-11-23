@@ -9,7 +9,7 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-from benchmark_vulkan import BATCH, ROOT, batch_sample, load_page
+from benchmark_vulkan import BATCH, ROOT, batch_sample, load_page, parse_vulkan_options
 
 from umzi_native import InferenceSession, SessionOptions
 
@@ -25,10 +25,22 @@ def main() -> None:
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--reference", action="store_true")
     parser.add_argument("--host-only", action="store_true", help="Time host calls with GPU timestamps disabled")
+    parser.add_argument("--vulkan-option", action="append", default=[], metavar="NAME=0|1")
     args = parser.parse_args()
     if args.runs < 1:
         parser.error("--runs must be positive")
-    if args.reference and args.precision == "fp16":
+    try:
+        kernel_options = parse_vulkan_options(args.vulkan_option)
+    except ValueError as error:
+        parser.error(str(error))
+    if args.reference:
+        if kernel_options.get("reference", 1) != 1:
+            parser.error("--reference conflicts with reference=0")
+        kernel_options["reference"] = 1
+    if args.host_only and kernel_options.get("profile"):
+        parser.error("--host-only conflicts with profile=1")
+    kernel_options.setdefault("profile", int(not args.host_only))
+    if kernel_options.get("reference") and args.precision == "fp16":
         parser.error("The reference kernels support mixed and FP32")
 
     tiles = load_page(args.image).tiles
@@ -38,7 +50,7 @@ def main() -> None:
         device_id=args.device,
         precision=args.precision,
         dll_path=args.library,
-        kernel_options={"reference": int(args.reference), "profile": int(not args.host_only)},
+        kernel_options=kernel_options,
     )
     host_ms = []
     groups_ns: dict[str, list[int]] = defaultdict(list)
@@ -67,10 +79,11 @@ def main() -> None:
                 "device": info["kernel_message"],
                 "batch": args.batch,
                 "precision": args.precision,
-                "reference": args.reference,
+                "reference": bool(kernel_options.get("reference")),
+                "kernel_options": kernel_options,
                 "dispatches": diagnostics["dispatches"],
                 "host_median_ms": statistics.median(host_ms),
-                "timestamps_requested": not args.host_only,
+                "timestamps_requested": bool(kernel_options["profile"]),
                 "valid_gpu_timestamp_runs": valid_runs,
                 "gpu_group_median_ms": {name: statistics.median(times) / 1e6 for name, times in groups_ns.items()},
             },

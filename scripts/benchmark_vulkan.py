@@ -408,6 +408,16 @@ def evaluate(
     }
 
 
+def parse_vulkan_options(entries: list[str]) -> dict[str, int]:
+    options: dict[str, int] = {}
+    for entry in entries:
+        name, separator, value = entry.partition("=")
+        if not name or not separator or value not in ("0", "1") or name in options:
+            raise ValueError(f"Expected a unique Vulkan option in NAME=0|1 form, got {entry!r}")
+        options[name] = int(value)
+    return options
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, default=CHECKPOINT)
@@ -439,12 +449,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--output is required for benchmarking")
     if args.warmup < 1:
         parser.error("--warmup must be positive")
-    options: dict[str, int] = {}
-    for entry in args.vulkan_option:
-        name, separator, value = entry.partition("=")
-        if not name or not separator or value not in ("0", "1") or name in options:
-            parser.error(f"Expected a unique Vulkan option in NAME=0|1 form, got {entry!r}")
-        options[name] = int(value)
+    try:
+        options = parse_vulkan_options(args.vulkan_option)
+    except ValueError as error:
+        parser.error(str(error))
     if args.vulkan_reference:
         if options.get("reference", 1) != 1:
             parser.error("--vulkan-reference conflicts with reference=0")

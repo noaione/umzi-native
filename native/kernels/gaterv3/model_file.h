@@ -217,6 +217,7 @@ public:
 
     Shape padded(Shape shape) const { return shape.padded(padding_alignment); }
     void check_shape(const Shape& shape) const { tensor_shapes(shape); }
+    int channels(int tensor) const { return specs[tensor].channels; }
 
     void parse(const umzi::ModelPackage& package) {
         if (package.schema != 1) throw std::runtime_error("Unsupported GateRV3 model payload version");

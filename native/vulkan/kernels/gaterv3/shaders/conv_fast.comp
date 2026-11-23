@@ -1,6 +1,19 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
+#ifdef HALF2_LOADS
+#extension GL_EXT_control_flow_attributes : require
+#endif
 #include "schedule.glsl"
+
+#ifdef HALF2_LOADS
+// Dense convolution offsets and channel strides are even. These aliases
+// load two adjacent FP16 values while preserving the scalar output layout.
+layout(set = 0, binding = 0, std430) readonly buffer InputPairs { f16vec2 activationPairs[]; };
+layout(set = 0, binding = 1, std430) readonly buffer WeightPairs { f16vec2 filterPairs[]; };
+#define Pair f16vec2
+#else
+#define Pair vec2
+#endif
 
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(constant_id = 0) const bool spatialKernel = false;
@@ -39,6 +52,9 @@ void main() {
         int filterBase[4];
         int dx = spatialKernel ? tap % 3 - 1 : 0;
         int dy = spatialKernel ? tap / 3 - 1 : 0;
+#ifdef HALF2_LOADS
+        [[unroll]]
+#endif
         for (int i = 0; i < 4; ++i) {
             int row = ly + i * 8;
             int pixel = basePixel + row;
@@ -55,15 +71,28 @@ void main() {
         }
         for (int start = 0; start < cin; start += depth) {
             int coordinate = start + k;
+#ifdef HALF2_LOADS
+            [[unroll]]
+#endif
             for (int i = 0; i < 4; ++i) {
                 int row = ly + i * 8;
-                vec2 a = vec2(0);
+                Pair a = Pair(0);
                 if (inputBase[i] >= 0 && coordinate < cin) {
                     int source = inputBase[i] + coordinate;
+#ifdef HALF2_LOADS
+                    a = activationPairs[source / 2];
+#else
                     a = vec2(loadActivation(source), loadActivation(source + 1));
+#endif
                 }
+#ifdef HALF2_LOADS
+                Pair b = Pair(0);
+                if (filterBase[i] >= 0 && coordinate < cin)
+                    b = filterPairs[op.weights.x / 4 + (filterBase[i] + coordinate) / 2];
+#else
                 vec2 b = filterBase[i] >= 0 && coordinate < cin
                     ? weightPair(op.weights.x, filterBase[i] + coordinate) : vec2(0);
+#endif
                 imageTile[k][row] = Operand(a.x);
                 imageTile[k + 1][row] = Operand(a.y);
                 weightTile[k][row] = Operand(b.x);
@@ -73,6 +102,9 @@ void main() {
 #ifdef HALF_MATH
             // Sum a short dot product in binary16 and merge the partials in FP32.
             Operand4 partial[4] = Operand4[4](Operand4(0), Operand4(0), Operand4(0), Operand4(0));
+#endif
+#ifdef HALF2_LOADS
+            [[unroll]]
 #endif
             for (int inner = 0; inner < depth; ++inner) {
                 Operand4 b = Operand4(weightTile[inner][lx], weightTile[inner][lx + 8],
@@ -92,6 +124,9 @@ void main() {
             barrier();
         }
     }
+#ifdef HALF2_LOADS
+    [[unroll]]
+#endif
     for (int r = 0; r < 4; ++r) {
         int pixel = basePixel + ly + r * 8;
         if (pixel >= totalPixels) break;

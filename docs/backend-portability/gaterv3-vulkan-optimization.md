@@ -23,6 +23,8 @@ Set any optimization to `0` in `SessionOptions.kernel_options` to disable it for
 | `fuse_residual_norm` | 1 | Fuses eligible residual operations with RMSNorm when `subgroup_norm` is active. |
 | `chunked_mean` | 1 | Splits spatial pooling over chunks. Set to 0 for the original spatial reduction. |
 | `paired_gates` | 1 | Processes local and Inception gates in channel pairs. Set to 0 for scalar gate shaders. |
+| `half2_convolution` | 1 | Uses aligned FP16 pairs and unrolled loops in the direct convolution shader when FP16 arithmetic and storage are active. Set to 0 for the prior direct FP16 kernel. |
+| `winograd_convolution` | 0 | Set to 1 to try Winograd for 32-input, 32-output 3×3 operations in FP16 mode with FP16 storage. The kernel needs 128 workgroup invocations and 13 KiB of shared memory. |
 | `reference` | 0 | Set to 1 to disable the optimizations as a group and select the original mixed or FP32 path. |
 | `profile` | 0 | Set to 1 to collect per-operation GPU timestamps on queues that support them. |
 
@@ -40,7 +42,7 @@ For an A/B benchmark, repeat `--vulkan-option NAME=0` for each option you want t
 
 The alternating mixed-mode benchmark measured **1.71–2.19×** speedups across both checkpoints, drivers, and batch sizes. On MoltenVK, the full-page mixed runs roughly halved tile latency and more than doubled batch-16 throughput. Sampled batch-16 GPU allocation fell from **338.3 to 210.7 MiB** for Original and **278.0 to 150.3 MiB** for IDC. Pooled mixed-mode PSNR moved by under **0.01 dB** on both drivers. [Same-precision full-page comparison](#same-precision-speedup-over-the-original-vulkan-kernels) · [Alternating mixed-mode checks](#alternating-mixed-mode-checks)
 
-Native FP16 continued the speed gains and beat WebGPU FP16 in both latency and throughput for both models on both drivers. Mixed mode retained the higher raw PSNR. The current FP16 measurements are the performance baseline for the next pass. [Full-page results](#full-page-results)
+Native FP16 continued the speed gains and beat WebGPU FP16 in both latency and throughput for both models on both drivers. Mixed mode retained the higher raw PSNR. [Pass 1 full-page results](#full-page-results) · [Pass 2 full-page results](#pass-2-full-page-results)
 
 ### What each pass changed
 
@@ -56,11 +58,11 @@ The table shows cumulative gains from the retained MoltenVK builds. Each stage u
 
 Specialized convolutions and FP16 storage delivered the largest step, cutting batch-16 call time by about 42–43% on both checkpoints. The raw samples are in `output/vulkan/optimization/pass-breakdown.ndjson`.
 
-## Targets for the next pass
+## Pass 2 targets
 
-These are proposed targets for the optimized MoltenVK FP16 path on the same Apple M4, checkpoints, and three pages. The latency column uses independently timed batch-1 tiles. The throughput column uses batch-16 calls.
+These targets were set after pass 1 for the MoltenVK FP16 path on the same Apple M4, checkpoints, and three pages. The latency column uses independently timed batch-1 tiles. The throughput column uses batch-16 calls.
 
-| Checkpoint | Current ms/tile | Target ms/tile | Current MPx/s | Target MPx/s | Current peak GPU MiB at batch 16 | Current raw PSNR / SSIMULACRA2 |
+| Checkpoint | Pass 1 ms/tile | Target ms/tile | Pass 1 MPx/s | Target MPx/s | Pass 1 peak GPU MiB at batch 16 | Pass 1 raw PSNR / SSIMULACRA2 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | Original | 24.96 | ≤22.00 | 1.032 | ≥1.18 | 210.7 | 80.79 dB / 92.25 |
 | IDC | 17.08 | ≤15.00 | 1.398 | ≥1.60 | 150.3 | 68.54 dB / 92.08 |
@@ -68,6 +70,122 @@ These are proposed targets for the optimized MoltenVK FP16 path on the same Appl
 Start with the dense convolutions. On Original batch 16, 1×1 projections and 3×3 convolutions with fused SiLU accounted for about **177 ms** of the **249 ms** profiled host call. A combined GPU time of **145 ms** is a useful first target if the rest of the call stays near its current cost. Compare tile and workgroup variants against the optimized build at the same precision. [GPU profile](#gpu-profile-and-validation)
 
 For a speed-only change, aim to retain the current sampled memory and quality. Report finite output, per-page PSNR and SSIMULACRA2, and both timing metrics on each driver. Repeat the alternating host comparison with the current optimized build as the baseline. KosmicKrisp's FP16 tile latency is within 3% of MoltenVK's, while its batch-16 throughput is about 20% lower. Use batch 16 to investigate that driver gap. [Full-page results](#full-page-results)
+
+## Pass 2 dense convolutions
+
+The direct FP16 shader now loads pairs of adjacent activations and weights and unrolls its short input, reduction, and output loops. It uses the same 32×32 tile and FP16 accumulation order. The opt-in Winograd F(2×2, 3×3) shader pretransforms the filters for 19 eligible layers per checkpoint once at load time. It reduces the multiply count for those layers and adds 0.59 MiB of transformed filters per session. The FP16 transforms can change numerical output. [Lavin and Gray, Fast Algorithms for Convolutional Neural Networks](https://openaccess.thecvf.com/content_cvpr_2016/html/Lavin_Fast_Algorithms_for_CVPR_2016_paper.html)
+
+The alternating comparison used six synchronized calls after two warmups per variant, with the first tile or first 16 tiles from page-001.jpg. Every value below is the median duration of an entire call.
+
+| Checkpoint | Driver | Batch | Prior direct FP16 (ms) | Direct with half2 (ms) | half2 plus Winograd (ms) |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Original | MoltenVK | 1 | 24.03 | 22.79 | 22.13 |
+| Original | MoltenVK | 16 | 245.21 | 235.08 | 224.55 |
+| Original | KosmicKrisp | 1 | 25.63 | 24.16 | 23.61 |
+| Original | KosmicKrisp | 16 | 295.25 | 282.52 | 276.71 |
+| IDC | MoltenVK | 1 | 15.58 | 14.97 | 14.20 |
+| IDC | MoltenVK | 16 | 182.23 | 173.98 | 163.48 |
+| IDC | KosmicKrisp | 1 | 17.45 | 16.48 | 16.01 |
+| IDC | KosmicKrisp | 16 | 223.09 | 212.20 | 206.48 |
+
+In a matched Original batch-16 profile on MoltenVK, combined 1×1 and 3×3 GPU time fell from **173.32 ms** to **160.47 ms** with half2 and **151.26 ms** with Winograd added. The 145 ms target remains open. Wider vector tiles, subgroup shuffles, and repacking weight rows did not beat the prior MoltenVK kernel in the initial probes. The eight-tile Winograd variant gained throughput after transposing and padding its shared operand tile.
+
+Re-run the profile with the current library. Pass `--vulkan-option half2_convolution=0` for the pass 1 kernel and omit the override for the new direct kernel.
+
+```sh
+python3 scripts/profile_vulkan.py --model output/vulkan/original.ummodel \
+  --library build/vulkan/libumzi_native_vulkan.dylib --batch 16 --precision fp16 \
+  --vulkan-option winograd_convolution=1
+```
+
+### Pass 2 full-page results
+
+The runs used the same Apple M4, 128×128 tiles, and three sample pages per checkpoint. The batch-16 columns sum 11 synchronized calls per image and compute throughput from source pixels. Batch-1 latency averages 528 separately timed calls per configuration. Timings include copies between host and GPU. The memory columns give the sampled increase in Metal allocations at each batch size. Raw PSNR uses peak 1 before quantization against the matching Torch MPS FP32 output. The SSIMULACRA2 column averages the scores from the rendered PNGs.
+
+| Checkpoint | Driver | FP16 kernel | Batch-16 s | Batch-16 MPx/s | Batch-1 total s | Batch-1 ms/tile | Peak GPU MiB, batch 1 / 16 | Raw PSNR dB | SSIMULACRA2 |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Original | MoltenVK | Prior direct | 8.123 | 1.037 | 13.518 | 25.60 | 79.3 / 210.7 | 80.79 | 92.25 |
+| Original | MoltenVK | half2 | 7.785 | 1.082 | 12.901 | 24.43 | 79.3 / 210.7 | 80.79 | 92.25 |
+| Original | MoltenVK | half2 + Winograd | 7.505 | 1.122 | 11.911 | 22.56 | 79.9 / 211.3 | 80.81 | 92.14 |
+| Original | KosmicKrisp | Prior direct | 9.832 | 0.857 | 13.475 | 25.52 | 81.4 / 212.8 | 80.80 | 92.17 |
+| Original | KosmicKrisp | half2 | 9.381 | 0.898 | 12.707 | 24.07 | 81.4 / 212.8 | 80.80 | 92.17 |
+| Original | KosmicKrisp | half2 + Winograd | 9.550 | 0.882 | 12.551 | 23.77 | 82.0 / 213.3 | 80.81 | 92.21 |
+| IDC | MoltenVK | Prior direct | 6.101 | 1.381 | 8.733 | 16.54 | 19.0 / 150.3 | 68.54 | 92.08 |
+| IDC | MoltenVK | half2 | 5.973 | 1.410 | 8.663 | 16.41 | 19.0 / 150.3 | 68.54 | 92.08 |
+| IDC | MoltenVK | half2 + Winograd | 5.602 | 1.504 | 7.894 | 14.95 | 19.6 / 150.9 | 68.50 | 92.00 |
+| IDC | KosmicKrisp | Prior direct | 7.866 | 1.071 | 9.411 | 17.82 | 20.3 / 151.6 | 68.54 | 92.08 |
+| IDC | KosmicKrisp | half2 | 7.432 | 1.134 | 8.907 | 16.87 | 20.3 / 151.6 | 68.54 | 92.08 |
+| IDC | KosmicKrisp | half2 + Winograd | 7.219 | 1.167 | 8.636 | 16.36 | 20.9 / 152.7 | 68.50 | 92.06 |
+
+The default half2 kernel raised batch-16 throughput by 2.2–5.9% and lowered mean tile latency by 0.8–5.7% across the four model and driver combinations. It matched the previous kernel bit for bit in 20 shape checks, with identical page PNGs, quality metrics, and sampled peak GPU memory.
+
+Winograd gave the fastest MoltenVK results for both models. It met the IDC tile latency target at 14.95 ms. Original reached 22.56 ms against the 22.00 ms target, and both batch-16 throughput targets remain open. On KosmicKrisp, Original throughput peaked with half2 at 0.898 MPx/s. Relative to the prior direct kernel, Winograd changed pooled PSNR by at most 0.05 dB and mean SSIMULACRA2 by up to 0.11 points across the four configurations.
+
+<details>
+<summary>Original per image</summary>
+
+| Image | Driver | FP16 kernel | Batch-16 s | Batch-16 MPx/s | Batch-1 total s | Batch-1 ms/tile | Raw PSNR dB | SSIMULACRA2 |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| page-001.jpg | MoltenVK | Prior direct | 2.712 | 1.035 | 4.491 | 25.51 | 80.37 | 94.30 |
+| page-005.jpg | MoltenVK | Prior direct | 2.705 | 1.038 | 4.510 | 25.63 | 84.38 | 90.99 |
+| page-009.jpg | MoltenVK | Prior direct | 2.706 | 1.038 | 4.517 | 25.66 | 79.15 | 91.46 |
+| page-001.jpg | MoltenVK | half2 | 2.591 | 1.084 | 4.344 | 24.68 | 80.37 | 94.30 |
+| page-005.jpg | MoltenVK | half2 | 2.604 | 1.078 | 4.285 | 24.35 | 84.38 | 90.99 |
+| page-009.jpg | MoltenVK | half2 | 2.590 | 1.084 | 4.272 | 24.27 | 79.15 | 91.46 |
+| page-001.jpg | MoltenVK | half2 + Winograd | 2.478 | 1.133 | 3.952 | 22.45 | 80.39 | 94.28 |
+| page-005.jpg | MoltenVK | half2 + Winograd | 2.515 | 1.116 | 3.972 | 22.57 | 84.39 | 90.86 |
+| page-009.jpg | MoltenVK | half2 + Winograd | 2.512 | 1.118 | 3.987 | 22.65 | 79.16 | 91.26 |
+| page-001.jpg | KosmicKrisp | Prior direct | 3.266 | 0.860 | 4.502 | 25.58 | 80.37 | 94.38 |
+| page-005.jpg | KosmicKrisp | Prior direct | 3.287 | 0.854 | 4.491 | 25.52 | 84.38 | 90.81 |
+| page-009.jpg | KosmicKrisp | Prior direct | 3.279 | 0.856 | 4.483 | 25.47 | 79.16 | 91.33 |
+| page-001.jpg | KosmicKrisp | half2 | 3.121 | 0.900 | 4.235 | 24.06 | 80.37 | 94.38 |
+| page-005.jpg | KosmicKrisp | half2 | 3.119 | 0.900 | 4.237 | 24.07 | 84.38 | 90.81 |
+| page-009.jpg | KosmicKrisp | half2 | 3.140 | 0.894 | 4.235 | 24.06 | 79.16 | 91.33 |
+| page-001.jpg | KosmicKrisp | half2 + Winograd | 3.196 | 0.879 | 4.198 | 23.85 | 80.39 | 94.44 |
+| page-005.jpg | KosmicKrisp | half2 + Winograd | 3.186 | 0.881 | 4.169 | 23.69 | 84.40 | 90.85 |
+| page-009.jpg | KosmicKrisp | half2 + Winograd | 3.167 | 0.887 | 4.185 | 23.78 | 79.16 | 91.35 |
+
+</details>
+
+<details>
+<summary>IDC per image</summary>
+
+| Image | Driver | FP16 kernel | Batch-16 s | Batch-16 MPx/s | Batch-1 total s | Batch-1 ms/tile | Raw PSNR dB | SSIMULACRA2 |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| page-001.jpg | MoltenVK | Prior direct | 2.031 | 1.382 | 2.917 | 16.58 | 69.32 | 94.14 |
+| page-005.jpg | MoltenVK | Prior direct | 2.023 | 1.388 | 2.978 | 16.92 | 68.41 | 90.90 |
+| page-009.jpg | MoltenVK | Prior direct | 2.047 | 1.372 | 2.838 | 16.12 | 68.01 | 91.21 |
+| page-001.jpg | MoltenVK | half2 | 1.960 | 1.433 | 2.899 | 16.47 | 69.32 | 94.14 |
+| page-005.jpg | MoltenVK | half2 | 2.001 | 1.404 | 2.881 | 16.37 | 68.41 | 90.90 |
+| page-009.jpg | MoltenVK | half2 | 2.012 | 1.395 | 2.882 | 16.38 | 68.01 | 91.21 |
+| page-001.jpg | MoltenVK | half2 + Winograd | 1.845 | 1.522 | 2.751 | 15.63 | 69.29 | 94.05 |
+| page-005.jpg | MoltenVK | half2 + Winograd | 1.885 | 1.489 | 2.602 | 14.79 | 68.34 | 90.66 |
+| page-009.jpg | MoltenVK | half2 + Winograd | 1.871 | 1.501 | 2.540 | 14.43 | 67.97 | 91.28 |
+| page-001.jpg | KosmicKrisp | Prior direct | 2.596 | 1.082 | 3.112 | 17.68 | 69.33 | 94.14 |
+| page-005.jpg | KosmicKrisp | Prior direct | 2.622 | 1.071 | 3.144 | 17.86 | 68.39 | 90.86 |
+| page-009.jpg | KosmicKrisp | Prior direct | 2.649 | 1.060 | 3.155 | 17.93 | 68.01 | 91.23 |
+| page-001.jpg | KosmicKrisp | half2 | 2.459 | 1.142 | 2.940 | 16.70 | 69.33 | 94.14 |
+| page-005.jpg | KosmicKrisp | half2 | 2.459 | 1.142 | 2.980 | 16.93 | 68.39 | 90.86 |
+| page-009.jpg | KosmicKrisp | half2 | 2.514 | 1.117 | 2.987 | 16.97 | 68.01 | 91.23 |
+| page-001.jpg | KosmicKrisp | half2 + Winograd | 2.420 | 1.160 | 2.844 | 16.16 | 69.29 | 94.09 |
+| page-005.jpg | KosmicKrisp | half2 + Winograd | 2.388 | 1.176 | 2.887 | 16.40 | 68.33 | 90.83 |
+| page-009.jpg | KosmicKrisp | half2 + Winograd | 2.410 | 1.165 | 2.905 | 16.51 | 67.97 | 91.28 |
+
+</details>
+
+The local records are `output/vulkan/optimization/pass2/original/report.json` and `output/vulkan/optimization/pass2/idc/report.json`. They contain each tile's time and coordinates, the per-image quality and timing measurements, sampled allocation peaks, and effective kernel options. The alternating timings and operation profiles are in `production-ab.ndjson` and `production-profile.ndjson` in the same pass directory.
+
+### Reproduce the pass 2 page comparison
+
+Use the same FP16 precision and compare across the three option sets. The command below runs the two Vulkan drivers and produces the matching Torch MPS FP32 reference. Repeat with `half2_convolution=0` for the prior direct kernel or with `winograd_convolution=1` for the optional shader, using a separate output directory for each. For IDC, pass `--checkpoint models/1x_umzi_idc_gaterv3.safetensors` and `--model output/vulkan/idc.ummodel`.
+
+```sh
+python3 scripts/benchmark_vulkan.py --model output/vulkan/original.ummodel \
+  --library build/vulkan/libumzi_native_vulkan.dylib --backends vulkan \
+  --vulkan-device 0 --vulkan-device 1 --vulkan-precision fp16 \
+  --ssimulacra2 /opt/homebrew/bin/ssimulacra2 \
+  --output output/vulkan/optimization/pass2/reproduction/original-half2
+```
 
 ## Reproduce
 

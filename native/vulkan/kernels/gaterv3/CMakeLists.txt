@@ -1,4 +1,4 @@
-target_sources(umzi_native_vulkan PRIVATE runner.cpp)
+target_sources(umzi_native_vulkan PRIVATE runner.cpp winograd.cpp)
 target_include_directories(umzi_native_vulkan PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 
 set(shader_headers)
@@ -10,5 +10,7 @@ foreach(shader conv element reduce attention conv_fast mean_fast norm_fast gates
 endforeach()
 umzi_vulkan_shader(gaterv3_conv_native_half conv_fast -DHALF_STORAGE -DHALF_MATH)
 umzi_vulkan_shader(gaterv3_conv_native_half_fp32_storage conv_fast -DHALF_MATH)
+umzi_vulkan_shader(gaterv3_conv_half2 conv_fast -DHALF_STORAGE -DHALF_MATH -DHALF2_LOADS)
+umzi_vulkan_shader(gaterv3_conv_winograd conv_winograd -DHALF_STORAGE)
 add_custom_target(umzi_vulkan_gaterv3_shaders DEPENDS ${shader_headers})
 add_dependencies(umzi_native_vulkan umzi_vulkan_gaterv3_shaders)
