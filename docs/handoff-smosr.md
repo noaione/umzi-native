@@ -761,3 +761,67 @@ $library = 'output/smosr-session/native-mixed-fp16-accumulation/umzi_native.dll'
 & $smosrPython scripts/benchmark_architectures.py smosr native-mixed --native-model $model --native-library $library --tag fp16-accum --mixed-fp16-accumulation
 & $smosrPython scripts/benchmark_architectures.py smosr native-mixed --native-model $model --native-library $library --tag fp16-accum-tuned --mixed-fp16-accumulation --tune-convolutions
 ```
+
+## Final backend comparison
+
+Run the seven backends sequentially on the same three `samples/2x-test`
+images, with batch 1, 256×256 input tiles, and zero overlap. Rebuild the
+Torch eager FP32 reference and export both TensorRT-RTX graphs in a fresh
+report directory. Use the validated DLL and package from the mixed tuning
+run. Select native mixed with `fp16_accumulation=1` and
+`tune_convolutions=1`, native FP16 with the default cuDNN plans, and strict
+native FP32 with the NCHW path.
+
+All seven runs completed on the RTX 3050 Laptop GPU with driver 610.62,
+Torch 2.15.0+cu132, cuDNN 9.26, ORT 1.31.1, and TensorRT-RTX EP plugin
+0.5.0. TF32 was disabled. Both TensorRT-RTX placement profiles showed
+exclusive RTX provider execution. The timed sessions enabled CUDA Graph
+replay. The exported FP16 and FP32 graphs used their corresponding input
+and output dtypes.
+
+| Backend | Total ms | Median ms/image | Median ms/tile | Median page mean ms/tile | PSNR (dB) | Mean SSIMULACRA2 | NVML peak MiB | Additional MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Torch eager FP32 | 6442.50 | 2112.88 | 26.25 | 26.29 | Reference | Reference | 1564.50 | 170.44 |
+| TorchInductor FP16 | 2863.20 | 909.00 | 11.41 | 11.81 | 70.41 | 88.97 | 1488.94 | 84.75 |
+| TensorRT-RTX FP16 | 1736.75 | 563.94 | 6.78 | 7.14 | 59.23 | 88.43 | 1568.82 | 169.97 |
+| TensorRT-RTX FP32 | 9683.66 | 3092.33 | 39.60 | 40.16 | 100.64 | 89.39 | 1609.25 | 200.44 |
+| Native FP32 | 4942.23 | 1576.96 | 20.14 | 20.48 | ∞ | 100.00 | 1509.25 | 102.00 |
+| Native FP16 | 1768.09 | 573.10 | 7.01 | 7.27 | 61.80 | 88.69 | 1479.25 | 72.00 |
+| Native mixed, FP16 accumulation and tuning | 1791.71 | 589.22 | 7.15 | 7.38 | 69.58 | 89.05 | 1481.25 | 74.00 |
+
+Tile medians use the 242 individual synchronized calls. Image times sum
+the calls within each image. Additional VRAM uses the sampled NVML peak
+minus the reading before backend setup. Native buffers total 72.16 MiB
+for FP32, 36.11 MiB for FP16, and 37.74 MiB for the selected mixed mode.
+Native FP32 matched the Torch reference at every page pixel in raw float.
+
+| Backend | `9798855404661.jpg` | `9798855424195.jpg` | `9798855444216.jpg` |
+| --- | ---: | ---: | ---: |
+| Torch eager FP32 | 2112.88 | 2024.51 | 2305.12 |
+| TorchInductor FP16 | 908.85 | 909.00 | 1045.35 |
+| TensorRT-RTX FP16 | 544.85 | 563.94 | 627.97 |
+| TensorRT-RTX FP32 | 3049.39 | 3092.33 | 3541.94 |
+| Native FP32 | 1562.40 | 1576.96 | 1802.87 |
+| Native FP16 | 573.10 | 559.90 | 635.08 |
+| Native mixed, FP16 accumulation and tuning | 553.09 | 589.22 | 649.41 |
+
+The per-image table shows inference time in milliseconds. Every tile
+duration and coordinate, per-image fidelity and VRAM, and backend setup
+details are in `output/smosr-final-matrix/smosr/batch-1/<backend>/report.json`.
+
+To repeat the comparison, use a fresh output directory.
+
+```powershell
+$env:PYTHONPATH = 'src'
+$smosrPython = 'C:/Python314/python.exe'
+$model = 'output/smosr-session/smosr-schema2-benchmark.ummodel'
+$library = 'output/smosr-session/native-mixed-fp16-accumulation/umzi_native.dll'
+$reportRoot = 'output/smosr-final-matrix-repeat'
+foreach ($backend in @('fp32', 'inductor', 'rtx', 'rtx-fp32', 'native-fp32', 'native-fp16', 'native-mixed')) {
+    $runArgs = @('scripts/benchmark_architectures.py', 'smosr', $backend, '--batch', '1', '--tile', '256', '--overlap', '0', '--input', 'samples/2x-test', '--output', $reportRoot)
+    if ($backend -like 'native-*') { $runArgs += @('--native-model', $model, '--native-library', $library) }
+    if ($backend -eq 'native-mixed') { $runArgs += @('--mixed-fp16-accumulation', '--tune-convolutions') }
+    & $smosrPython @runArgs
+    if ($LASTEXITCODE) { throw "Benchmark failed for $backend" }
+}
+```
