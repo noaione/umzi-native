@@ -39,9 +39,18 @@ __device__ float biased_value(const void* ptr, int i, float bias, bool fp16, boo
     return round_half(read_scalar(ptr, i, fp32) + round_half(bias, fp16), !fp32);
 }
 
+__device__ int planar_index(int pixel, int channel, int channels, int area) {
+    return (pixel / area * channels + channel) * area + pixel % area;
+}
+
 __device__ float gate_value(const void* expanded, const float* bias, int pixel, int lane, bool fp16, bool fp32) {
     const float g = biased_value(expanded, pixel * expansion + lane, bias[lane], fp16, fp32);
     return round_half(g / (1.f + expf(-g)), fp16);
+}
+
+__device__ float gate_planar(const float* expanded, const float* bias, int pixel, int lane, int area) {
+    const float g = expanded[planar_index(pixel, lane, expansion, area)] + bias[lane];
+    return g / (1.f + expf(-g));
 }
 }
 
@@ -186,4 +195,83 @@ extern "C" __global__ void shuffle_rgb(void* dst, const void* source, const floa
     const float scaled = round_half(__fmul_rn(value, round_half(statistics[c + 3], fp16)), fp16);
     const float shifted = scaled + round_half(statistics[c], fp16);
     write_scalar(dst, i, shifted, !fp16);
+}
+
+extern "C" __global__ void rms_norm_nchw(float* dst, const float* source, const float* parameters, int pixels, int area) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i / 32 >= pixels) return;
+    dst[planar_index(i / 32, i % 32, 32, area)] = normalize<32>(source[i], parameters, false);
+}
+
+extern "C" __global__ void residual_norm_nchw(float* state, float* projected, const float* bias,
+                                              const float* parameters, int pixels, int area) {
+    // Transpose 32 pixels at a time for coalesced planar I/O and warp-per-pixel reduction.
+    __shared__ float tile[32][33];
+    const int base = blockIdx.x * 32, lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    const int pixel = base + lane;
+    for (int channel = warp; channel < 32; channel += 8) {
+        if (pixel < pixels) tile[channel][lane] = projected[planar_index(pixel, channel, 32, area)];
+    }
+    __syncthreads();
+    for (int column = warp; column < 32; column += 8) {
+        const int p = base + column;
+        if (p < pixels) {
+            const float value = (tile[lane][column] + bias[lane]) + state[p * 32 + lane];
+            state[p * 32 + lane] = value;
+            if (parameters) tile[lane][column] = normalize<32>(value, parameters, false);
+        }
+    }
+    if (!parameters) return;
+    __syncthreads();
+    for (int channel = warp; channel < 32; channel += 8) {
+        if (pixel < pixels) projected[planar_index(pixel, channel, 32, area)] = tile[channel][lane];
+    }
+}
+
+extern "C" __global__ void extract_fourier_nchw(float* dst, const float* expanded, const float* bias,
+                                                int area, int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const int lane = expansion - 4 * fourier + i / area % fourier;
+    const int batch = i / (area * fourier);
+    dst[i] = expanded[(batch * expansion + lane) * area + i % area] + bias[lane];
+}
+
+extern "C" __global__ void split_spatial_nchw(float* dst, const float* expanded, const float* bias,
+                                              int offset, int count, int area) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const int lane = hidden + offset + i % fourier;
+    dst[i] = expanded[planar_index(i / fourier, lane, expansion, area)] + bias[lane];
+}
+
+extern "C" __global__ void gate_spatial_nchw(float* dst, const float* source, const float* bias,
+                                             const float* expanded, const float* expanded_bias,
+                                             int offset, int count, int area) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const int p = i / fourier, lane = offset + i % fourier;
+    dst[planar_index(p, lane, hidden, area)] = (source[i] + bias[i % fourier]) *
+        gate_planar(expanded, expanded_bias, p, lane, area);
+}
+
+extern "C" __global__ void inverse_norm_nchw(float* dst, const float* source, const float* parameters,
+                                             const float* expanded, const float* expanded_bias,
+                                             int area, int pixels, float ortho) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int p = i / fourier, lane = i % fourier;
+    if (p >= pixels) return;
+    const float value = source[planar_index(p, lane, fourier, area)] * ortho;
+    const int channel = hidden - 4 * fourier + lane;
+    dst[planar_index(p, channel, hidden, area)] = normalize<fourier>(value, parameters, false) *
+        gate_planar(expanded, expanded_bias, p, channel, area);
+}
+
+extern "C" __global__ void gate_identity_nchw(float* dst, const float* expanded, const float* bias, int count, int area) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    constexpr int channels = hidden - 4 * fourier;
+    const int p = i / (channels * area) * area + i % area, lane = i / area % channels;
+    const float value = expanded[planar_index(p, hidden + lane, expansion, area)] + bias[hidden + lane];
+    dst[planar_index(p, lane, hidden, area)] = value * gate_planar(expanded, bias, p, lane, area);
 }

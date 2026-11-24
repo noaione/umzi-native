@@ -262,6 +262,9 @@ Fourier transforms.
 Set `kernel_options={"tune_convolutions": 1}` to time alternate cuDNN
 plans for the recurring block convolutions. Tuning adds shape setup time
 and can change rounding. By default FiGSR uses its heuristic plans.
+For FP32, `kernel_options={"fp32_nchw": 1}` uses NCHW for the expansion
+and projection inside each block. It can be combined with
+`tune_convolutions`.
 See [FiGSR implementation and measurements](handoff-figsr.md).
 
 ## 5. Inspecting models and sessions

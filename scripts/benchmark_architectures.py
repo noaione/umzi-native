@@ -657,6 +657,7 @@ def main() -> None:
     parser.add_argument("--native-cache-dir", type=Path, help="SMoSR native plan cache directory")
     parser.add_argument("--tag", "--native-tag", help="Suffix for a named benchmark run")
     parser.add_argument("--tune-convolutions", action="store_true", help="Time the dominant native convolution plans")
+    parser.add_argument("--figsr-fp32-nchw", action="store_true", help="Use NCHW for FiGSR FP32 body convolutions")
     parser.add_argument(
         "--mixed-fp16-accumulation", action="store_true", help="Use FP16 accumulation in SMoSR mixed body convolutions"
     )
@@ -709,6 +710,8 @@ def main() -> None:
             parser.error("--tag requires a name using letters, digits, underscores, or hyphens")
     if args.tune_convolutions and (not native or (args.family == "smosr" and args.backend == "native-fp32")):
         parser.error("--tune-convolutions requires native FiGSR or native mixed or FP16 SMoSR")
+    if args.figsr_fp32_nchw and (args.family != "figsr" or args.backend != "native-fp32"):
+        parser.error("--figsr-fp32-nchw requires native FiGSR FP32")
     if args.mixed_fp16_accumulation and args.backend != "native-mixed":
         parser.error("--mixed-fp16-accumulation requires the native mixed backend")
     if args.fuse_silu and args.backend not in ("native-mixed", "native-fp16"):
@@ -815,6 +818,8 @@ def main() -> None:
                 raise ValueError("The native package must match the benchmark checkpoint")
             _, precision = args.backend.split("-", 1)
             kernel_options = {"tune_convolutions": 1} if args.tune_convolutions else {}
+            if args.figsr_fp32_nchw:
+                kernel_options["fp32_nchw"] = 1
             if args.mixed_fp16_accumulation:
                 kernel_options["fp16_accumulation"] = 1
             if args.fuse_silu:

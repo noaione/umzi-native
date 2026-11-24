@@ -108,19 +108,43 @@ struct Network {
         }
         return packed;
     }
+
+    std::vector<char> nchw_body_weights(std::string_view source) const {
+        std::vector<char> packed(source.begin(), source.end());
+        for (const auto& block : blocks) {
+            for (const auto* filter : {&block.expand, &block.project}) {
+                const int taps = filter->kh * filter->kw;
+                for (int out = 0; out < filter->cout; ++out) {
+                    for (int in = 0; in < filter->cin; ++in) {
+                        for (int tap = 0; tap < taps; ++tap) {
+                            const auto ohwi = (out * taps + tap) * filter->cin + in;
+                            const auto oihw = (out * filter->cin + in) * taps + tap;
+                            std::memcpy(packed.data() + filter->weight + oihw * sizeof(float),
+                                        source.data() + filter->weight + ohwi * sizeof(float), sizeof(float));
+                        }
+                    }
+                }
+            }
+        }
+        return packed;
+    }
 };
 
 enum Kernel { Pack, Bias, Rms, ResidualNorm, Copy, Extract, SplitSpatial, GateSpatial,
-              Spectrum, Gelu, Inverse, GateIdentity, Shuffle, KernelCount };
+              Spectrum, Gelu, Inverse, GateIdentity, Shuffle,
+              RmsNchw, ResidualNormNchw, ExtractNchw, SplitSpatialNchw, GateSpatialNchw, InverseNchw,
+              GateIdentityNchw, KernelCount };
 constexpr std::array<const char*, KernelCount> names{
     "pack_rgb", "bias_residual", "rms_norm", "residual_norm", "copy_channels", "extract_fourier",
-    "split_spatial", "gate_spatial", "spectrum_norm", "spectrum_gelu", "inverse_norm", "gate_identity", "shuffle_rgb"};
+    "split_spatial", "gate_spatial", "spectrum_norm", "spectrum_gelu", "inverse_norm", "gate_identity", "shuffle_rgb",
+    "rms_norm_nchw", "residual_norm_nchw", "extract_fourier_nchw", "split_spatial_nchw", "gate_spatial_nchw",
+    "inverse_norm_nchw", "gate_identity_nchw"};
 enum Buffer { State, Normalized, Stem, Middle, Expanded, Values, Fourier, Complex, Spectral, SpectralWork, BufferCount };
 
 class Session final : public umzi::KernelSession {
     Network net;
     bool fp16 = false, fp32 = false, graph = false, pending = false;
-    bool tune_convolutions = false;
+    bool tune_convolutions = false, fp32_nchw = false;
     CUdevice device{};
     CUcontext context = nullptr;
     CUmodule module = nullptr;
@@ -203,12 +227,15 @@ class Session final : public umzi::KernelSession {
     void prepare_conv(Shape shape, const Filter& filter, size_t limit) {
         const auto index = key(shape, filter);
         if (plans.find(index) != plans.end()) return;
+        const auto& body = net.blocks.front();
+        const auto layout = fp32_nchw && (&filter == &body.expand || &filter == &body.project)
+            ? CUDNN_TENSOR_NCHW : CUDNN_TENSOR_NHWC;
         umzi::CudnnBackendPlan selected;
         for (bool half_compute : {true, false}) {
             if (half_compute && !fp16) continue;
             selected.graph = std::make_unique<umzi::CudnnConvGraph>(
                 cudnn, shape.n, shape.h, shape.w, filter.cin, filter.cout, filter.kh, filter.kw, filter.groups,
-                fp32 ? CUDNN_DATA_FLOAT : CUDNN_DATA_HALF, half_compute);
+                fp32 ? CUDNN_DATA_FLOAT : CUDNN_DATA_HALF, half_compute, layout);
             auto candidates = selected.graph->candidates(cudnn, limit, true);
             if (candidates.empty()) continue;
             selected.workspace = size_t(candidates[0].workspace);
@@ -274,6 +301,12 @@ class Session final : public umzi::KernelSession {
                              threads, 1, 1, 0, target, parameters, nullptr));
     }
 
+    template<class... Args>
+    void launch_body(CUstream target, Kernel nhwc, Kernel nchw, int count, int area, Args... args) {
+        if (fp32_nchw) launch(target, nchw, count, args..., area);
+        else launch(target, nhwc, count, args..., fp16, fp32);
+    }
+
     void bind_stream(CUstream target) {
         CHECK(cudnnSetStream(cudnn, target));
         for (const auto handle : fft_plans) FFT_CHECK(fft->set_stream(handle, reinterpret_cast<void*>(target)));
@@ -300,17 +333,20 @@ class Session final : public umzi::KernelSession {
         biased(State, Spectral, net.head);
         const size_t saved_bytes = size_t(pixels) * features * element_bytes();
         CHECK(cuMemcpyDtoDAsync(b[Stem], b[State], saved_bytes, target));
-        launch(target, Rms, features * pixels, b[Normalized], b[State], weights + net.blocks.front().norm,
-               pixels, fp16, fp32);
+        launch_body(target, Rms, RmsNchw, features * pixels, area, b[Normalized], b[State],
+                    weights + net.blocks.front().norm, pixels);
         for (size_t i = 0; i < net.blocks.size(); ++i) {
             const auto& block = net.blocks[i];
             const auto expand_bias = weights + block.expand.bias;
             conv(b[Expanded], b[Normalized], block.expand, spatial);
             const int plain = pixels * (hidden - 4 * fourier);
-            launch(target, GateIdentity, plain, b[Values], b[Expanded], expand_bias, plain, fp16, fp32);
+            launch_body(target, GateIdentity, GateIdentityNchw, plain, area, b[Values], b[Expanded], expand_bias, plain);
 
-            launch(target, Extract, pixels * fourier, b[Fourier], b[Expanded], expand_bias,
-                   area, pixels * fourier, fp16, fp32);
+            const int fourier_count = pixels * fourier;
+            if (fp32_nchw)
+                launch(target, ExtractNchw, fourier_count, b[Fourier], b[Expanded], expand_bias, area, fourier_count);
+            else
+                launch(target, Extract, fourier_count, b[Fourier], b[Expanded], expand_bias, area, fourier_count, fp16, fp32);
             FFT_CHECK(fft->r2c(fft_plans[0], reinterpret_cast<void*>(b[Fourier]), reinterpret_cast<void*>(b[Complex])));
             launch(target, Spectrum, 2 * fourier * frequency_pixels, b[Spectral], b[Complex], weights + block.spectral_norm,
                    bins, frequency_pixels, ortho, fp16, fp32);
@@ -322,21 +358,31 @@ class Session final : public umzi::KernelSession {
             launch(target, Gelu, frequency_pixels * fourier, b[Complex], b[Spectral], weights + block.fdc.bias,
                    bins, frequency_pixels * fourier, fp16, fp32);
             FFT_CHECK(fft->c2r(fft_plans[1], reinterpret_cast<void*>(b[Complex]), reinterpret_cast<void*>(b[Fourier])));
-            launch(target, Inverse, fourier * pixels, b[Values], b[Fourier], weights + block.inverse_norm, b[Expanded], expand_bias,
-                   area, pixels, ortho, fp16, fp32);
+            const auto inverse_norm = weights + block.inverse_norm;
+            if (fp32_nchw)
+                launch(target, InverseNchw, fourier_count, b[Values], b[Fourier], inverse_norm, b[Expanded], expand_bias,
+                       area, pixels, ortho);
+            else
+                launch(target, Inverse, fourier_count, b[Values], b[Fourier], inverse_norm, b[Expanded], expand_bias,
+                       area, pixels, ortho, fp16, fp32);
 
             int offset = hidden - 3 * fourier;
             // Both Fourier staging buffers are dead after the inverse gate.
             for (const auto* filter : {&block.square, &block.row, &block.column}) {
                 const int count = pixels * fourier;
-                launch(target, SplitSpatial, count, b[Spectral], b[Expanded], expand_bias, offset, count, fp16, fp32);
+                launch_body(target, SplitSpatial, SplitSpatialNchw, count, area, b[Spectral], b[Expanded], expand_bias,
+                            offset, count);
                 conv(b[Fourier], b[Spectral], *filter, spatial);
-                launch(target, GateSpatial, count, b[Values], b[Fourier], weights + filter->bias,
-                       b[Expanded], expand_bias, offset, count, fp16, fp32);
+                launch_body(target, GateSpatial, GateSpatialNchw, count, area, b[Values], b[Fourier], weights + filter->bias,
+                            b[Expanded], expand_bias, offset, count);
                 offset += fourier;
             }
             conv(b[Normalized], b[Values], block.project, spatial);
-            if (i + 1 < net.blocks.size())
+            if (fp32_nchw) {
+                const auto parameters = i + 1 < net.blocks.size() ? weights + net.blocks[i + 1].norm : CUdeviceptr(0);
+                launch(target, ResidualNormNchw, pixels * 8, b[State], b[Normalized], weights + block.project.bias,
+                       parameters, pixels, area);
+            } else if (i + 1 < net.blocks.size())
                 launch(target, ResidualNorm, pixels * features, b[State], b[Normalized], weights + block.project.bias,
                        weights + net.blocks[i + 1].norm, pixels, fp16, fp32);
             else
@@ -445,16 +491,25 @@ public:
         const auto data = package.section(3);
         if (architecture.size() || !package.section(2).empty() || package.section(4).size() != 32 || data.size() != net.bytes)
             throw std::runtime_error("Invalid FiGSR metadata or weights");
-        if (options.kernel_option_count > 1) throw std::runtime_error("FiGSR accepts one tune_convolutions option");
-        if (options.kernel_option_count) {
-            const auto& option = options.kernel_options[0];
-            if (std::string_view(option.name ? option.name : "") != "tune_convolutions" ||
-                (option.value != 0 && option.value != 1))
-                throw std::runtime_error("FiGSR tune_convolutions requires a value of 0 or 1");
-            tune_convolutions = option.value != 0;
-        }
         fp16 = options.precision == UMZI_FP16;
         fp32 = options.precision == UMZI_FP32;
+        bool tune_seen = false, layout_seen = false;
+        for (uint32_t i = 0; i < options.kernel_option_count; ++i) {
+            const auto& option = options.kernel_options[i];
+            const std::string_view name(option.name ? option.name : "");
+            if (option.value != 0 && option.value != 1)
+                throw std::runtime_error("FiGSR kernel options require a value of 0 or 1");
+            if (name == "tune_convolutions" && !tune_seen) {
+                tune_seen = true;
+                tune_convolutions = option.value != 0;
+            } else if (name == "fp32_nchw" && !layout_seen) {
+                layout_seen = true;
+                fp32_nchw = option.value != 0;
+            } else {
+                throw std::runtime_error("Invalid or duplicate FiGSR kernel option: " + std::string(name));
+            }
+        }
+        if (!fp32 && fp32_nchw) throw std::runtime_error("FiGSR fp32_nchw requires FP32 precision");
         if (!fp32) net = Network(sizeof(uint16_t));
         graph = (options.flags & UMZI_CUDA_GRAPH) != 0;
         CHECK(cuInit(0));
@@ -470,7 +525,10 @@ public:
             for (auto& event : tuning_events) CHECK(cuEventCreate(&event, CU_EVENT_DEFAULT));
         CHECK(cudnnCreate(&cudnn));
         CHECK(cuMemAlloc(&weights, net.bytes));
-        if (fp32) {
+        if (fp32_nchw) {
+            const auto packed = net.nchw_body_weights(data);
+            CHECK(cuMemcpyHtoD(weights, packed.data(), packed.size()));
+        } else if (fp32) {
             CHECK(cuMemcpyHtoD(weights, data.data(), data.size()));
         } else {
             const auto packed = net.half_weights(Network{}, data);
@@ -547,6 +605,7 @@ public:
     }
 
     const char* kernel_message() const override {
+        if (fp32_nchw) return "FiGSR FP32 with NCHW expansion and projection and FP32 cuFFT";
         if (fp32) return "FiGSR NHWC FP32 with FP32 cuFFT";
         return fp16 ? "FiGSR NHWC FP16 with FP32 cuFFT" : "FiGSR NHWC mixed precision with FP32 cuFFT";
     }

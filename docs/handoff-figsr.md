@@ -283,3 +283,98 @@ The `native-{fp16,mixed,fp32}-optimized` and `-optimized-tuned` directories
 under `output/architecture-baselines/figsr/batch-1/` preserve the full
 per-image and per-tile records. The benchmark accepts
 `--tag optimized-tuned --tune-convolutions` for the tuned run.
+
+### Pass 4. Screen NCHW for the recurrent strict FP32 convolutions
+
+Compare the tuned NHWC control with an NCHW expansion and projection at
+batch 1, 256×256, zero overlap, and the same three `samples/2x-test` pages.
+Pack the two filters in OIHW order and let the existing bias, gate, and
+normalization kernels read or write those layouts directly. Leave the
+spatial and spectral branch convolutions in NHWC. Compare runtime, NVML,
+page fidelity, and the checkerboard stress output before choosing a default.
+
+The paired center screen gave 199.87 ms/tile with tuned NHWC and 172.51
+ms/tile with tuned NCHW, by median of the three tile medians. Every stress
+output in that comparison matched bitwise. The cuDNN convolution
+workspace fell from 51.71 to 17.15 MiB with the same activation allocation.
+The NCHW CUPTI trace shows 2.13 ms/tile in cuDNN layout conversions,
+compared with 23.87 ms in the previous post-fusion trace. The NCHW path
+uses strict FP32 plans and preserves the same reduction tree in RMS
+normalization. See `paired-optimized-fp32-layout-depthwise-nchw.json`
+and `pass4-nchw-profile.json` under `output/figsr-session/`.
+
+The first prototype shared layout branches with the half-storage paths.
+It preserved their stress output and added about 1 ms/tile in mixed mode
+in the center screen. Dedicated NCHW CUDA entry points restore the original
+NHWC kernels. The retained option is `fp32_nchw=1` and can be used with
+`tune_convolutions=1`.
+
+In the final build, tuned NCHW lowered the paired median from 192.556 to
+165.351 ms/tile and from 14971.48 to 12869.78 ms/image across the three
+pages. The stress fixtures matched the tuned control bitwise in that
+process. The paired page phase prepared the fixed shape again after two
+rectangular stress cases, and the two tuned outputs differed on all 242
+tiles. Use the separate raw PSNR and SSIMULACRA2 runs for page fidelity.
+FP16 and mixed matched their controls bitwise on all stress fixtures with
+center medians within 1 ms. The NCHW path passed graph, direct, host, and
+alternate-stream inference, odd-size batching, and minimum-size checks.
+See `paired-optimized-pass4-nchw-final-final-pages.json`,
+`paired-optimized-pass4-nchw-final-half-controls.json`, and
+`pass4-final-validation.log` under `output/figsr-session/`.
+
+**Next pass**. Try replacing cuDNN's FP32 grouped spectral convolution
+with a direct 16-channel depthwise kernel, as in GFISRv2. Fuse its bias and
+residual and keep the transform and RMS stages fixed.
+
+### Pass 5. Fuse the FP32 spectral depthwise convolution and residual
+
+The previous FP32 trace attributes 19.76 ms/tile to cuDNN's grouped
+convolution. Screen a direct 3×3 depthwise implementation that applies
+the bias and residual before writing the spectrum. Measure it against
+the same tuned control independently of the NCHW experiment.
+
+The direct kernel ran in 0.89 ms/tile in the combined CUPTI trace. On
+NHWC it moved the paired center median from 205.216 to 204.878 ms/tile.
+With NCHW already enabled, the paired page run moved the median from
+171.228 to 170.489 ms/tile and from 13201.11 to 13137.58 ms/image. All
+242 outputs in that comparison matched bitwise. The 0.74 ms/tile gain
+did not warrant an additional option, so the retained NCHW build uses
+the cuDNN depthwise plan. See
+`paired-fp32-layout-depthwise-fp32-layout-depthwise-pages-isolate-dw.json`
+and `pass4-nchw-dw-profile.json` under `output/figsr-session/`.
+
+**Next pass**. Time the three dense spatial convolutions individually in
+the NCHW body path. They now account for much of the remaining strict FP32
+time. Start with the 13×13 branch and compare strict cuDNN plans with a
+specialized implementation before changing the arithmetic or workspace.
+
+### Passes 4 and 5 final metrics
+
+The separate FP32 runs used `tune_convolutions=1` in both processes and
+`fp32_nchw=1` in the candidate. Every page had the same raw MSE against
+Torch FP32 and the same rendered PNG bytes in the two runs. Both scored
+26.188 dB on checkerboard. NVML values are device-wide, and the increase
+uses each process's pre-backend reading.
+
+| Tuned FP32 | Total ms | Median ms/image | Median ms/tile | Median page mean ms/tile | PSNR dB | Mean SSIMULACRA2 | NVML peak MiB | Peak increase MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| NHWC control | 45757.34 | 14590.62 | 188.739 | 189.285 | 100.27 | 90.69 | 1674.93 | 233.06 |
+| NCHW expansion and projection | 39507.58 | 12593.63 | 163.035 | 163.554 | 100.27 | 90.69 | 1641.05 | 194.13 |
+
+| Image | Control ms | NCHW ms | Control mean ms/tile | NCHW mean ms/tile | PSNR dB | SSIMULACRA2 | NCHW NVML peak MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `9798855404661.jpg` | 14509.62 | 12518.39 | 188.437 | 162.577 | 116.84 | 89.68 | 1640.93 |
+| `9798855424195.jpg` | 14590.62 | 12593.63 | 189.489 | 163.554 | 121.94 | 91.18 | 1640.93 |
+| `9798855444216.jpg` | 16657.10 | 14395.56 | 189.285 | 163.586 | 95.67 | 91.21 | 1641.05 |
+
+The fixed-shape plan stage took 807 ms in the control and 581 ms with
+NCHW. The per-image device peaks and individual tile timings are in
+`native-fp32-pass4-nhwc-control/report.json` and
+`native-fp32-pass4-nchw/report.json` below
+`output/architecture-baselines/figsr/batch-1/`.
+
+Rebuild with `scripts/build_native.py` as above. For the optimized run,
+pass `--tune-convolutions --figsr-fp32-nchw --tag pass4-nchw` to
+`scripts/benchmark_architectures.py figsr native-fp32` with the package and
+library paths. Python callers use
+`SessionOptions(precision="fp32", kernel_options={"tune_convolutions": 1, "fp32_nchw": 1})`.
