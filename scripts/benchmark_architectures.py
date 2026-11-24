@@ -656,7 +656,7 @@ def main() -> None:
     parser.add_argument("--native-library", type=Path, help="Umzi session library for the native backend")
     parser.add_argument("--native-cache-dir", type=Path, help="SMoSR native plan cache directory")
     parser.add_argument("--tag", "--native-tag", help="Suffix for a named benchmark run")
-    parser.add_argument("--tune-convolutions", action="store_true", help="Time the dominant zero-workspace SMoSR plans")
+    parser.add_argument("--tune-convolutions", action="store_true", help="Time the dominant native convolution plans")
     parser.add_argument(
         "--mixed-fp16-accumulation", action="store_true", help="Use FP16 accumulation in SMoSR mixed body convolutions"
     )
@@ -700,17 +700,15 @@ def main() -> None:
         args.family not in ("smosr", "figsr") or batch != 1 or not args.native_model or not args.native_library
     ):
         parser.error("Native baselines require SMoSR or FiGSR, batch 1, --native-model, and --native-library")
-    if args.family != "smosr" and (
-        args.native_cache_dir or args.tune_convolutions or args.mixed_fp16_accumulation or args.fuse_silu
-    ):
-        parser.error("The native plan cache and tuning options require SMoSR")
+    if args.family != "smosr" and (args.native_cache_dir or args.mixed_fp16_accumulation or args.fuse_silu):
+        parser.error("The native plan cache, FP16 accumulation, and SiLU fusion options require SMoSR")
     if args.tag is not None:
         if not native and args.backend not in RTX_BACKENDS:
             parser.error("--tag requires a native or TensorRT-RTX backend")
         if not re.fullmatch(r"[a-zA-Z0-9_-]+", args.tag):
             parser.error("--tag requires a name using letters, digits, underscores, or hyphens")
-    if args.tune_convolutions and (not native or args.backend == "native-fp32"):
-        parser.error("--tune-convolutions requires a native mixed or FP16 backend")
+    if args.tune_convolutions and (not native or (args.family == "smosr" and args.backend == "native-fp32")):
+        parser.error("--tune-convolutions requires native FiGSR or native mixed or FP16 SMoSR")
     if args.mixed_fp16_accumulation and args.backend != "native-mixed":
         parser.error("--mixed-fp16-accumulation requires the native mixed backend")
     if args.fuse_silu and args.backend not in ("native-mixed", "native-fp16"):

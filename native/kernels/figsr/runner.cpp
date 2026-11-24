@@ -110,21 +110,23 @@ struct Network {
     }
 };
 
-enum Kernel { Pack, Bias, Rms, Copy, Extract, Spectrum, Gelu, Inverse, Gate, Shuffle, KernelCount };
+enum Kernel { Pack, Bias, Rms, ResidualNorm, Copy, Extract, SplitSpatial, GateSpatial,
+              Spectrum, Gelu, Inverse, GateIdentity, Shuffle, KernelCount };
 constexpr std::array<const char*, KernelCount> names{
-    "pack_rgb", "bias_residual", "rms_norm", "copy_channels", "extract_fourier", "spectrum_norm",
-    "spectrum_gelu", "inverse_norm", "apply_gate", "shuffle_rgb"};
-enum Buffer { SpatialInput, SpatialOutput, State, Normalized, Stem, Middle, Expanded, Values, Joined,
-              Fourier, Complex, Spectral, SpectralWork, BufferCount };
+    "pack_rgb", "bias_residual", "rms_norm", "residual_norm", "copy_channels", "extract_fourier",
+    "split_spatial", "gate_spatial", "spectrum_norm", "spectrum_gelu", "inverse_norm", "gate_identity", "shuffle_rgb"};
+enum Buffer { State, Normalized, Stem, Middle, Expanded, Values, Fourier, Complex, Spectral, SpectralWork, BufferCount };
 
 class Session final : public umzi::KernelSession {
     Network net;
     bool fp16 = false, fp32 = false, graph = false, pending = false;
+    bool tune_convolutions = false;
     CUdevice device{};
     CUcontext context = nullptr;
     CUmodule module = nullptr;
     CUstream stream = nullptr;
     CUevent complete = nullptr;
+    std::array<CUevent, 2> tuning_events{};
     cudnnHandle_t cudnn = nullptr;
     std::unique_ptr<umzi::CufftApi> fft;
     std::array<int, 2> fft_plans{};
@@ -136,6 +138,7 @@ class Session final : public umzi::KernelSession {
     Shape shape;
     size_t activation_bytes = 0, conv_bytes = 0, fft_bytes = 0;
     int32_t fp32_fallbacks = 0;
+    int32_t timed_candidates = 0, changed_plans = 0;
     std::array<double, 4> setup_ms{};
     std::array<uint64_t, 4> device_used{};
     using PlanKey = std::array<int, 7>;
@@ -169,6 +172,7 @@ class Session final : public umzi::KernelSession {
         shape = {};
         activation_bytes = conv_bytes = fft_bytes = 0;
         fp32_fallbacks = 0;
+        timed_candidates = changed_plans = 0;
         setup_ms = {};
         device_used = {};
     }
@@ -231,6 +235,37 @@ class Session final : public umzi::KernelSession {
         CHECK(cudnnBackendExecute(cudnn, plans.at(key(grid, filter)).plan->get(), bound->second->get()));
     }
 
+    void tune_conv(Shape padded, const Filter& filter, Buffer input, Buffer output) {
+        auto& selected = plans.at(key(padded, filter));
+        auto candidates = selected.graph->candidates(cudnn, conv_bytes);
+        if (candidates.size() < 2) return;
+        CHECK(cuMemsetD8Async(buffers[input], 0, size_t(padded.pixels()) * filter.cin * element_bytes(), stream));
+        size_t scratch_bytes = conv_bytes;
+        const auto elapsed = [&](const umzi::CudnnBackendPlan& plan, float best) {
+            ++timed_candidates;
+            return umzi::time_cudnn_backend_plan(cudnn, stream, tuning_events, plan, buffers[input],
+                weights + filter.weight, buffers[output], conv_workspace, scratch_bytes, best);
+        };
+        const auto control = elapsed(selected, std::numeric_limits<float>::infinity());
+        float fastest = control;
+        umzi::CudnnBackendPlan winner;
+        for (auto& candidate : candidates) {
+            umzi::CudnnBackendPlan trial;
+            trial.plan = std::move(candidate.plan);
+            trial.workspace = size_t(candidate.workspace);
+            const auto elapsed_ms = elapsed(trial, fastest);
+            if (elapsed_ms < fastest) {
+                fastest = elapsed_ms;
+                winner = std::move(trial);
+            }
+        }
+        if (winner.plan && fastest < 0.97f * control) {
+            selected.plan = std::move(winner.plan);
+            selected.workspace = winner.workspace;
+            ++changed_plans;
+        }
+    }
+
     template<class... Args>
     void launch(CUstream target, Kernel kernel, int count, Args... args) {
         constexpr unsigned threads = 256;
@@ -259,20 +294,25 @@ class Session final : public umzi::KernelSession {
             const int count = pixels * filter.cout;
             launch(target, Bias, count, b[out], b[out], weights + filter.bias, CUdeviceptr(0), filter.cout, count, fp16, fp32);
         };
-        launch(target, Pack, pixels * 8, b[SpatialInput], input, weights + net.rgb, shape.h, shape.w,
+        // The spectral buffer holds at least eight spatial lanes per pixel.
+        launch(target, Pack, pixels * 8, b[Spectral], input, weights + net.rgb, shape.h, shape.w,
                spatial.h, spatial.w, pixels * 8, fp16, fp32);
-        biased(State, SpatialInput, net.head);
+        biased(State, Spectral, net.head);
         const size_t saved_bytes = size_t(pixels) * features * element_bytes();
         CHECK(cuMemcpyDtoDAsync(b[Stem], b[State], saved_bytes, target));
+        launch(target, Rms, features * pixels, b[Normalized], b[State], weights + net.blocks.front().norm,
+               pixels, fp16, fp32);
         for (size_t i = 0; i < net.blocks.size(); ++i) {
             const auto& block = net.blocks[i];
-            launch(target, Rms, 32 * pixels, b[Normalized], b[State], weights + block.norm, features, pixels, fp16, fp32);
-            biased(Expanded, Normalized, block.expand);
-            copy(Values, Expanded, hidden, 2 * hidden, 0, hidden, hidden - features);
+            const auto expand_bias = weights + block.expand.bias;
+            conv(b[Expanded], b[Normalized], block.expand, spatial);
+            const int plain = pixels * (hidden - 4 * fourier);
+            launch(target, GateIdentity, plain, b[Values], b[Expanded], expand_bias, plain, fp16, fp32);
 
-            launch(target, Extract, pixels * fourier, b[Fourier], b[Expanded], area, pixels * fourier, fp32);
+            launch(target, Extract, pixels * fourier, b[Fourier], b[Expanded], expand_bias,
+                   area, pixels * fourier, fp16, fp32);
             FFT_CHECK(fft->r2c(fft_plans[0], reinterpret_cast<void*>(b[Fourier]), reinterpret_cast<void*>(b[Complex])));
-            launch(target, Spectrum, 32 * frequency_pixels, b[Spectral], b[Complex], weights + block.spectral_norm,
+            launch(target, Spectrum, 2 * fourier * frequency_pixels, b[Spectral], b[Complex], weights + block.spectral_norm,
                    bins, frequency_pixels, ortho, fp16, fp32);
             conv(b[SpectralWork], b[Spectral], block.fpe, frequency);
             const int spectrum_elements = frequency_pixels * 2 * fourier;
@@ -282,28 +322,34 @@ class Session final : public umzi::KernelSession {
             launch(target, Gelu, frequency_pixels * fourier, b[Complex], b[Spectral], weights + block.fdc.bias,
                    bins, frequency_pixels * fourier, fp16, fp32);
             FFT_CHECK(fft->c2r(fft_plans[1], reinterpret_cast<void*>(b[Complex]), reinterpret_cast<void*>(b[Fourier])));
-            launch(target, Inverse, 32 * pixels, b[Values], b[Fourier], weights + block.inverse_norm,
+            launch(target, Inverse, fourier * pixels, b[Values], b[Fourier], weights + block.inverse_norm, b[Expanded], expand_bias,
                    area, pixels, ortho, fp16, fp32);
 
             int offset = hidden - 3 * fourier;
+            // Both Fourier staging buffers are dead after the inverse gate.
             for (const auto* filter : {&block.square, &block.row, &block.column}) {
-                copy(SpatialInput, Expanded, fourier, 2 * hidden, 0, hidden + offset, fourier);
-                biased(SpatialOutput, SpatialInput, *filter);
-                copy(Values, SpatialOutput, hidden, fourier, offset, 0, fourier);
+                const int count = pixels * fourier;
+                launch(target, SplitSpatial, count, b[Spectral], b[Expanded], expand_bias, offset, count, fp16, fp32);
+                conv(b[Fourier], b[Spectral], *filter, spatial);
+                launch(target, GateSpatial, count, b[Values], b[Fourier], weights + filter->bias,
+                       b[Expanded], expand_bias, offset, count, fp16, fp32);
                 offset += fourier;
             }
-            launch(target, Gate, pixels * hidden, b[Values], b[Expanded], pixels * hidden, fp16, fp32);
             conv(b[Normalized], b[Values], block.project, spatial);
-            launch(target, Bias, pixels * features, b[State], b[Normalized], weights + block.project.bias,
-                   b[State], features, pixels * features, fp16, fp32);
+            if (i + 1 < net.blocks.size())
+                launch(target, ResidualNorm, pixels * features, b[State], b[Normalized], weights + block.project.bias,
+                       weights + net.blocks[i + 1].norm, pixels, fp16, fp32);
+            else
+                launch(target, Bias, pixels * features, b[State], b[Normalized], weights + block.project.bias,
+                       b[State], features, pixels * features, fp16, fp32);
             if (i + 1 == group_blocks)
                 CHECK(cuMemcpyDtoDAsync(b[Middle], b[State], saved_bytes, target));
         }
         biased(Normalized, State, net.end);
-        copy(Joined, Normalized, 3 * features, features, 0, 0, features);
-        copy(Joined, Stem, 3 * features, features, features, 0, features);
-        copy(Joined, Middle, 3 * features, features, 2 * features, 0, features);
-        biased(State, Joined, net.combine);
+        copy(Expanded, Normalized, 3 * features, features, 0, 0, features);
+        copy(Expanded, Stem, 3 * features, features, features, 0, features);
+        copy(Expanded, Middle, 3 * features, features, 2 * features, 0, features);
+        biased(State, Expanded, net.combine);
         conv(b[Normalized], b[State], net.tail, spatial);
         const int count = shape.pixels() * 3 * scale * scale;
         launch(target, Shuffle, count, output, b[Normalized], weights + net.tail.bias, weights + net.rgb,
@@ -322,8 +368,8 @@ class Session final : public umzi::KernelSession {
             const size_t fft_input = size_t(padded.pixels()) * fourier * sizeof(float);
             const size_t fft_output = size_t(frequency.pixels()) * fourier * 2 * sizeof(float);
             const std::array<size_t, BufferCount> bytes{
-                8 * image, fourier * image, features * image, features * image, features * image, features * image,
-                2 * hidden * image, hidden * image, 3 * features * image, fft_input, fft_output,
+                features * image, features * image, features * image, features * image,
+                2 * hidden * image, hidden * image, fft_input, fft_output,
                 2 * fourier * spectrum, 2 * fourier * spectrum};
             auto start = umzi::Clock::now();
             device_used[0] = umzi::device_used_bytes();
@@ -350,6 +396,12 @@ class Session final : public umzi::KernelSession {
             prepare_conv(frequency, block.fpe, cap);
             prepare_conv(frequency, block.fdc, cap);
             if (conv_bytes) CHECK(cuMemAlloc(&conv_workspace, conv_bytes));
+            if (tune_convolutions) {
+                tune_conv(padded, block.expand, Normalized, Expanded);
+                tune_conv(padded, block.project, Values, Normalized);
+                for (const auto* filter : {&block.square, &block.row, &block.column})
+                    tune_conv(padded, *filter, Spectral, Fourier);
+            }
             device_used[2] = umzi::device_used_bytes();
             setup_ms[1] = umzi::elapsed_ms(start);
 
@@ -393,7 +445,14 @@ public:
         const auto data = package.section(3);
         if (architecture.size() || !package.section(2).empty() || package.section(4).size() != 32 || data.size() != net.bytes)
             throw std::runtime_error("Invalid FiGSR metadata or weights");
-        if (options.kernel_option_count) throw std::runtime_error("FiGSR has no kernel options");
+        if (options.kernel_option_count > 1) throw std::runtime_error("FiGSR accepts one tune_convolutions option");
+        if (options.kernel_option_count) {
+            const auto& option = options.kernel_options[0];
+            if (std::string_view(option.name ? option.name : "") != "tune_convolutions" ||
+                (option.value != 0 && option.value != 1))
+                throw std::runtime_error("FiGSR tune_convolutions requires a value of 0 or 1");
+            tune_convolutions = option.value != 0;
+        }
         fp16 = options.precision == UMZI_FP16;
         fp32 = options.precision == UMZI_FP32;
         if (!fp32) net = Network(sizeof(uint16_t));
@@ -407,6 +466,8 @@ public:
         for (size_t i = 0; i < names.size(); ++i) CHECK(cuModuleGetFunction(&functions[i], module, names[i]));
         CHECK(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
         CHECK(cuEventCreate(&complete, CU_EVENT_DISABLE_TIMING));
+        if (tune_convolutions)
+            for (auto& event : tuning_events) CHECK(cuEventCreate(&event, CU_EVENT_DEFAULT));
         CHECK(cudnnCreate(&cudnn));
         CHECK(cuMemAlloc(&weights, net.bytes));
         if (fp32) {
@@ -426,6 +487,7 @@ public:
             if (weights) cuMemFree(weights);
             if (cudnn) cudnnDestroy(cudnn);
             if (complete) cuEventDestroy(complete);
+            for (auto event : tuning_events) if (event) cuEventDestroy(event);
             if (stream) cuStreamDestroy(stream);
             if (module) cuModuleUnload(module);
             CUcontext previous;
@@ -489,10 +551,12 @@ public:
         return fp16 ? "FiGSR NHWC FP16 with FP32 cuFFT" : "FiGSR NHWC mixed precision with FP32 cuFFT";
     }
 
-    uint32_t diagnostic_count() const override { return 2; }
+    uint32_t diagnostic_count() const override { return tune_convolutions ? 4 : 2; }
     UmziDiagnostic diagnostic(uint32_t index) const override {
         if (index == 0) return {sizeof(UmziDiagnostic), "fp32_accumulation_fallbacks", fp32_fallbacks};
         if (index == 1) return {sizeof(UmziDiagnostic), "cufft_workspace_bytes", int64_t(fft_bytes)};
+        if (index == 2 && tune_convolutions) return {sizeof(UmziDiagnostic), "timed_convolution_candidates", timed_candidates};
+        if (index == 3 && tune_convolutions) return {sizeof(UmziDiagnostic), "changed_convolution_plans", changed_plans};
         throw std::runtime_error("Invalid FiGSR diagnostic index");
     }
 

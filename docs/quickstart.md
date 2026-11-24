@@ -258,6 +258,10 @@ wide. The session handles reflection padding and even alignment internally.
 Use `np.float32` arrays for `precision="fp32"` or `"mixed"` and `np.float16`
 arrays for `precision="fp16"`. All three modes require cuFFT 12 for FP32
 Fourier transforms.
+
+Set `kernel_options={"tune_convolutions": 1}` to time alternate cuDNN
+plans for the recurring block convolutions. Tuning adds shape setup time
+and can change rounding. By default FiGSR uses its heuristic plans.
 See [FiGSR implementation and measurements](handoff-figsr.md).
 
 ## 5. Inspecting models and sessions

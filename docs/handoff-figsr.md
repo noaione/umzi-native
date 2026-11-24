@@ -159,3 +159,127 @@ foreach ($backend in 'native-fp32', 'native-mixed', 'native-fp16') {
 Reports are under `output/architecture-baselines/figsr/batch-1/`. Each
 `report.json` contains the individual image metrics, every synchronized
 tile time with coordinates, validation fixtures, and setup measurements.
+
+## Optimization passes
+
+Keep the baseline package and DLL as controls. Repeat the same batch-1,
+256×256, zero-overlap workload. Use paired runs for latency decisions
+and separate processes for NVML and fidelity against the eager FP32 renders.
+
+### Pass 1. Fuse bias, gating, and normalization with their consumers
+
+The control CUPTI trace is in `output/figsr-session/optimization-control-profile.json`.
+FP16 spent 14.76 ms/tile in bias and residual kernels, 7.21 in the gate,
+6.87 in channel copies, and 3.04 in cuFFT. The corresponding mixed times
+were 14.01, 7.09, 6.77, and 2.90 ms. GFISRv2's fused data movement applies
+here, while the FiGSR spatial branches use dense convolutions.
+
+Apply the expansion bias when consuming each slice. Fuse the identity
+branch copy and the spatial bias and output copies with the gate. Apply
+the same gate after inverse Fourier normalization. Share the residual
+update with the next block's RMS read, preserving the activation storage
+rounding between them. Use 16-lane and eight-lane reductions in the
+spectral normalization kernels.
+
+| Precision | Control median ms/tile | Pass 1 median ms/tile | Control median ms/image | Pass 1 median ms/image |
+| --- | ---: | ---: | ---: | ---: |
+| FP16 | 63.747 | 45.193 | 4916.21 | 3479.05 |
+| Mixed | 77.670 | 59.373 | 5986.05 | 4584.88 |
+| FP32 | 221.178 | 197.469 | 17115.21 | 15292.71 |
+
+All 242 tiles in each precision and all stress fixtures matched the
+control bitwise. FP16 custom kernel time fell from 41.02 to 18.09 ms in
+the separate CUPTI run, and mixed fell from 39.40 to 17.76 ms. Fusion is
+the default for all three precisions. See `paired-native-pass1.json` and
+`optimization-pass1-profile.json` under `output/figsr-session/`.
+
+**Next pass**. Time alternative cuDNN plans for the recurrent expansion,
+projection, and three dense spatial convolutions. Keep the first plan as
+the control and retain the existing workspace limit.
+
+### Pass 2. Screen alternate cuDNN plans
+
+Use the shared cuDNN plan timer from GFISRv2. Time the five recurrent
+shapes with the precision and workspace allocated by the heuristic path.
+Replace a plan only when its measured convolution time drops by at least
+3%. Screen the effect on the full captured forward and compare fidelity.
+The screen uses the opt-in `tune_convolutions=1` option because it adds
+shape setup work and may change convolution accumulation order.
+
+| Precision | Pass 1 ms/tile | Tuned ms/tile | Candidates timed | Plans changed | Tuned plan stage ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| FP16 | 47.004 | 44.036 | 187 | 3 | 2235.76 |
+| Mixed | 61.050 | 54.682 | 179 | 3 | 3163.34 |
+| FP32 | 196.970 | 184.196 | 36 | 1 | 841.00 |
+
+These are medians of the three paired center-tile medians. All modes
+gained speed and changed raw output on stress fixtures. Plan selection
+stays opt-in. It keeps each precision's original convolution math type
+and uses the previously allocated workspace. The screen is in
+`output/figsr-session/paired-pass1-pass2-tuned.json`.
+
+**Next pass**. Reuse the Fourier staging for the spatial branches and
+the expansion buffer for the final concatenation after their last reads.
+
+### Pass 3. Reuse inactive activation buffers
+
+The spatial branches run after inverse Fourier normalization and gating.
+At that point the spectral and planar real buffers can hold their input
+and output respectively. The final three-way concatenation fits in the
+larger expansion buffer after the last block. The reuse depends on
+single-stream ordering and leaves the convolution workspace and rounding
+points intact.
+
+The activation allocation fell from 70.22 to 55.33 MiB in FP16 and mixed,
+and from 136.17 to 106.40 MiB in FP32. The paired center-tile medians
+were within 0.36 ms of Pass 1 in each precision. Stress outputs matched
+Pass 1 bitwise. The final default renders and raw page MSE values matched
+the original baseline on all three pages in each precision. Graph, direct,
+host, and alternate-stream calls passed again. See
+`output/figsr-session/paired-pass1-optimized.json` and
+`output/figsr-session/optimization-validation.log`.
+
+**Next pass**. Screen an NCHW layout for the two recurrent strict FP32
+3×3 convolutions. The Pass 1 profile attributed 23.87 ms/tile to cuDNN's
+layout conversions. Test the layout with strict FP32 math and compare both
+page fidelity and the checkerboard stress tile before enabling it.
+
+## Final optimized metrics
+
+The default uses the fusions and buffer reuse. The tuned rows additionally
+set `kernel_options={"tune_convolutions": 1}`. These are separate runs with
+the same checkpoint, tiles, zero overlap, and FP32 reference as the
+baseline. NVML reports device-wide VRAM and its increase over the reading
+before backend setup.
+
+| Native mode | Total ms | Median image ms | Median tile ms | Median page mean ms/tile | PSNR dB | Mean SSIMULACRA2 | NVML peak MiB | Peak increase MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| FP16 default | 10875.47 | 3460.16 | 44.771 | 44.937 | 62.86 | 88.31 | 1003.73 | 124.00 |
+| FP16 tuned | 10323.91 | 3287.16 | 42.523 | 42.690 | 62.82 | 88.33 | 1005.73 | 126.00 |
+| Mixed default | 14187.28 | 4532.59 | 58.370 | 58.665 | 68.06 | 88.76 | 1003.73 | 124.00 |
+| Mixed tuned | 12923.33 | 4113.82 | 53.220 | 53.426 | 68.08 | 88.69 | 1005.73 | 126.00 |
+| FP32 default | 47388.22 | 15191.07 | 195.388 | 195.437 | 100.27 | 90.68 | 1107.73 | 228.00 |
+| FP32 tuned | 44249.00 | 14109.48 | 182.613 | 182.773 | 100.27 | 90.69 | 1107.73 | 228.00 |
+
+The final tuned plan stage took 2.15 s in FP16, 2.78 s in mixed, and
+0.79 s in FP32. The heuristic plan stage took 0.12 s in each mode.
+FiGSR reruns the tuner when the session prepares a new shape.
+
+### Per-image tuned metrics
+
+| Precision | Image | Inference ms | Mean ms/tile | PSNR dB | SSIMULACRA2 | NVML peak MiB |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| FP16 | `9798855404661.jpg` | 3272.58 | 42.501 | 62.32 | 87.19 | 1005.73 |
+| FP16 | `9798855424195.jpg` | 3287.16 | 42.690 | 63.29 | 89.01 | 1005.73 |
+| FP16 | `9798855444216.jpg` | 3764.18 | 42.775 | 62.89 | 88.80 | 1005.73 |
+| Mixed | `9798855404661.jpg` | 4094.57 | 53.176 | 67.38 | 87.44 | 1005.73 |
+| Mixed | `9798855424195.jpg` | 4113.82 | 53.426 | 68.54 | 89.33 | 1005.73 |
+| Mixed | `9798855444216.jpg` | 4714.93 | 53.579 | 68.41 | 89.28 | 1005.73 |
+| FP32 | `9798855404661.jpg` | 14073.54 | 182.773 | 116.84 | 89.68 | 1107.73 |
+| FP32 | `9798855424195.jpg` | 14109.48 | 183.240 | 121.94 | 91.18 | 1107.73 |
+| FP32 | `9798855444216.jpg` | 16065.98 | 182.568 | 95.67 | 91.21 | 1107.73 |
+
+The `native-{fp16,mixed,fp32}-optimized` and `-optimized-tuned` directories
+under `output/architecture-baselines/figsr/batch-1/` preserve the full
+per-image and per-tile records. The benchmark accepts
+`--tag optimized-tuned --tune-convolutions` for the tuned run.

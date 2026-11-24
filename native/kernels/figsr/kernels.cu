@@ -21,16 +21,27 @@ __device__ int reflected(int coordinate, int extent) {
     return coordinate < extent ? coordinate : 2 * extent - coordinate - 2;
 }
 
-__device__ float normalize(float x, const float* parameters, int channels, bool fp16) {
-    const int lane = threadIdx.x % 32;
+template<int channels>
+__device__ float normalize(float x, const float* parameters, bool fp16) {
+    const int lane = threadIdx.x % channels;
     float squared = x * x;
-    for (int offset = 16; offset; offset /= 2) squared += __shfl_xor_sync(0xffffffff, squared, offset);
+    const unsigned active = __activemask();
+    for (int offset = channels / 2; offset; offset /= 2)
+        squared += __shfl_xor_sync(active, squared, offset, channels);
     const float norm = round_half(sqrtf(squared), fp16);
     const float denominator = round_half(fmaf(norm, round_half(parameters[2 * channels + 1], fp16),
                                                round_half(parameters[2 * channels], fp16)), fp16);
-    if (lane >= channels) return 0.f;
     const float divided = round_half(x / denominator, fp16);
     return fmaf(divided, round_half(parameters[lane], fp16), round_half(parameters[channels + lane], fp16));
+}
+
+__device__ float biased_value(const void* ptr, int i, float bias, bool fp16, bool fp32) {
+    return round_half(read_scalar(ptr, i, fp32) + round_half(bias, fp16), !fp32);
+}
+
+__device__ float gate_value(const void* expanded, const float* bias, int pixel, int lane, bool fp16, bool fp32) {
+    const float g = biased_value(expanded, pixel * expansion + lane, bias[lane], fp16, fp32);
+    return round_half(g / (1.f + expf(-g)), fp16);
 }
 }
 
@@ -62,14 +73,20 @@ extern "C" __global__ void bias_residual(void* dst, const void* convolution, con
 }
 
 extern "C" __global__ void rms_norm(void* dst, const void* source, const float* parameters,
-                                   int channels, int pixels, bool fp16, bool fp32) {
+                                   int pixels, bool fp16, bool fp32) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    const int pixel = i / 32, lane = i % 32;
-    if (pixel >= pixels) return;
-    const int j = pixel * channels + lane;
-    const float value = lane < channels ? read_scalar(source, j, fp32) : 0.f;
-    const float normalized = normalize(value, parameters, channels, fp16);
-    if (lane < channels) write_scalar(dst, j, normalized, fp32);
+    if (i / 32 >= pixels) return;
+    write_scalar(dst, i, normalize<32>(read_scalar(source, i, fp32), parameters, fp16), fp32);
+}
+
+extern "C" __global__ void residual_norm(void* state, void* projected, const float* bias,
+                                         const float* parameters, int pixels, bool fp16, bool fp32) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i / 32 >= pixels) return;
+    const float projection = round_half(read_scalar(projected, i, fp32) + round_half(bias[i % 32], fp16), fp16);
+    const float value = round_half(projection + read_scalar(state, i, fp32), !fp32);
+    write_scalar(state, i, value, fp32);
+    write_scalar(projected, i, normalize<32>(value, parameters, fp16), fp32);
 }
 
 extern "C" __global__ void copy_channels(void* dst, const void* source, int dst_stride, int source_stride,
@@ -83,26 +100,42 @@ extern "C" __global__ void copy_channels(void* dst, const void* source, int dst_
     else static_cast<half*>(dst)[to] = static_cast<const half*>(source)[from];
 }
 
-extern "C" __global__ void extract_fourier(float* dst, const void* expanded, int area, int count, bool fp32) {
+extern "C" __global__ void extract_fourier(float* dst, const void* expanded, const float* bias,
+                                           int area, int count, bool fp16, bool fp32) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
     const int c = i / area % fourier, p = i / (area * fourier) * area + i % area;
-    dst[i] = read_scalar(expanded, p * expansion + expansion - 4 * fourier + c, fp32);
+    const int lane = expansion - 4 * fourier + c;
+    dst[i] = biased_value(expanded, p * expansion + lane, bias[lane], fp16, fp32);
+}
+
+extern "C" __global__ void split_spatial(void* dst, const void* expanded, const float* bias,
+                                         int offset, int count, bool fp16, bool fp32) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const int lane = hidden + offset + i % fourier;
+    write_scalar(dst, i, biased_value(expanded, i / fourier * expansion + lane, bias[lane], fp16, fp32), fp32);
+}
+
+extern "C" __global__ void gate_spatial(void* dst, const void* source, const float* bias,
+                                        const void* expanded, const float* expanded_bias,
+                                        int offset, int count, bool fp16, bool fp32) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const int p = i / fourier, lane = offset + i % fourier;
+    const float value = biased_value(source, i, bias[i % fourier], fp16, fp32);
+    write_scalar(dst, p * hidden + lane, value * gate_value(expanded, expanded_bias, p, lane, fp16, fp32), fp32);
 }
 
 extern "C" __global__ void spectrum_norm(void* dst, const float2* source, const float* parameters,
                                          int bins, int pixels, float ortho, bool fp16, bool fp32) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    const int p = i / 32, lane = i % 32;
+    const int p = i / (2 * fourier), lane = i % (2 * fourier);
     if (p >= pixels) return;
-    float value = 0.f;
-    if (lane < 2 * fourier) {
-        // Resselt packs all real channels before all imaginary channels.
-        const float2 bin = source[(p / bins * fourier + lane % fourier) * bins + p % bins];
-        value = round_half((lane < fourier ? bin.x : bin.y) * ortho, fp16);
-    }
-    const float normalized = normalize(value, parameters, 2 * fourier, fp16);
-    if (lane < 2 * fourier) write_scalar(dst, p * 2 * fourier + lane, normalized, fp32);
+    // Resselt packs all real channels before all imaginary channels.
+    const float2 bin = source[(p / bins * fourier + lane % fourier) * bins + p % bins];
+    const float value = round_half((lane < fourier ? bin.x : bin.y) * ortho, fp16);
+    write_scalar(dst, i, normalize<2 * fourier>(value, parameters, fp16), fp32);
 }
 
 extern "C" __global__ void spectrum_gelu(float2* dst, const void* source, const float* bias,
@@ -120,24 +153,25 @@ extern "C" __global__ void spectrum_gelu(float2* dst, const void* source, const 
 }
 
 extern "C" __global__ void inverse_norm(void* dst, const float* source, const float* parameters,
+                                        const void* expanded, const float* expanded_bias,
                                         int area, int pixels, float ortho, bool fp16, bool fp32) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    const int p = i / 32, lane = i % 32;
+    const int p = i / fourier, lane = i % fourier;
     if (p >= pixels) return;
-    float value = 0.f;
-    if (lane < fourier) {
-        value = round_half(source[(p / area * fourier + lane) * area + p % area] * ortho, fp16);
-    }
-    const float normalized = normalize(value, parameters, fourier, fp16);
-    if (lane < fourier) write_scalar(dst, p * hidden + hidden - 4 * fourier + lane, normalized, fp32);
+    const float value = round_half(source[(p / area * fourier + lane) * area + p % area] * ortho, fp16);
+    const float normalized = round_half(normalize<fourier>(value, parameters, fp16), !fp32);
+    const int channel = hidden - 4 * fourier + lane;
+    write_scalar(dst, p * hidden + channel, normalized * gate_value(expanded, expanded_bias, p, channel, fp16, fp32), fp32);
 }
 
-extern "C" __global__ void apply_gate(void* value, const void* expanded, int count, bool fp16, bool fp32) {
+extern "C" __global__ void gate_identity(void* dst, const void* expanded, const float* bias,
+                                         int count, bool fp16, bool fp32) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
-    const float g = read_scalar(expanded, i / hidden * expansion + i % hidden, fp32);
-    const float silu = round_half(g / (1.f + expf(-g)), fp16);
-    write_scalar(value, i, read_scalar(value, i, fp32) * silu, fp32);
+    constexpr int channels = hidden - 4 * fourier;
+    const int p = i / channels, lane = i % channels;
+    const float value = biased_value(expanded, p * expansion + hidden + lane, bias[hidden + lane], fp16, fp32);
+    write_scalar(dst, p * hidden + lane, value * gate_value(expanded, bias, p, lane, fp16, fp32), fp32);
 }
 
 extern "C" __global__ void shuffle_rgb(void* dst, const void* source, const float* bias, const float* statistics,
