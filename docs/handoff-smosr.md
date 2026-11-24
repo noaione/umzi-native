@@ -1115,15 +1115,45 @@ The paired run is the latency comparison. The fused plan search took
 26.92 s including unfused plan timing, versus 1.04–1.29 s with a cache hit.
 The latter still times the 83 unfused candidates. Permanent session
 buffers stayed at 37.74 MiB including weights and RGB staging, with zero
-convolution workspace. The startup, NVML, and fidelity tradeoffs warrant
+convolution workspace. The startup and fidelity tradeoffs warrant
 keeping `fuse_silu=1` opt-in. Full per-image metrics and per-tile samples
 are in `smosr/batch-1/native-mixed-{control,fused}/report.json` below
 `output/smosr-final-tuning/`.
 
+A fresh-process check on the final library prepared only 256×256. Both
+modes peaked at 1540.54 MiB device-wide and 72.00 MiB over baseline, and
+reproduced the same PSNR and SSIMULACRA2 as above. The extra VRAM in the
+earlier fused run was observed after rectangular stress tests. The fixed
+control and fused runs measured 585.79 and 506.74 ms median per image and
+7.123 and 6.271 ms median per tile. The fused cache loaded both plans with
+a 1.27 s plan stage including unfused tuning. See the
+`native-mixed-fixed-{control,fused}` reports in the same directory.
+
+Enable the tested combination through `SessionOptions` with
+`precision="mixed"`, `kernel_options={"fp16_accumulation": 1,
+"tune_convolutions": 1, "fuse_silu": 1}`, and a persistent `cache_dir`.
+Omit `fuse_silu` or set it to `0` to keep the unfused mixed path. The commands
+below rebuild the native library and reproduce the two full-page reports.
+
+```powershell
+$env:PYTHONPATH = 'src'
+$env:CUDA_VISIBLE_DEVICES = '0'
+$smosrPython = 'C:/Python314/python.exe'
+$reportRoot = 'output/smosr-final-tuning-repeat'
+$model = 'output/smosr-session/smosr-schema2-benchmark.ummodel'
+$library = 'output/smosr-final-tuning-repeat/native/umzi_native.dll'
+& $smosrPython scripts/build_native.py --arch sm_86 --nvrtc-root output/nvrtc-13.0/nvidia/cu13 --output "$reportRoot/native"
+& $smosrPython scripts/benchmark_architectures.py smosr fp32 --output $reportRoot
+$native = @('--output', $reportRoot, '--native-model', $model, '--native-library', $library, '--mixed-fp16-accumulation', '--tune-convolutions')
+& $smosrPython scripts/benchmark_architectures.py smosr native-mixed @native --tag control
+& $smosrPython scripts/benchmark_architectures.py smosr native-mixed @native --tag fused --fuse-silu --native-cache-dir "$reportRoot/plan-cache"
+```
+
 ### Strict FP32
 
-The cuDNN FMA probe tested all eight legacy algorithms on the padded
-260×260 3×3 convolution shapes. Winograd was fastest on the 48→48 and
+The cuDNN FMA probe queried all eight legacy algorithms on the padded
+260×260 3×3 convolution shapes and timed the supported algorithms within
+the workspace limit. Winograd was fastest on the 48→48 and
 48→96 shapes and matched the Torch convolution bitwise in that probe.
 The native control's CUPTI trace also showed Winograd on the body layers.
 The nonfused Winograd variants requested 891.5 and 1337.4 MiB respectively,
@@ -1137,3 +1167,53 @@ matched the control and Torch bitwise. The CUPTI trace put the control's
 Winograd kernels at about 17 ms/tile. The under-0.5% wall-time gain did
 not warrant retaining the new dispatch path. Keep the strict FP32 control.
 See `screen-fp32.json` and its two CUDA traces.
+
+### FP16 gate
+
+The cuDNN probe put the 48→96 FP16 projection, bias, channel slices,
+tanh, residual add, and multiply into one operation graph. cuDNN 9.26
+returned zero plans within a 64 MiB cap. It returned 25 zero-workspace plans
+for projection plus bias alone. The fastest took 0.420 ms versus 0.417 ms for the
+existing projection, and still needed a separate gate. See
+`output/smosr-final-tuning/probe_fp16_gate.log`.
+
+The next prototype replaced the tanh lookup with hardware FP16 tanh and
+prepacked the projection biases as halves. Both paired configurations used
+the same cached SiLU-fused convolution plans. The gate kernel sum fell from
+0.955 to 0.900 ms/tile in the CUPTI trace, but the median of all 726 forward
+calls moved from 6.236 to 6.227 ms. Median image latency was 489.44 vs
+489.16 ms. The approximate path won five of nine page comparisons and
+changed outputs. Keep the existing fused FP16 path. See `paired-fp16.json`
+and its two traces.
+
+### Full-page fidelity of the FP32 and FP16 prototypes
+
+Use the paired timing for the performance decision. These separate
+processes measure fidelity and NVML for each configuration.
+
+| Configuration | Median image ms | Median tile ms | PSNR (dB) | Mean SSIMULACRA2 | NVML peak MiB | Peak increase MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Strict FP32 control | 1575.20 | 20.113 | ∞ | 100.00 | 1560.13 | 102.00 |
+| Strict FP32 `float4` prototype | 1580.27 | 20.062 | ∞ | 100.00 | 1560.13 | 102.00 |
+| SiLU-fused FP16 control | 513.33 | 6.187 | 61.801 | 88.664 | 1522.28 | 72.09 |
+| SiLU-fused FP16 with hardware tanh | 508.46 | 6.149 | 61.903 | 88.725 | 1509.09 | 72.00 |
+
+The individual page scores, NVML peaks, and synchronized tile samples
+are in the `native-fp32-{control,vector}` and
+`native-fp16-{fused-control,approx-gate}` reports under
+`output/smosr-final-tuning/smosr/batch-1/`.
+
+### Final validation and retained artifacts
+
+The final SM 8.6 library matched the previous native library bitwise on
+all 242 tiles and the stress fixtures in each of the three default
+precision modes. The mixed fusion option passed CUDA graph, direct, host,
+and alternate-stream calls on schema 2 at 256×256 and schema 1 at 65×79.
+Both cases restored two fused plans, and the direct outputs matched the
+graph outputs bitwise. Both returned finite 6×6 output for 3×3 input.
+See `output/smosr-final-tuning/validation.json`.
+
+The report directory retains per-image and per-tile JSON, traces, and plan
+caches. The generated images and NumPy references were removed after
+scoring. Rerun the Torch FP32 reference before repeating any fidelity
+comparison in that directory.

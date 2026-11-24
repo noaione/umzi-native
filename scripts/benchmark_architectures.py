@@ -651,7 +651,10 @@ def main() -> None:
         "--mixed-fp16-accumulation", action="store_true", help="Use FP16 accumulation in SMoSR mixed body convolutions"
     )
     parser.add_argument(
-        "--fuse-silu", "--fp16-fuse-silu", action="store_true", help="Fuse SMoSR mixed or FP16 convolutions with bias and SiLU"
+        "--fuse-silu",
+        "--fp16-fuse-silu",
+        action="store_true",
+        help="Fuse SMoSR mixed or FP16 convolutions with bias and SiLU",
     )
     args = parser.parse_args()
     family = FAMILIES[args.family]
