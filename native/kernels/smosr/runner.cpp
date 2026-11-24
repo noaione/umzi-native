@@ -12,6 +12,8 @@ using umzi::ContextScope;
 constexpr int scale = 2, context_pixels = 2, features = 48;
 constexpr int half_values = 1 << 16;
 constexpr size_t table_bytes = 2 * half_values * sizeof(uint16_t);
+constexpr uint32_t fused_plan_schema = 1;
+constexpr size_t fused_plan_file_limit = 256 * 1024;
 constexpr std::array<uint32_t, 8> configuration{3, 3, scale, context_pixels, features, 2, 3, 1};
 
 struct Shape {
@@ -127,15 +129,25 @@ class Session final : public umzi::KernelSession {
     std::array<CUdeviceptr, BufferCount> buffer{};
     Shape shape;
     size_t activation_bytes = 0, workspace_bytes = 0;
-    bool tune_convolutions = false, fp16_accumulation = false;
+    bool tune_convolutions = false, fp16_accumulation = false, fuse_silu = false;
+    std::filesystem::path cache_dir;
+    umzi::Digest cache_environment{};
+    UmziCacheStatus cache_status = UMZI_CACHE_DISABLED;
+    std::string cache_diagnostic;
     int64_t timed_candidates = 0;
     std::array<double, 4> setup_ms{};
     std::array<uint64_t, 4> device_used{};
-    std::map<std::array<int, 3>, umzi::CudnnBackendPlan> plans;
+    std::map<std::array<int, 4>, umzi::CudnnBackendPlan> plans;
     std::map<std::array<CUdeviceptr, 3>, std::unique_ptr<umzi::CudnnDescriptor>> variants;
 
     size_t rgb_bytes(Shape input) const { return size_t(input.pixels()) * 3 * (fp16 ? 2 : 4); }
-    size_t persistent_bytes() const { return net.bytes + (fp16 ? table_bytes : 0); }
+    size_t persistent_bytes() const {
+        return net.bytes + (fp16 ? table_bytes : 0)
+            + (fuse_silu ? net.blocks.size() * 2 * features * sizeof(uint16_t) : 0);
+    }
+    CUdeviceptr fused_bias(size_t block, size_t convolution) const {
+        return fuse_silu ? weights + net.bytes + table_bytes + (block * 2 + convolution) * features * sizeof(uint16_t) : 0;
+    }
 
     void wait() {
         if (!pending) return;
@@ -160,16 +172,76 @@ class Session final : public umzi::KernelSession {
         device_used = {};
     }
 
-    void prepare_plan(const Filter& f, Shape padded, size_t limit) {
-        const std::array key{f.cin, f.cout, f.k};
+    void cache_issue(UmziCacheStatus status, const std::exception& error) {
+        cache_status = status;
+        cache_diagnostic = error.what();
+    }
+
+    std::unique_ptr<umzi::CudnnDescriptor> load_fused_plan(const std::filesystem::path& path,
+        const umzi::Digest& digest, const Filter& f, CUdeviceptr bias) {
+        try {
+            if (!std::filesystem::exists(path)) {
+                if (cache_status == UMZI_CACHE_HIT) cache_status = UMZI_CACHE_MISS;
+                return {};
+            }
+            auto payload = umzi::read_plan(path, umzi::smosr_id, fused_plan_schema, digest, fused_plan_file_limit);
+            if (payload.empty() || std::find(payload.begin(), payload.end(), '\0') != payload.end())
+                throw std::runtime_error("Invalid cached SMoSR plan JSON");
+            payload.push_back('\0');
+            umzi::CudnnBackendPlan restored;
+            restored.plan = std::make_unique<umzi::CudnnDescriptor>(CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR);
+            restored.plan->set(CUDNN_ATTR_EXECUTION_PLAN_HANDLE, CUDNN_TYPE_HANDLE, &cudnn);
+            restored.plan->set(CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION, CUDNN_TYPE_CHAR,
+                               payload.data(), int64_t(payload.size()));
+            restored.plan->finalize();
+            int64_t bytes = 0, count = 0;
+            CHECK(cudnnBackendGetAttribute(restored.plan->get(), CUDNN_ATTR_EXECUTION_PLAN_WORKSPACE_SIZE,
+                                           CUDNN_TYPE_INT64, 1, &count, &bytes));
+            if (count != 1 || bytes != 0) throw std::runtime_error("Cached SMoSR plan requires workspace");
+            CUdeviceptr scratch = 0;
+            size_t scratch_bytes = 0;
+            const float elapsed = umzi::time_cudnn_backend_plan(cudnn, stream, timing, restored,
+                buffer[Activated], weights + f.weight, buffer[Projection], scratch, scratch_bytes, 0,
+                nullptr, nullptr, bias);
+            if (elapsed == std::numeric_limits<float>::infinity())
+                throw std::runtime_error("Cached SMoSR plan did not execute");
+            return std::move(restored.plan);
+        } catch (const std::filesystem::filesystem_error& error) {
+            cache_issue(UMZI_CACHE_UNAVAILABLE, error);
+        } catch (const std::exception& error) {
+            cache_issue(UMZI_CACHE_REBUILT, error);
+        }
+        return {};
+    }
+
+    void prepare_plan(const Filter& f, Shape padded, size_t limit, CUdeviceptr bias = 0) {
+        const std::array key{f.cin, f.cout, f.k, int(bias != 0)};
         if (plans.find(key) != plans.end()) return;
         umzi::CudnnBackendPlan plan;
+        std::filesystem::path cache_path;
+        umzi::Digest cache_key{};
+        if (bias && !cache_dir.empty() && cache_status != UMZI_CACHE_UNAVAILABLE) {
+            try {
+                umzi::Sha256 hash;
+                hash.add(cache_environment);
+                hash.add(std::array{padded.n, padded.h, padded.w, f.cin, f.cout, f.k});
+                cache_key = hash.finish();
+                cache_path = umzi::plan_path(cache_dir, "smosr-silu", cache_key);
+                plan.plan = load_fused_plan(cache_path, cache_key, f, bias);
+            } catch (const std::exception& error) {
+                cache_issue(UMZI_CACHE_UNAVAILABLE, error);
+            }
+            if (plan.plan) {
+                plans.emplace(key, std::move(plan));
+                return;
+            }
+        }
         const bool body_accumulates_in_fp16 = fp16_accumulation && f.cin == features && f.k == 3;
         plan.graph = std::make_unique<umzi::CudnnConvGraph>(
             cudnn, padded.n, padded.h, padded.w, f.cin, f.cout, f.k, fp32 ? CUDNN_DATA_FLOAT : CUDNN_DATA_HALF,
             fp16 || body_accumulates_in_fp16,
-            fp32 ? CUDNN_TENSOR_NCHW : CUDNN_TENSOR_NHWC);
-        const bool tune = tune_convolutions && f.cin == features && f.k == 3;
+            fp32 ? CUDNN_TENSOR_NCHW : CUDNN_TENSOR_NHWC, bias != 0);
+        const bool tune = bias || (tune_convolutions && f.cin == features && f.k == 3);
         auto candidates = plan.graph->candidates(cudnn, tune ? 0 : limit, !tune);
         size_t selected = 0;
         if (tune) {
@@ -182,7 +254,8 @@ class Session final : public umzi::KernelSession {
                 plan.plan = std::move(candidate.plan);
                 plan.workspace = size_t(candidate.workspace);
                 const float elapsed = umzi::time_cudnn_backend_plan(cudnn, stream, timing, plan,
-                    buffer[Activated], weights + f.weight, buffer[Projection], scratch, scratch_bytes, fastest);
+                    buffer[Activated], weights + f.weight, buffer[Projection], scratch, scratch_bytes, fastest,
+                    nullptr, nullptr, bias);
                 candidate.plan = std::move(plan.plan);
                 ++timed_candidates;
                 if (elapsed < fastest) {
@@ -191,11 +264,22 @@ class Session final : public umzi::KernelSession {
                 }
             }
         }
+        if (selected >= candidates.size() && bias) return;
         if (selected >= candidates.size())
             throw std::runtime_error("No cuDNN SMoSR plan for " + std::to_string(f.cin) + " to "
                                      + std::to_string(f.cout) + " channels, kernel " + std::to_string(f.k));
         plan.plan = std::move(candidates[selected].plan);
         plan.workspace = size_t(candidates[selected].workspace);
+        if (!cache_path.empty() && cache_status != UMZI_CACHE_UNAVAILABLE) {
+            try {
+                const auto json = umzi::CudnnConvGraph::plan_json(*plan.plan);
+                if (json.empty()) throw std::runtime_error("Could not serialize SMoSR fused plan");
+                umzi::write_plan(cache_path, umzi::smosr_id, fused_plan_schema, cache_key,
+                                 {json.begin(), json.end()}, fused_plan_file_limit);
+            } catch (const std::exception& error) {
+                cache_issue(UMZI_CACHE_UNAVAILABLE, error);
+            }
+        }
         workspace_bytes = std::max(workspace_bytes, plan.workspace);
         plans.emplace(key, std::move(plan));
     }
@@ -208,17 +292,20 @@ class Session final : public umzi::KernelSession {
                              threads, 1, 1, 0, target, parameters, nullptr));
     }
 
-    void conv(CUdeviceptr out, CUdeviceptr in, const Filter& f) {
-        const auto& plan = plans.at({f.cin, f.cout, f.k});
+    bool conv(CUdeviceptr out, CUdeviceptr in, const Filter& f, CUdeviceptr bias = 0) {
+        const auto fused = bias ? plans.find({f.cin, f.cout, f.k, 1}) : plans.end();
+        const bool activated = fused != plans.end();
+        const auto& plan = activated ? fused->second : plans.at({f.cin, f.cout, f.k, 0});
         const std::array key{in, weights + f.weight, out};
         auto variant = variants.find(key);
         if (variant == variants.end()) {
             auto descriptor = umzi::bind_conv_variant(reinterpret_cast<void*>(in),
                 reinterpret_cast<void*>(weights + f.weight), reinterpret_cast<void*>(out),
-                reinterpret_cast<void*>(workspace));
+                reinterpret_cast<void*>(workspace), activated ? reinterpret_cast<void*>(bias) : nullptr);
             variant = variants.emplace(key, std::move(descriptor)).first;
         }
         CHECK(cudnnBackendExecute(cudnn, plan.plan->get(), variant->second->get()));
+        return activated;
     }
 
     void forward(CUdeviceptr input, CUdeviceptr output, CUstream target) {
@@ -239,10 +326,10 @@ class Session final : public umzi::KernelSession {
             const bool starts_middle = i == configuration[5];
             const bool ends_middle = i + 1 == configuration[5] + configuration[6];
             const auto& block = net.blocks[i];
-            conv(buffer[Hidden], i ? state : buffer[RgbInput], block[0]);
-            activate(buffer[Hidden], weights + block[0].bias);
-            conv(buffer[Activated], buffer[Hidden], block[1]);
-            activate(buffer[Activated], weights + block[1].bias);
+            if (!conv(buffer[Hidden], i ? state : buffer[RgbInput], block[0], fused_bias(i, 0)))
+                activate(buffer[Hidden], weights + block[0].bias);
+            if (!conv(buffer[Activated], buffer[Hidden], block[1], fused_bias(i, 1)))
+                activate(buffer[Activated], weights + block[1].bias);
             conv(buffer[Projection], buffer[Activated], block[2]);
             const auto out = starts_middle ? saved : state, shortcut = i ? state : saved;
             const auto bias = weights + block[2].bias, shortcut_bias = i ? 0 : weights + net.first_skip.bias;
@@ -289,12 +376,20 @@ class Session final : public umzi::KernelSession {
             CHECK(cuMemGetInfo(&available, &total));
             const auto limit = std::min<size_t>(available / 2, 256u << 20);
             CHECK(cudnnSetStream(cudnn, stream));
-            if (tune_convolutions)
+            if (!cache_dir.empty() && cache_status != UMZI_CACHE_UNAVAILABLE) {
+                cache_status = UMZI_CACHE_HIT;
+                cache_diagnostic.clear();
+            }
+            if (tune_convolutions || fuse_silu)
                 CHECK(cuMemsetD16Async(buffer[Activated], 0x3400, size_t(padded.pixels()) * features, stream));
             prepare_plan(net.rgb, padded, limit);
             prepare_plan(net.first_skip, padded, limit);
             for (const auto& block : net.blocks)
                 for (const auto& filter : block) prepare_plan(filter, padded, limit);
+            if (fuse_silu) {
+                prepare_plan(net.blocks[0][0], padded, 0, fused_bias(0, 0));
+                prepare_plan(net.blocks[0][1], padded, 0, fused_bias(0, 1));
+            }
             prepare_plan(net.end, padded, limit);
             prepare_plan(net.tail, padded, limit);
             if (workspace_bytes) CHECK(cuMemAlloc(&workspace, workspace_bytes));
@@ -348,7 +443,7 @@ public:
         if (architecture.size() || !package.section(2).empty() || package.section(4).size() != 32
             || data.size() != source.bytes)
             throw std::runtime_error("Invalid SMoSR metadata or weights");
-        bool tune_set = false, accumulation_set = false;
+        bool tune_set = false, accumulation_set = false, fusion_set = false;
         for (uint32_t i = 0; i < options.kernel_option_count; ++i) {
             const auto& option = options.kernel_options[i];
             const auto name = std::string_view(option.name ? option.name : "");
@@ -360,6 +455,9 @@ public:
             } else if (name == "fp16_accumulation" && !accumulation_set) {
                 fp16_accumulation = option.value != 0;
                 accumulation_set = true;
+            } else if (name == "fuse_silu" && !fusion_set) {
+                fuse_silu = option.value != 0;
+                fusion_set = true;
             } else {
                 throw std::runtime_error("Invalid or duplicate SMoSR kernel option: " + std::string(name));
             }
@@ -367,17 +465,31 @@ public:
         if (fp32 && tune_convolutions) throw std::runtime_error("SMoSR tune_convolutions requires mixed or FP16 precision");
         if ((fp16 || fp32) && fp16_accumulation)
             throw std::runtime_error("SMoSR fp16_accumulation requires mixed precision");
+        if (fuse_silu && !fp16) throw std::runtime_error("SMoSR fuse_silu requires FP16 precision");
         graph = (options.flags & UMZI_CUDA_GRAPH) != 0;
         CHECK(cuInit(0));
         CHECK(cuDeviceGet(&device, options.device));
         CHECK(cuDevicePrimaryCtxRetain(&context, device));
         ContextScope scope(context);
-        umzi::load_kernel_module(device, module, smosr_images::embedded_cubins, smosr_images::embedded_ptx);
+        const auto& image = umzi::load_kernel_module(device, module, smosr_images::embedded_cubins,
+                                                     smosr_images::embedded_ptx);
+        if (fuse_silu && options.cache_dir && *options.cache_dir) {
+            try {
+                cache_dir = std::filesystem::absolute(std::filesystem::u8path(options.cache_dir));
+                std::filesystem::create_directories(cache_dir);
+                umzi::Sha256 hash;
+                umzi::hash_plan_environment(hash, umzi::smosr_id, fused_plan_schema, package.digest, image, device);
+                cache_environment = hash.finish();
+                cache_status = UMZI_CACHE_MISS;
+            } catch (const std::exception& error) {
+                cache_issue(UMZI_CACHE_UNAVAILABLE, error);
+            }
+        }
         for (size_t i = 0; i < names.size(); ++i)
             CHECK(cuModuleGetFunction(&functions[i], module, names[i]));
         CHECK(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
         CHECK(cuEventCreate(&complete, CU_EVENT_DISABLE_TIMING));
-        if (tune_convolutions)
+        if (tune_convolutions || fuse_silu)
             for (auto& event : timing) CHECK(cuEventCreate(&event, CU_EVENT_DEFAULT));
         CHECK(cudnnCreate(&cudnn));
         CHECK(cuMemAlloc(&weights, persistent_bytes()));
@@ -386,6 +498,20 @@ public:
             CHECK(cuMemcpyHtoD(weights, packed.data(), packed.size()));
         } else {
             CHECK(cuMemcpyHtoD(weights, data.data(), data.size()));
+        }
+        if (fuse_silu) {
+            std::vector<uint16_t> biases;
+            biases.reserve(source.blocks.size() * 2 * features);
+            for (const auto& block : source.blocks) {
+                for (size_t j = 0; j < 2; ++j) {
+                    for (int i = 0; i < features; ++i) {
+                        float value;
+                        std::memcpy(&value, data.data() + block[j].bias + i * sizeof(value), sizeof(value));
+                        biases.push_back(umzi::float_to_half(value));
+                    }
+                }
+            }
+            CHECK(cuMemcpyHtoD(fused_bias(0, 0), biases.data(), biases.size() * sizeof(uint16_t)));
         }
         if (fp16) {
             launch(stream, InitActivations, half_values, weights + net.bytes);
@@ -463,19 +589,25 @@ public:
 
     const char* kernel_message() const override {
         if (fp16_accumulation) return "SMoSR NHWC mixed precision with FP16 accumulation in body convolutions";
+        if (fuse_silu) return "SMoSR NHWC FP16 with convolution and SiLU fusion";
         return fp32 ? "SMoSR NCHW FP32" : fp16 ? "SMoSR NHWC FP16" : "SMoSR NHWC mixed precision";
     }
 
-    uint32_t diagnostic_count() const override { return 1; }
+    uint32_t diagnostic_count() const override { return fuse_silu ? 2 : 1; }
+    const char* cache_message() const override { return cache_diagnostic.c_str(); }
     UmziDiagnostic diagnostic(uint32_t index) const override {
         if (index == 0) return {sizeof(UmziDiagnostic), "timed_candidates", timed_candidates};
+        if (index == 1 && fuse_silu) {
+            const auto count = std::count_if(plans.begin(), plans.end(), [](const auto& plan) { return plan.first[3]; });
+            return {sizeof(UmziDiagnostic), "fused_silu_shapes", int64_t(count)};
+        }
         throw std::runtime_error("Invalid SMoSR diagnostic index");
     }
 
     UmziSessionInfo session_info() const override {
         UmziSessionInfo info{};
         info.struct_size = sizeof(info);
-        info.cache_status = UMZI_CACHE_DISABLED;
+        info.cache_status = cache_status;
         info.buffer_bytes[0] = persistent_bytes();
         if (shape.n) {
             info.prepared_input = shape.padded().nchw();

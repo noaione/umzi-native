@@ -825,3 +825,110 @@ foreach ($backend in @('fp32', 'inductor', 'rtx', 'rtx-fp32', 'native-fp32', 'na
     if ($LASTEXITCODE) { throw "Benchmark failed for $backend" }
 }
 ```
+
+## FP16 convolution and SiLU fusion
+
+Reused the batch-1, 256×256 workload and the validated final DLL. A fresh
+three-pass interleaved run with output readback gave 6.983 ms/tile for
+native FP16 and 6.975 ms/tile for TensorRT-RTX. The median measured image
+times were 546.00 and 545.29 ms. The original seven-backend run ranked
+whole pages in separate processes. The interleaved run is recorded in
+`output/smosr-session/paired-native-mixed-fp16-accumulation-readback/`.
+
+The new experiment fuses convolution, bias, and SiLU using half bias and
+half virtual tensors at the existing precision boundaries. A cuDNN probe
+found 18 zero-workspace plans for 8→48 and 17 for 48→48. Its fastest isolated
+48→48 fused plan took 0.254 ms, versus 0.240 ms for convolution alone.
+The first fused plan took 0.383 ms. Select plans by timing, then measure
+the complete native pipeline and check fidelity against Torch FP32.
+The probe timings are in `output/smosr-session/probe_fp16_fusion_timing.log`.
+
+The full three-pass interleaved prototype beat both controls on all nine
+page comparisons. The CUPTI trace showed zero standalone SiLU launches
+with fusion, versus twelve launches totaling 0.957 ms/tile in the
+unfused path. Center-tile PSNR differed from unfused FP16 by at most
+0.01 dB. The checkerboard score was 37.43 dB with fusion and 37.44 dB
+without it.
+
+| Backend | Median image ms | Median tile ms | Total ms over three passes |
+| --- | ---: | ---: | ---: |
+| TensorRT-RTX FP16 | 567.52 | 7.213 | 5335.40 |
+| Native FP16 | 560.39 | 7.121 | 5266.47 |
+| Native FP16 with convolution and SiLU fusion | 501.74 | 6.293 | 4667.27 |
+
+The paired trace and 726 samples per backend are in
+`output/smosr-session/paired-native-fp16-silu-fusion-readback/`. The
+`fuse_silu=1` FP16 session option times zero-workspace fused cuDNN plans
+at shape preparation. The unfused plans cover shapes with no supported
+fused plan. The packed half bias bank costs 1,152 bytes.
+
+### Full-page result
+
+The final DLL used fusion for both shapes and timed 35 candidates. Its
+first shape plan setup took 24.68 s. Preparing the fixed tile size again
+after the rectangular stress cases took 24.17 s. The per-image NVML peak includes
+resources retained by cuDNN after setup. The native session buffers were
+36.11 MiB and the selected plans used zero workspace.
+
+| Backend | Total ms | Median image ms | Median tile ms | PSNR (dB) | Mean SSIMULACRA2 | NVML peak MiB | Additional MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Native FP16 with fusion | 1585.60 | 515.48 | 6.38 | 61.80 | 88.66 | 1413.58 | 115.03 |
+
+| Image | Inference ms | Mean ms/tile | PSNR (dB) | SSIMULACRA2 | NVML peak MiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `9798855404661.jpg` | 496.13 | 6.44 | 61.31 | 87.52 | 1413.33 |
+| `9798855424195.jpg` | 515.48 | 6.69 | 62.31 | 89.00 | 1413.58 |
+| `9798855444216.jpg` | 573.99 | 6.52 | 61.84 | 89.48 | 1408.89 |
+
+The separate run's additional VRAM was 43 MiB higher than unfused native
+FP16 and 55 MiB lower than the last measured TensorRT-RTX FP16 run. The
+latency gain applies to warmed sessions at this tile size. Plan compilation
+and tuning are excluded from forward latency. The startup cost and slight
+numeric change motivate keeping fusion opt-in.
+
+### Reproduce the fused run
+
+```powershell
+$env:PYTHONPATH = 'src'
+$smosrPython = 'C:/Python314/python.exe'
+$model = 'output/smosr-session/smosr-schema2-benchmark.ummodel'
+$library = 'output/smosr-session/native-fp16-silu-fusion-final/umzi_native.dll'
+& $smosrPython scripts/build_native.py --arch sm_86 --nvrtc-root output/nvrtc-13.0/nvidia/cu13 --output output/smosr-session/native-fp16-silu-fusion-final
+& $smosrPython scripts/benchmark_architectures.py smosr native-fp16 --native-model $model --native-library $library --tag fused-silu --fp16-fuse-silu
+```
+
+The full-page `report.json` is under
+`output/architecture-baselines/smosr/batch-1/native-fp16-fused-silu/`.
+
+### Cache the fused plans
+
+Pass the existing `cache_dir` option to a fused FP16 session.
+
+```python
+options = SessionOptions(
+    precision="fp16",
+    kernel_options={"fuse_silu": 1},
+    cache_dir="output/plan-cache",
+)
+```
+
+SMoSR saves the two selected fused cuDNN plans as checked `.umplan`
+files. Each key includes the package, selected CUDA kernel image, GPU,
+driver, cuDNN version, and convolution dimensions. A new process restores
+the selected zero-workspace plan and verifies it executes before capture.
+A corrupt entry triggers timing and replacement for that convolution
+shape. See [cuDNN execution plan serialization](https://docs.nvidia.com/deeplearning/cudnn/backend/v9.26.1/api/cudnn-graph-library.html).
+
+| Fresh-process check | Shape preparation | Plans timed |
+| --- | ---: | ---: |
+| Empty cache | 25,961 ms | 35 |
+| Cache hit | 162 ms | 0 |
+| One corrupt cache entry | 12,473 ms | 18 |
+| Cache hit after repair | 141 ms | 0 |
+
+Both cache hits matched the original fused output bit for bit on the
+checked 256×256 tile. Cache measurements and the corruption fixture live
+under `output/smosr-session/silu-cache-check/`. Unfused defaults passed
+bitwise validation across all 242 tiles and the stress inputs. Fused
+schema 1 and schema 2 passed the direct, graph, host, alternate-stream,
+and minimum-size checks.

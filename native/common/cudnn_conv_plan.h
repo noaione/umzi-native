@@ -88,14 +88,14 @@ class CudnnConvGraph {
         return *descriptors.emplace_back(std::make_unique<CudnnDescriptor>(type));
     }
 
-    CudnnDescriptor& tensor(int64_t uid, int64_t n, int64_t c, int64_t h, int64_t w, cudnnDataType_t type) {
+    CudnnDescriptor& tensor(int64_t uid, int64_t n, int64_t c, int64_t h, int64_t w, cudnnDataType_t type,
+                            bool is_virtual = false) {
         auto& desc = make(CUDNN_BACKEND_TENSOR_DESCRIPTOR);
         constexpr int64_t alignment = 16;
         const int64_t dimensions[] = {n, c, h, w};
         const auto strides = format == CUDNN_TENSOR_NCHW
             ? std::array<int64_t, 4>{c * h * w, h * w, w, 1}
             : std::array<int64_t, 4>{h * w * c, 1, w * c, c};
-        const bool is_virtual = false;
         desc.set(CUDNN_ATTR_TENSOR_UNIQUE_ID, CUDNN_TYPE_INT64, &uid);
         desc.set(CUDNN_ATTR_TENSOR_DATA_TYPE, CUDNN_TYPE_DATA_TYPE, &type);
         desc.set(CUDNN_ATTR_TENSOR_DIMENSIONS, CUDNN_TYPE_INT64, dimensions, 4);
@@ -106,15 +106,35 @@ class CudnnConvGraph {
         return desc;
     }
 
+    CudnnDescriptor& pointwise(cudnnPointwiseMode_t mode, CudnnDescriptor& x, CudnnDescriptor& y,
+                              CudnnDescriptor* bias = nullptr) {
+        auto& desc = make(CUDNN_BACKEND_POINTWISE_DESCRIPTOR);
+        const auto math = CUDNN_DATA_FLOAT;
+        desc.set(CUDNN_ATTR_POINTWISE_MODE, CUDNN_TYPE_POINTWISE_MODE, &mode);
+        desc.set(CUDNN_ATTR_POINTWISE_MATH_PREC, CUDNN_TYPE_DATA_TYPE, &math);
+        if (mode == CUDNN_POINTWISE_SWISH_FWD) {
+            constexpr float beta = 1.f;
+            desc.set(CUDNN_ATTR_POINTWISE_SWISH_BETA, CUDNN_TYPE_FLOAT, &beta);
+        }
+        desc.finalize();
+        auto& op = make(CUDNN_BACKEND_OPERATION_POINTWISE_DESCRIPTOR);
+        op.ref(CUDNN_ATTR_OPERATION_POINTWISE_PW_DESCRIPTOR, desc);
+        op.ref(CUDNN_ATTR_OPERATION_POINTWISE_XDESC, x);
+        op.ref(CUDNN_ATTR_OPERATION_POINTWISE_YDESC, y);
+        if (bias) op.ref(CUDNN_ATTR_OPERATION_POINTWISE_BDESC, *bias);
+        op.finalize();
+        return op;
+    }
+
 public:
     CudnnDescriptor* graph = nullptr;
 
     CudnnConvGraph(cudnnHandle_t handle, int n, int h, int w, int cin, int cout, int k, cudnnDataType_t io_type,
-                   bool fp16_compute, cudnnTensorFormat_t layout = CUDNN_TENSOR_NHWC)
+                   bool fp16_compute, cudnnTensorFormat_t layout = CUDNN_TENSOR_NHWC, bool fused_silu = false)
         : strict_float(io_type == CUDNN_DATA_FLOAT), format(layout) {
         auto& x = tensor(1, n, cin, h, w, io_type);
         auto& filter = tensor(2, cout, cin, k, k, io_type);
-        auto& y = tensor(3, n, cout, h, w, io_type);
+        auto& y = tensor(3, n, cout, h, w, io_type, fused_silu);
         const auto compute = (io_type == CUDNN_DATA_HALF && fp16_compute) ? CUDNN_DATA_HALF : CUDNN_DATA_FLOAT;
         auto& conv = make(CUDNN_BACKEND_CONVOLUTION_DESCRIPTOR);
         constexpr int64_t spatial = 2, unit[] = {1, 1};
@@ -140,10 +160,24 @@ public:
         op.finalize();
 
         graph = &make(CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR);
-        const auto operation = op.get();
+        std::array<cudnnBackendDescriptor_t, 3> operations{op.get()};
+        if (fused_silu) {
+            auto& biased = tensor(4, n, cout, h, w, io_type, true);
+            auto& bias = tensor(5, 1, cout, 1, 1, io_type);
+            auto& result = tensor(6, n, cout, h, w, io_type);
+            operations[1] = pointwise(CUDNN_POINTWISE_ADD, y, biased, &bias).get();
+            operations[2] = pointwise(CUDNN_POINTWISE_SWISH_FWD, biased, result).get();
+        }
         graph->set(CUDNN_ATTR_OPERATIONGRAPH_HANDLE, CUDNN_TYPE_HANDLE, &handle);
-        graph->set(CUDNN_ATTR_OPERATIONGRAPH_OPS, CUDNN_TYPE_BACKEND_DESCRIPTOR, &operation, 1);
-        graph->finalize();
+        graph->set(CUDNN_ATTR_OPERATIONGRAPH_OPS, CUDNN_TYPE_BACKEND_DESCRIPTOR, operations.data(), fused_silu ? 3 : 1);
+        const auto status = graph->try_finalize();
+        if (fused_silu && (status == CUDNN_STATUS_NOT_SUPPORTED || status == CUDNN_STATUS_NOT_SUPPORTED_GRAPH_PATTERN
+            || status == CUDNN_STATUS_NOT_SUPPORTED_SHAPE || status == CUDNN_STATUS_NOT_SUPPORTED_DATA_TYPE
+            || status == CUDNN_STATUS_NOT_SUPPORTED_ARCH_MISMATCH)) {
+            graph = nullptr;
+        } else {
+            check(status, "cudnnBackendFinalize");
+        }
     }
 
     CudnnConvGraph(cudnnHandle_t handle, int n, int h, int w, int cin, int cout, bool fp16_compute)
@@ -153,6 +187,7 @@ public:
     // into a plan within the workspace limit, in heuristic order, deduplicated.
     std::vector<CudnnCandidate> candidates(cudnnHandle_t handle, uint64_t limit, bool first_only = false) {
         std::vector<CudnnCandidate> result;
+        if (!graph) return result;
         for (auto mode : {CUDNN_HEUR_MODE_A, CUDNN_HEUR_MODE_FALLBACK}) {
             CudnnDescriptor heuristic(CUDNN_BACKEND_ENGINEHEUR_DESCRIPTOR);
             heuristic.set(CUDNN_ATTR_ENGINEHEUR_MODE, CUDNN_TYPE_HEUR_MODE, &mode);
@@ -217,12 +252,14 @@ public:
     }
 };
 
-inline std::unique_ptr<CudnnDescriptor> bind_conv_variant(void* x, void* filter, void* y, void* workspace) {
+inline std::unique_ptr<CudnnDescriptor> bind_conv_variant(void* x, void* filter, void* y, void* workspace,
+                                                         void* bias = nullptr) {
     auto variant = std::make_unique<CudnnDescriptor>(CUDNN_BACKEND_VARIANT_PACK_DESCRIPTOR);
-    const int64_t ids[] = {1, 2, 3};
-    void* data[] = {x, filter, y};
-    variant->set(CUDNN_ATTR_VARIANT_PACK_UNIQUE_IDS, CUDNN_TYPE_INT64, ids, 3);
-    variant->set(CUDNN_ATTR_VARIANT_PACK_DATA_POINTERS, CUDNN_TYPE_VOID_PTR, data, 3);
+    const int64_t ids[] = {1, 2, bias ? 6 : 3, 5};
+    void* data[] = {x, filter, y, bias};
+    const auto count = bias ? 4 : 3;
+    variant->set(CUDNN_ATTR_VARIANT_PACK_UNIQUE_IDS, CUDNN_TYPE_INT64, ids, count);
+    variant->set(CUDNN_ATTR_VARIANT_PACK_DATA_POINTERS, CUDNN_TYPE_VOID_PTR, data, count);
     variant->set(CUDNN_ATTR_VARIANT_PACK_WORKSPACE, CUDNN_TYPE_VOID_PTR, &workspace);
     variant->finalize();
     return variant;
@@ -259,13 +296,15 @@ inline bool ensure_device_scratch(CUstream stream, CUdeviceptr& scratch, size_t&
 inline float time_cudnn_backend_plan(cudnnHandle_t cudnn, CUstream stream, const std::array<CUevent, 2>& timing,
                                      const CudnnBackendPlan& p, CUdeviceptr in_buf, CUdeviceptr weight_buf,
                                      CUdeviceptr out_buf, CUdeviceptr& scratch, size_t& scratch_bytes, float best,
-                                     size_t* peak_bytes = nullptr, uint64_t* peak_device_used = nullptr) {
+                                     size_t* peak_bytes = nullptr, uint64_t* peak_device_used = nullptr,
+                                     CUdeviceptr bias = 0) {
     const size_t before = scratch_bytes;
     if (!ensure_device_scratch(stream, scratch, scratch_bytes, p.workspace, peak_bytes))
         return std::numeric_limits<float>::infinity();
     if (peak_device_used && scratch_bytes > before) *peak_device_used = std::max(*peak_device_used, device_used_bytes());
     const auto variant = bind_conv_variant(reinterpret_cast<void*>(in_buf), reinterpret_cast<void*>(weight_buf),
-                                           reinterpret_cast<void*>(out_buf), reinterpret_cast<void*>(scratch));
+                                           reinterpret_cast<void*>(out_buf), reinterpret_cast<void*>(scratch),
+                                           reinterpret_cast<void*>(bias));
     const auto run = [&] { return cudnnBackendExecute(cudnn, p.plan->get(), variant->get()) == CUDNN_STATUS_SUCCESS; };
     const auto measure = [&](int repeats) {
         check(cuEventRecord(timing[0], stream), "cuEventRecord");

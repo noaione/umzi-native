@@ -631,6 +631,7 @@ def main() -> None:
     parser.add_argument(
         "--mixed-fp16-accumulation", action="store_true", help="Use FP16 accumulation in SMoSR mixed body convolutions"
     )
+    parser.add_argument("--fp16-fuse-silu", action="store_true", help="Fuse SMoSR FP16 convolutions with bias and SiLU")
     args = parser.parse_args()
     family = FAMILIES[args.family]
     if args.tile is not None:
@@ -662,6 +663,8 @@ def main() -> None:
         parser.error("--tune-convolutions requires a native mixed or FP16 backend")
     if args.mixed_fp16_accumulation and args.backend != "native-mixed":
         parser.error("--mixed-fp16-accumulation requires the native mixed backend")
+    if args.fp16_fuse_silu and args.backend != "native-fp16":
+        parser.error("--fp16-fuse-silu requires the native FP16 backend")
     os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
     torch.set_num_threads(2)
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -761,6 +764,8 @@ def main() -> None:
             kernel_options = {"tune_convolutions": 1} if args.tune_convolutions else {}
             if args.mixed_fp16_accumulation:
                 kernel_options["fp16_accumulation"] = 1
+            if args.fp16_fuse_silu:
+                kernel_options["fuse_silu"] = 1
             report["native"] = {
                 "precision": precision,
                 "package_sha256": packaged.digest,
