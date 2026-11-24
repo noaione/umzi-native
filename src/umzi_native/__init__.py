@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from ._loader import load_cuda_libraries
 from ._model import (
+    FiGSRModel,
     GateRV2Model,
     GateRV3Model,
     GFISRv2Model,
@@ -16,6 +17,7 @@ from ._model import (
 from ._session import InferenceSession, SessionOptions, TensorInfo
 
 __all__ = [
+    "FiGSRModel",
     "GFISRv2Model",
     "GateRV2Model",
     "GateRV3Model",

@@ -365,7 +365,7 @@ struct FftPlan {
     CUdeviceptr workspace = 0;
     size_t bytes = 0;
 
-    void setup(const gfi::CufftApi& api, Shape shape, int transform) {
+    void setup(const umzi::CufftApi& api, Shape shape, int transform) {
         FFT_CHECK(api.create(&handle));
         created = true;
         FFT_CHECK(api.auto_allocation(handle, 0));
@@ -377,7 +377,7 @@ struct FftPlan {
         }
     }
 
-    void release(const gfi::CufftApi& api) {
+    void release(const umzi::CufftApi& api) {
         if (created) api.destroy(handle);
         if (workspace) cuMemFree(workspace);
         *this = {};
@@ -442,7 +442,7 @@ class Session final : public umzi::KernelSession {
     CUevent complete = nullptr;
     std::array<CUevent, 2> timing{};
     cudnnHandle_t cudnn = nullptr;
-    std::unique_ptr<gfi::CufftApi> fft;
+    std::unique_ptr<umzi::CufftApi> fft;
     int fft_version = 0;
     std::array<CUfunction, KernelCount> functions{};
     CUdeviceptr weights = 0;
@@ -512,7 +512,7 @@ public:
         graph_enabled = (options.flags & UMZI_CUDA_GRAPH) != 0;
         dev_model = DeviceNetwork(half_io());
 
-        fft = std::make_unique<gfi::CufftApi>();
+        fft = std::make_unique<umzi::CufftApi>();
         FFT_CHECK(fft->version(&fft_version));
         CHECK(cuInit(0));
         CHECK(cuDeviceGet(&device, options.device));

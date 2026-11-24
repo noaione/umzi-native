@@ -2,7 +2,7 @@
 
 `umzi-native` runs packed `.ummodel` packages on NVIDIA GPUs through one
 Python API (`InferenceSession`) across all supported model families:
-**GateRV3**, **GateRV2**, **MoESR**, and **GFISRv2**.
+**GateRV3**, **GateRV2**, **MoESR**, **GFISRv2**, **SMoSR**, and **FiGSR**.
 
 **Prerequisites:**
 
@@ -58,7 +58,7 @@ Image.fromarray(png).save("output/restored-tile.png")
 - **Precision and dtype must match:**
   - `precision="mixed"` (default) expects `np.float32` input and returns `np.float32`.
   - `precision="fp16"` expects `np.float16` input (`tiles.astype(np.float16)`) and returns `np.float16`.
-  - `precision="fp32"` selects the GFISRv2 FP32 path and uses `np.float32` input and output.
+  - `precision="fp32"` selects the GFISRv2, SMoSR, or FiGSR FP32 path and uses `np.float32` input and output.
   - The same `.ummodel` file works with all precision modes supported by its family.
 - **Batching:** Stack multiple equal-size CHW tiles with `np.stack(chw_tiles)`
   to get `(N, 3, H, W)`; `restored[i]` corresponds to tile `i`.
@@ -86,7 +86,7 @@ model-specific kernel switches.
 
 | Field | Default | What it does |
 | --- | --- | --- |
-| `precision` | `"mixed"` | All four families support mixed precision with FP32 NumPy I/O and FP16 precision with FP16 NumPy I/O. GFISRv2 also supports `"fp32"` for the FP32 reference path. |
+| `precision` | `"mixed"` | All families support mixed precision with FP32 NumPy I/O and FP16 precision with FP16 NumPy I/O. GFISRv2, SMoSR, and FiGSR also support `"fp32"`. |
 | `device_id` | `0` | CUDA GPU index to run on (respects `CUDA_VISIBLE_DEVICES`). |
 | `cache_dir` | `None` | Writable directory for saving and reusing tuned GPU algorithm choices (`<family>_<key>.umplan`). **Strongly recommended:** first run tunes and writes the file; later runs skip tuning. Keys include the model, padded shape, precision, relevant options, GPU, driver, and CUDA/cuDNN versions. CUDA Graphs are still captured per process. |
 | `enable_cuda_graph` | `True` | Captures the forward pass into a CUDA Graph and replays it to cut CPU launch overhead. Set `False` to submit kernels directly (still uses tuned cuBLASLt/cuDNN plans). |
@@ -250,6 +250,15 @@ preparation. This option adds setup time and can change rounding. The default
 uses the first supported plan. The native CLI accepts `--option tune_convolutions=1`.
 
 See [SMoSR implementation and measurements](handoff-smosr.md).
+
+### FiGSR
+
+FiGSR returns 2× RGB output and accepts inputs at least six pixels high and
+wide. The session handles reflection padding and even alignment internally.
+Use `np.float32` arrays for `precision="fp32"` or `"mixed"` and `np.float16`
+arrays for `precision="fp16"`. All three modes require cuFFT 12 for FP32
+Fourier transforms.
+See [FiGSR implementation and measurements](handoff-figsr.md).
 
 ## 5. Inspecting models and sessions
 

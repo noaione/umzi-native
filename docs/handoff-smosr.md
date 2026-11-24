@@ -1,5 +1,11 @@
 # SMoSR implementation and baseline
 
+The benchmark tables below preserve the measured results. The SMoSR output
+directories and caches were removed after this round, so paths in the
+historical sections mark where those runs wrote their artifacts. The
+follow-up mixed-precision recipe exports a fresh package and regenerates
+the reference, reports, and plan cache.
+
 ## Workload
 
 Use `models/2x_enhancr_da_smosr_v1.safetensors` with batch size 1 and 256×256
@@ -1140,8 +1146,10 @@ $env:PYTHONPATH = 'src'
 $env:CUDA_VISIBLE_DEVICES = '0'
 $smosrPython = 'C:/Python314/python.exe'
 $reportRoot = 'output/smosr-final-tuning-repeat'
-$model = 'output/smosr-session/smosr-schema2-benchmark.ummodel'
-$library = 'output/smosr-final-tuning-repeat/native/umzi_native.dll'
+$model = "$reportRoot/smosr-schema2.ummodel"
+$library = "$reportRoot/native/umzi_native.dll"
+New-Item -ItemType Directory -Path $reportRoot -Force | Out-Null
+& $smosrPython -m umzi_native export models/2x_enhancr_da_smosr_v1.safetensors -o $model --kernel smosr
 & $smosrPython scripts/build_native.py --arch sm_86 --nvrtc-root output/nvrtc-13.0/nvidia/cu13 --output "$reportRoot/native"
 & $smosrPython scripts/benchmark_architectures.py smosr fp32 --output $reportRoot
 $native = @('--output', $reportRoot, '--native-model', $model, '--native-library', $library, '--mixed-fp16-accumulation', '--tune-convolutions')
@@ -1203,7 +1211,7 @@ are in the `native-fp32-{control,vector}` and
 `native-fp16-{fused-control,approx-gate}` reports under
 `output/smosr-final-tuning/smosr/batch-1/`.
 
-### Final validation and retained artifacts
+### Final validation and cleanup
 
 The final SM 8.6 library matched the previous native library bitwise on
 all 242 tiles and the stress fixtures in each of the three default
@@ -1213,7 +1221,8 @@ Both cases restored two fused plans, and the direct outputs matched the
 graph outputs bitwise. Both returned finite 6×6 output for 3×3 input.
 See `output/smosr-final-tuning/validation.json`.
 
-The report directory retains per-image and per-tile JSON, traces, and plan
-caches. The generated images and NumPy references were removed after
-scoring. Rerun the Torch FP32 reference before repeating any fidelity
-comparison in that directory.
+The cleanup removed the SMoSR-specific baseline, session, final matrix,
+follow-up tuning, and variable-tiling output directories. This included
+generated packages, DLLs, per-image and per-tile JSON, profiles, images,
+NumPy references, and plan caches. The checkpoint and input samples are
+available for a fresh run.

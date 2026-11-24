@@ -12,6 +12,7 @@ from typing import BinaryIO
 from ._loader import PathArg
 
 __all__ = [
+    "FiGSRModel",
     "GFISRv2Model",
     "GateRV2Model",
     "GateRV3Model",
@@ -42,14 +43,16 @@ GFISRV2_FAMILY = 2
 GATERV2_FAMILY = 3
 MOESR_FAMILY = 4
 SMOSR_FAMILY = 5
+FIGSR_FAMILY = 6
 FAMILIES = {
     GATERV3_FAMILY: "gaterv3",
     GFISRV2_FAMILY: "gfisrv2",
     GATERV2_FAMILY: "gaterv2",
     MOESR_FAMILY: "moesr",
     SMOSR_FAMILY: "smosr",
+    FIGSR_FAMILY: "figsr",
 }
-SCHEMAS = {"gaterv3": 1, "gfisrv2": 1, "gaterv2": 1, "moesr": 1, "smosr": 2}
+SCHEMAS = {"gaterv3": 1, "gfisrv2": 1, "gaterv2": 1, "moesr": 1, "smosr": 2, "figsr": 1}
 SECTION_NAMES = {1: "architecture", 2: "schedule", 3: "weights", 4: "checkpoint"}
 # GateRV2 schema 1 architecture: input, output, scale, alignment, base
 # channels, levels, latent blocks, the attention epsilon as float32, four
@@ -76,6 +79,20 @@ SMOSR_FILTERS = (
     (48, 48, 3),
     (64, 16, 3),
 )
+FIGSR_ARCHITECTURE = struct.Struct("<11I")
+FIGSR_CONFIG = (3, 3, 2, 4, 2, 32, 12, 80, 8, 13, 17)
+# Input lanes, output lanes, kernel height and width, groups.
+FIGSR_HEAD = (8, 32, 3, 3, 1)
+FIGSR_BLOCK_FILTERS = (
+    (32, 160, 3, 3, 1),
+    (16, 16, 3, 3, 16),
+    (16, 16, 1, 1, 1),
+    (8, 8, 13, 13, 1),
+    (8, 8, 1, 17, 1),
+    (8, 8, 17, 1, 1),
+    (80, 32, 3, 3, 1),
+)
+FIGSR_TAIL = ((32, 32, 3, 3, 1), (96, 32, 1, 1, 1), (32, 16, 3, 3, 1))
 
 
 class GateRV3Op(IntEnum):
@@ -195,6 +212,41 @@ class SMoSRModel:
     checkpoint: str
 
 
+@dataclass(frozen=True)
+class FiGSRModel:
+    """Direct-shuffle 2x FiGSR payload (schema 1)."""
+
+    input_channels: int
+    output_channels: int
+    scale: int
+    reflection_padding: int
+    alignment: int
+    base_channels: int
+    blocks_per_group: int
+    hidden_channels: int
+    fourier_channels: int
+    square_kernel: int
+    band_kernel: int
+    weight_bytes: int
+    checkpoint: str
+
+
+def figsr_parameter_sizes() -> list[int]:
+    """Unaligned byte sizes in the same order as FiGSR's native weight layout."""
+
+    def convolution(cin: int, cout: int, kh: int, kw: int, groups: int) -> list[int]:
+        return [cout * (cin // groups) * kh * kw * 4, cout * 4]
+
+    norm_sizes = [(2 * channels + 2) * 4 for channels in (32, 16, 8)]
+    block = [*norm_sizes, *(size for shape in FIGSR_BLOCK_FILTERS for size in convolution(*shape))]
+    return [
+        6 * 4,
+        *convolution(*FIGSR_HEAD),
+        *block * 24,
+        *(size for shape in FIGSR_TAIL for size in convolution(*shape)),
+    ]
+
+
 def gfisrv2_parameter_sizes() -> list[int]:
     """FP32 tensor sizes in bytes in native execution order."""
     cin, cout, scale, dim, blocks, hidden, fourier = GFISRV2_CONFIG
@@ -297,7 +349,7 @@ class ModelInfo:
     schema: int
     digest: str
     sections: tuple[ModelSection, ...]
-    payload: GateRV3Model | GateRV2Model | MoESRModel | GFISRv2Model | SMoSRModel | None = None
+    payload: GateRV3Model | GateRV2Model | MoESRModel | GFISRv2Model | SMoSRModel | FiGSRModel | None = None
     problems: tuple[str, ...] = ()
 
     @property
@@ -385,6 +437,8 @@ def peek_model(path: PathArg) -> ModelInfo:
         payload = _read_gfisrv2(schema, contents.get(1), contents.get(2), weights, contents.get(4), problems)
     elif family_name == "smosr":
         payload = _read_smosr(schema, contents.get(1), contents.get(2), weights, contents.get(4), problems)
+    elif family_name == "figsr":
+        payload = _read_figsr(schema, contents.get(1), contents.get(2), weights, contents.get(4), problems)
     return ModelInfo(
         path=model,
         size=size,
@@ -607,6 +661,29 @@ def _read_smosr(
             return SMoSRModel(*SMOSR_CONFIG, weight_bytes, checkpoint.hex())
         problems.append("Invalid SMoSR weight layout")
     return None
+
+
+def _read_figsr(
+    schema: int,
+    architecture: bytes | None,
+    schedule: bytes | None,
+    weights: int,
+    checkpoint: bytes | None,
+    problems: list[str],
+) -> FiGSRModel | None:
+    if schema != SCHEMAS["figsr"]:
+        problems.append(f"FiGSR payload schema {schema} is not supported")
+    if architecture != FIGSR_ARCHITECTURE.pack(*FIGSR_CONFIG):
+        problems.append("Unsupported FiGSR architecture")
+    length = 0
+    for size in figsr_parameter_sizes():
+        length += -length % 256 + size
+    if schedule is not None or weights != length:
+        problems.append("Invalid FiGSR weights or schedule")
+    if checkpoint is None or len(checkpoint) != DIGEST_SIZE:
+        problems.append("Invalid FiGSR checkpoint digest")
+        return None
+    return FiGSRModel(*FIGSR_CONFIG, weights, checkpoint.hex()) if not problems else None
 
 
 def _read_gfisrv2(

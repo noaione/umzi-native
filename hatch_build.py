@@ -23,8 +23,10 @@ from typing import NamedTuple
 
 ROOT = Path(__file__).resolve().parent
 NATIVE = ROOT / "native"
-KERNEL_SOURCES = {family: NATIVE / "kernels" / family for family in ("gaterv3", "gaterv2", "moesr", "gfisrv2", "smosr")}
-EXACT_MATH_FAMILIES = frozenset({"gaterv2", "moesr", "gfisrv2", "smosr"})
+KERNEL_SOURCES = {
+    family: NATIVE / "kernels" / family for family in ("gaterv3", "gaterv2", "moesr", "gfisrv2", "smosr", "figsr")
+}
+EXACT_MATH_FAMILIES = frozenset({"gaterv2", "moesr", "gfisrv2", "smosr", "figsr"})
 HOST_SOURCES = (
     *(source / "runner.cpp" for source in KERNEL_SOURCES.values()),
     NATIVE / "runtime" / "api.cpp",

@@ -129,17 +129,17 @@ class CudnnConvGraph {
 public:
     CudnnDescriptor* graph = nullptr;
 
-    CudnnConvGraph(cudnnHandle_t handle, int n, int h, int w, int cin, int cout, int k, cudnnDataType_t io_type,
-                   bool fp16_compute, cudnnTensorFormat_t layout = CUDNN_TENSOR_NHWC, bool fused_silu = false,
-                   bool float_silu_bias = false)
+    CudnnConvGraph(cudnnHandle_t handle, int n, int h, int w, int cin, int cout, int kh, int kw, int groups,
+                   cudnnDataType_t io_type, bool fp16_compute, cudnnTensorFormat_t layout = CUDNN_TENSOR_NHWC,
+                   bool fused_silu = false, bool float_silu_bias = false)
         : strict_float(io_type == CUDNN_DATA_FLOAT), format(layout) {
         auto& x = tensor(1, n, cin, h, w, io_type);
-        auto& filter = tensor(2, cout, cin, k, k, io_type);
+        auto& filter = tensor(2, cout, cin / groups, kh, kw, io_type);
         auto& y = tensor(3, n, cout, h, w, io_type, fused_silu);
         const auto compute = (io_type == CUDNN_DATA_HALF && fp16_compute) ? CUDNN_DATA_HALF : CUDNN_DATA_FLOAT;
         auto& conv = make(CUDNN_BACKEND_CONVOLUTION_DESCRIPTOR);
         constexpr int64_t spatial = 2, unit[] = {1, 1};
-        const int64_t pad[] = {k / 2, k / 2};
+        const int64_t pad[] = {kh / 2, kw / 2};
         const auto mode = CUDNN_CROSS_CORRELATION;
         conv.set(CUDNN_ATTR_CONVOLUTION_COMP_TYPE, CUDNN_TYPE_DATA_TYPE, &compute);
         conv.set(CUDNN_ATTR_CONVOLUTION_CONV_MODE, CUDNN_TYPE_CONVOLUTION_MODE, &mode);
@@ -182,6 +182,12 @@ public:
             check(status, "cudnnBackendFinalize");
         }
     }
+
+    CudnnConvGraph(cudnnHandle_t handle, int n, int h, int w, int cin, int cout, int k, cudnnDataType_t io_type,
+                   bool fp16_compute, cudnnTensorFormat_t layout = CUDNN_TENSOR_NHWC, bool fused_silu = false,
+                   bool float_silu_bias = false)
+        : CudnnConvGraph(handle, n, h, w, cin, cout, k, k, 1, io_type, fp16_compute, layout, fused_silu,
+                         float_silu_bias) {}
 
     CudnnConvGraph(cudnnHandle_t handle, int n, int h, int w, int cin, int cout, bool fp16_compute)
         : CudnnConvGraph(handle, n, h, w, cin, cout, 3, CUDNN_DATA_HALF, fp16_compute) {}

@@ -38,7 +38,16 @@ from umzi_native.exporter._loader import load_checkpoint
 METRIC = Path(r"C:\Tools\imaging\ssimulacra2.exe")
 NATIVE_BACKENDS = ("native-mixed", "native-fp16", "native-fp32")
 RTX_BACKENDS = ("rtx", "rtx-fp32")
-BACKENDS = ("fp32", "inductor", "inductor-attention-fp32", "supplied", "eager-fp16", *RTX_BACKENDS, *NATIVE_BACKENDS)
+BACKENDS = (
+    "fp32",
+    "inductor",
+    "inductor-fp32",
+    "inductor-attention-fp32",
+    "supplied",
+    "eager-fp16",
+    *RTX_BACKENDS,
+    *NATIVE_BACKENDS,
+)
 RTX_WORKSPACE_BYTES = 512 * 2**20
 
 
@@ -58,6 +67,7 @@ FAMILIES = {
     "moesr": Family("4x_dwtp_ds_moesr_v2.pth", "MoESR", "mscale", 4, 256, 2),
     "gfisrv2": Family("4x_wtp_MangaScale_GfisrV2.pth", "GFISRV2", "mscale", 4, 256, 2, 32),
     "smosr": Family("2x_enhancr_da_smosr_v1.safetensors", "SMoSR", "2x-test", 2, 256, 1),
+    "figsr": Family("2x_enhancr_da_figsr.safetensors", "FIGSR", "2x-test", 2, 256, 1),
 }
 
 
@@ -362,13 +372,13 @@ def torch_runners(checkpoint: Path, family: Family, batch: int, backend: str, re
         raise ValueError(f"Unexpected checkpoint class {type(model)}")
     report["model_class"] = type(model).__name__
     report["parameters"] = sum(parameter.numel() for parameter in model.parameters())
-    dtype = torch.float32 if backend == "fp32" else torch.float16
+    dtype = torch.float32 if backend in ("fp32", "inductor-fp32") else torch.float16
     model.eval().to(device="cuda", dtype=dtype)
     run = model
     if backend == "inductor-attention-fp32":
         use_fp32_attention(model)
         report["precision"] = "FP16 except FP32 latent attention normalization, contractions and division"
-    if backend in ("inductor", "inductor-attention-fp32"):
+    if backend in ("inductor", "inductor-fp32", "inductor-attention-fp32"):
         if os.name == "nt":
             # Windows cannot pass file descriptors to Inductor's compile subprocesses.
             os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
@@ -642,7 +652,7 @@ def main() -> None:
     parser.add_argument("--overlap", type=int, help="Override the family's default tile overlap in input pixels")
     parser.add_argument("--input", type=Path, help="Override the family's default sample directory")
     parser.add_argument("--output", type=Path, default=ROOT / "output/architecture-baselines")
-    parser.add_argument("--native-model", type=Path, help="Exported SMoSR .ummodel")
+    parser.add_argument("--native-model", type=Path, help="Exported native .ummodel")
     parser.add_argument("--native-library", type=Path, help="Umzi session library for the native backend")
     parser.add_argument("--native-cache-dir", type=Path, help="SMoSR native plan cache directory")
     parser.add_argument("--tag", "--native-tag", help="Suffix for a named benchmark run")
@@ -686,8 +696,14 @@ def main() -> None:
         parser.error("Variable edge tiles require SMoSR native or Torch FP32, batch 1, tile >= 3, and zero overlap")
     if args.native_cache_dir and not native:
         parser.error("--native-cache-dir requires a native backend")
-    if native and (args.family != "smosr" or batch != 1 or not args.native_model or not args.native_library):
-        parser.error("Native baselines require SMoSR batch 1, --native-model, and --native-library")
+    if native and (
+        args.family not in ("smosr", "figsr") or batch != 1 or not args.native_model or not args.native_library
+    ):
+        parser.error("Native baselines require SMoSR or FiGSR, batch 1, --native-model, and --native-library")
+    if args.family != "smosr" and (
+        args.native_cache_dir or args.tune_convolutions or args.mixed_fp16_accumulation or args.fuse_silu
+    ):
+        parser.error("The native plan cache and tuning options require SMoSR")
     if args.tag is not None:
         if not native and args.backend not in RTX_BACKENDS:
             parser.error("--tag requires a native or TensorRT-RTX backend")

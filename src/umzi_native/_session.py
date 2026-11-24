@@ -15,7 +15,7 @@ import numpy as np
 
 from ._abi import IoABI, ModelABI, ShapeABI, TensorABI, check_status, open_session, read_session_info, session_setup
 from ._loader import PathArg, find_session_library, load_cuda_libraries, load_session_library
-from ._model import GFISRV2_FAMILY, MAGIC, PREFIX
+from ._model import FIGSR_FAMILY, GFISRV2_FAMILY, MAGIC, PREFIX
 
 __all__ = ["InferenceSession", "SessionOptions", "TensorInfo"]
 
@@ -79,10 +79,12 @@ class InferenceSession:
         if options.dll_dirs:
             with model.open("rb") as file:
                 header = file.read(PREFIX.size)
-            is_gfisrv2 = (
-                len(header) == PREFIX.size and header[:8] == MAGIC and PREFIX.unpack(header)[2] == GFISRV2_FAMILY
+            needs_cufft = (
+                len(header) == PREFIX.size
+                and header[:8] == MAGIC
+                and PREFIX.unpack(header)[2] in (GFISRV2_FAMILY, FIGSR_FAMILY)
             )
-            load_cuda_libraries(*options.dll_dirs, include_cufft=is_gfisrv2)
+            load_cuda_libraries(*options.dll_dirs, include_cufft=needs_cufft)
         self._dll = load_session_library(self._library)
         self._handle = open_session(
             self._dll, model, device_id, options.precision, options.enable_cuda_graph, cache, kernel_options

@@ -20,6 +20,7 @@ _PACKERS = {
     "gaterv2": "._gaterv2",
     "moesr": "._moesr",
     "smosr": "._smosr",
+    "figsr": "._figsr",
 }
 
 

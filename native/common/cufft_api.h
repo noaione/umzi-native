@@ -1,14 +1,14 @@
 #pragma once
 
-#include "../../common/platform.h"
+#include "platform.h"
 
-namespace gfi {
-// Only the cuFFT 12 entry points used by this family. Resolve them at session
+namespace umzi {
+// Only the cuFFT 12 entry points used by the native sessions. Resolve them at session
 // open so loading the Umzi library has no link-time cuFFT dependency.
 #ifdef _WIN32
-#define GFI_FFT_CALL WINAPI
+#define UMZI_FFT_CALL WINAPI
 #else
-#define GFI_FFT_CALL
+#define UMZI_FFT_CALL
 #endif
 
 struct CufftApi {
@@ -17,12 +17,12 @@ struct CufftApi {
 #else
     void* library = nullptr;
 #endif
-    using Simple = int (GFI_FFT_CALL*)(int);
-    using Create = int (GFI_FFT_CALL*)(int*);
-    using Flag = int (GFI_FFT_CALL*)(int, int);
-    using Plan = int (GFI_FFT_CALL*)(int, int, int*, int*, int, int, int*, int, int, int, int, size_t*);
-    using Pointer = int (GFI_FFT_CALL*)(int, void*);
-    using Exec = int (GFI_FFT_CALL*)(int, void*, void*);
+    using Simple = int (UMZI_FFT_CALL*)(int);
+    using Create = int (UMZI_FFT_CALL*)(int*);
+    using Flag = int (UMZI_FFT_CALL*)(int, int);
+    using Plan = int (UMZI_FFT_CALL*)(int, int, int*, int*, int, int, int*, int, int, int, int, size_t*);
+    using Pointer = int (UMZI_FFT_CALL*)(int, void*);
+    using Exec = int (UMZI_FFT_CALL*)(int, void*, void*);
 
     Create create = nullptr, version = nullptr;
     Simple destroy = nullptr;
@@ -38,7 +38,7 @@ struct CufftApi {
         library = dlopen("libcufft.so.12", RTLD_NOW | RTLD_LOCAL);
 #endif
         if (!library)
-            throw std::runtime_error("GFISRv2 requires cuFFT 12 (cufft64_12.dll or libcufft.so.12) on the library search path");
+            throw std::runtime_error("This model requires cuFFT 12 (cufft64_12.dll or libcufft.so.12) on the library search path");
         try {
             create = symbol<Create>("cufftCreate");
             version = symbol<Create>("cufftGetVersion");
@@ -66,7 +66,7 @@ private:
 #else
         auto entry = dlsym(library, name);
 #endif
-        if (!entry) throw std::runtime_error(std::string("GFISRv2 could not resolve cuFFT entry point ") + name);
+        if (!entry) throw std::runtime_error(std::string("Could not resolve cuFFT entry point ") + name);
         return reinterpret_cast<T>(entry);
     }
 
@@ -78,5 +78,5 @@ private:
 #endif
     }
 };
-#undef GFI_FFT_CALL
-} // namespace gfi
+#undef UMZI_FFT_CALL
+} // namespace umzi
