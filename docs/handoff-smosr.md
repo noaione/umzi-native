@@ -932,3 +932,154 @@ under `output/smosr-session/silu-cache-check/`. Unfused defaults passed
 bitwise validation across all 242 tiles and the stress inputs. Fused
 schema 1 and schema 2 passed the direct, graph, host, alternate-stream,
 and minimum-size checks.
+
+## Variable edge tiles
+
+The current benchmark replicates the bottom and right edges of each crop
+to fill the nominal tile. SMoSR separately adds two pixels of reflection
+padding per side inside the model. Keep that model padding in the
+experiment. Compare the fixed-size control with actual rectangular edge
+crops at the same tile origins. Keep the same stitching and crop the
+stitched page to 2× the source dimensions. Validate each output against
+twice the submitted height and width. SMoSR requires both input dimensions
+to be at least three. Apply only enough edge padding to meet that minimum
+if a future sample has a smaller remainder.
+
+Start with the three established `samples/2x-test` images, batch 1,
+256×256 nominal tiles, and zero overlap. Their dimensions give these
+input shapes before SMoSR's reflection padding.
+
+| Height × width | Calls across the three pages |
+| --- | ---: |
+| 256×256 | 190 |
+| 256×197 | 20 |
+| 256×20 | 10 |
+| 40×256 | 19 |
+| 40×197 | 2 |
+| 40×20 | 1 |
+
+Cut each tile to `min(tile, height - top) × min(tile, width - left)`.
+For a 2600×1733 page, the 512-pixel grid's last tile starts at row 2560
+and column 1536, giving a 40×197 crop. Stitch each rectangular output at
+its original origin multiplied by two.
+
+| Nominal tile | Calls | Distinct shapes | Fixed input pixels | Variable input pixels | Reduction | Fixed pixels after SMoSR padding | Variable pixels after SMoSR padding |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 256 | 242 | 6 | 15,859,712 | 13,722,800 | 13.47% | 16,359,200 | 14,187,704 |
+| 512 | 72 | 6 | 18,874,368 | 13,722,800 | 27.29% | 19,170,432 | 13,975,424 |
+
+SMoSR's reflection pad adds 3.39% at 256 and 1.84% at 512 to the
+variable grid's submitted area.
+
+Prescan the inputs for every distinct shape, prepare each shape, run a
+synchronized warmup forward, and keep those prepared runners resident
+throughout the timed page run. Start with one native session per shape.
+A native SMoSR session keeps one prepared shape. Changing shape releases
+the CUDA Graph, bound buffers, and in-memory plans. Calling `prepare()`
+with several shapes on one session would leave only the last shape warm.
+
+For fused FP16, use a consistent `cache_dir` and check the cache status
+and candidate count for each prepared shape. The disk cache restores
+compatible fused cuDNN plans per shape. Buffer allocation, binding, and
+CUDA Graph capture still occur when that shape is prepared in a session.
+Record cache-miss setup, cache-hit setup, and the NVML peak with all
+shape-specific runners resident. Where TensorRT-RTX is included in the
+comparison, build and warm one fixed-profile session per shape and verify
+RTX provider placement for each session.
+
+Time the fixed control and variable run sequentially. Save the submitted
+shape, tile coordinates, and synchronized latency for every call. Report
+per-image and median latency, total inference time, and peak NVML usage.
+Use matching Torch FP32 renders for backend PSNR and SSIMULACRA2. Also
+compare the fixed and variable Torch FP32 renders to quantify changes
+from edge handling. The active comparison covers 256 and 512 using Torch
+CUDA FP32 references and native FP16. The 1024 runs ended before the stop
+request. Their reports remain archived under `tile-1024`.
+
+### Native FP16 without fusion
+
+All six shapes stayed resident throughout each variable run. Additional
+VRAM is the sampled device-wide peak during page inference above the
+pre-setup reading. Each layout uses its own Torch FP32 output for the
+backend fidelity scores.
+
+| Nominal tile | Edges | Median ms/image | Median ms/tile | Additional VRAM (MiB) | PSNR (dB) | Mean SSIMULACRA2 |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 256 | Fixed | 619.25 | 7.94 | 72.00 | 61.80 | 88.69 |
+| 256 | Variable | 560.73 | 7.55 | 222.59 | 61.80 | 88.69 |
+| 512 | Fixed | 688.47 | 28.24 | 103.91 | 61.79 | 88.72 |
+| 512 | Variable | 519.99 | 27.88 | 347.84 | 61.79 | 88.71 |
+
+At 512, the variable grid reduced median image latency by 24.5%. The 45
+full-size calls out of 72 dominated the tile median, so the image totals
+better show the gain from cutting edges. The 512 variable run peaked at
+2,013.88 MiB device-wide. Torch FP32 median image latency fell from
+2,507.90 to 1,900.61 ms at 512 and from 2,141.87 to 1,929.00 ms at 256.
+
+### Native FP16 with SiLU fusion and a shape cache
+
+At 512, fixed padding with fusion took 607.80 ms per median image. The
+variable run took 466.47 ms, a 23.3% reduction. A fresh process with all
+six cache hits measured 463.30 ms and the same 61.56 dB PSNR and 88.72 mean
+SSIMULACRA2. Its additional NVML peak was 358.25 MiB. The 512×512 plan
+was already cached from the fixed control. The other five shapes took
+25.27–26.38 s each to prepare on the first run and 42–60 ms each on the
+cache-hit run. All six sessions used both fused convolution shapes and
+timed zero candidates on the cache-hit run.
+
+| Nominal tile | Edges | Median ms/image | Median ms/tile | Additional VRAM (MiB) | PSNR (dB) | Mean SSIMULACRA2 |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 256 | Fixed | 569.01 | 7.02 | 83.59 | 61.80 | 88.66 |
+| 256 | Variable, cache hit | 488.24 | 6.89 | 134.00 | 61.80 | 88.66 |
+| 512 | Fixed | 607.80 | 25.36 | 178.03 | 61.54 | 88.69 |
+| 512 | Variable, cache hit | 463.30 | 24.79 | 358.25 | 61.56 | 88.72 |
+
+The saved PNGs from cold and cache-hit variable runs are byte-identical
+at both sizes. The six native sessions allocated 83.38 MiB of buffers
+at 256 and 295.57 MiB at 512. The cold variable 256 run recorded a negative
+NVML delta after device-wide background usage fell during setup. Use the
+fresh cache-hit repeat for that row's VRAM comparison.
+
+Comparing the fixed and variable Torch FP32 page outputs directly gave
+58.63–66.03 dB PSNR and 91.32–92.90 SSIMULACRA2 at 256, and 58.62–66.01 dB
+and 91.40–93.00 at 512. The crop reaches the real image edge, which moves
+where SMoSR's reflection padding starts. Backend fidelity in the tables
+uses the matching Torch FP32 layout.
+
+### Reproduce the active sweep
+
+`output/smosr-variable-tiles/` contains the per-image and per-tile JSON,
+the per-shape warmup and cache status, and `torch-layout-fidelity.json`.
+The benchmark accepts `--variable-edge-tiles` for zero-overlap batch-1
+SMoSR with native backends or Torch FP32. This sweep used the native FP16
+default and the fused option. For a fresh 512 comparison, run these
+commands once per layout. Repeat the variable command with a different
+report tag and the same cache directory to measure cache-hit preparation.
+
+```powershell
+$env:PYTHONPATH = 'src'
+$smosrPython = 'C:/Python314/python.exe'
+$reportRoot = 'output/smosr-variable-tiles-repeat'
+$model = 'output/smosr-session/smosr-schema2-benchmark.ummodel'
+$library = 'output/smosr-session/native-fp16-silu-cache/umzi_native.dll'
+$common = @('--batch', '1', '--tile', '512', '--overlap', '0', '--input', 'samples/2x-test', '--output', $reportRoot)
+$native = @('--native-model', $model, '--native-library', $library)
+$fused = @('--fp16-fuse-silu', '--native-cache-dir', "$reportRoot/native-cache", '--tag', 'fused')
+& $smosrPython scripts/benchmark_architectures.py smosr fp32 @common
+& $smosrPython scripts/benchmark_architectures.py smosr fp32 @common --variable-edge-tiles
+& $smosrPython scripts/benchmark_architectures.py smosr native-fp16 @common @native @fused
+& $smosrPython scripts/benchmark_architectures.py smosr native-fp16 @common @native @fused --variable-edge-tiles
+```
+
+## Follow-up tuning on fixed 256×256 tiles
+
+Use batch 1, zero overlap, and the three `samples/2x-test` pages on the
+NVIDIA RTX 3050 Laptop GPU. Run mixed precision first, then strict FP32,
+then FP16. Use the tuned mixed path with FP16 body accumulation, the strict
+NCHW FP32 path, and the fused FP16 path as the respective controls. Compare
+each candidate with warmed, interleaved control runs and check full-page
+fidelity against a fresh Torch CUDA FP32 reference with TF32 disabled.
+Report synchronized image and tile latency, NVML device peak and increase
+over background, raw PSNR, and SSIMULACRA2. Keep any winning path behind a
+kernel option when it costs fidelity, workspace, or startup time. Variable
+edge tiles remain a separate experiment.

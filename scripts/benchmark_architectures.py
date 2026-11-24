@@ -71,9 +71,11 @@ def read_image(path: Path) -> Tensor:
         return tensor_image(image)
 
 
-def extract(image: Tensor, top: int, left: int, tile: int) -> Tensor:
+def extract(image: Tensor, top: int, left: int, tile: int, *, variable_edges: bool = False) -> Tensor:
     crop = image[:, :, top : top + tile, left : left + tile]
-    return functional.pad(crop, (0, tile - crop.shape[-1], 0, tile - crop.shape[-2]), mode="replicate")
+    minimum = 3 if variable_edges else tile
+    height, width = crop.shape[-2:]
+    return functional.pad(crop, (0, max(0, minimum - width), 0, max(0, minimum - height)), mode="replicate")
 
 
 def grid(height: int, width: int, tile: int, overlap: int) -> list[tuple[int, int]]:
@@ -93,18 +95,18 @@ def stitch(
     top *= scale
     left *= scale
     height, width = canvas.shape[-2:]
-    tile = result.shape[-1]
+    tile_h, tile_w = result.shape[-2:]
     if feather is not None:
         overlap = len(feather)
         if top:
             result[:, :overlap, :] *= feather[:, None]
-        if top + tile < height:
+        if top + tile_h < height:
             result[:, -overlap:, :] *= feather.flip(0)[:, None]
         if left:
             result[:, :, :overlap] *= feather
-        if left + tile < width:
+        if left + tile_w < width:
             result[:, :, -overlap:] *= feather.flip(0)
-    rows, cols = min(tile, height - top), min(tile, width - left)
+    rows, cols = min(tile_h, height - top), min(tile_w, width - left)
     canvas[:, :, top : top + rows, left : left + cols] += result[:, :rows, :cols]
 
 
@@ -287,23 +289,36 @@ def check_tiny(runner: Runner, scale: int) -> dict[str, Any]:
 
 
 def timed_page(
-    image: Tensor, label: str, runners: dict[int, Runner], family: Family, batch: int
+    image: Tensor,
+    label: str,
+    runners: dict[int, Runner],
+    family: Family,
+    batch: int,
+    *,
+    shape_runners: dict[tuple[int, int], Runner] | None = None,
 ) -> tuple[dict[str, Any], Tensor]:
+    variable_edges = shape_runners is not None
+    if variable_edges and (batch != 1 or family.overlap):
+        raise ValueError("Variable edge tiles require batch 1 and zero overlap")
     height, width = image.shape[-2:]
     tile, overlap, scale = family.tile, family.overlap, family.scale
     coords = grid(height, width, tile, overlap)
     output = torch.zeros((1, 3, height * scale, width * scale))
     feather = (torch.arange(overlap * scale) + 0.5) / (overlap * scale) if overlap else None
     calls = []
+    input_sizes = []
     for start in range(0, len(coords), batch):
         group = coords[start : start + batch]
-        inputs = [extract(image, top, left, tile) for top, left in group]
+        inputs = [extract(image, top, left, tile, variable_edges=variable_edges) for top, left in group]
         # Repeat the last real input so every backend submits the same fixed batch.
         sample = torch.cat(inputs + [inputs[-1]] * (batch - len(group)))
-        prediction, elapsed = runners[batch].measure(sample)
-        if prediction.shape != (batch, 3, tile * scale, tile * scale):
+        input_h, input_w = sample.shape[-2:]
+        runner = runners[batch] if shape_runners is None else shape_runners[input_h, input_w]
+        prediction, elapsed = runner.measure(sample)
+        if prediction.shape != (batch, 3, input_h * scale, input_w * scale):
             raise ValueError(f"Incorrect page tile output shape {list(prediction.shape)}")
         calls.append(elapsed)
+        input_sizes.append((input_h, input_w))
         prediction = prediction.to(device="cpu", dtype=torch.float32)
         for part, (top, left) in zip(prediction[: len(group)], group, strict=True):
             stitch(output, part, top, left, scale, feather)
@@ -319,6 +334,7 @@ def timed_page(
             "top": top,
             "left": left,
             "milliseconds": elapsed * 1000,
+            "input_hw": input_sizes[index] if batch == 1 else (tile, tile),
         })
     seconds = sum(calls)
     tile_ms = [sample["milliseconds"] for sample in latencies]
@@ -327,6 +343,7 @@ def timed_page(
         "height": height,
         "width": width,
         "input_pixels": height * width,
+        "submitted_input_pixels": sum(h * w * batch for h, w in input_sizes),
         "real_tiles": len(coords),
         "submitted_tiles": len(calls) * batch,
         "batch_inference_seconds": seconds,
@@ -621,11 +638,13 @@ def main() -> None:
     parser.add_argument("backend", choices=BACKENDS)
     parser.add_argument("--batch", type=int, help="Override the family's planned throughput batch")
     parser.add_argument("--tile", type=int, help="Override the square input tile size in pixels")
+    parser.add_argument("--variable-edge-tiles", action="store_true", help="Submit rectangular SMoSR edge crops")
     parser.add_argument("--overlap", type=int, help="Override the family's default tile overlap in input pixels")
     parser.add_argument("--input", type=Path, help="Override the family's default sample directory")
     parser.add_argument("--output", type=Path, default=ROOT / "output/architecture-baselines")
     parser.add_argument("--native-model", type=Path, help="Exported SMoSR .ummodel")
     parser.add_argument("--native-library", type=Path, help="Umzi session library for the native backend")
+    parser.add_argument("--native-cache-dir", type=Path, help="SMoSR native plan cache directory")
     parser.add_argument("--tag", "--native-tag", help="Suffix for a named benchmark run")
     parser.add_argument("--tune-convolutions", action="store_true", help="Time the dominant zero-workspace SMoSR plans")
     parser.add_argument(
@@ -652,6 +671,16 @@ def main() -> None:
     if args.backend == "inductor-attention-fp32" and args.family != "gaterv2":
         parser.error("The FP32 attention candidate requires GateRV2")
     native = args.backend in NATIVE_BACKENDS
+    if args.variable_edge_tiles and (
+        args.family != "smosr"
+        or batch != 1
+        or family.overlap
+        or family.tile < 3
+        or (not native and args.backend != "fp32")
+    ):
+        parser.error("Variable edge tiles require SMoSR native or Torch FP32, batch 1, tile >= 3, and zero overlap")
+    if args.native_cache_dir and not native:
+        parser.error("--native-cache-dir requires a native backend")
     if native and (args.family != "smosr" or batch != 1 or not args.native_model or not args.native_library):
         parser.error("Native baselines require SMoSR batch 1, --native-model, and --native-library")
     if args.tag is not None:
@@ -681,6 +710,8 @@ def main() -> None:
     base = args.output.resolve() / args.family / f"batch-{batch}"
     if family.tile != FAMILIES[args.family].tile:
         base /= f"tile-{family.tile}"
+    if args.variable_edge_tiles:
+        base /= "variable-edges"
     directory = base / (f"{args.backend}-{args.tag}" if args.tag else args.backend)
     directory.mkdir(parents=True, exist_ok=True)
     signature = {
@@ -693,6 +724,8 @@ def main() -> None:
         "images": {path.name: digest(path) for path in paths},
         "tiling": "row-major, replicate edge padding, linear output-space feather, crop to source size times scale",
     }
+    if args.variable_edge_tiles:
+        signature["tiling"] = "row-major, exact edge crops, replicate to minimum 3, crop to source size times scale"
     report: dict[str, Any] = {
         "config": signature,
         "backend": args.backend,
@@ -724,6 +757,7 @@ def main() -> None:
     reference = args.backend == "fp32"
     stack = ExitStack()
     session = None
+    options = None
 
     def save() -> None:
         path = directory / "report.json"
@@ -772,7 +806,14 @@ def main() -> None:
                 "library_sha256": digest(args.native_library),
                 "kernel_options": kernel_options,
             }
-            options = SessionOptions(precision=precision, dll_path=args.native_library, kernel_options=kernel_options)
+            if args.native_cache_dir:
+                report["native"]["cache_dir"] = str(args.native_cache_dir.resolve())
+            options = SessionOptions(
+                precision=precision,
+                dll_path=args.native_library,
+                kernel_options=kernel_options,
+                cache_dir=args.native_cache_dir,
+            )
             session = stack.enter_context(InferenceSession(args.native_model, options))
             session.prepare((1, 3, family.tile, family.tile))
             report["setup"]["first_tile"] = session.get_session_info()
@@ -791,11 +832,45 @@ def main() -> None:
             session.prepare(shape)
             runners[1].measure(torch.zeros(shape))
             report["setup"]["1"] = session.get_session_info()
+        shape_runners: dict[tuple[int, int], Runner] | None = None
+        if args.variable_edge_tiles:
+            shapes = set()
+            tile = family.tile
+            for path in paths:
+                with Image.open(path) as image:
+                    width, height = image.size
+                shapes.update(
+                    (max(3, min(tile, height - top)), max(3, min(tile, width - left)))
+                    for top, left in grid(height, width, tile, family.overlap)
+                )
+            shape_runners = {}
+            setup = report["setup"]["prewarmed_shapes"] = {}
+            with NvmlSampler(nvml) as memory:
+                for height, width in sorted(shapes, key=lambda hw: (math.prod(hw), hw), reverse=True):
+                    shape = (1, 3, height, width)
+                    stage: dict[str, Any] = {"input_shape": shape}
+                    setup[f"{height}x{width}"] = stage
+                    print(f"Prewarming {height}x{width}", flush=True)
+                    runner = runners[1]
+                    shape_session = session
+                    if options is not None and (height, width) != (tile, tile):
+                        shape_session = stack.enter_context(InferenceSession(args.native_model, options))
+                        started = time.perf_counter()
+                        shape_session.prepare(shape)
+                        stage["prepare_seconds"] = time.perf_counter() - started
+                        runner = NativeRunner(shape_session)
+                    stage["warm_call_seconds"] = runner.measure(torch.zeros(shape))[1]
+                    if shape_session is not None:
+                        stage["native"] = shape_session.get_session_info()
+                    shape_runners[height, width] = runner
+                    save()
+            report["vram"]["shape_prewarm"] = memory.report(background["used_mib"])
+            report["vram"]["all_shapes_warm"] = nvml.read()
         save()
         for path in paths:
             image = read_image(path)
             with NvmlSampler(nvml) as memory:
-                row, output = timed_page(image, path.name, runners, family, batch)
+                row, output = timed_page(image, path.name, runners, family, batch, shape_runners=shape_runners)
             row["vram"] = memory.report(background["used_mib"])
             row["vram"]["peak_above_setup_background_mib"] = row["vram"].pop("peak_above_pre_context_background_mib")
             png = directory / f"{path.stem}.png"
