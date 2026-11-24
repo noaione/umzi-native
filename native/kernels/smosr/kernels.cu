@@ -18,7 +18,8 @@ __device__ float rounded(float value, bool fp16) {
 __device__ float silu_value(float x) { return x / (1.f + expf(-x)); }
 
 __device__ half2 lookup(half2 input, const half* table) {
-    return __halves2half2(table[__half_as_ushort(__low2half(input))], table[__half_as_ushort(__high2half(input))]);
+    return __halves2half2(__ldg(table + __half_as_ushort(__low2half(input))),
+                         __ldg(table + __half_as_ushort(__high2half(input))));
 }
 
 template<class T>

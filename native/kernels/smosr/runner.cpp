@@ -200,7 +200,7 @@ class Session final : public umzi::KernelSession {
 
     template<class... Args>
     void launch(CUstream target, Kernel kernel, int count, Args... args) {
-        constexpr unsigned threads = 256;
+        const unsigned threads = fp16 && (kernel == Silu || kernel == Gate) ? 128 : 256;
         void* parameters[] = {&args...};
         CHECK(cuLaunchKernel(functions[kernel], (unsigned(count) + threads - 1) / threads, 1, 1,
                              threads, 1, 1, 0, target, parameters, nullptr));

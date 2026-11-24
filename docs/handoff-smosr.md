@@ -446,3 +446,218 @@ build bitwise on all 242 benchmark tiles and all stress fixtures.
 The 128×160 FP32 stress tensor scored 131.95 dB. See
 `output/architecture-baselines/smosr/batch-1/native-fp32-nchw/report.json`
 for every tile timing, per-image scores, and plan setup measurements.
+
+## Matched TensorRT-RTX comparison
+
+Compare native and TensorRT-RTX FP32 and FP16 on the same three 2× test pages.
+Use CUDA Graphs, synchronized device-resident tiles, and fresh cache paths
+for the FP32 engine. Build the FP32 ONNX graph from the original weights with
+`NVIDIA_TF32_OVERRIDE=0`, verify TensorRT-RTX node placement, and keep the
+Torch FP32 raw arrays and PNGs as the fidelity reference.
+
+The RTX FP32 graph has FLOAT inputs, outputs, and weights. The exported
+graph was also checked for reduced-precision casts and constants. ONNX
+Runtime profiled every executed node on `NvTensorRTRTXExecutionProvider`.
+The FP32 comparison disables TF32 before creating either CUDA session.
+See [NVIDIA's precision controls](https://docs.nvidia.com/deeplearning/tensorrt/10.x.x/inference-library/precision-control.html).
+
+Both backends reuse their device input and output. The timer includes
+graph replay and synchronization. Native graph staging still copies to and
+from its fixed CUDA graph addresses inside that interval.
+
+### FP16 optimization
+
+The CUPTI trace attributed about 4.9 ms per tile to cuDNN convolutions,
+0.94 ms to the 12 SiLU kernels, and 0.92 ms to the six gated residuals.
+The default FP16 path now uses 128-thread blocks and read-only lookup loads
+for those two pointwise kernels. It retains the same lookup bits and half
+arithmetic, so the change needs no kernel option.
+
+128-bit vector loads made SiLU faster and the gate slower, saving roughly
+0.01 ms/tile across the three pages. Approximate SiLU and tanh saved about
+0.06 ms/tile across those pages and changed numeric output. With readback
+over three passes, approximate activations measured 7.123 ms/tile by median
+page average, versus 7.179 for the lookup build and 7.213 for TensorRT-RTX.
+The speed difference was too small to add a precision option. The timing
+and fidelity are in
+`output/smosr-session/paired-native-fp16-vector/report.json` and
+`output/smosr-session/paired-native-fast-activations-readback/report.json`.
+
+An interleaved full-page run rotated the starting backend each tile. It
+used the same prepared inputs for TensorRT-RTX, the new FP16 kernel, and
+the previous native binary. Each cell shows summed inference time and the
+mean of the independently synchronized tile calls.
+
+| Image | Tiles | TensorRT-RTX FP16 ms / ms per tile | Previous native FP16 ms / ms per tile | New native FP16 ms / ms per tile |
+| --- | ---: | ---: | ---: | ---: |
+| `9798855404661.jpg` | 77 | 553.63 / 7.190 | 550.64 / 7.151 | 549.07 / 7.131 |
+| `9798855424195.jpg` | 77 | 562.50 / 7.305 | 555.80 / 7.218 | 551.34 / 7.160 |
+| `9798855444216.jpg` | 88 | 637.08 / 7.239 | 630.63 / 7.166 | 627.55 / 7.131 |
+| Median | | 562.50 / 7.239 | 555.80 / 7.166 | 551.34 / 7.131 |
+
+Across all 242 calls, median tile latency was 7.167 ms for TensorRT-RTX,
+7.093 ms for the previous native kernel, and 7.085 ms for the new kernel.
+The trace and every tile sample are under
+`output/smosr-session/paired-native-fp16-lookup/`.
+
+With output readback and the usual NVML sampler, three interleaved passes
+were effectively tied. TensorRT-RTX and native measured 7.048 and 7.055
+ms/tile by median page average, and 6.972 and 6.984 ms by median of all
+726 tile calls per backend. This follow-up is under
+`output/smosr-session/paired-native-fp16-lookup-readback/`.
+
+A second vector experiment used 128-bit SiLU and 64-bit gate loads. In
+three interleaved passes with readback, it took 7.109 ms/tile by median
+page average, versus 7.107 for the simpler lookup build and 7.186 for
+TensorRT-RTX. In separate processes, the vector build took 7.393 ms/tile
+and RTX took 7.247. The simpler lookup build remains the default.
+See `output/smosr-session/paired-native-fp16-wide-readback/report.json`
+and the `native-fp16-wide-match` and `rtx-after-wide` reports.
+
+### Full-page fidelity, latency, and GPU memory
+
+These separate runs used an RTX 3050 Laptop GPU with driver 610.62 and
+the ONNX Runtime TensorRT-RTX plugin 0.5.0. Each image contributes its 77
+or 88 independently timed batch-1 calls. The image median covers each
+page's summed inference time. The tile median covers all 242 samples.
+The NVML peak is device-wide. The peak delta uses the CUDA-initialized
+snapshot taken just before setting up each backend.
+
+| Backend | Total ms | Median ms/image | Median ms/tile | Median page mean ms/tile | PSNR (dB) | Mean SSIMULACRA2 | NVML peak MiB | Peak delta MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| TensorRT-RTX FP32 | 9655.43 | 3091.76 | 39.55 | 40.12 | 100.64 | 89.39 | 1512.50 | 202 |
+| Native FP32 | 4998.44 | 1602.65 | 20.37 | 20.68 | ∞ (zero error) | 100.00 | 1403.13 | 102 |
+| TensorRT-RTX FP16 | 1708.47 | 550.32 | 6.75 | 7.03 | 59.23 | 88.43 | 1471.25 | 160 |
+| Native FP16 | 1768.78 | 565.05 | 7.00 | 7.31 | 61.80 | 88.69 | 1374.82 | 72 |
+
+| Image | Backend | Inference ms | Mean ms/tile | Median ms/tile | PSNR (dB) | SSIMULACRA2 | NVML peak MiB |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `9798855404661.jpg` | TensorRT-RTX FP32 | 3032.74 | 39.39 | 39.26 | 99.73 | 88.30 | 1512.50 |
+| `9798855404661.jpg` | Native FP32 | 1575.85 | 20.47 | 20.29 | ∞ | 100.00 | 1403.13 |
+| `9798855404661.jpg` | TensorRT-RTX FP16 | 541.19 | 7.03 | 6.77 | 58.65 | 87.34 | 1471.25 |
+| `9798855404661.jpg` | Native FP16 | 562.87 | 7.31 | 6.98 | 61.31 | 87.56 | 1374.82 |
+| `9798855424195.jpg` | TensorRT-RTX FP32 | 3091.76 | 40.15 | 39.65 | 100.91 | 89.74 | 1509.88 |
+| `9798855424195.jpg` | Native FP32 | 1602.65 | 20.81 | 20.41 | ∞ | 100.00 | 1403.13 |
+| `9798855424195.jpg` | TensorRT-RTX FP16 | 550.32 | 7.15 | 6.73 | 59.51 | 88.69 | 1462.82 |
+| `9798855424195.jpg` | Native FP16 | 565.05 | 7.34 | 7.08 | 62.31 | 89.00 | 1374.82 |
+| `9798855444216.jpg` | TensorRT-RTX FP32 | 3530.93 | 40.12 | 39.65 | 101.41 | 90.13 | 1509.88 |
+| `9798855444216.jpg` | Native FP32 | 1819.94 | 20.68 | 20.38 | ∞ | 100.00 | 1401.38 |
+| `9798855444216.jpg` | TensorRT-RTX FP16 | 616.97 | 7.01 | 6.74 | 59.57 | 89.26 | 1462.82 |
+| `9798855444216.jpg` | Native FP16 | 640.86 | 7.28 | 7.00 | 61.84 | 89.52 | 1373.13 |
+
+Native FP32 reduced median page-average tile latency by 48.5%. The
+separate FP16 run favored TensorRT-RTX by 0.28 ms/tile. Native FP16 matched
+the previous native DLL byte for byte on all 242 tiles and stress inputs.
+The FP16 advantage varied by run order and timing protocol.
+
+### Reproduce the separate runs
+
+Use the same schema 2 package and untouched Torch FP32 results as above.
+The RTX runs each export a fixed-shape ONNX graph. The FP32 engine uses a
+separate cache from the FP16 engine. `--tag` saves each run separately.
+
+```powershell
+$env:PYTHONPATH = 'src'
+$smosrPython = 'C:/Python314/python.exe'
+$model = 'output/smosr-session/smosr-schema2-benchmark.ummodel'
+$library = 'output/smosr-session/native-fp16-lookup/umzi_native.dll'
+& $smosrPython scripts/build_native.py --arch sm_86 --nvrtc-root output/nvrtc-13.0/nvidia/cu13 --output output/smosr-session/native-fp16-lookup
+& $smosrPython scripts/benchmark_architectures.py smosr rtx-fp32
+& $smosrPython scripts/benchmark_architectures.py smosr rtx --tag matched
+& $smosrPython scripts/benchmark_architectures.py smosr native-fp32 --native-model $model --native-library $library --tag matched
+& $smosrPython scripts/benchmark_architectures.py smosr native-fp16 --native-model $model --native-library $library --tag matched
+```
+
+## 512 and 1024 tile sweep
+
+Use batch 1, zero overlap, and the same three `samples/2x-test` images.
+Keep the 256-pixel runs as the comparison point. Generate a Torch CUDA FP32
+reference at each new size before benchmarking TorchInductor FP16,
+TensorRT-RTX FP16 and FP32, and the native FP32, FP16, and mixed modes.
+Include the existing opt-in mixed convolution tuner. Use the same native
+library and schema 2 package as in the 256-pixel comparison.
+
+Fidelity uses the same-size Torch FP32 output. Compare the three Torch
+references separately to see how the tile grid affects the rendered page.
+Record synchronized forward latency, native buffer totals, and NVML peak
+above the pre-setup snapshot. Save reports and graphs in separate
+`tile-512` and `tile-1024` directories under `batch-1`.
+
+The two 1733×2600 images and the 1812×2600 image used 77, 77, and 88 tiles
+at 256. They each use 24 tiles at 512 and six at 1024. Both larger sizes
+submit 18.87 million input pixels across the set, 19.0% more than the 256
+grid's 15.86 million, because the benchmark pads the right and bottom tiles
+to the fixed input size.
+
+Native FP16 finished at both sizes. The median page took 668 ms at 512
+and 670 ms at 1024, versus 565 ms at 256. Native buffers grew from
+36.11 MiB at 256 to 138.74 MiB at 512 and 547.24 MiB at 1024. The 1024
+native FP32 run fit in the GPU's memory and produced small raw differences
+from same-size Torch FP32. See the fidelity scores below.
+
+### Results
+
+GeForce RTX 3050 Laptop GPU, 4 GiB, driver 610.62. The timer measures
+synchronized forward calls. The page median uses summed inference time
+from each image, and the tile median uses all 72 or 18 individual calls.
+NVML reports the device-wide page peak and its increase above the
+CUDA-initialized reading before backend setup. Native buffers are the
+sum of weights, activations, workspace, and RGB staging from the session.
+
+| Tile | Backend | Total ms | Median ms/image | Median ms/tile | Median page mean ms/tile | PSNR (dB) | Mean SSIMULACRA2 | NVML peak MiB | NVML delta MiB | Native buffer MiB |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 512 | Torch CUDA FP32 | 7114.59 | 2372.26 | 98.27 | 98.84 | Ref. | Ref. | 1676.04 | 452 | — |
+| 512 | TorchInductor FP16 | 3163.25 | 1053.39 | 42.26 | 43.89 | 70.41 | 88.97 | 1425.97 | 204 | — |
+| 512 | TensorRT-RTX FP16 | 1751.98 | 586.09 | 23.90 | 24.42 | 59.26 | 88.51 | 1518.16 | 296 | — |
+| 512 | TensorRT-RTX FP32 | 11124.29 | 3718.85 | 152.91 | 154.95 | 100.64 | 89.45 | 1695.97 | 474 | — |
+| 512 | Native FP16 | 1996.92 | 668.02 | 27.26 | 27.83 | 61.79 | 88.72 | 1398.16 | 176 | 138.74 |
+| 512 | Native mixed | 3060.27 | 1026.07 | 41.63 | 42.75 | 72.52 | 89.10 | 1402.16 | 180 | 145.99 |
+| 512 | Native mixed, tuned | 2549.84 | 849.25 | 34.69 | 35.39 | 72.52 | 89.04 | 1404.16 | 182 | 145.99 |
+| 512 | Native FP32 | 5593.80 | 1861.90 | 77.25 | 77.58 | ∞ | 100.00 | 1528.16 | 306 | 278.49 |
+| 1024 | Torch CUDA FP32 | 7051.37 | 2348.09 | 390.10 | 391.35 | Ref. | Ref. | 2907.97 | 1686 | — |
+| 1024 | TorchInductor FP16 | 3058.43 | 1030.46 | 165.71 | 171.74 | 70.41 | 88.98 | 2378.39 | 798 | — |
+| 1024 | TensorRT-RTX FP16 | OOM | — | — | — | — | — | — | — | — |
+| 1024 | TensorRT-RTX FP32 | OOM | — | — | — | — | — | — | — | — |
+| 1024 | Native FP16 | 2011.53 | 670.11 | 110.56 | 111.69 | 61.93 | 88.72 | 1877.97 | 656 | 547.24 |
+| 1024 | Native mixed | 2994.35 | 1004.74 | 162.66 | 167.46 | 72.52 | 89.08 | 1871.97 | 650 | 576.99 |
+| 1024 | Native mixed, tuned | 2577.62 | 863.14 | 139.94 | 143.86 | 72.52 | 89.05 | 2204.02 | 704.93 | 576.99 |
+| 1024 | Native FP32 | 5575.96 | 1862.98 | 307.97 | 310.50 | 129.68 | 90.21 | 2387.72 | 1165.62 | 1100.02 |
+
+Each completed run contains per-image timing, fidelity, and VRAM, plus
+each tile's duration and coordinates, in its `report.json`.
+The native 1024-pixel FP32 maximum raw error was 2.26e-6. In the PNGs,
+1,627 to 3,001 pixels per page differed by at most one channel level.
+
+Against the 256-pixel Torch reference renders, the 512-pixel Torch outputs
+scored 52.80–60.31 dB and 85.78–88.10 SSIMULACRA2. The 1024-pixel Torch
+outputs scored 50.79–58.77 dB and 85.12–87.64. These scores measure the
+effect of changing the grid. The table compares each backend against the
+Torch reference at the same size.
+
+Both TensorRT-RTX 1024-pixel engines failed during creation with CUDA
+`OutOfMemory` and provider `EPFail`. Fresh runs with 128 and 32 MiB
+workspace caps also failed. A standalone 32 MiB builder that reused the ONNX
+graphs before initializing Torch CUDA failed for both precisions. See the
+`rtx*-workspace-*` reports and `rtx*-standalone-32.log` files in `tile-1024`.
+The 512-pixel profiles confirmed exclusive TensorRT-RTX node placement.
+
+### Reproduce the sweep
+
+Use the schema 2 package and DLL from the matched 256-pixel run.
+
+```powershell
+$env:PYTHONPATH = 'src'
+$smosrPython = 'C:/Python314/python.exe'
+$model = 'output/smosr-session/smosr-schema2-benchmark.ummodel'
+$library = 'output/smosr-session/native-fp16-lookup/umzi_native.dll'
+foreach ($tile in @(512, 1024)) {
+    & $smosrPython scripts/benchmark_architectures.py smosr fp32 --tile $tile
+    foreach ($backend in @('native-fp16', 'native-mixed', 'native-fp32')) {
+        & $smosrPython scripts/benchmark_architectures.py smosr $backend --tile $tile --native-model $model --native-library $library
+    }
+    & $smosrPython scripts/benchmark_architectures.py smosr native-mixed --tile $tile --native-model $model --native-library $library --tag tuned --tune-convolutions
+    foreach ($backend in @('rtx', 'rtx-fp32', 'inductor')) {
+        & $smosrPython scripts/benchmark_architectures.py smosr $backend --tile $tile
+    }
+}
+```

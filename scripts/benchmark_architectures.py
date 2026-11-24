@@ -37,7 +37,8 @@ from umzi_native.exporter._loader import load_checkpoint
 
 METRIC = Path(r"C:\Tools\imaging\ssimulacra2.exe")
 NATIVE_BACKENDS = ("native-mixed", "native-fp16", "native-fp32")
-BACKENDS = ("fp32", "inductor", "inductor-attention-fp32", "rtx", "supplied", "eager-fp16", *NATIVE_BACKENDS)
+RTX_BACKENDS = ("rtx", "rtx-fp32")
+BACKENDS = ("fp32", "inductor", "inductor-attention-fp32", "supplied", "eager-fp16", *RTX_BACKENDS, *NATIVE_BACKENDS)
 RTX_WORKSPACE_BYTES = 512 * 2**20
 
 
@@ -177,6 +178,20 @@ class Runner:
         return prediction, time.perf_counter() - started
 
 
+class NativeRunner(Runner):
+    """Reuse device input and output storage for the synchronized benchmark."""
+
+    def __init__(self, session: InferenceSession):
+        runner = DeviceSession(session, reuse_output=True)
+        super().__init__(runner, runner.dtype)
+        self.input: Tensor | None = None
+
+    def prepare(self, host: Tensor) -> Tensor:
+        if self.input is None or self.input.shape != host.shape:
+            self.input = torch.empty(host.shape, device="cuda", dtype=self.dtype)
+        return self.input.copy_(host.to(dtype=self.dtype))
+
+
 def stress_inputs(tile: int, paths: list[Path], batch: int) -> Iterator[tuple[str, Tensor]]:
     shape = (1, 3, tile, tile)
     for label, gray in (("black", 0.0), ("gray", 0.5), ("gray-128", 128 / 255), ("white", 1.0)):
@@ -213,7 +228,7 @@ def validate_stress(
         count, _, height, width = sample.shape
         row: dict[str, Any] = {"input_shape": list(sample.shape)}
         rows[label] = row
-        if count not in runners or (backend == "rtx" and (height, width) != (family.tile, family.tile)):
+        if count not in runners or (backend in RTX_BACKENDS and (height, width) != (family.tile, family.tile)):
             row["skipped"] = "outside the fixed RTX input shapes"
             continue
         try:
@@ -306,6 +321,7 @@ def timed_page(
             "milliseconds": elapsed * 1000,
         })
     seconds = sum(calls)
+    tile_ms = [sample["milliseconds"] for sample in latencies]
     return {
         "image": label,
         "height": height,
@@ -317,7 +333,8 @@ def timed_page(
         "image_inference_ms": seconds * 1000,
         "batch_input_mpx_per_second": height * width / seconds / 1e6,
         "batch_call_seconds": calls,
-        "average_batch1_tile_latency_ms": statistics.mean(sample["milliseconds"] for sample in latencies),
+        "average_batch1_tile_latency_ms": statistics.mean(tile_ms),
+        "median_batch1_tile_latency_ms": statistics.median(tile_ms),
         "batch1_tile_latency": latencies,
     }, output
 
@@ -362,18 +379,19 @@ def torch_runners(checkpoint: Path, family: Family, batch: int, backend: str, re
 
 
 class RtxRunner(Runner):
-    def __init__(self, session: Any, batch: int, tile: int, scale: int):
+    def __init__(self, session: Any, batch: int, tile: int, scale: int, dtype: torch.dtype):
         self.session = session
-        self.input = torch.empty((batch, 3, tile, tile), dtype=torch.float16, device="cuda")
-        self.output = torch.empty((batch, 3, tile * scale, tile * scale), dtype=torch.float16, device="cuda")
+        self.input = torch.empty((batch, 3, tile, tile), dtype=dtype, device="cuda")
+        self.output = torch.empty((batch, 3, tile * scale, tile * scale), dtype=dtype, device="cuda")
+        element_type = np.float32 if dtype == torch.float32 else np.float16
         self.binding = session.io_binding()
         self.binding.bind_input(
-            session.get_inputs()[0].name, "cuda", 0, np.float16, tuple(self.input.shape), self.input.data_ptr()
+            session.get_inputs()[0].name, "cuda", 0, element_type, tuple(self.input.shape), self.input.data_ptr()
         )
         self.binding.bind_output(
-            session.get_outputs()[0].name, "cuda", 0, np.float16, tuple(self.output.shape), self.output.data_ptr()
+            session.get_outputs()[0].name, "cuda", 0, element_type, tuple(self.output.shape), self.output.data_ptr()
         )
-        super().__init__(self.forward, torch.float16)
+        super().__init__(self.forward, dtype)
 
     def prepare(self, host: Tensor) -> Tensor:
         return self.input.copy_(host.to(dtype=self.dtype))
@@ -383,22 +401,23 @@ class RtxRunner(Runner):
         return self.output
 
 
-def prepare_rtx_graph(checkpoint: Path, directory: Path, batch: int, tile: int, scale: int):
+def prepare_rtx_graph(checkpoint: Path, directory: Path, batch: int, tile: int, scale: int, dtype: torch.dtype):
     import onnx
 
     path = directory / f"t{tile}-b{batch}.onnx"
     model, _ = load_checkpoint(checkpoint)
-    model.eval().half().cuda()
-    sample = torch.zeros((batch, 3, tile, tile), dtype=torch.float16, device="cuda")
+    model.eval().to(device="cuda", dtype=dtype)
+    sample = torch.zeros((batch, 3, tile, tile), dtype=dtype, device="cuda")
     print(f"Exporting {path.name}", flush=True)
     torch.onnx.export(
         model, (sample,), str(path), dynamo=False, opset_version=20, input_names=["input"], output_names=["output"]
     )
     graph = onnx.load(path, load_external_data=False)
     inp, out = graph.graph.input[0], graph.graph.output[0]
+    element_type = onnx.TensorProto.FLOAT if dtype == torch.float32 else onnx.TensorProto.FLOAT16
     for value in (inp, out):
-        if value.type.tensor_type.elem_type != onnx.TensorProto.FLOAT16:
-            raise ValueError(f"Expected FP16 I/O in {path}")
+        if value.type.tensor_type.elem_type != element_type:
+            raise ValueError(f"Expected {dtype} I/O in {path}")
     # The fixed-shape legacy exporter leaves the final Slice's axes symbolic.
     for axis, extent in zip(out.type.tensor_type.shape.dim, (batch, 3, tile * scale, tile * scale), strict=True):
         if axis.HasField("dim_value") and axis.dim_value != extent:
@@ -424,7 +443,14 @@ def prepare_rtx_graph(checkpoint: Path, directory: Path, batch: int, tile: int, 
 
 
 def open_rtx_runner(
-    path: Path, input_name: str, batch: int, family: Family, stage: dict[str, Any], *, output_dir: Path | None = None
+    path: Path,
+    input_name: str,
+    batch: int,
+    family: Family,
+    stage: dict[str, Any],
+    *,
+    output_dir: Path | None = None,
+    dtype: torch.dtype = torch.float16,
 ) -> Runner:
     tile, scale = family.tile, family.scale
     directory = path.parent if output_dir is None else output_dir
@@ -443,9 +469,10 @@ def open_rtx_runner(
         workspace_bytes=RTX_WORKSPACE_BYTES,
     )
     shape = (batch, 3, tile, tile)
+    element_type = np.float32 if dtype == torch.float32 else np.float16
     try:
-        output = np.asarray(session.run(None, {input_name: np.zeros(shape, dtype=np.float16)})[0])
-        if output.shape != (batch, 3, tile * scale, tile * scale) or output.dtype != np.float16:
+        output = np.asarray(session.run(None, {input_name: np.zeros(shape, dtype=element_type)})[0])
+        if output.shape != (batch, 3, tile * scale, tile * scale) or output.dtype != element_type:
             raise ValueError(f"Unexpected RTX output {output.shape} with dtype {output.dtype}")
     finally:
         profile = Path(session.end_profiling())
@@ -462,7 +489,7 @@ def open_rtx_runner(
         path, batch, tile, cache, scale=scale, input_name=input_name, workspace_bytes=RTX_WORKSPACE_BYTES
     )
     stage["provider_options"] = config
-    runner = RtxRunner(session, batch, tile, scale)
+    runner = RtxRunner(session, batch, tile, scale, dtype)
     sample = torch.zeros(shape)
     stage["first_call_seconds"] = runner.measure(sample)[1]
     stage["warm_call_seconds"] = runner.measure(sample)[1]
@@ -473,12 +500,13 @@ def open_rtx_runner(
 def rtx_runners(checkpoint: Path, directory: Path, family: Family, batch: int, report: dict[str, Any]):
     runners: dict[int, Runner] = {}
     errors = []
+    dtype = torch.float32 if report["backend"] == "rtx-fp32" else torch.float16
     for count in sorted({1, batch}):
         tile = family.tile
         stage = report["setup"].setdefault(str(count), {"input_shape": [count, 3, tile, tile]})
         try:
             started = time.perf_counter()
-            path, input_name, permutations = prepare_rtx_graph(checkpoint, directory, count, tile, family.scale)
+            path, input_name, permutations = prepare_rtx_graph(checkpoint, directory, count, tile, family.scale, dtype)
             stage.update(
                 export_seconds=time.perf_counter() - started,
                 graph=path.name,
@@ -486,7 +514,7 @@ def rtx_runners(checkpoint: Path, directory: Path, family: Family, batch: int, r
                 normalized_transpose_permutations=permutations,
             )
             torch.cuda.empty_cache()
-            runners[count] = open_rtx_runner(path, input_name, count, family, stage)
+            runners[count] = open_rtx_runner(path, input_name, count, family, stage, dtype=dtype)
         except Exception as error:
             stage.update(error_type=type(error).__name__, error=str(error))
             errors.append(f"batch {count}: {type(error).__name__}")
@@ -562,6 +590,7 @@ def summarize(pages: list[dict[str, Any]]) -> dict[str, Any]:
         "real_tiles": len(latencies),
         "submitted_tiles": sum(page["submitted_tiles"] for page in pages),
         "average_batch1_tile_latency_ms": statistics.mean(latencies),
+        "median_batch1_tile_latency_ms": statistics.median(latencies),
         "median_image_inference_ms": statistics.median(page["batch_inference_seconds"] * 1000 for page in pages),
         "median_image_average_batch1_tile_latency_ms": statistics.median(
             page["average_batch1_tile_latency_ms"] for page in pages
@@ -591,23 +620,28 @@ def main() -> None:
     parser.add_argument("family", choices=FAMILIES)
     parser.add_argument("backend", choices=BACKENDS)
     parser.add_argument("--batch", type=int, help="Override the family's planned throughput batch")
+    parser.add_argument("--tile", type=int, help="Override the square input tile size in pixels")
     parser.add_argument("--overlap", type=int, help="Override the family's default tile overlap in input pixels")
     parser.add_argument("--input", type=Path, help="Override the family's default sample directory")
     parser.add_argument("--output", type=Path, default=ROOT / "output/architecture-baselines")
     parser.add_argument("--native-model", type=Path, help="Exported SMoSR .ummodel")
     parser.add_argument("--native-library", type=Path, help="Umzi session library for the native backend")
-    parser.add_argument("--native-tag", help="Suffix for a named native benchmark run")
+    parser.add_argument("--tag", "--native-tag", help="Suffix for a named benchmark run")
     parser.add_argument("--tune-convolutions", action="store_true", help="Time the dominant zero-workspace SMoSR plans")
     args = parser.parse_args()
     family = FAMILIES[args.family]
+    if args.tile is not None:
+        if args.tile < 1:
+            parser.error("--tile must be positive")
+        family = replace(family, tile=args.tile)
     if args.overlap is not None:
-        if args.overlap < 0 or args.overlap >= family.tile:
-            parser.error(f"--overlap must satisfy 0 <= overlap < {family.tile}")
         family = replace(family, overlap=args.overlap)
+    if not 0 <= family.overlap < family.tile:
+        parser.error(f"Overlap must satisfy 0 <= overlap < {family.tile}")
     batch = family.batch if args.batch is None else args.batch
     if batch < 1:
         parser.error("--batch must be positive")
-    if args.backend == "rtx" and args.family == "gfisrv2":
+    if args.backend in RTX_BACKENDS and args.family == "gfisrv2":
         parser.error("The baseline matrix skips TensorRT-RTX for GFISRv2")
     if args.backend == "supplied" and args.family != "moesr":
         parser.error("Only MoESR has a supplied graph")
@@ -616,8 +650,11 @@ def main() -> None:
     native = args.backend in NATIVE_BACKENDS
     if native and (args.family != "smosr" or batch != 1 or not args.native_model or not args.native_library):
         parser.error("Native baselines require SMoSR batch 1, --native-model, and --native-library")
-    if args.native_tag is not None and (not native or not re.fullmatch(r"[a-zA-Z0-9_-]+", args.native_tag)):
-        parser.error("--native-tag requires a native backend and a name using letters, digits, underscores, or hyphens")
+    if args.tag is not None:
+        if not native and args.backend not in RTX_BACKENDS:
+            parser.error("--tag requires a native or TensorRT-RTX backend")
+        if not re.fullmatch(r"[a-zA-Z0-9_-]+", args.tag):
+            parser.error("--tag requires a name using letters, digits, underscores, or hyphens")
     if args.tune_convolutions and (not native or args.backend == "native-fp32"):
         parser.error("--tune-convolutions requires a native mixed or FP16 backend")
     os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
@@ -634,7 +671,9 @@ def main() -> None:
     if nvidia_smi is None:
         raise RuntimeError("nvidia-smi is required to record the CUDA driver and device memory")
     base = args.output.resolve() / args.family / f"batch-{batch}"
-    directory = base / (f"{args.backend}-{args.native_tag}" if args.native_tag else args.backend)
+    if family.tile != FAMILIES[args.family].tile:
+        base /= f"tile-{family.tile}"
+    directory = base / (f"{args.backend}-{args.tag}" if args.tag else args.backend)
     directory.mkdir(parents=True, exist_ok=True)
     signature = {
         "checkpoint": family.checkpoint,
@@ -671,7 +710,7 @@ def main() -> None:
             "cudnn_benchmark": False,
             "cpu_threads": torch.get_num_threads(),
         },
-        "timing": "synchronized wall time of device-resident forward calls; excludes transfers, tiling and rendering",
+        "timing": "synchronized device-resident forward wall time, excluding host transfers, tiling and rendering",
         "vram": {"free_before_bytes": torch.cuda.mem_get_info()[0]},
     }
     reference = args.backend == "fp32"
@@ -685,6 +724,7 @@ def main() -> None:
         temporary.replace(path)
 
     save()
+    runners: dict[int, Runner]
     try:
         # Match the CUDA device even when CUDA_VISIBLE_DEVICES remaps its index.
         device_uuid = str(torch.cuda.get_device_properties(0).uuid)
@@ -702,7 +742,7 @@ def main() -> None:
                 raise RuntimeError("Supplied-graph validation failed. See individual stress cases.")
             report["status"] = "complete"
             return
-        if args.backend == "rtx":
+        if args.backend in RTX_BACKENDS:
             runners = rtx_runners(checkpoint, directory, family, batch, report)
         elif native:
             packaged = peek_model(args.native_model)
@@ -724,8 +764,8 @@ def main() -> None:
             session = stack.enter_context(InferenceSession(args.native_model, options))
             session.prepare((1, 3, family.tile, family.tile))
             report["setup"]["first_tile"] = session.get_session_info()
-            device_runner = DeviceSession(session)
-            runners = {1: Runner(device_runner, device_runner.dtype)}
+            report["native"]["buffer_policy"] = "preallocated CUDA input and output at the measured shape"
+            runners = {1: NativeRunner(session)}
         else:
             runners = torch_runners(checkpoint, family, batch, args.backend, report)
         if reference:
