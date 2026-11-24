@@ -662,6 +662,14 @@ def main() -> None:
         "--figsr-mixed-fp16-expand", action="store_true", help="Use FP16 expansion accumulation in FiGSR mixed"
     )
     parser.add_argument(
+        "--figsr-fuse-row-gate", action="store_true", help="Fuse the 1x17 convolution and gate in FiGSR mixed"
+    )
+    parser.add_argument(
+        "--figsr-fuse-expand-gate",
+        action="store_true",
+        help="Fuse FiGSR expansion, identity gate, and FFT input packing",
+    )
+    parser.add_argument(
         "--mixed-fp16-accumulation", action="store_true", help="Use FP16 accumulation in SMoSR mixed body convolutions"
     )
     parser.add_argument(
@@ -717,6 +725,10 @@ def main() -> None:
         parser.error("--figsr-fp32-nchw requires native FiGSR FP32")
     if args.figsr_mixed_fp16_expand and (args.family != "figsr" or args.backend != "native-mixed"):
         parser.error("--figsr-mixed-fp16-expand requires native FiGSR mixed precision")
+    if args.figsr_fuse_row_gate and (args.family != "figsr" or args.backend != "native-mixed"):
+        parser.error("--figsr-fuse-row-gate requires native FiGSR mixed precision")
+    if args.figsr_fuse_expand_gate and (args.family != "figsr" or args.backend not in ("native-mixed", "native-fp16")):
+        parser.error("--figsr-fuse-expand-gate requires native FiGSR mixed or FP16 precision")
     if args.mixed_fp16_accumulation and args.backend != "native-mixed":
         parser.error("--mixed-fp16-accumulation requires the native mixed backend")
     if args.fuse_silu and args.backend not in ("native-mixed", "native-fp16"):
@@ -827,6 +839,10 @@ def main() -> None:
                 kernel_options["fp32_nchw"] = 1
             if args.figsr_mixed_fp16_expand:
                 kernel_options["fp16_expand_accumulation"] = 1
+            if args.figsr_fuse_row_gate:
+                kernel_options["fuse_row_gate"] = 1
+            if args.figsr_fuse_expand_gate:
+                kernel_options["fuse_expand_gate"] = 1
             if args.mixed_fp16_accumulation:
                 kernel_options["fp16_accumulation"] = 1
             if args.fuse_silu:

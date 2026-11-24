@@ -1,4 +1,5 @@
 #include <cuda_fp16.h>
+#include "../../common/tensor_core.cuh"
 
 namespace {
 constexpr int border = 4, scale = 2, fourier = 8, hidden = 80, expansion = 2 * hidden;
@@ -52,6 +53,102 @@ __device__ float gate_planar(const float* expanded, const float* bias, int pixel
     const float g = expanded[planar_index(pixel, lane, expansion, area)] + bias[lane];
     return g / (1.f + expf(-g));
 }
+
+constexpr int expand_tile_h = 4, expand_tile_w = 16, expand_input = 32, expand_taps = 9;
+constexpr int expand_halo_w = expand_tile_w + 2;
+constexpr int expand_halo_elements = (expand_tile_h + 2) * expand_halo_w * expand_input;
+
+__device__ float expansion_bias(float value, float bias, bool half_pointwise) {
+    return round_half(round_half(value, true) + round_half(bias, half_pointwise), true);
+}
+
+template<bool HalfAccumulation>
+__device__ void expand_gate(half* expanded, half* values, float* fft, const half* source, const half* weight,
+                            const float* bias, int h, int w, int tiles_x, int tiles_y, bool half_pointwise,
+                            half* activations, half (*filters)[expansion * expand_input]) {
+    constexpr int chunks = expand_input / 8;
+    const int tile = blockIdx.x, lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    const int x0 = tile % tiles_x * expand_tile_w, y0 = tile / tiles_x % tiles_y * expand_tile_h;
+    const int image = tile / (tiles_x * tiles_y);
+    for (int i = threadIdx.x; i < expand_halo_elements / 8; i += blockDim.x) {
+        const int pixel = i / chunks, chunk = i % chunks;
+        const int x = x0 - 1 + pixel % expand_halo_w, y = y0 - 1 + pixel / expand_halo_w;
+        const bool valid = unsigned(x) < unsigned(w) && unsigned(y) < unsigned(h);
+        const half* input = valid ? source + (((image * h + y) * w + x) * expand_input + chunk * 8) : source;
+        copy_async(activations + swizzle32(pixel, chunk), input, valid);
+    }
+    const auto load_filter = [&](int tap) {
+        for (int i = threadIdx.x; i < expansion * chunks; i += blockDim.x) {
+            const int channel = i / chunks, chunk = i % chunks;
+            copy_async_always(filters[tap % 2] + swizzle32(channel, chunk),
+                              weight + (channel * expand_taps + tap) * expand_input + chunk * 8);
+        }
+        asm volatile("cp.async.commit_group;");
+    };
+    load_filter(0);
+
+    constexpr int groups = hidden / 16;
+    Accumulator<HalfAccumulation> accumulators[2][groups];
+    // Each warp takes one output row and owns both halves of its gate/value pairs.
+    const int row = warp % expand_tile_h, half_channels = warp / expand_tile_h * (hidden / 2);
+    for (int tap = 0; tap < expand_taps; ++tap) {
+        asm volatile("cp.async.wait_group 0;");
+        __syncthreads();
+        if (tap + 1 < expand_taps) load_filter(tap + 1);
+        const int pixel = (row + tap / 3) * expand_halo_w + tap % 3 + lane % 16;
+        #pragma unroll
+        for (int k = 0; k < expand_input / 16; ++k) {
+            unsigned a[4];
+            load_matrix_x4(a, activations + swizzle32(pixel, 2 * k + lane / 16));
+            #pragma unroll
+            for (int part = 0; part < 2; ++part) {
+                #pragma unroll
+                for (int group = 0; group < groups; ++group) {
+                    const int channel = part * hidden + half_channels + group * 8 + lane % 8;
+                    unsigned b[2];
+                    load_matrix_x2(b, filters[tap % 2] + swizzle32(channel, 2 * k + (lane / 8) % 2));
+                    accumulators[part][group].mma(a, b[0], b[1]);
+                }
+            }
+        }
+    }
+
+    const int y = y0 + row;
+    if (y >= h) return;
+    #pragma unroll
+    for (int half_row = 0; half_row < 2; ++half_row) {
+        const int x = x0 + lane / 4 + 8 * half_row;
+        if (x >= w) continue;
+        const int pixel = (image * h + y) * w + x;
+        #pragma unroll
+        for (int group = 0; group < groups; ++group) {
+            const int c = half_channels + group * 8 + lane % 4 * 2;
+            const float2 g = accumulators[0][group].pair(half_row);
+            const float2 v = accumulators[1][group].pair(half_row);
+            if (c < hidden - 4 * fourier) {
+                const auto apply_gate = [&](int channel, float gate, float value) {
+                    const float biased_gate = expansion_bias(gate, bias[channel], half_pointwise);
+                    const float biased_value = expansion_bias(value, bias[hidden + channel], half_pointwise);
+                    return biased_value * round_half(biased_gate / (1.f + expf(-biased_gate)), half_pointwise);
+                };
+                *reinterpret_cast<half2*>(values + pixel * hidden + c) =
+                    __floats2half2_rn(apply_gate(c, g.x, v.x), apply_gate(c + 1, g.y, v.y));
+            } else {
+                auto* out = reinterpret_cast<half2*>(expanded + pixel * expansion + c);
+                out[0] = __floats2half2_rn(g.x, g.y);
+                constexpr int first = hidden - 4 * fourier;
+                if (c < first + fourier) {
+                    const int area = h * w;
+                    float* plane = fft + (image * fourier + c - first) * area + y * w + x;
+                    plane[0] = expansion_bias(v.x, bias[hidden + c], half_pointwise);
+                    plane[area] = expansion_bias(v.y, bias[hidden + c + 1], half_pointwise);
+                } else {
+                    out[hidden / 2] = __floats2half2_rn(v.x, v.y);
+                }
+            }
+        }
+    }
+}
 }
 
 extern "C" __global__ void pack_rgb(void* dst, const void* source, const float* statistics,
@@ -70,6 +167,17 @@ extern "C" __global__ void pack_rgb(void* dst, const void* source, const float* 
         normalized = shifted / round_half(statistics[c + 3], fp16);
     }
     write_scalar(dst, i, normalized, fp32);
+}
+
+extern "C" __global__ void expand_gate_half(half* expanded, half* values, float* fft, const half* source,
+                                             const half* weight, const float* bias, int h, int w,
+                                             int tiles_x, int tiles_y, bool half_acc, bool half_pointwise) {
+    __shared__ __align__(16) half activations[expand_halo_elements];
+    __shared__ __align__(16) half filters[2][expansion * expand_input];
+    if (half_acc)
+        expand_gate<true>(expanded, values, fft, source, weight, bias, h, w, tiles_x, tiles_y, half_pointwise, activations, filters);
+    else
+        expand_gate<false>(expanded, values, fft, source, weight, bias, h, w, tiles_x, tiles_y, half_pointwise, activations, filters);
 }
 
 extern "C" __global__ void bias_residual(void* dst, const void* convolution, const float* bias,
@@ -150,6 +258,48 @@ extern "C" __global__ void gate_spatial(void* dst, const void* source, const flo
     const int p = i / fourier, lane = offset + i % fourier;
     const float value = biased_value(source, i, bias[i % fourier], fp16, fp32);
     write_scalar(dst, p * hidden + lane, value * gate_value(expanded, expanded_bias, p, lane, fp16, fp32), fp32);
+}
+
+extern "C" __global__ void row_conv_gate(half* dst, const uint4* source, const unsigned* weight,
+                                         const float* bias, const half* expanded, const float* expanded_bias,
+                                         int width, int rows, int offset) {
+    constexpr int tile = 16, taps = 17, window = tile + taps - 1;
+    __shared__ __align__(16) uint4 staging[8][window + 1];
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    auto* pixels = staging[warp];
+    const int stripes = (width + tile - 1) / tile;
+    const int stripe = blockIdx.x * 8 + warp;
+    const int y = stripe / stripes, x = stripe % stripes * tile;
+    if (y >= rows) return;
+    const int source_x = x + lane - taps / 2;
+    pixels[lane] = source_x >= 0 && source_x < width ? source[y * width + source_x] : uint4{};
+    if (lane == 0) pixels[window] = uint4{};
+    __syncwarp();
+
+    const auto* weights = weight + (lane / 4) * taps * (fourier / 2) + lane % 4;
+    Accumulator<false> acc;
+    // Each MMA consumes two taps of eight channels. Pad the last tap with zeros.
+    #pragma unroll
+    for (int tap = 0; tap < taps; tap += 2) {
+        const int src = tap == taps - 1 && lane >= 16 ? window : tap + lane % 16 + lane / 16;
+        unsigned values[4];
+        load_matrix_x4(values, reinterpret_cast<const half*>(&pixels[src]));
+        acc.mma(values, weights[tap * 4], tap + 1 < taps ? weights[(tap + 1) * 4] : 0u);
+    }
+
+    const int channel = lane % 4 * 2;
+    #pragma unroll
+    for (int group = 0; group < 2; ++group) {
+        const int output_x = x + lane / 4 + group * 8;
+        if (output_x >= width) continue;
+        const int p = y * width + output_x;
+        const float2 result = acc.pair(group);
+        const float left = round_half(round_half(result.x, true) + bias[channel], true);
+        const float right = round_half(round_half(result.y, true) + bias[channel + 1], true);
+        const int gate = offset + channel;
+        dst[p * hidden + gate] = __float2half_rn(left * gate_value(expanded, expanded_bias, p, gate, false, false));
+        dst[p * hidden + gate + 1] = __float2half_rn(right * gate_value(expanded, expanded_bias, p, gate + 1, false, false));
+    }
 }
 
 extern "C" __global__ void spectrum_norm(void* dst, const float2* source, const float* parameters,

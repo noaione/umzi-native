@@ -507,11 +507,33 @@ Convolutions remain the largest category at 25.17 ms and 31.50 ms per
 tile, respectively. See `pass10-fp16-profile.json` and
 `pass10-mixed-profile.json` under `output/figsr-session/`.
 
-**Next pass**. Screen a fused 32→160 expansion and identity gate using
-the GFISRv2 expansion epilogue as a starting point. FiGSR uses a 1×1
-expansion and dense spatial branches, so keep those branches on cuDNN
-and verify the intermediate half rounding before comparing the fused
-path. Put it behind a kernel option if it changes numeric behavior.
+#### Per-operation follow-up trace
+
+Attribute CUDA kernel time in stream order to the runner's layer calls.
+Each column is the mean across six direct forwards, two per image's
+center tile, at batch 1 and 256×256 with `tune_convolutions=1`. Times sum the
+operation across all blocks. See `pass10-operation-profile.json` in
+`output/figsr-session/`.
+
+| Operation | FP16 ms/tile | Mixed ms/tile | Mixed with FP16 expansion ms/tile |
+| --- | ---: | ---: | ---: |
+| 3×3 expansion, 32→160 | 9.50 | 13.00 | 8.41 |
+| Identity gate | 3.33 | 3.20 | 3.24 |
+| 3×3 projection, 80→32 | 6.57 | 7.07 | 7.41 |
+| Projection residual and next RMSNorm | 3.16 | 2.77 | 2.72 |
+| 13×13 spatial convolution | 5.45 | 6.90 | 6.73 |
+| 1×17 spatial convolution | 0.89 | 4.71 | 4.73 |
+| 17×1 spatial convolution | 1.05 | 1.19 | 1.07 |
+| cuFFT total | 3.24 | 3.06 | 3.09 |
+
+**Next pass**. For FP16 and mixed, screen fusing the 3×3 expansion and
+identity gate using the GFISRv2 expansion epilogue as a starting point.
+Keep the existing rounding between convolution, bias, and gate. For a
+smaller mixed-only experiment, screen a different FP32-accumulating plan
+or a dedicated kernel for the 1×17 convolution. Both mixed modes show
+the same slowdown on that branch. Then screen fusing the 3×3 projection
+with its residual and next RMSNorm. Put precision changes behind kernel
+options and measure fidelity against the existing reference.
 
 ### Pass 10 final metrics
 
@@ -558,3 +580,198 @@ The runtime smoke checks covered graph capture, direct CUDA execution,
 host I/O, alternate streams, odd-size batches, and minimum dimensions
 for all three modes and mixed with the new option. The benchmark CLI
 rejected the mixed-only flag with the FP16 backend.
+
+### Pass 11. Fuse the mixed 1×17 convolution and spatial gate
+
+Keep FP32 accumulation. Stage a horizontal input window in shared memory,
+apply the dense eight-channel filter on Tensor Cores, and consume the
+rounded convolution output directly in the spatial gate. Compare the
+opt-in kernel with the tuned cuDNN control before changing other branches.
+
+In paired page runs, `fuse_row_gate=1` reduced the median from 53.095
+to 48.795 ms/tile and from 4096.57 to 3764.87 ms/image with standard mixed
+accumulation. With `fp16_expand_accumulation=1` enabled in both sessions,
+the median fell from 50.088 to 45.505 ms/tile and from 3867.90 to 3504.68
+ms/image. All 242 tiles matched bitwise in each comparison, and all 12
+heuristic stress fixtures had zero difference. Keep the fused path
+opt-in. See `paired-pass11-row-pass11-row-row-gate-*.json` under
+`output/figsr-session/`.
+
+The fused convolution and gate took 1.39 ms/tile in a separate trace.
+See `pass11-row-profile.json`.
+
+**Next pass**. Screen the shared expansion and identity gate with a
+separate option to isolate its latency and rounding changes.
+
+### Pass 12. Fuse the 3×3 expansion and identity gate
+
+Use shared-memory tiles and the same Tensor Core instructions as GFISRv2
+for the 32→160 expansion. Apply the identity gate to the paired channels
+inside the kernel, at the original half-rounding points. The remaining
+32 gate/value pairs still go to the existing Fourier and spatial paths.
+Screen FP16 and mixed independently against the same tuned plan policy.
+
+The first center screen moved the median from 42.402 to 41.755 ms/tile
+in FP16, 52.477 to 49.874 ms/tile in mixed, and 45.427 to 44.120 ms/tile
+in mixed with both `fuse_row_gate` and `fp16_expand_accumulation` enabled.
+See `paired-pass12-expand-pass12-expand-expand-gate-*.json`.
+
+**Next pass**. Have the same expansion kernel pack the first eight branch
+values directly into the planar FP32 cuFFT input. Screen the combined
+epilogue before retaining it as an option.
+
+### Pass 13. Pack the FFT input in the fused expansion
+
+Write the eight Fourier value channels directly to the existing planar
+FP32 cuFFT input. Apply the same bias and half rounding as the standalone
+extraction. Keep the corresponding gate channels for the inverse Fourier
+path. Compare against each precision mode's tuned path, retaining the
+fused row gate in both mixed sessions.
+
+With `fuse_expand_gate=1`, the paired FP16 page median fell from 42.232
+to 40.690 ms/tile and 3271.49 to 3159.09 ms/image. The independently
+tuned FP16 sessions picked different plans and differed on all 242
+tile outputs. Standard mixed fell from 48.920 to 46.128 ms/tile and
+3771.65 to 3563.66 ms/image, with all 242 tile outputs matching bitwise.
+With FP16 expansion accumulation enabled in both mixed sessions, the
+median fell from 44.679 to 43.040 ms/tile and 3501.02 to 3373.87
+ms/image. All 242 tiles matched bitwise there as well. Each comparison
+matched 11 of 12 stress outputs exactly. See the `fused-expansion-*`
+paired reports under `output/figsr-session/`.
+
+Retain `fuse_expand_gate=1` as an opt-in for FP16 and mixed. It removes
+two launches per block and uses the original FP32 cuFFT input buffer.
+
+**Next pass**. Use the GFISRv2 fused projection and RMSNorm epilogue to
+screen FiGSR's 80→32 convolution with the residual and next RMSNorm.
+Retain the intermediate half rounding and check both accumulation modes
+before enabling it on the measured workload.
+
+### Passes 11–13 final metrics
+
+All runs used `tune_convolutions=1`, batch 1, fixed 256×256 tiles, zero
+overlap, and the same 242 tiles. NVML peak is device-wide and peak
+increase uses each run's pre-setup device reading. Both fused mixed
+variants reproduced their respective Pass 10 per-image PSNR and
+SSIMULACRA2. The FP16 control and fused run were within 0.02 dB PSNR
+and 0.03 mean SSIMULACRA2 of each other.
+
+| Tuned mode | Total ms | Median ms/image | Median ms/tile | Median page mean ms/tile | PSNR dB | Mean SSIMULACRA2 | NVML peak MiB | Peak increase MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| FP16 control | 10189.40 | 3239.16 | 41.977 | 42.067 | 62.81 | 88.36 | 1500.29 | 126.13 |
+| FP16 fused | 9817.51 | 3130.33 | 40.363 | 40.654 | 62.82 | 88.33 | 1498.29 | 124.00 |
+| Mixed fused | 11132.76 | 3561.13 | 45.846 | 46.106 | 68.08 | 88.69 | 1496.54 | 124.00 |
+| Mixed fused with FP16 expansion | 10331.17 | 3311.28 | 42.553 | 42.616 | 64.64 | 88.54 | 1496.54 | 124.00 |
+
+| Tuned mode | Image | Image ms | Mean ms/tile | PSNR dB | SSIMULACRA2 | NVML peak MiB |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| FP16 control | `9798855404661.jpg` | 3239.16 | 42.067 | 62.19 | 87.13 | 1500.29 |
+| FP16 control | `9798855424195.jpg` | 3232.64 | 41.982 | 63.26 | 89.11 | 1500.29 |
+| FP16 control | `9798855444216.jpg` | 3717.60 | 42.245 | 63.03 | 88.85 | 1500.29 |
+| FP16 fused | `9798855404661.jpg` | 3106.70 | 40.347 | 62.32 | 87.19 | 1498.29 |
+| FP16 fused | `9798855424195.jpg` | 3130.33 | 40.654 | 63.29 | 89.01 | 1498.29 |
+| FP16 fused | `9798855444216.jpg` | 3580.48 | 40.687 | 62.89 | 88.80 | 1498.29 |
+| Mixed fused | `9798855404661.jpg` | 3514.31 | 45.640 | 67.38 | 87.44 | 1496.54 |
+| Mixed fused | `9798855424195.jpg` | 3561.13 | 46.248 | 68.54 | 89.33 | 1496.54 |
+| Mixed fused | `9798855444216.jpg` | 4057.32 | 46.106 | 68.41 | 89.28 | 1496.54 |
+| Mixed fused with FP16 expansion | `9798855404661.jpg` | 3269.65 | 42.463 | 63.74 | 87.36 | 1496.54 |
+| Mixed fused with FP16 expansion | `9798855424195.jpg` | 3311.28 | 43.004 | 65.08 | 89.37 | 1496.54 |
+| Mixed fused with FP16 expansion | `9798855444216.jpg` | 3750.24 | 42.616 | 65.24 | 88.87 | 1496.54 |
+
+Use `--figsr-fuse-expand-gate` for the fused runs, `--figsr-fuse-row-gate`
+for both fused mixed runs, and `--figsr-mixed-fp16-expand` for the last
+row. Rebuild the native library and use the package and library paths
+as in Pass 10. Reports are under
+`output/architecture-baselines/figsr/batch-1/`.
+
+- `native-fp16-pass13-fp16-control/report.json`
+- `native-fp16-pass13-fp16-fused/report.json`
+- `native-mixed-pass13-mixed-fused/report.json`
+- `native-mixed-pass13-mixed-fast/report.json`
+
+Separate CUPTI traces put the fused expansion, gate, and FFT packing at
+12.20 ms/tile in FP16 and 15.90 ms/tile in standard mixed. The mixed
+row kernel took 1.39 ms/tile with both fusions enabled. See
+`pass13-fp16-profile.json` and `pass13-mixed-profile.json`.
+
+Runtime checks covered graph, direct execution, host I/O, alternate
+streams, odd-size batch 2, and the minimum 6×6 input. Unsupported
+precision and kernel-option combinations were rejected at session open.
+
+## Final Torch and native comparison
+
+Rerun the three Torch backends and four tuned native configurations in
+separate processes on the RTX 3050 Laptop GPU. Use batch 1, fixed 256×256
+tiles, zero overlap, and all three `samples/2x-test` images. The fresh
+eager FP32 outputs are the common reference for raw PSNR and rendered
+SSIMULACRA2. Reports and renders for this comparison are under
+`output/figsr-final-comparison/figsr/batch-1/`.
+
+Use the commands in [Reproduce](#reproduce) with
+`--output output/figsr-final-comparison` for each backend. For the native
+runs, this comparison used `output/figsr-session/figsr-benchmark.ummodel`
+and `output/figsr-session/pass12-expand-fft/umzi_native.dll`. Pass
+`--tune-convolutions` with these options.
+
+| Backend | Additional flags |
+| --- | --- |
+| `native-fp32` | `--figsr-fp32-nchw` |
+| `native-fp16` | `--figsr-fuse-expand-gate` |
+| `native-mixed` | `--figsr-fuse-row-gate --figsr-fuse-expand-gate` |
+| `native-mixed` with FP16 expansion | `--figsr-fuse-row-gate --figsr-fuse-expand-gate --figsr-mixed-fp16-expand --tag fp16-expand` |
+
+All seven reports completed and matched the checkpoint hash, image
+hashes, tile coordinates, input sizes, and device. Each configuration
+timed 242 synchronized forwards. The totals below sum the three image
+latencies. NVML is the device-wide reading, and the increase is relative
+to each process's pre-backend reading.
+
+| Backend | Total ms | Median ms/image | Median ms/tile | Median page mean ms/tile | PSNR dB | Mean SSIMULACRA2 | NVML peak MiB | Peak increase MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Torch eager FP32 | 44591.40 | 14202.38 | 183.961 | 184.446 | Reference | Reference | 1598.20 | 206.94 |
+| TorchInductor FP32 | 50951.98 | 16235.14 | 209.746 | 210.432 | 99.80 | 90.68 | 1693.45 | 304.38 |
+| TorchInductor FP16 | 16488.16 | 5428.21 | 66.734 | 67.120 | 66.49 | 88.50 | 1537.50 | 155.37 |
+| Native FP32 | 40138.27 | 13096.80 | 164.425 | 165.252 | 100.27 | 90.69 | 1590.13 | 208.63 |
+| Native FP16 | 10388.63 | 3487.93 | 42.285 | 42.888 | 62.82 | 88.33 | 1634.38 | 213.56 |
+| Native mixed | 11152.26 | 3560.97 | 45.878 | 46.246 | 68.08 | 88.69 | 1569.79 | 120.34 |
+| Native mixed with FP16 expansion | 10344.84 | 3306.23 | 42.469 | 42.893 | 64.64 | 88.54 | 1568.29 | 124.00 |
+
+### Per-image final results
+
+| Backend | Image | Inference ms | Mean ms/tile | PSNR dB | SSIMULACRA2 | NVML peak MiB |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Torch eager FP32 | `9798855404661.jpg` | 14107.05 | 183.208 | Reference | Reference | 1598.20 |
+| Torch eager FP32 | `9798855424195.jpg` | 14202.38 | 184.446 | Reference | Reference | 1597.95 |
+| Torch eager FP32 | `9798855444216.jpg` | 16281.97 | 185.022 | Reference | Reference | 1597.95 |
+| TorchInductor FP32 | `9798855404661.jpg` | 16235.14 | 210.846 | 117.89 | 89.68 | 1688.51 |
+| TorchInductor FP32 | `9798855424195.jpg` | 16203.25 | 210.432 | 121.38 | 91.07 | 1693.45 |
+| TorchInductor FP32 | `9798855444216.jpg` | 18513.59 | 210.382 | 95.19 | 91.27 | 1688.51 |
+| TorchInductor FP16 | `9798855404661.jpg` | 5153.34 | 66.927 | 66.31 | 87.35 | 1537.50 |
+| TorchInductor FP16 | `9798855424195.jpg` | 5428.21 | 70.496 | 66.88 | 89.21 | 1537.50 |
+| TorchInductor FP16 | `9798855444216.jpg` | 5906.60 | 67.120 | 66.31 | 88.94 | 1537.50 |
+| Native FP32 | `9798855404661.jpg` | 12499.29 | 162.328 | 116.84 | 89.68 | 1577.50 |
+| Native FP32 | `9798855424195.jpg` | 13096.80 | 170.088 | 121.94 | 91.18 | 1590.13 |
+| Native FP32 | `9798855444216.jpg` | 14542.18 | 165.252 | 95.67 | 91.21 | 1580.32 |
+| Native FP16 | `9798855404661.jpg` | 3487.93 | 45.298 | 62.32 | 87.19 | 1544.82 |
+| Native FP16 | `9798855424195.jpg` | 3302.36 | 42.888 | 63.29 | 89.01 | 1634.38 |
+| Native FP16 | `9798855444216.jpg` | 3598.34 | 40.890 | 62.89 | 88.80 | 1573.44 |
+| Native mixed | `9798855404661.jpg` | 3518.98 | 45.701 | 67.38 | 87.44 | 1569.79 |
+| Native mixed | `9798855424195.jpg` | 3560.97 | 46.246 | 68.54 | 89.33 | 1569.79 |
+| Native mixed | `9798855444216.jpg` | 4072.31 | 46.276 | 68.41 | 89.28 | 1569.79 |
+| Native mixed with FP16 expansion | `9798855404661.jpg` | 3264.06 | 42.390 | 63.74 | 87.36 | 1568.29 |
+| Native mixed with FP16 expansion | `9798855424195.jpg` | 3306.23 | 42.938 | 65.08 | 89.37 | 1567.29 |
+| Native mixed with FP16 expansion | `9798855444216.jpg` | 3774.56 | 42.893 | 65.24 | 88.87 | 1567.29 |
+
+Each backend directory contains `report.json`, including setup timings
+and every tile's synchronized latency. Directory names are
+`fp32`, `inductor-fp32`, `inductor`, `native-fp32`,
+`native-fp16`, `native-mixed`, and
+`native-mixed-fp16-expand`.
+
+The original native FP16 run peaked at 1634.38 MiB on `9798855424195.jpg`.
+A full repeat with the same package, library, and options peaked at
+1550.59 MiB on every page, 124 MiB above its background. The repeat took
+10210.30 ms total, with medians of 3265.27 ms/image and 42.049 ms/tile.
+The per-image fidelity values matched the first run. Both sessions
+reported zero native convolution workspace. See
+`native-fp16-repeat/report.json` in the same directory.

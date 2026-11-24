@@ -133,18 +133,19 @@ struct Network {
 enum Kernel { Pack, Bias, Rms, ResidualNorm, Copy, Extract, SplitSpatial, GateSpatial,
               Spectrum, Gelu, Inverse, GateIdentity, Shuffle,
               RmsNchw, ResidualNormNchw, ExtractNchw, SplitSpatialNchw, GateSpatialNchw, InverseNchw,
-              GateIdentityNchw, ExtractHalf, KernelCount };
+              GateIdentityNchw, ExtractHalf, RowConvGate, ExpandGateHalf, KernelCount };
 constexpr std::array<const char*, KernelCount> names{
     "pack_rgb", "bias_residual", "rms_norm", "residual_norm", "copy_channels", "extract_fourier",
     "split_spatial", "gate_spatial", "spectrum_norm", "spectrum_gelu", "inverse_norm", "gate_identity", "shuffle_rgb",
     "rms_norm_nchw", "residual_norm_nchw", "extract_fourier_nchw", "split_spatial_nchw", "gate_spatial_nchw",
-    "inverse_norm_nchw", "gate_identity_nchw", "extract_fourier_half"};
+    "inverse_norm_nchw", "gate_identity_nchw", "extract_fourier_half", "row_conv_gate", "expand_gate_half"};
 enum Buffer { State, Normalized, Stem, Middle, Expanded, Values, Fourier, Complex, Spectral, SpectralWork, BufferCount };
 
 class Session final : public umzi::KernelSession {
     Network net;
     bool fp16 = false, fp32 = false, graph = false, pending = false;
     bool tune_convolutions = false, fp32_nchw = false, fp16_expand_accumulation = false;
+    bool fuse_row_gate = false, fuse_expand_gate = false;
     CUdevice device{};
     CUcontext context = nullptr;
     CUmodule module = nullptr;
@@ -339,17 +340,26 @@ class Session final : public umzi::KernelSession {
         for (size_t i = 0; i < net.blocks.size(); ++i) {
             const auto& block = net.blocks[i];
             const auto expand_bias = weights + block.expand.bias;
-            conv(b[Expanded], b[Normalized], block.expand, spatial);
-            const int plain = pixels * (hidden - 4 * fourier);
-            launch_body(target, GateIdentity, GateIdentityNchw, plain, area, b[Values], b[Expanded], expand_bias, plain);
+            if (fuse_expand_gate) {
+                const int tiles_x = (spatial.w + 15) / 16, tiles_y = (spatial.h + 3) / 4;
+                launch(target, ExpandGateHalf, spatial.n * tiles_x * tiles_y * 256, b[Expanded], b[Values], b[Fourier], b[Normalized],
+                       weights + block.expand.weight, expand_bias, spatial.h, spatial.w, tiles_x, tiles_y,
+                       fp16 || fp16_expand_accumulation, fp16);
+            } else {
+                conv(b[Expanded], b[Normalized], block.expand, spatial);
+                const int plain = pixels * (hidden - 4 * fourier);
+                launch_body(target, GateIdentity, GateIdentityNchw, plain, area, b[Values], b[Expanded], expand_bias, plain);
+            }
 
             const int fourier_count = pixels * fourier;
-            if (fp32_nchw)
-                launch(target, ExtractNchw, fourier_count, b[Fourier], b[Expanded], expand_bias, area, fourier_count);
-            else if (!fp32)
-                launch(target, ExtractHalf, pixels, b[Fourier], b[Expanded], expand_bias, area, pixels, fp16);
-            else
-                launch(target, Extract, fourier_count, b[Fourier], b[Expanded], expand_bias, area, fourier_count, fp16, fp32);
+            if (!fuse_expand_gate) {
+                if (fp32_nchw)
+                    launch(target, ExtractNchw, fourier_count, b[Fourier], b[Expanded], expand_bias, area, fourier_count);
+                else if (!fp32)
+                    launch(target, ExtractHalf, pixels, b[Fourier], b[Expanded], expand_bias, area, pixels, fp16);
+                else
+                    launch(target, Extract, fourier_count, b[Fourier], b[Expanded], expand_bias, area, fourier_count, fp16, fp32);
+            }
             FFT_CHECK(fft->r2c(fft_plans[0], reinterpret_cast<void*>(b[Fourier]), reinterpret_cast<void*>(b[Complex])));
             launch(target, Spectrum, 2 * fourier * frequency_pixels, b[Spectral], b[Complex], weights + block.spectral_norm,
                    bins, frequency_pixels, ortho, fp16, fp32);
@@ -375,9 +385,15 @@ class Session final : public umzi::KernelSession {
                 const int count = pixels * fourier;
                 launch_body(target, SplitSpatial, SplitSpatialNchw, count, area, b[Spectral], b[Expanded], expand_bias,
                             offset, count);
-                conv(b[Fourier], b[Spectral], *filter, spatial);
-                launch_body(target, GateSpatial, GateSpatialNchw, count, area, b[Values], b[Fourier], weights + filter->bias,
-                            b[Expanded], expand_bias, offset, count);
+                if (fuse_row_gate && filter == &block.row) {
+                    const int threads = 32 * ((spatial.w + 15) / 16) * spatial.h * spatial.n;
+                    launch(target, RowConvGate, threads, b[Values], b[Spectral], weights + filter->weight,
+                           weights + filter->bias, b[Expanded], expand_bias, spatial.w, spatial.h * spatial.n, offset);
+                } else {
+                    conv(b[Fourier], b[Spectral], *filter, spatial);
+                    launch_body(target, GateSpatial, GateSpatialNchw, count, area, b[Values], b[Fourier], weights + filter->bias,
+                                b[Expanded], expand_bias, offset, count);
+                }
                 offset += fourier;
             }
             conv(b[Normalized], b[Values], block.project, spatial);
@@ -441,15 +457,16 @@ class Session final : public umzi::KernelSession {
             for (const auto* filter : {&net.head, &net.end, &net.combine, &net.tail}) prepare_conv(padded, *filter, cap);
             const auto& block = net.blocks.front();
             for (const auto* filter : {&block.expand, &block.square, &block.row, &block.column, &block.project})
-                prepare_conv(padded, *filter, cap);
+                if ((!fuse_row_gate || filter != &block.row) && (!fuse_expand_gate || filter != &block.expand))
+                    prepare_conv(padded, *filter, cap);
             prepare_conv(frequency, block.fpe, cap);
             prepare_conv(frequency, block.fdc, cap);
             if (conv_bytes) CHECK(cuMemAlloc(&conv_workspace, conv_bytes));
             if (tune_convolutions) {
-                tune_conv(padded, block.expand, Normalized, Expanded);
+                if (!fuse_expand_gate) tune_conv(padded, block.expand, Normalized, Expanded);
                 tune_conv(padded, block.project, Values, Normalized);
                 for (const auto* filter : {&block.square, &block.row, &block.column})
-                    tune_conv(padded, *filter, Spectral, Fourier);
+                    if (!fuse_row_gate || filter != &block.row) tune_conv(padded, *filter, Spectral, Fourier);
             }
             device_used[2] = umzi::device_used_bytes();
             setup_ms[1] = umzi::elapsed_ms(start);
@@ -496,7 +513,7 @@ public:
             throw std::runtime_error("Invalid FiGSR metadata or weights");
         fp16 = options.precision == UMZI_FP16;
         fp32 = options.precision == UMZI_FP32;
-        bool tune_seen = false, layout_seen = false, expand_seen = false;
+        bool tune_seen = false, layout_seen = false, expand_seen = false, row_seen = false, fusion_seen = false;
         for (uint32_t i = 0; i < options.kernel_option_count; ++i) {
             const auto& option = options.kernel_options[i];
             const std::string_view name(option.name ? option.name : "");
@@ -511,6 +528,12 @@ public:
             } else if (name == "fp16_expand_accumulation" && !expand_seen) {
                 expand_seen = true;
                 fp16_expand_accumulation = option.value != 0;
+            } else if (name == "fuse_row_gate" && !row_seen) {
+                row_seen = true;
+                fuse_row_gate = option.value != 0;
+            } else if (name == "fuse_expand_gate" && !fusion_seen) {
+                fusion_seen = true;
+                fuse_expand_gate = option.value != 0;
             } else {
                 throw std::runtime_error("Invalid or duplicate FiGSR kernel option: " + std::string(name));
             }
@@ -518,6 +541,8 @@ public:
         if (!fp32 && fp32_nchw) throw std::runtime_error("FiGSR fp32_nchw requires FP32 precision");
         if ((fp16 || fp32) && fp16_expand_accumulation)
             throw std::runtime_error("FiGSR fp16_expand_accumulation requires mixed precision");
+        if ((fp16 || fp32) && fuse_row_gate) throw std::runtime_error("FiGSR fuse_row_gate requires mixed precision");
+        if (fp32 && fuse_expand_gate) throw std::runtime_error("FiGSR fuse_expand_gate requires mixed or FP16 precision");
         if (!fp32) net = Network(sizeof(uint16_t));
         graph = (options.flags & UMZI_CUDA_GRAPH) != 0;
         CHECK(cuInit(0));

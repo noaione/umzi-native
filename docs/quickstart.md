@@ -269,6 +269,12 @@ For mixed precision, `kernel_options={"fp16_expand_accumulation": 1}`
 speeds up the block expansion by accumulating in FP16. On the three
 FiGSR benchmark images it reduced latency and lowered PSNR against the
 Torch FP32 reference. It can be combined with `tune_convolutions`.
+For mixed precision, `kernel_options={"fuse_row_gate": 1}` fuses the
+1×17 convolution and its spatial gate with FP32 accumulation. It can be
+combined with `tune_convolutions` and `fp16_expand_accumulation`.
+For FP16 and mixed, `kernel_options={"fuse_expand_gate": 1}` fuses the
+3×3 expansion, identity gate, and Fourier input packing. It uses the
+selected expansion accumulation precision with a custom Tensor Core kernel.
 See [FiGSR implementation and measurements](handoff-figsr.md).
 
 ## 5. Inspecting models and sessions
