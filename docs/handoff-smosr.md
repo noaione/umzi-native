@@ -1083,3 +1083,57 @@ Report synchronized image and tile latency, NVML device peak and increase
 over background, raw PSNR, and SSIMULACRA2. Keep any winning path behind a
 kernel option when it costs fidelity, workspace, or startup time. Variable
 edge tiles remain a separate experiment.
+
+### Mixed precision
+
+The mixed `fuse_silu=1` experiment describes the convolution output and
+fused output as FP16, with FP32 bias, bias sum, and SiLU math. It uses the
+existing FP32 bias bank and stores fused plans under keys separate from
+FP16 and from the other mixed accumulation mode. At 256×256 with
+`fp16_accumulation=1` and `tune_convolutions=1`, cuDNN selected fused plans
+for both 8→48 and 48→48. The center-tile screen gave 8.06 vs 7.12 ms
+by median of the three tile medians. The candidate's center-tile PSNR
+against Torch ranged from 67.21 to 71.96 dB. Output changed slightly,
+including a 0.13 dB PSNR drop on the checkerboard stress input. See
+`output/smosr-final-tuning/screen-mixed.json`.
+
+The fused path won all nine paired page comparisons over three passes.
+Median image latency fell from 616.39 to 543.37 ms, and the median of all
+726 tile calls fell from 8.066 to 7.167 ms. The median page mean was 7.911
+vs 7.051 ms/tile. Paired timings are in `paired-mixed.json` under the same
+output root.
+
+Separate runs provide the fidelity and device-wide NVML measurements.
+Peak increase is relative to each run's pre-setup device usage.
+
+| Mixed configuration | Total ms | Median image ms | Median tile ms | PSNR (dB) | Mean SSIMULACRA2 | NVML peak MiB | Peak increase MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Tuned FP16 body accumulation | 1891.16 | 604.12 | 7.674 | 69.585 | 89.050 | 1494.72 | 74.44 |
+| Tuned FP16 body accumulation with SiLU fusion | 1637.56 | 521.49 | 6.585 | 69.585 | 88.924 | 1565.38 | 141.41 |
+
+The paired run is the latency comparison. The fused plan search took
+26.92 s including unfused plan timing, versus 1.04–1.29 s with a cache hit.
+The latter still times the 83 unfused candidates. Permanent session
+buffers stayed at 37.74 MiB including weights and RGB staging, with zero
+convolution workspace. The startup, NVML, and fidelity tradeoffs warrant
+keeping `fuse_silu=1` opt-in. Full per-image metrics and per-tile samples
+are in `smosr/batch-1/native-mixed-{control,fused}/report.json` below
+`output/smosr-final-tuning/`.
+
+### Strict FP32
+
+The cuDNN FMA probe tested all eight legacy algorithms on the padded
+260×260 3×3 convolution shapes. Winograd was fastest on the 48→48 and
+48→96 shapes and matched the Torch convolution bitwise in that probe.
+The native control's CUPTI trace also showed Winograd on the body layers.
+The nonfused Winograd variants requested 891.5 and 1337.4 MiB respectively,
+above the 256 MiB workspace limit. Neither direct nor untiled FFT was
+supported on these shapes. See `probe_fp32_conv.json`.
+
+An exact `float4` SiLU and gate prototype won seven of nine paired page
+measurements. The median image was 1583.34 vs 1578.21 ms and the median
+tile was 20.370 vs 20.284 ms. The fixed-shape stress and center tiles
+matched the control and Torch bitwise. The CUPTI trace put the control's
+Winograd kernels at about 17 ms/tile. The under-0.5% wall-time gain did
+not warrant retaining the new dispatch path. Keep the strict FP32 control.
+See `screen-fp32.json` and its two CUDA traces.

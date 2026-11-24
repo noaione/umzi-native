@@ -143,10 +143,12 @@ class Session final : public umzi::KernelSession {
     size_t rgb_bytes(Shape input) const { return size_t(input.pixels()) * 3 * (fp16 ? 2 : 4); }
     size_t persistent_bytes() const {
         return net.bytes + (fp16 ? table_bytes : 0)
-            + (fuse_silu ? net.blocks.size() * 2 * features * sizeof(uint16_t) : 0);
+            + (fuse_silu && fp16 ? net.blocks.size() * 2 * features * sizeof(uint16_t) : 0);
     }
     CUdeviceptr fused_bias(size_t block, size_t convolution) const {
-        return fuse_silu ? weights + net.bytes + table_bytes + (block * 2 + convolution) * features * sizeof(uint16_t) : 0;
+        if (!fuse_silu) return 0;
+        if (!fp16) return weights + net.blocks[block][convolution].bias;
+        return weights + net.bytes + table_bytes + (block * 2 + convolution) * features * sizeof(uint16_t);
     }
 
     void wait() {
@@ -225,6 +227,7 @@ class Session final : public umzi::KernelSession {
                 umzi::Sha256 hash;
                 hash.add(cache_environment);
                 hash.add(std::array{padded.n, padded.h, padded.w, f.cin, f.cout, f.k});
+                if (!fp16) hash.add(std::array{int(fp16_accumulation)});
                 cache_key = hash.finish();
                 cache_path = umzi::plan_path(cache_dir, "smosr-silu", cache_key);
                 plan.plan = load_fused_plan(cache_path, cache_key, f, bias);
@@ -240,7 +243,7 @@ class Session final : public umzi::KernelSession {
         plan.graph = std::make_unique<umzi::CudnnConvGraph>(
             cudnn, padded.n, padded.h, padded.w, f.cin, f.cout, f.k, fp32 ? CUDNN_DATA_FLOAT : CUDNN_DATA_HALF,
             fp16 || body_accumulates_in_fp16,
-            fp32 ? CUDNN_TENSOR_NCHW : CUDNN_TENSOR_NHWC, bias != 0);
+            fp32 ? CUDNN_TENSOR_NCHW : CUDNN_TENSOR_NHWC, bias != 0, !fp16);
         const bool tune = bias || (tune_convolutions && f.cin == features && f.k == 3);
         auto candidates = plan.graph->candidates(cudnn, tune ? 0 : limit, !tune);
         size_t selected = 0;
@@ -465,7 +468,7 @@ public:
         if (fp32 && tune_convolutions) throw std::runtime_error("SMoSR tune_convolutions requires mixed or FP16 precision");
         if ((fp16 || fp32) && fp16_accumulation)
             throw std::runtime_error("SMoSR fp16_accumulation requires mixed precision");
-        if (fuse_silu && !fp16) throw std::runtime_error("SMoSR fuse_silu requires FP16 precision");
+        if (fuse_silu && fp32) throw std::runtime_error("SMoSR fuse_silu requires mixed or FP16 precision");
         graph = (options.flags & UMZI_CUDA_GRAPH) != 0;
         CHECK(cuInit(0));
         CHECK(cuDeviceGet(&device, options.device));
@@ -499,7 +502,7 @@ public:
         } else {
             CHECK(cuMemcpyHtoD(weights, data.data(), data.size()));
         }
-        if (fuse_silu) {
+        if (fuse_silu && fp16) {
             std::vector<uint16_t> biases;
             biases.reserve(source.blocks.size() * 2 * features);
             for (const auto& block : source.blocks) {
@@ -588,6 +591,9 @@ public:
     }
 
     const char* kernel_message() const override {
+        if (fuse_silu && fp16_accumulation)
+            return "SMoSR NHWC mixed precision with FP16 body accumulation and convolution and SiLU fusion";
+        if (fuse_silu && !fp16) return "SMoSR NHWC mixed precision with convolution and SiLU fusion";
         if (fp16_accumulation) return "SMoSR NHWC mixed precision with FP16 accumulation in body convolutions";
         if (fuse_silu) return "SMoSR NHWC FP16 with convolution and SiLU fusion";
         return fp32 ? "SMoSR NCHW FP32" : fp16 ? "SMoSR NHWC FP16" : "SMoSR NHWC mixed precision";

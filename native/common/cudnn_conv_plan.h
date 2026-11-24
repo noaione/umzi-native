@@ -130,7 +130,8 @@ public:
     CudnnDescriptor* graph = nullptr;
 
     CudnnConvGraph(cudnnHandle_t handle, int n, int h, int w, int cin, int cout, int k, cudnnDataType_t io_type,
-                   bool fp16_compute, cudnnTensorFormat_t layout = CUDNN_TENSOR_NHWC, bool fused_silu = false)
+                   bool fp16_compute, cudnnTensorFormat_t layout = CUDNN_TENSOR_NHWC, bool fused_silu = false,
+                   bool float_silu_bias = false)
         : strict_float(io_type == CUDNN_DATA_FLOAT), format(layout) {
         auto& x = tensor(1, n, cin, h, w, io_type);
         auto& filter = tensor(2, cout, cin, k, k, io_type);
@@ -162,8 +163,10 @@ public:
         graph = &make(CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR);
         std::array<cudnnBackendDescriptor_t, 3> operations{op.get()};
         if (fused_silu) {
-            auto& biased = tensor(4, n, cout, h, w, io_type, true);
-            auto& bias = tensor(5, 1, cout, 1, 1, io_type);
+            // Mixed preserves the half convolution output and float bias sum before SiLU.
+            const auto bias_type = float_silu_bias ? CUDNN_DATA_FLOAT : io_type;
+            auto& biased = tensor(4, n, cout, h, w, bias_type, true);
+            auto& bias = tensor(5, 1, cout, 1, 1, bias_type);
             auto& result = tensor(6, n, cout, h, w, io_type);
             operations[1] = pointwise(CUDNN_POINTWISE_ADD, y, biased, &bias).get();
             operations[2] = pointwise(CUDNN_POINTWISE_SWISH_FWD, biased, result).get();
