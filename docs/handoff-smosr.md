@@ -661,3 +661,103 @@ foreach ($tile in @(512, 1024)) {
     }
 }
 ```
+
+## Further mixed and FP16 tuning
+
+Use the original batch-1 256×256 workload and the matched native DLL as
+the control. Keep Torch FP32 untouched. The six 48→96 projections and
+the twelve 48→48 convolutions account for most of the forward time.
+
+A screen of additional cuDNN heuristic B configurations returned the same
+74 mixed and 83 FP16 zero-workspace candidates. The tuned mixed medians
+were 8.889 and 8.886 ms/tile before and after the extra heuristic. FP16 was
+7.124 ms/tile by default and 7.284 ms/tile after expanded tuning. Approximate
+mixed SiLU saved at most 0.04 ms/tile and changed numeric output. Both
+experiments were dropped. See `output/smosr-session/screen-plan-b-silu.json`
+and [cuDNN engine heuristics](https://docs.nvidia.com/deeplearning/cudnn/latest/developer/graph-api.html).
+
+Test whether the existing 48→48 plan can compute the value and gate in
+separate outputs faster than the 48→96 plan. This keeps the same weights,
+projection buffer size, and elementwise arithmetic.
+
+The split was slower in the interleaved screen. Mixed went from 11.133
+to 11.198 ms/tile by default and from 8.892 to 9.508 ms/tile with tuning.
+FP16 went from 7.019 to 7.449 ms/tile, and strict FP32 went from 20.347
+to 22.388 ms/tile. See `output/smosr-session/screen-split-projection.json`.
+
+The next experiment keeps the original projection and tests up to nine
+combinations of the heuristic plan and the fastest zero-workspace plans
+found by isolated convolution timing. Score them by replaying the complete
+captured CUDA Graph at the same shape, then benchmark the winner on images.
+
+Whole-graph tuning recovered the FP16 heuristic plan's 7.12 ms/tile and
+added setup work. Mixed measured 8.971 ms/tile with graph ranking and
+8.864 with the existing tuner. See `output/smosr-session/screen-graph-tune.json`.
+The existing tuner remains the control.
+
+The accumulation screen keeps each mode's existing I/O and pointwise math.
+Within the hot 3×3 layers it flips accumulation precision for the 48→48
+group, the 48→96 group, or both. Screen each with and without the existing
+zero-workspace tuner. Changing accumulation is a numeric trade-off and
+belongs behind an option if it improves the page runs.
+
+The interleaved accumulation screen returned 7.065 ms/tile for mixed
+with both groups accumulating in FP16, versus 9.169 ms/tile for the
+existing tuned mixed control. The three center tiles scored 67.18–71.96 dB
+against Torch FP32, compared with 60.56–62.20 dB for native FP16. The
+one-group variants were slower. Applying FP32 accumulation to either
+group in native FP16 also slowed it down. See
+`output/smosr-session/screen-hybrid-accumulation.json` for each trial.
+
+Use `SessionOptions(precision="mixed", kernel_options={"fp16_accumulation": 1})`
+to select FP16 accumulation for 48-input 3×3 convolutions. This includes
+the 48→48 and 48→96 plans. Mixed I/O, bias, pointwise math, and the other
+convolutions retain their original precision. The original mixed mode is
+the default. `tune_convolutions=1` can be used with either mixed mode.
+
+### Full-page results
+
+All five runs use batch 1, 256×256 tiles, zero overlap, and the same 242
+tiles on the RTX 3050 Laptop GPU. Fidelity compares to Torch FP32.
+The tile median uses all individual synchronized calls. Image times sum
+the calls for each page. Additional VRAM is the NVML peak over the reading
+before backend setup.
+
+| Mode | Total ms | Median ms/image | Median ms/tile | Median page mean ms/tile | PSNR (dB) | Mean SSIMULACRA2 | NVML peak MiB | Additional MiB | Native buffers MiB | First plans ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Mixed | 2680.82 | 853.66 | 10.72 | 11.09 | 72.53 | 89.15 | 1462.79 | 72.00 | 37.74 | 195.91 |
+| Mixed, tuned | 2242.77 | 709.33 | 8.98 | 9.21 | 72.53 | 89.12 | 1464.79 | 80.94 | 37.74 | 1427.48 |
+| Mixed with FP16 accumulation | 1806.08 | 585.34 | 7.17 | 7.47 | 69.58 | 89.05 | 1456.10 | 72.00 | 37.74 | 198.31 |
+| Mixed with FP16 accumulation, tuned | 1773.30 | 572.35 | 7.13 | 7.31 | 69.58 | 89.05 | 1464.79 | 74.00 | 37.74 | 1207.70 |
+| FP16 | 1777.50 | 572.17 | 7.03 | 7.33 | 61.80 | 88.69 | 1461.04 | 70.25 | 36.11 | 108.08 |
+
+The opt-in mode reduced median tile latency by 20.2% and median page
+latency by 17.5% against the tuned mixed control. Adding convolution
+tuning to the new mode saved about 13 ms per median page in this run and
+added roughly one second to first plan setup. Its measured page latency
+was within 0.2 ms of native FP16 and its PSNR was 7.78 dB higher.
+
+The defaults matched the previous native DLL byte for byte on all 242
+tiles and the stress fixtures in all three precisions. The new option's
+host, direct, captured, and alternate-stream outputs agreed for schema 1
+and schema 2 on the rectangular sample. Invalid option values and
+selecting the option in FP16 or FP32 were rejected. The new option was
+benchmarked at 256×256.
+
+Report directories under `output/architecture-baselines/smosr/batch-1/`
+are `native-mixed-accum-control`, `native-mixed-accum-control-tuned`,
+`native-mixed-fp16-accum`, `native-mixed-fp16-accum-tuned`, and
+`native-fp16-accum-control`. Their `report.json` files contain per-image
+PSNR, SSIMULACRA2, observed NVML peak, and all tile timings and coordinates.
+
+### Reproduce the opt-in run
+
+```powershell
+$env:PYTHONPATH = 'src'
+$smosrPython = 'C:/Python314/python.exe'
+$model = 'output/smosr-session/smosr-schema2-benchmark.ummodel'
+$library = 'output/smosr-session/native-mixed-fp16-accumulation/umzi_native.dll'
+& $smosrPython scripts/build_native.py --arch sm_86 --nvrtc-root output/nvrtc-13.0/nvidia/cu13 --output output/smosr-session/native-mixed-fp16-accumulation
+& $smosrPython scripts/benchmark_architectures.py smosr native-mixed --native-model $model --native-library $library --tag fp16-accum --mixed-fp16-accumulation
+& $smosrPython scripts/benchmark_architectures.py smosr native-mixed --native-model $model --native-library $library --tag fp16-accum-tuned --mixed-fp16-accumulation --tune-convolutions
+```

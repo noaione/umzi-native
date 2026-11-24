@@ -628,6 +628,9 @@ def main() -> None:
     parser.add_argument("--native-library", type=Path, help="Umzi session library for the native backend")
     parser.add_argument("--tag", "--native-tag", help="Suffix for a named benchmark run")
     parser.add_argument("--tune-convolutions", action="store_true", help="Time the dominant zero-workspace SMoSR plans")
+    parser.add_argument(
+        "--mixed-fp16-accumulation", action="store_true", help="Use FP16 accumulation in SMoSR mixed body convolutions"
+    )
     args = parser.parse_args()
     family = FAMILIES[args.family]
     if args.tile is not None:
@@ -657,6 +660,8 @@ def main() -> None:
             parser.error("--tag requires a name using letters, digits, underscores, or hyphens")
     if args.tune_convolutions and (not native or args.backend == "native-fp32"):
         parser.error("--tune-convolutions requires a native mixed or FP16 backend")
+    if args.mixed_fp16_accumulation and args.backend != "native-mixed":
+        parser.error("--mixed-fp16-accumulation requires the native mixed backend")
     os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
     torch.set_num_threads(2)
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -754,6 +759,8 @@ def main() -> None:
                 raise ValueError("The native package must match the benchmark checkpoint")
             _, precision = args.backend.split("-", 1)
             kernel_options = {"tune_convolutions": 1} if args.tune_convolutions else {}
+            if args.mixed_fp16_accumulation:
+                kernel_options["fp16_accumulation"] = 1
             report["native"] = {
                 "precision": precision,
                 "package_sha256": packaged.digest,

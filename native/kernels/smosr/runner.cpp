@@ -127,7 +127,7 @@ class Session final : public umzi::KernelSession {
     std::array<CUdeviceptr, BufferCount> buffer{};
     Shape shape;
     size_t activation_bytes = 0, workspace_bytes = 0;
-    bool tune_convolutions = false;
+    bool tune_convolutions = false, fp16_accumulation = false;
     int64_t timed_candidates = 0;
     std::array<double, 4> setup_ms{};
     std::array<uint64_t, 4> device_used{};
@@ -164,8 +164,10 @@ class Session final : public umzi::KernelSession {
         const std::array key{f.cin, f.cout, f.k};
         if (plans.find(key) != plans.end()) return;
         umzi::CudnnBackendPlan plan;
+        const bool body_accumulates_in_fp16 = fp16_accumulation && f.cin == features && f.k == 3;
         plan.graph = std::make_unique<umzi::CudnnConvGraph>(
-            cudnn, padded.n, padded.h, padded.w, f.cin, f.cout, f.k, fp32 ? CUDNN_DATA_FLOAT : CUDNN_DATA_HALF, fp16,
+            cudnn, padded.n, padded.h, padded.w, f.cin, f.cout, f.k, fp32 ? CUDNN_DATA_FLOAT : CUDNN_DATA_HALF,
+            fp16 || body_accumulates_in_fp16,
             fp32 ? CUDNN_TENSOR_NCHW : CUDNN_TENSOR_NHWC);
         const bool tune = tune_convolutions && f.cin == features && f.k == 3;
         auto candidates = plan.graph->candidates(cudnn, tune ? 0 : limit, !tune);
@@ -346,14 +348,25 @@ public:
         if (architecture.size() || !package.section(2).empty() || package.section(4).size() != 32
             || data.size() != source.bytes)
             throw std::runtime_error("Invalid SMoSR metadata or weights");
-        if (options.kernel_option_count) {
-            const auto& option = options.kernel_options[0];
-            if (options.kernel_option_count != 1 || !option.name || std::string_view(option.name) != "tune_convolutions"
-                || (option.value != 0 && option.value != 1))
-                throw std::runtime_error("Specify SMoSR tune_convolutions once with a value of 0 or 1");
-            tune_convolutions = option.value != 0;
+        bool tune_set = false, accumulation_set = false;
+        for (uint32_t i = 0; i < options.kernel_option_count; ++i) {
+            const auto& option = options.kernel_options[i];
+            const auto name = std::string_view(option.name ? option.name : "");
+            if (option.value != 0 && option.value != 1)
+                throw std::runtime_error("SMoSR kernel options require a value of 0 or 1");
+            if (name == "tune_convolutions" && !tune_set) {
+                tune_convolutions = option.value != 0;
+                tune_set = true;
+            } else if (name == "fp16_accumulation" && !accumulation_set) {
+                fp16_accumulation = option.value != 0;
+                accumulation_set = true;
+            } else {
+                throw std::runtime_error("Invalid or duplicate SMoSR kernel option: " + std::string(name));
+            }
         }
         if (fp32 && tune_convolutions) throw std::runtime_error("SMoSR tune_convolutions requires mixed or FP16 precision");
+        if ((fp16 || fp32) && fp16_accumulation)
+            throw std::runtime_error("SMoSR fp16_accumulation requires mixed precision");
         graph = (options.flags & UMZI_CUDA_GRAPH) != 0;
         CHECK(cuInit(0));
         CHECK(cuDeviceGet(&device, options.device));
@@ -449,6 +462,7 @@ public:
     }
 
     const char* kernel_message() const override {
+        if (fp16_accumulation) return "SMoSR NHWC mixed precision with FP16 accumulation in body convolutions";
         return fp32 ? "SMoSR NCHW FP32" : fp16 ? "SMoSR NHWC FP16" : "SMoSR NHWC mixed precision";
     }
 
