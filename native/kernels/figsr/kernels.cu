@@ -118,6 +118,22 @@ extern "C" __global__ void extract_fourier(float* dst, const void* expanded, con
     dst[i] = biased_value(expanded, p * expansion + lane, bias[lane], fp16, fp32);
 }
 
+extern "C" __global__ void extract_fourier_half(float* dst, const uint4* expanded, const float* bias,
+                                                 int area, int pixels, bool fp16) {
+    const int pixel = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pixel >= pixels) return;
+    constexpr int first = expansion - 4 * fourier;
+    static_assert(fourier == 8 && expansion % 8 == 0 && first % 8 == 0);
+    const uint4 packed = expanded[(pixel * expansion + first) / 8];
+    const unsigned int pairs[] = {packed.x, packed.y, packed.z, packed.w};
+    const int base = pixel / area * fourier * area + pixel % area;
+    #pragma unroll
+    for (int lane = 0; lane < fourier; ++lane) {
+        const auto value = __ushort_as_half(static_cast<unsigned short>(pairs[lane / 2] >> (16 * (lane % 2))));
+        dst[base + lane * area] = round_half(__half2float(value) + round_half(bias[first + lane], fp16), true);
+    }
+}
+
 extern "C" __global__ void split_spatial(void* dst, const void* expanded, const float* bias,
                                          int offset, int count, bool fp16, bool fp32) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;

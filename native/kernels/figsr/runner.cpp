@@ -133,18 +133,18 @@ struct Network {
 enum Kernel { Pack, Bias, Rms, ResidualNorm, Copy, Extract, SplitSpatial, GateSpatial,
               Spectrum, Gelu, Inverse, GateIdentity, Shuffle,
               RmsNchw, ResidualNormNchw, ExtractNchw, SplitSpatialNchw, GateSpatialNchw, InverseNchw,
-              GateIdentityNchw, KernelCount };
+              GateIdentityNchw, ExtractHalf, KernelCount };
 constexpr std::array<const char*, KernelCount> names{
     "pack_rgb", "bias_residual", "rms_norm", "residual_norm", "copy_channels", "extract_fourier",
     "split_spatial", "gate_spatial", "spectrum_norm", "spectrum_gelu", "inverse_norm", "gate_identity", "shuffle_rgb",
     "rms_norm_nchw", "residual_norm_nchw", "extract_fourier_nchw", "split_spatial_nchw", "gate_spatial_nchw",
-    "inverse_norm_nchw", "gate_identity_nchw"};
+    "inverse_norm_nchw", "gate_identity_nchw", "extract_fourier_half"};
 enum Buffer { State, Normalized, Stem, Middle, Expanded, Values, Fourier, Complex, Spectral, SpectralWork, BufferCount };
 
 class Session final : public umzi::KernelSession {
     Network net;
     bool fp16 = false, fp32 = false, graph = false, pending = false;
-    bool tune_convolutions = false, fp32_nchw = false;
+    bool tune_convolutions = false, fp32_nchw = false, fp16_expand_accumulation = false;
     CUdevice device{};
     CUcontext context = nullptr;
     CUmodule module = nullptr;
@@ -230,9 +230,10 @@ class Session final : public umzi::KernelSession {
         const auto& body = net.blocks.front();
         const auto layout = fp32_nchw && (&filter == &body.expand || &filter == &body.project)
             ? CUDNN_TENSOR_NCHW : CUDNN_TENSOR_NHWC;
+        const bool prefer_half = fp16 || (fp16_expand_accumulation && &filter == &body.expand);
         umzi::CudnnBackendPlan selected;
         for (bool half_compute : {true, false}) {
-            if (half_compute && !fp16) continue;
+            if (half_compute && !prefer_half) continue;
             selected.graph = std::make_unique<umzi::CudnnConvGraph>(
                 cudnn, shape.n, shape.h, shape.w, filter.cin, filter.cout, filter.kh, filter.kw, filter.groups,
                 fp32 ? CUDNN_DATA_FLOAT : CUDNN_DATA_HALF, half_compute, layout);
@@ -241,7 +242,7 @@ class Session final : public umzi::KernelSession {
             selected.workspace = size_t(candidates[0].workspace);
             selected.plan = std::move(candidates[0].plan);
             conv_bytes = std::max(conv_bytes, selected.workspace);
-            if (fp16 && !half_compute) ++fp32_fallbacks;
+            if (prefer_half && !half_compute) ++fp32_fallbacks;
             plans.emplace(index, std::move(selected));
             return;
         }
@@ -345,6 +346,8 @@ class Session final : public umzi::KernelSession {
             const int fourier_count = pixels * fourier;
             if (fp32_nchw)
                 launch(target, ExtractNchw, fourier_count, b[Fourier], b[Expanded], expand_bias, area, fourier_count);
+            else if (!fp32)
+                launch(target, ExtractHalf, pixels, b[Fourier], b[Expanded], expand_bias, area, pixels, fp16);
             else
                 launch(target, Extract, fourier_count, b[Fourier], b[Expanded], expand_bias, area, fourier_count, fp16, fp32);
             FFT_CHECK(fft->r2c(fft_plans[0], reinterpret_cast<void*>(b[Fourier]), reinterpret_cast<void*>(b[Complex])));
@@ -493,7 +496,7 @@ public:
             throw std::runtime_error("Invalid FiGSR metadata or weights");
         fp16 = options.precision == UMZI_FP16;
         fp32 = options.precision == UMZI_FP32;
-        bool tune_seen = false, layout_seen = false;
+        bool tune_seen = false, layout_seen = false, expand_seen = false;
         for (uint32_t i = 0; i < options.kernel_option_count; ++i) {
             const auto& option = options.kernel_options[i];
             const std::string_view name(option.name ? option.name : "");
@@ -505,11 +508,16 @@ public:
             } else if (name == "fp32_nchw" && !layout_seen) {
                 layout_seen = true;
                 fp32_nchw = option.value != 0;
+            } else if (name == "fp16_expand_accumulation" && !expand_seen) {
+                expand_seen = true;
+                fp16_expand_accumulation = option.value != 0;
             } else {
                 throw std::runtime_error("Invalid or duplicate FiGSR kernel option: " + std::string(name));
             }
         }
         if (!fp32 && fp32_nchw) throw std::runtime_error("FiGSR fp32_nchw requires FP32 precision");
+        if ((fp16 || fp32) && fp16_expand_accumulation)
+            throw std::runtime_error("FiGSR fp16_expand_accumulation requires mixed precision");
         if (!fp32) net = Network(sizeof(uint16_t));
         graph = (options.flags & UMZI_CUDA_GRAPH) != 0;
         CHECK(cuInit(0));

@@ -46,7 +46,9 @@ shuffle head pads its 12 output lanes to 16.
   cuDNN plans with input down-conversion, reduced-precision reduction, or
   Tensor Core numerical notes are excluded in this mode.
 - **Mixed** uses FP32 I/O and pointwise math with FP16 filters and
-  activation storage. Convolutions accumulate in FP32.
+  activation storage. Convolutions accumulate in FP32 by default.
+  `fp16_expand_accumulation=1` allows FP16 accumulation in the block
+  expansion only.
 - **FP16** uses FP16 I/O, filters, and activations. It rounds bias and
   pointwise intermediates at the half-precision boundaries. It requests
   FP16 convolution accumulation and uses FP32 accumulation when no
@@ -378,3 +380,181 @@ pass `--tune-convolutions --figsr-fp32-nchw --tag pass4-nchw` to
 `scripts/benchmark_architectures.py figsr native-fp32` with the package and
 library paths. Python callers use
 `SessionOptions(precision="fp32", kernel_options={"tune_convolutions": 1, "fp32_nchw": 1})`.
+
+### Pass 6. Screen FP16 accumulation in mixed expansion
+
+Use the tuned mixed control at batch 1, 256×256, zero overlap, and the same
+three pages. The earlier mixed profile spent 17.65 ms/tile in the most
+expensive recurring convolution kernel. Screen FP16 accumulation in the
+32→160 expansion with the mixed projection, gates, I/O, and normalization
+unchanged. Keep it opt-in if it improves latency because it changes the
+numeric policy.
+
+The center test moved from 54.347 to 50.109 ms/tile. The paired page test
+lowered median tile latency from 55.140 to 50.671 ms and median image
+latency from 4249.14 to 3915.51 ms across the three pages. The CUDA plan
+diagnostic reported zero FP32 fallbacks for the requested expansion.
+Keep `fp16_expand_accumulation=1` opt-in and combine it with
+`tune_convolutions=1` for that configuration. The reports are
+`paired-half-candidates-half-candidates-mixed-expand*.json`.
+
+Separate warmed runs measured raw PSNR and rendered SSIMULACRA2 against
+the Torch eager FP32 reference. The candidate lowered median tile
+latency by 4.9% in those runs and by 8.1% with paired timing. It cost
+3.44 dB PSNR and 0.15 mean SSIMULACRA2. NVML peak is device-wide. The
+increase is measured from the device reading before the backend starts.
+
+| Tuned mixed | Total ms | Median ms/image | Median ms/tile | Median page mean ms/tile | PSNR dB | Mean SSIMULACRA2 | NVML peak MiB | Peak increase MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| FP32 expansion accumulation | 13296.07 | 4225.55 | 54.742 | 54.877 | 68.08 | 88.69 | 1448.22 | 126 |
+| FP16 expansion accumulation | 12634.62 | 4021.70 | 52.072 | 52.230 | 64.64 | 88.54 | 1450.22 | 128 |
+
+| Image | Expansion accumulation | Image ms | Mean ms/tile | PSNR dB | SSIMULACRA2 | NVML peak MiB |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| `9798855404661.jpg` | FP32 | 4206.39 | 54.628 | 67.38 | 87.44 | 1448.22 |
+| `9798855424195.jpg` | FP32 | 4225.55 | 54.877 | 68.54 | 89.33 | 1448.22 |
+| `9798855444216.jpg` | FP32 | 4864.13 | 55.274 | 68.41 | 89.28 | 1448.22 |
+| `9798855404661.jpg` | FP16 | 4007.35 | 52.044 | 63.74 | 87.36 | 1450.22 |
+| `9798855424195.jpg` | FP16 | 4021.70 | 52.230 | 65.08 | 89.37 | 1450.22 |
+| `9798855444216.jpg` | FP16 | 4605.57 | 52.336 | 65.24 | 88.87 | 1450.22 |
+
+See `native-mixed-pass6-mixed-control/report.json` and
+`native-mixed-pass6-mixed-expand/report.json` under
+`output/architecture-baselines/figsr/batch-1/`. To reproduce the candidate,
+run `scripts/benchmark_architectures.py figsr native-mixed` with
+`--tune-convolutions --figsr-mixed-fp16-expand --tag pass6-mixed-expand`
+and the model and library paths. Python callers use
+`SessionOptions(precision="mixed", kernel_options={"tune_convolutions": 1, "fp16_expand_accumulation": 1})`.
+
+**Next pass**. Check whether the FP16 gate can save time without changing
+its rounding, then screen additional convolution plans if needed.
+
+### Pass 7. Screen an exact SiLU lookup in FP16
+
+Use the tuned FP16 control on the same workload. Before the gate's SiLU
+the activation has already rounded to FP16. Precompute the original
+rounded SiLU for every half bit pattern, then look it up in the three
+FP16 gate kernels. Compare stress outputs bitwise and measure whether the
+lookup avoids enough activation math to pay for the table reads.
+
+The lookup matched the heuristic control bitwise on all stress inputs.
+The heuristic center medians were 46.244 and 46.815 ms/tile for the control
+and lookup. The tuned center medians were 43.598 and 44.650 ms/tile.
+Drop the lookup. See the `fp16-lut-fixed` and `fp16-lut-tuned` paired
+reports below `output/figsr-session/`.
+
+**Next pass**. Test whether the current zero-workspace cap excludes faster
+FP16 convolution plans.
+
+### Pass 8. Screen a bounded FP16 tuning workspace
+
+Allow up to 32 MiB of workspace in the FP16 plan screen for the expansion,
+projection, and three dense spatial convolutions. Keep the steady-state
+allocation at the maximum required by the selected plans. Compare warmed
+time and fidelity with the existing tuned FP16 control.
+
+The wider cap timed 194 candidates instead of 187. The selected plans
+still used zero workspace, and the paired center median was 43.811
+ms/tile compared with 43.734 ms for the control. Drop the workspace
+option. See `paired-half-workspace-half-workspace-fp16-32mib.json`.
+
+**Next pass**. Use packed FP16 bias and multiplication in the identity and
+spatial gates, keeping the existing FP32 SiLU computation and FP16
+rounding.
+
+### Pass 9. Pack two channels per thread in the FP16 gates
+
+Test `half2` loads, bias addition, and output multiplication for the two
+spatially local gates. Convert both lanes to float for the current SiLU
+expression and round back to FP16 before multiplication. The inverse
+Fourier gate still uses the existing per-pixel RMS reduction.
+
+All heuristic stress fixtures matched bitwise. The tuned page mean
+improved by only 0.16–0.19 ms/tile on each image, and the independently
+tuned sessions differed on all 242 outputs. Drop the packed
+gates. See `fp16-packed-heuristic` and `fp16-packed-tuned` in the paired
+reports.
+
+**Next pass**. Load all eight Fourier input channels for a pixel together.
+The planar extraction in the FP16 trace takes 2.79 ms/tile across the 24
+blocks, with each channel currently issuing its own strided reads.
+
+### Pass 10. Vectorize extraction of the Fourier input
+
+For FP16 and mixed, read the eight adjacent half channels in one aligned
+16-byte load per pixel. Add the bias and round at the same points as the
+scalar path before writing the FP32 cuFFT input in planar order. Keep the
+FFT plan and convolutions fixed for the parity screen.
+
+The scalar and vectorized paths produced bitwise-identical outputs on
+all 12 heuristic stress inputs in both modes, including the two
+rectangular shapes. With tuning enabled in both FP16 sessions, the
+paired 242-tile median fell from 44.203 to 42.322 ms (4.3%) and median
+image time from 3419.99 to 3285.25 ms. The independently tuned FP16
+sessions selected different plans and differed on all 242 outputs.
+With tuning and FP16 expansion accumulation enabled in both mixed
+sessions, the median fell from 50.861 to 48.790 ms/tile (4.1%) and from
+3919.08 to 3761.71 ms/image. All 242 mixed outputs matched bitwise.
+
+Retain the vectorized read for FP16 and mixed. It uses the same activation
+buffer, FFT input format, and rounding as the scalar path. See the
+`half-extract-heuristic`, `fp16-extract-tuned`, and `mixed-extract-tuned`
+paired reports under `output/figsr-session/`.
+
+Separate CUPTI traces put the new extraction at 0.63 ms/tile for FP16
+and 0.71 ms/tile for mixed with FP16 expansion, summed across 24 blocks.
+Convolutions remain the largest category at 25.17 ms and 31.50 ms per
+tile, respectively. See `pass10-fp16-profile.json` and
+`pass10-mixed-profile.json` under `output/figsr-session/`.
+
+**Next pass**. Screen a fused 32→160 expansion and identity gate using
+the GFISRv2 expansion epilogue as a starting point. FiGSR uses a 1×1
+expansion and dense spatial branches, so keep those branches on cuDNN
+and verify the intermediate half rounding before comparing the fused
+path. Put it behind a kernel option if it changes numeric behavior.
+
+### Pass 10 final metrics
+
+All four runs used `tune_convolutions=1`, batch 1, and fixed 256×256 tiles
+with zero overlap. Each run processed the same 242 tiles. Against the
+FP32 Torch reference, FP16 stayed within 0.02 dB PSNR and 0.03 mean
+SSIMULACRA2 of its scalar control. The two mixed runs reproduced the
+per-image PSNR and SSIMULACRA2 of their respective scalar runs in pass 6.
+
+| Tuned mode | Total ms | Median ms/image | Median ms/tile | Median page mean ms/tile | PSNR dB | Mean SSIMULACRA2 | NVML peak MiB | Peak increase MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| FP16 scalar control | 10799.62 | 3443.82 | 44.462 | 44.610 | 62.81 | 88.36 | 1424.69 | 126 |
+| FP16 vectorized | 10226.57 | 3254.48 | 42.050 | 42.266 | 62.82 | 88.33 | 1424.07 | 126 |
+| Mixed vectorized | 12913.53 | 4120.33 | 53.186 | 53.421 | 68.08 | 88.69 | 1424.07 | 126 |
+| Mixed vectorized, FP16 expansion | 11729.52 | 3729.79 | 48.335 | 48.439 | 64.64 | 88.54 | 1426.07 | 128 |
+
+| Tuned mode | Image | Image ms | Mean ms/tile | PSNR dB | SSIMULACRA2 | NVML peak MiB |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| FP16 scalar control | `9798855404661.jpg` | 3430.08 | 44.546 | 62.19 | 87.13 | 1424.69 |
+| FP16 scalar control | `9798855424195.jpg` | 3443.82 | 44.725 | 63.26 | 89.11 | 1424.69 |
+| FP16 scalar control | `9798855444216.jpg` | 3925.72 | 44.610 | 63.03 | 88.85 | 1424.07 |
+| FP16 vectorized | `9798855404661.jpg` | 3243.49 | 42.123 | 62.32 | 87.19 | 1424.07 |
+| FP16 vectorized | `9798855424195.jpg` | 3254.48 | 42.266 | 63.29 | 89.01 | 1424.07 |
+| FP16 vectorized | `9798855444216.jpg` | 3728.59 | 42.370 | 62.89 | 88.80 | 1424.07 |
+| Mixed vectorized | `9798855404661.jpg` | 4092.16 | 53.145 | 67.38 | 87.44 | 1424.07 |
+| Mixed vectorized | `9798855424195.jpg` | 4120.33 | 53.511 | 68.54 | 89.33 | 1424.07 |
+| Mixed vectorized | `9798855444216.jpg` | 4701.03 | 53.421 | 68.41 | 89.28 | 1424.07 |
+| Mixed vectorized, FP16 expansion | `9798855404661.jpg` | 3728.05 | 48.416 | 63.74 | 87.36 | 1426.07 |
+| Mixed vectorized, FP16 expansion | `9798855424195.jpg` | 3729.79 | 48.439 | 65.08 | 89.37 | 1426.07 |
+| Mixed vectorized, FP16 expansion | `9798855444216.jpg` | 4271.67 | 48.542 | 65.24 | 88.87 | 1426.07 |
+
+Reports live under `output/architecture-baselines/figsr/batch-1/`.
+Each `report.json` contains individual tile timings and the pre-setup
+NVML reading. Use `--tune-convolutions` for all rows and
+`--figsr-mixed-fp16-expand` for the last row. The vectorized path is
+selected automatically by a rebuilt native library for FP16 and mixed.
+
+- `native-fp16-pass10-fp16-control/report.json`
+- `native-fp16-pass10-fp16-vector/report.json`
+- `native-mixed-pass10-mixed-vector/report.json`
+- `native-mixed-pass10-mixed-vector-expand/report.json`
+
+The runtime smoke checks covered graph capture, direct CUDA execution,
+host I/O, alternate streams, odd-size batches, and minimum dimensions
+for all three modes and mixed with the new option. The benchmark CLI
+rejected the mixed-only flag with the FP16 backend.

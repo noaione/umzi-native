@@ -265,6 +265,10 @@ and can change rounding. By default FiGSR uses its heuristic plans.
 For FP32, `kernel_options={"fp32_nchw": 1}` uses NCHW for the expansion
 and projection inside each block. It can be combined with
 `tune_convolutions`.
+For mixed precision, `kernel_options={"fp16_expand_accumulation": 1}`
+speeds up the block expansion by accumulating in FP16. On the three
+FiGSR benchmark images it reduced latency and lowered PSNR against the
+Torch FP32 reference. It can be combined with `tune_convolutions`.
 See [FiGSR implementation and measurements](handoff-figsr.md).
 
 ## 5. Inspecting models and sessions
