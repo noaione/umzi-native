@@ -4,6 +4,32 @@
 
 Nothing yet!
 
+## [0.0.5] - 2026-11-25
+
+### Added
+
+- Native CUDA support (exporter, `peek_model()`, CUDA Graph and direct
+  sessions) for two new 2× upscaling model families:
+  - **SMoSR** (`fp32`/`mixed`/`fp16`): 2× direct pixel-shuffle network with
+    internal reflection padding, schema 2 FP32 weight storage (preserving
+    schema 1 compatibility for `mixed` and `fp16`), and `tune_convolutions`,
+    `fp16_accumulation`, and `fuse_silu` (with `smosr-silu_*.umplan` caching)
+    options.
+  - **FiGSR** (`fp32`/`mixed`/`fp16`): 2× direct pixel-shuffle network using
+    dynamic cuFFT 12 for FP32 Fourier transforms, fused tensor-core
+    expansion/gate (`fuse_expand_gate`) and row gate (`fuse_row_gate`) kernels,
+    plus `tune_convolutions`, `fp32_nchw`, and `fp16_expand_accumulation`
+    options.
+
+### Changed
+
+- Shared `native/common/cufft_api.h` dynamic cuFFT 12 loader across GFISRv2 and
+  FiGSR, and updated `SessionOptions(dll_dirs=...)` to preload cuFFT 12
+  automatically for FiGSR packages as well.
+- Extended `native/common/cudnn_conv_plan.h` with NCHW layout, grouped and
+  rectangular convolutions, strict FP32 numerical filtering, and fused bias +
+  SiLU graph support.
+
 ## [0.0.4] - 2026-11-23
 
 ### Changed
