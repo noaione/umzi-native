@@ -664,11 +664,17 @@ private:
             cuStreamSynchronize(stream);
             release_shape();
             throw;
-        } catch (const std::exception& error) {
+        } catch (const std::runtime_error& error) {
+            // Only runtime failures may trigger the fallback; bad_alloc and logic errors fall through to the rethrow below.
             cuStreamSynchronize(stream);
             release_shape();
             if (!fused_gate) throw;
-            disable_fused_gate(error.what());
+            const auto original = std::current_exception();
+            try {
+                disable_fused_gate(error.what());
+            } catch (...) {
+                std::rethrow_exception(original); // The fallback failed too; report the failure that started it.
+            }
             prepare(requested);
         } catch (...) {
             cuStreamSynchronize(stream);

@@ -440,7 +440,8 @@ class Session final : public umzi::KernelSession {
             cuStreamSynchronize(stream);
             release_shape();
             throw;
-        } catch (const std::exception& error) {
+        } catch (const std::runtime_error& error) {
+            // Only runtime failures may trigger the fallback; bad_alloc and logic errors fall through to the rethrow below.
             cuStreamSynchronize(stream);
             release_shape();
             if (!fuse_silu) throw;

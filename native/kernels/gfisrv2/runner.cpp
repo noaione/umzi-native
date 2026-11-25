@@ -899,11 +899,17 @@ private:
             cuStreamSynchronize(stream);
             release_shape();
             throw;
-        } catch (const std::exception& error) {
+        } catch (const std::runtime_error& error) {
+            // Only runtime failures may trigger the fallback; bad_alloc and logic errors fall through to the rethrow below.
             cuStreamSynchronize(stream);
             release_shape();
             if (!fused_conv || !reduced()) throw; // only the reduced-precision path has a fused layout
-            disable_fused_conv(error.what());
+            const auto original = std::current_exception();
+            try {
+                disable_fused_conv(error.what());
+            } catch (...) {
+                std::rethrow_exception(original); // The fallback failed too; report the failure that started it.
+            }
             prepare(requested);
         } catch (...) {
             cuStreamSynchronize(stream);
