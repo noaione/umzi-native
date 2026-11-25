@@ -131,7 +131,7 @@ extern "C" __global__ void finish_page(TileGrid grid, const float* sums, const f
         const float weight = weights[pixel];
         for (int channel = 0; channel < grid.output_channels; ++channel) {
             const Index index = pixel * grid.output_channels + channel;
-            store_pixel(output, index, sums[index] / weight, grid.raw);
+            store_pixel(output, index, weight > 0.f ? sums[index] / weight : 0.f, grid.raw); // uncovered pixel: 0, not 0/0
         }
     }
 }
@@ -153,7 +153,7 @@ extern "C" __global__ void finish_strip(TileGrid grid, float* sums, float* weigh
             weights[ring_pixel] = 0.f;
             for (int channel = 0; channel < grid.output_channels; ++channel) {
                 const Index from = ring_pixel * grid.output_channels + channel;
-                store_pixel(output, out_pixel * grid.output_channels + channel, sums[from] / weight, grid.raw);
+                store_pixel(output, out_pixel * grid.output_channels + channel, weight > 0.f ? sums[from] / weight : 0.f, grid.raw);
                 sums[from] = 0.f;
             }
         }
