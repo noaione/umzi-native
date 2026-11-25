@@ -3,6 +3,7 @@
 #include "tiling.h"
 
 #include <chrono>
+#include <cstddef>
 #include <limits>
 #include <string>
 
@@ -96,9 +97,31 @@ void check_buffers(const UmziIo& io, bool pointers, uint64_t input, uint64_t out
         throw std::runtime_error("Contiguous input and output require " + std::to_string(io.input.bytes)
             + " and " + std::to_string(io.output.bytes) + " bytes, respectively");
 }
+
+int run_tiled_page(UmziSession* session, uint32_t height, uint32_t width, const UmziTilingOptions* options,
+                   const uint8_t* input, uint64_t input_bytes, void* output, uint64_t output_bytes,
+                   bool variable) {
+    return report([&] {
+        auto& implementation = kernel(session);
+        if (!options || options->struct_size < offsetof(UmziTilingOptions, overlap_method))
+            throw std::runtime_error("Invalid Umzi tiling options");
+        const UmziTilingOptions settings{sizeof(UmziTilingOptions), options->tile_size, options->batch_size,
+            options->overlap, options->background, options->output_format,
+            options->struct_size >= sizeof(*options) ? options->overlap_method : uint32_t(UMZI_OVERLAP_LINEAR)};
+        umzi::OpenTileRunner open_edge;
+        if (variable) {
+            open_edge = [&] {
+                if (auto cloned = implementation.clone_shared()) return cloned;
+                return session->open_edge();
+            };
+        }
+        umzi::run_tiled(implementation, session->tiler, session->options.device, height, width,
+                        settings, input, input_bytes, output, output_bytes, open_edge);
+    });
+}
 }
 
-uint32_t umzi_abi_version() { return 1; }
+uint32_t umzi_abi_version() { return 2; }
 const char* umzi_error() { return error_text.c_str(); }
 int umzi_error_code() { return error_code; }
 
@@ -176,28 +199,13 @@ int umzi_session_enqueue(UmziSession* session, const UmziShape* shape,
 int umzi_session_run_tiled(UmziSession* session, uint32_t height, uint32_t width,
                            const UmziTilingOptions* options, const uint8_t* input,
                            uint64_t input_bytes, void* output, uint64_t output_bytes) {
-    return report([&] {
-        auto& implementation = kernel(session);
-        if (!options || options->struct_size < sizeof(*options))
-            throw std::runtime_error("Invalid Umzi tiling options");
-        umzi::run_tiled(implementation, session->tiler, session->options.device, height, width,
-                        *options, input, input_bytes, output, output_bytes);
-    });
+    return run_tiled_page(session, height, width, options, input, input_bytes, output, output_bytes, false);
 }
 
 int umzi_session_run_tiled_variable(UmziSession* session, uint32_t height, uint32_t width,
                                     const UmziTilingOptions* options, const uint8_t* input,
                                     uint64_t input_bytes, void* output, uint64_t output_bytes) {
-    return report([&] {
-        auto& implementation = kernel(session);
-        if (!options || options->struct_size < sizeof(*options))
-            throw std::runtime_error("Invalid Umzi tiling options");
-        umzi::run_tiled(implementation, session->tiler, session->options.device, height, width,
-                        *options, input, input_bytes, output, output_bytes, [&] {
-            if (auto cloned = implementation.clone_shared()) return cloned;
-            return session->open_edge();
-        });
-    });
+    return run_tiled_page(session, height, width, options, input, input_bytes, output, output_bytes, true);
 }
 
 int umzi_session_info(const UmziSession* session, UmziSessionInfo* info) {

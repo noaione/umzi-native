@@ -112,15 +112,25 @@ def smoke(backend: ModuleType, tiler: ModuleType, session: InferenceSession, til
         with Image.fromarray(array) as image:
             raw, quantized = cpu_raw(backend, tiler, image, session, tile, batch, overlap, background)
         result = session.run_tiled(
-            array, tile_size=tile, batch_size=batch, overlap=overlap, background=background, output_dtype=np.float32
+            array,
+            tile_size=tile,
+            batch_size=batch,
+            overlap=overlap,
+            overlap_method="linear",
+            background=background,
+            output_dtype=np.float32,
         )
-        rendered = session.run_tiled(array, tile_size=tile, batch_size=batch, overlap=overlap, background=background)
+        rendered = session.run_tiled(
+            array, tile_size=tile, batch_size=batch, overlap=overlap, overlap_method="linear", background=background
+        )
         np.testing.assert_allclose(result, raw, rtol=1e-6, atol=1e-6)
         assert np.max(np.abs(rendered.astype(np.int16) - quantized)) <= int(overlap != 0)
         rows.append({"size": [width, height], "overlap": overlap, "max_abs": float(np.max(np.abs(result - raw)))})
     for limit, blend, fill in ((batch, -1, "white"), (batch, tile, "white"), (0, 0, "other"), (1, 0, "other")):
         try:
-            session.run_tiled(array, tile_size=tile, batch_size=limit, overlap=blend, background=fill)
+            session.run_tiled(
+                array, tile_size=tile, batch_size=limit, overlap=blend, overlap_method="linear", background=fill
+            )
         except ValueError:
             continue
         raise AssertionError(f"Expected validation error for {limit}, {blend}, {fill}")
@@ -151,10 +161,18 @@ def variable_smoke(
                 backend, tiler, image, session, tile, batch, overlap, "white", policy, variable_spatial
             )
         actual = session.run_tiled(
-            pixels, tile_size=tile, batch_size=batch, overlap=overlap, tiling="variable", output_dtype=np.float32
+            pixels,
+            tile_size=tile,
+            batch_size=batch,
+            overlap=overlap,
+            tiling="variable",
+            overlap_method="linear",
+            output_dtype=np.float32,
         )
         np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
-        rendered = session.run_tiled(pixels, tile_size=tile, batch_size=batch, overlap=overlap, tiling="variable")
+        rendered = session.run_tiled(
+            pixels, tile_size=tile, batch_size=batch, overlap=overlap, tiling="variable", overlap_method="linear"
+        )
         assert np.max(np.abs(rendered.astype(np.int16) - quantized)) <= int(overlap != 0)
         rows.append({"size": [width, height], "overlap": overlap, "max_abs": float(np.max(np.abs(actual - expected)))})
     return rows
@@ -224,8 +242,10 @@ def quality(
     directory: Path,
 ) -> dict:
     src = np.asarray(image)
-    gpu_raw = session.run_tiled(src, tile_size=tile, batch_size=batch, overlap=overlap, output_dtype=np.float32)
-    gpu_image = session.run_tiled(src, tile_size=tile, batch_size=batch, overlap=overlap)
+    gpu_raw = session.run_tiled(
+        src, tile_size=tile, batch_size=batch, overlap=overlap, overlap_method="linear", output_dtype=np.float32
+    )
+    gpu_image = session.run_tiled(src, tile_size=tile, batch_size=batch, overlap=overlap, overlap_method="linear")
     cpu_values, cpu_image = cpu_raw(backend, tiler, image, session, tile, batch, overlap, "white")
     eager_values, eager_image = cpu_raw(backend, tiler, image, reference, tile, batch, overlap, "white")
     parity = comparison(np.moveaxis(gpu_raw, -1, 0), np.moveaxis(cpu_values, -1, 0))
@@ -269,7 +289,7 @@ def timed_pages(
     phases = {
         "cpu": lambda: cpu_page(backend, image, session, tile, batch, overlap, "white").close(),
         "gpu": lambda: Image.fromarray(
-            session.run_tiled(source, tile_size=tile, batch_size=batch, overlap=overlap)
+            session.run_tiled(source, tile_size=tile, batch_size=batch, overlap=overlap, overlap_method="linear")
         ).close(),
     }
     samples: dict[str, list[dict]] = {name: [] for name in phases}

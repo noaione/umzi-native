@@ -82,7 +82,15 @@ class DiagnosticABI(ctypes.Structure):
 class TilingABI(ctypes.Structure):
     _fields_ = [
         (name, ctypes.c_uint32)
-        for name in ("struct_size", "tile_size", "batch_size", "overlap", "background", "output_format")
+        for name in (
+            "struct_size",
+            "tile_size",
+            "batch_size",
+            "overlap",
+            "background",
+            "output_format",
+            "overlap_method",
+        )
     ]
 
 
@@ -112,7 +120,7 @@ def bind_session_api(dll: ctypes.CDLL) -> None:
         function = getattr(dll, name)
         function.argtypes = args
         function.restype = result
-    if dll.umzi_abi_version() != 1:
+    if dll.umzi_abi_version() not in (1, 2):
         raise OSError("Unsupported Umzi native ABI version")
     for name in ("umzi_session_run_tiled", "umzi_session_run_tiled_variable"):
         tiled = getattr(dll, name, None)

@@ -87,10 +87,12 @@ typedef struct UmziDiagnostic {
 } UmziDiagnostic;
 
 typedef enum UmziPageFormat { UMZI_PAGE_U8 = 0, UMZI_PAGE_FLOAT32 = 1 } UmziPageFormat;
+typedef enum UmziOverlapMethod { UMZI_OVERLAP_CENTERED = 0, UMZI_OVERLAP_LINEAR = 1 } UmziOverlapMethod;
 
 typedef struct UmziTilingOptions {
     uint32_t struct_size, tile_size, batch_size, overlap;
     uint32_t background, output_format;
+    uint32_t overlap_method;
 } UmziTilingOptions;
 
 UMZI_API uint32_t umzi_abi_version(void);

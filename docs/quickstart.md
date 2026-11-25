@@ -79,12 +79,15 @@ Image.fromarray(restored).save("output/restored-page.png")
 | --- | --- | --- |
 | `tile_size` | *(required)* | Square nominal tile edge in source pixels (`>= 1`). |
 | `batch_size` | *(required)* | Maximum tiles per GPU batch (`>= 1`). |
-| `overlap` | `0` | Shared source pixels between adjacent tiles (`0 <= overlap < tile_size - 2 * session.context`). `0` copies tiles directly; `> 0` replicates page edges and feathers overlaps in FP32. |
-| `tiling` | `"fixed"` | `"fixed"` keeps every batch at `(batch_size, 3, tile_size, tile_size)` using `background` padding at edges. `"variable"` trims/absorbs partial edge tiles and final batches to cut wasted pixel work. |
-| `background` | `"white"` | Out-of-bounds pad color for `"fixed"` tiling (`"white"` = `255`, `"black"` = `0`). |
+| `overlap` | `0` | Requested shared width in source pixels. `0` copies tiles directly. `"centered"` caps overlap at half the tile's output core in source pixels. `"linear"` requires overlap below the core size. |
+| `tiling` | `"fixed"` | `"fixed"` keeps every batch at `(batch_size, 3, tile_size, tile_size)`. `"variable"` adapts edge tile shapes and final batches. |
+| `overlap_method` | `"centered"` | `"centered"` blends across up to 16 source pixels at the center of each join. `"linear"` feathers across the full overlap. |
+| `background` | `"white"` | Out-of-bounds pad color when using fixed shapes with zero overlap and zero model context (`"white"` = `255`, `"black"` = `0`). |
 | `output_dtype` | `np.uint8` | `np.uint8` quantizes to RGB `[0, 255]` (using a ring-buffered FP32 strip accumulator when `overlap > 0`). `np.float32` returns raw unclipped FP32 stitched values. |
 
 - **`"fixed"` vs. `"variable"`:** `"variable"` caches up to three edge runners in an LRU cache sharing model weights and immutable CUDA/cuDNN handles with the main session, evicting runners automatically if VRAM gets tight. On **GateRV3 Original**, nominal `tile_size <= 128` keeps the fixed square spatial shape (adapting only the tail batch size), while larger tiles (`> 128`) and other families can shrink rectangular edge dimensions too. Keep the `.ummodel` file readable while the session is open.
+- **Centered overlap with fixed tiles:** The final tile sits flush with each far edge, and short axes are mirror-padded. Variable tiling uses its adaptive edge shapes and replicated padding with either overlap method. Both methods retain any context the model requires.
+- **Older native libraries:** Set `overlap_method="linear"` to use nonzero overlap with an ABI 1 library.
 - **Overlap memory:** With `overlap > 0` and `output_dtype=np.uint8`, the tiler keeps only a rolling strip of rows in FP32 instead of allocating a full-page FP32 accumulation buffer. Setting `output_dtype=np.float32` uses a full-page FP32 output buffer instead.
 
 See the [GPU tiling plan and measurements](gpu-tiling-plan.md) and [manga tiling benchmark](gaterv3-manga-tiling.md) for workload results.

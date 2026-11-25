@@ -246,15 +246,22 @@ class InferenceSession:
         batch_size: int,
         overlap: int = 0,
         tiling: Literal["fixed", "variable"] = "fixed",
+        overlap_method: Literal["centered", "linear"] = "centered",
         background: str = "white",
         output_dtype: type[np.uint8] | type[np.float32] = np.uint8,
     ) -> np.ndarray:
         """Restore a contiguous HWC uint8 image with CUDA tiles.
 
-        Overlap is the total shared width in source pixels. Float32 output
-        contains stitched values before clipping and quantization. Variable tiling
-        adapts edge shapes and uses replicated edge padding.
+        Overlap is the total shared width in source pixels. The default method
+        blends the center 16 source pixels of each join at most. With fixed
+        tiles, it also places the last tile flush and mirrors short axes.
+        Variable tiling adapts edge shapes and uses replicated edge padding.
+        Float32 output contains stitched values before clipping and quantization.
         """
+        if tiling not in ("fixed", "variable"):
+            raise ValueError("tiling must be 'fixed' or 'variable'")
+        if overlap_method not in ("centered", "linear"):
+            raise ValueError("overlap_method must be 'centered' or 'linear'")
         if not isinstance(image, np.ndarray) or image.dtype != np.uint8:
             raise TypeError("The GPU tiler expects a uint8 NumPy image")
         if image.ndim != 3 or not image.flags.c_contiguous or image.shape[2] != self._input.shape[1]:
@@ -269,13 +276,11 @@ class InferenceSession:
             min(height, width, tile_size, batch_size, scale) < 1
             or max(height, width, tile_size) * scale >= 2**31
             or batch_size >= 2**31
-            or not 0 <= overlap < tile_size - 2 * self.context
+            or not 0 <= overlap < (2**32 if overlap_method == "centered" else tile_size - 2 * self.context)
         ):
             raise ValueError("Invalid GPU tiling dimensions or overlap")
         if background not in ("white", "black"):
             raise ValueError("background must be 'white' or 'black'")
-        if tiling not in ("fixed", "variable"):
-            raise ValueError("tiling must be 'fixed' or 'variable'")
         dtype = np.dtype(output_dtype)
         if dtype not in (np.dtype(np.uint8), np.dtype(np.float32)):
             raise ValueError("output_dtype must be uint8 or float32")
@@ -286,15 +291,20 @@ class InferenceSession:
             overlap,
             255 if background == "white" else 0,
             int(dtype == np.dtype(np.float32)),
+            int(overlap_method == "linear"),
         )
 
         with self._lock:
             self._ensure_open()
-            symbol = "umzi_session_run_tiled_variable" if tiling == "variable" else "umzi_session_run_tiled"
+            symbol = "umzi_session_run_tiled" if tiling == "fixed" else f"umzi_session_run_tiled_{tiling}"
             tiled = getattr(self._dll, symbol, None)
             if tiled is None:
-                feature = "variable GPU tiling" if tiling == "variable" else "GPU tiling"
+                feature = "GPU tiling" if tiling == "fixed" else f"{tiling} GPU tiling"
                 raise RuntimeError(f"This Umzi native library does not support {feature}")
+            if overlap > 0 and overlap_method == "centered" and self._dll.umzi_abi_version() < 2:
+                raise RuntimeError(
+                    "Centered overlap requires a newer Umzi library. Use overlap_method='linear' with this build."
+                )
             restored = np.empty((height * scale, width * scale, output_channels), dtype=dtype)
             check_status(
                 self._dll,
