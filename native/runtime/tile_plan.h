@@ -89,6 +89,8 @@ inline TilePlan plan_tiles(const KernelSession& model, int height, int width, in
         best.calls = 1 + (useful - 1) / batch;
         const auto padded = align_tile(int64_t(tile) + constraints.internal_border, constraints.alignment);
         best.pixels = static_cast<long double>(best.calls * batch) * padded * padded;
+    } catch (const AllocationError&) {
+        throw; // Out of memory is not "no layout fits"; let the caller shrink the request.
     } catch (const std::runtime_error&) {
         // A smaller variable batch can fit even if the full nominal shape does not.
     }
@@ -109,6 +111,8 @@ inline TilePlan plan_tiles(const KernelSession& model, int height, int width, in
                     try {
                         candidate.groups[candidate.size++] = {y.first, x.first, y.count, x.count,
                                                                shape, model.describe(shape)};
+                    } catch (const AllocationError&) {
+                        throw;
                     } catch (const std::runtime_error&) {
                         valid = false;
                         continue;
