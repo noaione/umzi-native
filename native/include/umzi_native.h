@@ -97,6 +97,9 @@ UMZI_API uint32_t umzi_abi_version(void);
 UMZI_API const char* umzi_error(void);
 UMZI_API int umzi_error_code(void);
 // Caller initializes struct_size. Strings returned by the API belong to the session unless noted.
+// umzi_session_cache_message and umzi_session_kernel_message return a pointer that stays valid only until the
+// next call on the same session (including another message call); copy the text if it must outlive that.
+// umzi_error is per thread and valid until the next API call on that thread.
 UMZI_API UmziSession* umzi_session_open(const char* utf8_model, const UmziSessionOptions* options);
 UMZI_API void umzi_session_close(UmziSession* session);
 UMZI_API int umzi_session_model(const UmziSession* session, UmziModelInfo* info);

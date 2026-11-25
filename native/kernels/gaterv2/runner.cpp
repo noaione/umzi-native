@@ -1282,7 +1282,10 @@ public:
             pending = true; // Before the record, so teardown waits even if recording fails.
             CHECK(cuEventRecord(completed, selected));
         } catch (...) {
-            cuStreamSynchronize(selected);
+            if (const auto failure = umzi::drain_failure(selected); !failure.empty()) {
+                pending = true; // Keep teardown waiting for work that may still be running.
+                warn_option(failure);
+            }
             throw;
         }
     }

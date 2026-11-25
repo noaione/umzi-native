@@ -27,7 +27,7 @@ std::filesystem::path plan_path(const std::filesystem::path& directory, std::str
         name += digits[byte >> 4];
         name += digits[byte & 15];
     }
-    return directory / (name + ".umplan");
+    return long_path_safe(directory / (name + ".umplan"));
 }
 
 std::vector<char> read_plan(const std::filesystem::path& path, uint32_t family, uint32_t schema,

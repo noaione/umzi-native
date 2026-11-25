@@ -7,6 +7,8 @@
 #include <string>
 
 struct UmziSession {
+    // Declared before the tiler so it is destroyed after the cached edge sessions that were built from it.
+    mutable std::unique_ptr<umzi::ModelPackage> edge_package;
     std::unique_ptr<umzi::KernelSession> kernel;
     std::unique_ptr<umzi::PageTiler> tiler;
     double model_load_ms = 0;
@@ -16,9 +18,7 @@ struct UmziSession {
     std::string cache;
     std::vector<std::pair<std::string, int64_t>> kernel_options;
 
-    // Read and hashed once, on the first edge session, instead of once per edge session.
-    mutable std::unique_ptr<umzi::ModelPackage> edge_package;
-
+    // edge_package is read and hashed once, on the first edge session, instead of once per edge session.
     std::unique_ptr<umzi::KernelSession> open_edge() const {
         if (!edge_package) {
             auto loaded = std::make_unique<umzi::ModelPackage>(path);

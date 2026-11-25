@@ -355,6 +355,9 @@ class Session final : public umzi::KernelSession {
     uint64_t workspace_limit = default_workspace_mib << 20;
     bool accumulate_fp16 = false, fused_gate = true;
     // Weights repacked without fused_gate after a fallback; shared with clones.
+    // Ownership: Shared::weights frees the original fused upload; this frees the repack. `weights` points at
+    // whichever one is in use. Both must outlive every session that reads them, so keep this a shared_ptr
+    // that each session releases before it drops `shared`.
     std::shared_ptr<umzi::DeviceAllocation> unfused_weights;
     // Device memory in use (cuMemGetInfo) at shape setup, after workspace
     // allocation, after tuning, and after warmup/capture.
@@ -918,7 +921,10 @@ public:
             pending = true; // Before the record, so teardown waits even if recording fails.
             CHECK(cuEventRecord(complete, target));
         } catch (...) {
-            cuStreamSynchronize(target);
+            if (const auto failure = umzi::drain_failure(target); !failure.empty()) {
+                pending = true; // Keep teardown waiting for work that may still be running.
+                warn_option(failure);
+            }
             throw;
         }
     }

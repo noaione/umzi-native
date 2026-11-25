@@ -65,6 +65,15 @@ struct ContextScope {
     }
 };
 
+// Drains a stream after a failed launch. Returns a description when the drain itself failed (the work may still be
+// in flight, so the caller must keep waiting for it), and an empty string otherwise.
+inline std::string drain_failure(CUstream stream) {
+    const auto status = cuStreamSynchronize(stream);
+    if (status == CUDA_SUCCESS) return {};
+    return "Stream synchronize failed after an earlier error (CUDA status " + std::to_string(int(status))
+        + "); the batch may still be in flight";
+}
+
 // Balances cuDevicePrimaryCtxRetain at scope exit, even when the context can no longer be made current.
 struct PrimaryContextRelease {
     CUdevice device;

@@ -677,12 +677,16 @@ public:
             pending = true; // Before the record, so teardown waits even if recording fails.
             CHECK(cuEventRecord(complete, target));
         } catch (...) {
-            cuStreamSynchronize(target);
+            if (const auto failure = umzi::drain_failure(target); !failure.empty()) {
+                pending = true; // Keep teardown waiting for work that may still be running.
+                warn_option(failure);
+            }
             throw;
         }
     }
 
-    // True once a shape is prepared and at least one fused plan exists; before that, whatever was requested.
+    // A session-level summary, not a per-layer guarantee: true once a shape is prepared and at least one fused plan
+    // exists (some layers may still have fallen back); before that, whatever was requested.
     bool fusing() const {
         return fuse_silu && (plans.empty() || std::any_of(plans.begin(), plans.end(), [](const auto& plan) { return plan.first[3]; }));
     }

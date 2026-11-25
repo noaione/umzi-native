@@ -84,7 +84,9 @@ void submit_range(KernelSession& model, PageTiler& tiler, uint64_t begin, uint64
         int region_height = bottom_start - top + std::min(output_h, out_height - bottom_start);
         // A ring slot holds one row; rows still unfinished must fit in the strip or two rows would share a slot.
         if (committed_y && grid.strip_height > 0 && top + region_height - *committed_y > grid.strip_height)
-            throw std::runtime_error("GPU tiling strip is smaller than the rows still being blended");
+            throw std::runtime_error("GPU tiling strip of " + std::to_string(grid.strip_height)
+                                     + " rows is smaller than the " + std::to_string(top + region_height - *committed_y)
+                                     + " rows still being blended");
         void* blend_args[]{&grid, &tile_output, &sums, &weights, &first, &real, &left, &top,
                            &region_width, &region_height};
         constexpr unsigned threads = 256;

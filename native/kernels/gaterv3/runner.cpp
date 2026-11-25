@@ -153,7 +153,13 @@ struct TuningTimer {
         CHECK(cuStreamBeginCapture(stream, CU_STREAM_CAPTURE_MODE_THREAD_LOCAL));
         constexpr int launches = 8;
         bool captured = true;
-        for (int i = 0; i < launches && captured; ++i) captured = launch();
+        try {
+            for (int i = 0; i < launches && captured; ++i) captured = launch();
+        } catch (...) {
+            // An exception must not leave the stream in capture mode.
+            cuStreamEndCapture(stream, &graph.graph);
+            throw;
+        }
         auto status = cuStreamEndCapture(stream, &graph.graph);
         if (!captured || status != CUDA_SUCCESS) return bad_timing;
         if (cuGraphInstantiate(&graph.executable, graph.graph, 0) != CUDA_SUCCESS)
@@ -1286,7 +1292,10 @@ public:
             pending = true; // Before the record, so teardown waits even if recording fails.
             CHECK(cuEventRecord(completed, target));
         } catch (...) {
-            cuStreamSynchronize(target);
+            if (const auto failure = umzi::drain_failure(target); !failure.empty()) {
+                pending = true; // Keep teardown waiting for work that may still be running.
+                warn_option(failure);
+            }
             throw;
         }
     }

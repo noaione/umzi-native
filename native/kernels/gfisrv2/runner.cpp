@@ -471,6 +471,9 @@ class Session final : public umzi::KernelSession {
     CUdeviceptr weights = 0;
     size_t weight_bytes = 0;
     // Weights repacked without fused_conv after a fallback; shared with clones.
+    // Ownership: Shared::weights frees the original fused upload; this frees the repack. `weights` points at
+    // whichever one is in use. Both must outlive every session that reads them, so keep this a shared_ptr
+    // that each session releases before it drops `shared`.
     std::shared_ptr<umzi::DeviceAllocation> unfused_weights;
 
     Shape shape{};
@@ -1227,7 +1230,10 @@ public:
             pending = true; // Before the record, so teardown waits even if recording fails.
             CHECK(cuEventRecord(complete, target));
         } catch (...) {
-            cuStreamSynchronize(target);
+            if (const auto failure = umzi::drain_failure(target); !failure.empty()) {
+                pending = true; // Keep teardown waiting for work that may still be running.
+                warn_option(failure);
+            }
             throw;
         }
     }

@@ -118,6 +118,20 @@ inline void hash_driver_version(Sha256& hash) {
 #endif
 }
 
+// Windows only honours paths past MAX_PATH when they carry the \\?\ prefix (unless the process opted in to long
+// paths), so give long cache paths that form once, where they are built. Short paths and other platforms are unchanged.
+inline std::filesystem::path long_path_safe(const std::filesystem::path& path) {
+#ifdef _WIN32
+    if (path.native().size() < MAX_PATH || path.native().rfind(L"\\\\?\\", 0) == 0) return path;
+    auto full = std::filesystem::absolute(path).lexically_normal().make_preferred().native();
+    if (full.rfind(L"\\\\", 0) == 0) full.replace(0, 2, L"\\\\?\\UNC\\");
+    else full.insert(0, L"\\\\?\\");
+    return full;
+#else
+    return path;
+#endif
+}
+
 inline std::filesystem::path temporary_cache_path(const std::filesystem::path& directory) {
 #ifdef _WIN32
     // GetTempFileNameW rejects directories longer than MAX_PATH - 14, so name the file here.
