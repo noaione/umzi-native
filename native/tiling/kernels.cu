@@ -84,34 +84,42 @@ extern "C" __global__ void blend_tiles(TileGrid grid, const void* tiles, float* 
     const int overlap = grid.overlap * grid.scale, step = grid.step * grid.scale;
     const Index plane = Index(core_w) * core_h;
     const Index last = first + real - 1;
-    for (Index index = thread_index(); index < Index(region_width) * region_height; index += thread_stride()) {
-        const int x = left + index % region_width, y = top + index / region_width;
-        const int local_x = x - grid.column * step, local_y = y - grid.row * step;
-        const int x_min = local_x < core_w ? 0 : (local_x - core_w) / step + 1;
+    const int x0 = left + int(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int x_end = left + region_width;
+    const int x_stride = int(gridDim.x) * blockDim.x;
+    for (int dy_reg = int(blockIdx.y); dy_reg < region_height; dy_reg += int(gridDim.y)) {
+        const int y = top + dy_reg;
+        const int local_y = y - grid.row * step;
         const int y_min = max(local_y < core_h ? 0 : (local_y - core_h) / step + 1, int(first / grid.columns));
-        const int x_max = min(local_x / step, grid.columns - 1);
         const int y_max = min(min(local_y / step, grid.rows - 1), int(last / grid.columns));
-        const Index pixel = Index(y) * width + x;
-        for (int row = y_min; row <= y_max; ++row) {
-            const Index row_start = Index(row) * grid.columns;
-            const int start = row_start < first ? max(x_min, int(first - row_start)) : x_min;
-            const int end = min(x_max, int(min(last - row_start, Index(grid.columns - 1))));
-            const int dy = local_y - row * step, page_row = grid.row + row;
-            const float wy = feather(dy, min(core_h, height - page_row * step), overlap,
-                                     page_row > 0, page_row + 1 < grid.page_rows);
-            for (int column = start; column <= end; ++column) {
-                const int dx = local_x - column * step, page_column = grid.column + column;
-                const Index sample = row_start + column - first;
-                const Index source = sample * grid.output_channels * plane + Index(dy) * core_w + dx;
-                const float weight = wy * feather(dx, min(core_w, width - page_column * step), overlap,
-                                                  page_column > 0, page_column + 1 < grid.page_columns);
-                for (int channel = 0; channel < grid.output_channels; ++channel) {
-                    const Index from = source + plane * channel;
-                    const Index to = pixel * grid.output_channels + channel;
-                    const float value = load_tile(tiles, from, grid.output_half);
-                    sums[to] = __fadd_rn(sums[to], __fmul_rn(value, weight));
+        const int ring_y = grid.strip_height ? (y % grid.strip_height) : y;
+        const Index ring_row = Index(ring_y) * width;
+        for (int x = x0; x < x_end; x += x_stride) {
+            const int local_x = x - grid.column * step;
+            const int x_min = local_x < core_w ? 0 : (local_x - core_w) / step + 1;
+            const int x_max = min(local_x / step, grid.columns - 1);
+            const Index pixel = ring_row + x;
+            for (int row = y_min; row <= y_max; ++row) {
+                const Index row_start = Index(row) * grid.columns;
+                const int start = row_start < first ? max(x_min, int(first - row_start)) : x_min;
+                const int end = min(x_max, int(min(last - row_start, Index(grid.columns - 1))));
+                const int dy = local_y - row * step, page_row = grid.row + row;
+                const float wy = feather(dy, min(core_h, height - page_row * step), overlap,
+                                         page_row > 0, page_row + 1 < grid.page_rows);
+                for (int column = start; column <= end; ++column) {
+                    const int dx = local_x - column * step, page_column = grid.column + column;
+                    const Index sample = row_start + column - first;
+                    const Index source = sample * grid.output_channels * plane + Index(dy) * core_w + dx;
+                    const float weight = wy * feather(dx, min(core_w, width - page_column * step), overlap,
+                                                      page_column > 0, page_column + 1 < grid.page_columns);
+                    for (int channel = 0; channel < grid.output_channels; ++channel) {
+                        const Index from = source + plane * channel;
+                        const Index to = pixel * grid.output_channels + channel;
+                        const float value = load_tile(tiles, from, grid.output_half);
+                        sums[to] = __fadd_rn(sums[to], __fmul_rn(value, weight));
+                    }
+                    weights[pixel] += weight;
                 }
-                weights[pixel] += weight;
             }
         }
     }
@@ -124,6 +132,30 @@ extern "C" __global__ void finish_page(TileGrid grid, const float* sums, const f
         for (int channel = 0; channel < grid.output_channels; ++channel) {
             const Index index = pixel * grid.output_channels + channel;
             store_pixel(output, index, sums[index] / weight, grid.raw);
+        }
+    }
+}
+
+extern "C" __global__ void finish_strip(TileGrid grid, float* sums, float* weights, void* output,
+                                        int y_start, int rows) {
+    const int width = grid.width * grid.scale;
+    const int x0 = int(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int x_stride = int(gridDim.x) * blockDim.x;
+    for (int local_y = int(blockIdx.y); local_y < rows; local_y += int(gridDim.y)) {
+        const int y = y_start + local_y;
+        const int ring_y = grid.strip_height ? (y % grid.strip_height) : y;
+        const Index ring_row = Index(ring_y) * width;
+        const Index out_row = Index(y) * width;
+        for (int x = x0; x < width; x += x_stride) {
+            const Index ring_pixel = ring_row + x;
+            const Index out_pixel = out_row + x;
+            const float weight = weights[ring_pixel];
+            weights[ring_pixel] = 0.f;
+            for (int channel = 0; channel < grid.output_channels; ++channel) {
+                const Index from = ring_pixel * grid.output_channels + channel;
+                store_pixel(output, out_pixel * grid.output_channels + channel, sums[from] / weight, grid.raw);
+                sums[from] = 0.f;
+            }
         }
     }
 }

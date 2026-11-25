@@ -170,7 +170,10 @@ int umzi_session_run_tiled_variable(UmziSession* session, uint32_t height, uint3
         if (!options || options->struct_size < sizeof(*options))
             throw std::runtime_error("Invalid Umzi tiling options");
         umzi::run_tiled(implementation, session->tiler, session->options.device, height, width,
-                        *options, input, input_bytes, output, output_bytes, [&] { return session->open_edge(); });
+                        *options, input, input_bytes, output, output_bytes, [&] {
+            if (auto cloned = implementation.clone_shared()) return cloned;
+            return session->open_edge();
+        });
     });
 }
 

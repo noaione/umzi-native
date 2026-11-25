@@ -13,6 +13,7 @@ using umzi::ContextScope;
 #define CHECK(call) umzi::check((call), #call)
 
 constexpr int scale = 2, border = 4, features = 32, hidden = 80, fourier = 8, group_blocks = 12;
+constexpr int compact_expansion = 7 * fourier;
 constexpr int r2c = 0x2a, c2r = 0x2c;
 constexpr std::array<uint32_t, 11> configuration{3, 3, scale, border, 2, features, group_blocks, hidden, fourier, 13, 17};
 
@@ -142,6 +143,26 @@ constexpr std::array<const char*, KernelCount> names{
 enum Buffer { State, Normalized, Stem, Middle, Expanded, Values, Fourier, Complex, Spectral, SpectralWork, BufferCount };
 
 class Session final : public umzi::KernelSession {
+    struct Shared {
+        CUdevice device{};
+        CUcontext context = nullptr;
+        CUmodule module = nullptr;
+        cudnnHandle_t cudnn = nullptr;
+        std::shared_ptr<umzi::CufftApi> fft;
+        CUdeviceptr weights = 0;
+
+        ~Shared() {
+            if (!context || cuCtxPushCurrent(context) != CUDA_SUCCESS) return;
+            if (cudnn) cudnnDestroy(cudnn);
+            if (weights) cuMemFree(weights);
+            if (module) cuModuleUnload(module);
+            CUcontext previous;
+            cuCtxPopCurrent(&previous);
+            cuDevicePrimaryCtxRelease(device);
+        }
+    };
+    std::shared_ptr<Shared> shared = std::make_shared<Shared>();
+
     Network net;
     bool fp16 = false, fp32 = false, graph = false, pending = false;
     bool tune_convolutions = false, fp32_nchw = false, fp16_expand_accumulation = false;
@@ -153,7 +174,7 @@ class Session final : public umzi::KernelSession {
     CUevent complete = nullptr;
     std::array<CUevent, 2> tuning_events{};
     cudnnHandle_t cudnn = nullptr;
-    std::unique_ptr<umzi::CufftApi> fft;
+    std::shared_ptr<umzi::CufftApi> fft;
     std::array<int, 2> fft_plans{};
     std::array<bool, 2> fft_created{};
     std::array<CUfunction, KernelCount> functions{};
@@ -172,6 +193,13 @@ class Session final : public umzi::KernelSession {
 
     size_t rgb_bytes(Shape input) const { return size_t(input.pixels()) * 3 * (fp16 ? 2 : 4); }
     size_t element_bytes() const { return fp32 ? sizeof(float) : sizeof(uint16_t); }
+
+    void ensure_staging() {
+        if (stage_in) return;
+        const size_t input_bytes = rgb_bytes(shape);
+        CHECK(cuMemAlloc(&stage_in, input_bytes));
+        CHECK(cuMemAlloc(&stage_out, input_bytes * scale * scale));
+    }
 
     void wait() {
         if (!pending) return;
@@ -192,8 +220,14 @@ class Session final : public umzi::KernelSession {
             if (*pointer) cuMemFree(*pointer);
             *pointer = 0;
         }
-        for (auto& pointer : buffers) if (pointer) cuMemFree(pointer);
-        buffers.fill(0);
+        for (size_t i = 0; i < BufferCount; ++i) {
+            if (fuse_expand_gate && i == Values) {
+                buffers[i] = 0;
+                continue;
+            }
+            if (buffers[i]) cuMemFree(buffers[i]);
+            buffers[i] = 0;
+        }
         shape = {};
         activation_bytes = conv_bytes = fft_bytes = 0;
         fp32_fallbacks = 0;
@@ -377,22 +411,30 @@ class Session final : public umzi::KernelSession {
                        area, pixels, ortho);
             else
                 launch(target, Inverse, fourier_count, b[Values], b[Fourier], inverse_norm, b[Expanded], expand_bias,
-                       area, pixels, ortho, fp16, fp32);
+                       area, pixels, ortho, fp16, fp32, fuse_expand_gate);
 
             int offset = hidden - 3 * fourier;
             // Both Fourier staging buffers are dead after the inverse gate.
             for (const auto* filter : {&block.square, &block.row, &block.column}) {
                 const int count = pixels * fourier;
-                launch_body(target, SplitSpatial, SplitSpatialNchw, count, area, b[Spectral], b[Expanded], expand_bias,
-                            offset, count);
+                if (fp32_nchw)
+                    launch(target, SplitSpatialNchw, count, b[Spectral], b[Expanded], expand_bias, offset, count, area);
+                else
+                    launch(target, SplitSpatial, count, b[Spectral], b[Expanded], expand_bias, offset, count, fp16, fp32,
+                           fuse_expand_gate);
                 if (fuse_row_gate && filter == &block.row) {
                     const int threads = 32 * ((spatial.w + 15) / 16) * spatial.h * spatial.n;
                     launch(target, RowConvGate, threads, b[Values], b[Spectral], weights + filter->weight,
-                           weights + filter->bias, b[Expanded], expand_bias, spatial.w, spatial.h * spatial.n, offset);
+                           weights + filter->bias, b[Expanded], expand_bias, spatial.w, spatial.h * spatial.n, offset,
+                           fuse_expand_gate);
                 } else {
                     conv(b[Fourier], b[Spectral], *filter, spatial);
-                    launch_body(target, GateSpatial, GateSpatialNchw, count, area, b[Values], b[Fourier], weights + filter->bias,
-                                b[Expanded], expand_bias, offset, count);
+                    if (fp32_nchw)
+                        launch(target, GateSpatialNchw, count, b[Values], b[Fourier], weights + filter->bias,
+                               b[Expanded], expand_bias, offset, count, area);
+                    else
+                        launch(target, GateSpatial, count, b[Values], b[Fourier], weights + filter->bias,
+                               b[Expanded], expand_bias, offset, count, fp16, fp32, fuse_expand_gate);
                 }
                 offset += fourier;
             }
@@ -434,17 +476,17 @@ class Session final : public umzi::KernelSession {
             const size_t fft_output = size_t(frequency.pixels()) * fourier * 2 * sizeof(float);
             const std::array<size_t, BufferCount> bytes{
                 features * image, features * image, features * image, features * image,
-                2 * hidden * image, hidden * image, fft_input, fft_output,
-                2 * fourier * spectrum, 2 * fourier * spectrum};
+                fuse_expand_gate ? (compact_expansion + hidden) * image : 2 * hidden * image,
+                fuse_expand_gate ? size_t(0) : hidden * image,
+                fft_input, fft_output, 2 * fourier * spectrum, 2 * fourier * spectrum};
             auto start = umzi::Clock::now();
             device_used[0] = umzi::device_used_bytes();
             for (size_t i = 0; i < bytes.size(); ++i) {
+                if (!bytes[i]) continue;
                 CHECK(cuMemAlloc(&buffers[i], bytes[i]));
                 activation_bytes += bytes[i];
             }
-            const size_t input_bytes = rgb_bytes(requested);
-            CHECK(cuMemAlloc(&stage_in, input_bytes));
-            CHECK(cuMemAlloc(&stage_out, input_bytes * scale * scale));
+            if (fuse_expand_gate) buffers[Values] = buffers[Expanded] + compact_expansion * image;
             device_used[1] = umzi::device_used_bytes();
             setup_ms[0] = umzi::elapsed_ms(start);
 
@@ -471,13 +513,14 @@ class Session final : public umzi::KernelSession {
             device_used[2] = umzi::device_used_bytes();
             setup_ms[1] = umzi::elapsed_ms(start);
 
-            start = umzi::Clock::now();
             shape = requested;
-            CHECK(cuMemsetD8Async(stage_in, 0, input_bytes, stream));
-            forward(stage_in, stage_out, stream);
-            CHECK(cuStreamSynchronize(stream));
-            setup_ms[2] = umzi::elapsed_ms(start);
             if (graph) {
+                start = umzi::Clock::now();
+                ensure_staging();
+                CHECK(cuMemsetD8Async(stage_in, 0, rgb_bytes(requested), stream));
+                forward(stage_in, stage_out, stream);
+                CHECK(cuStreamSynchronize(stream));
+                setup_ms[2] = umzi::elapsed_ms(start);
                 start = umzi::Clock::now();
                 umzi::capture_cuda_graph(stream, executable, [&] { forward(stage_in, stage_out, stream); });
                 setup_ms[3] = umzi::elapsed_ms(start);
@@ -549,7 +592,7 @@ public:
         CHECK(cuDeviceGet(&device, options.device));
         CHECK(cuDevicePrimaryCtxRetain(&context, device));
         ContextScope scope(context);
-        fft = std::make_unique<umzi::CufftApi>();
+        fft = std::make_shared<umzi::CufftApi>();
         umzi::load_kernel_module(device, module, figsr_images::embedded_cubins, figsr_images::embedded_ptx);
         for (size_t i = 0; i < names.size(); ++i) CHECK(cuModuleGetFunction(&functions[i], module, names[i]));
         CHECK(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
@@ -567,24 +610,54 @@ public:
             const auto packed = net.half_weights(Network{}, data);
             CHECK(cuMemcpyHtoD(weights, packed.data(), packed.size()));
         }
+        shared->device = device;
+        shared->context = context;
+        shared->module = module;
+        shared->cudnn = cudnn;
+        shared->fft = fft;
+        shared->weights = weights;
     }
 
     ~Session() override {
-        if (!context) return;
-        if (cuCtxPushCurrent(context) == CUDA_SUCCESS) {
+        if (context && cuCtxPushCurrent(context) == CUDA_SUCCESS) {
             if (pending) cuEventSynchronize(complete);
             if (stream) cuStreamSynchronize(stream);
             release_shape();
-            if (weights) cuMemFree(weights);
-            if (cudnn) cudnnDestroy(cudnn);
             if (complete) cuEventDestroy(complete);
             for (auto event : tuning_events) if (event) cuEventDestroy(event);
             if (stream) cuStreamDestroy(stream);
-            if (module) cuModuleUnload(module);
             CUcontext previous;
             cuCtxPopCurrent(&previous);
         }
-        cuDevicePrimaryCtxRelease(device);
+        fft.reset();
+        shared.reset();
+    }
+
+    std::unique_ptr<umzi::KernelSession> clone_shared() const override {
+        auto copy = std::make_unique<Session>();
+        copy->shared = shared;
+        copy->net = net;
+        copy->fp16 = fp16;
+        copy->fp32 = fp32;
+        copy->graph = graph;
+        copy->tune_convolutions = tune_convolutions;
+        copy->fp32_nchw = fp32_nchw;
+        copy->fp16_expand_accumulation = fp16_expand_accumulation;
+        copy->fuse_row_gate = fuse_row_gate;
+        copy->fuse_expand_gate = fuse_expand_gate;
+        copy->device = device;
+        copy->context = context;
+        copy->module = module;
+        copy->cudnn = cudnn;
+        copy->fft = fft;
+        copy->functions = functions;
+        copy->weights = weights;
+        ContextScope scope(context);
+        CHECK(cuStreamCreate(&copy->stream, CU_STREAM_NON_BLOCKING));
+        CHECK(cuEventCreate(&copy->complete, CU_EVENT_DISABLE_TIMING));
+        if (tune_convolutions)
+            for (auto& event : copy->tuning_events) CHECK(cuEventCreate(&event, CU_EVENT_DEFAULT));
+        return copy;
     }
 
     UmziModelInfo model_info() const override { return {sizeof(UmziModelInfo), "figsr", scale, 0}; }
@@ -613,6 +686,7 @@ public:
     void run_host(const UmziShape& request, const void* input, void* output) override {
         ContextScope scope(context);
         prepare(checked(request));
+        ensure_staging();
         const auto bytes = rgb_bytes(shape);
         try {
             CHECK(cuMemcpyHtoDAsync(stage_in, input, bytes, stream));
@@ -661,7 +735,7 @@ public:
             info.prepared_input = shape.padded().nchw();
             info.buffer_bytes[1] = activation_bytes;
             info.buffer_bytes[2] = conv_bytes + fft_bytes;
-            info.buffer_bytes[3] = rgb_bytes(shape) * (1 + scale * scale);
+            info.buffer_bytes[3] = stage_in ? rgb_bytes(shape) * (1 + scale * scale) : 0;
             std::copy(setup_ms.begin(), setup_ms.end(), info.shape_setup_ms);
             std::copy(device_used.begin(), device_used.end(), info.startup_device_used_bytes);
         }

@@ -129,7 +129,8 @@ __device__ void local16(half2* out, const half2* in, const half2* weight,
 
 template<int channels, int square>
 __device__ void inception16_pair(half2* out, const half2* in, const half2* weight,
-                                  const half2* bias, int total, int h = square, int w = square) {
+                                  const half2* bias, int total, int h = square, int w = square,
+                                  bool inplace = false) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= total) return;
     constexpr int hidden = channels * 3 / 2, stride = channels * 3, band = channels / 8;
@@ -161,14 +162,16 @@ __device__ void inception16_pair(half2* out, const half2* in, const half2* weigh
             }
         }
     }
-    out[i] = __hmul2(mish16_pair(in[pixel * stride + c]), v);
+    out[inplace ? (pixel * stride + c) : i] = __hmul2(mish16_pair(in[pixel * stride + c]), v);
 }
 
 #define SPATIAL16(C, W) \
 extern "C" __global__ void local_gate16_##C(half2* y, const half2* x, const half2* k, \
                                             const half2* b, int n) { local16<C, W>(y, x, k, b, n); } \
 extern "C" __global__ void inception16_##C(half2* y, const half2* x, const half2* k, \
-                                            const half2* b, int n) { inception16_pair<C / 2, W>(y, x, k, b, n); }
+                                            const half2* b, int inplace, int n) { \
+    inception16_pair<C / 2, W>(y, x, k, b, n, W, W, inplace != 0); \
+}
 SPATIAL16(32, 128)
 SPATIAL16(64, 64)
 SPATIAL16(128, 32)
@@ -178,7 +181,9 @@ SPATIAL16(256, 16)
 extern "C" __global__ void local_gate16_##C##_dynamic(half2* y, const half2* x, const half2* k, \
     const half2* b, int h, int w, int total) { local16<C, 0>(y, x, k, b, total, h, w); } \
 extern "C" __global__ void inception16_##C##_dynamic(half2* y, const half2* x, const half2* k, \
-    const half2* b, int h, int w, int total) { inception16_pair<C / 2, 0>(y, x, k, b, total, h, w); }
+    const half2* b, int h, int w, int inplace, int total) { \
+    inception16_pair<C / 2, 0>(y, x, k, b, total, h, w, inplace != 0); \
+}
 SPATIAL16_DYNAMIC(32)
 SPATIAL16_DYNAMIC(64)
 SPATIAL16_DYNAMIC(128)

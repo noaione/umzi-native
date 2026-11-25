@@ -3,6 +3,7 @@
 
 namespace {
 constexpr int border = 4, scale = 2, fourier = 8, hidden = 80, expansion = 2 * hidden;
+constexpr int compact_base = hidden - 4 * fourier, compact_expansion = 7 * fourier;
 
 __device__ float round_half(float value, bool fp16) {
     return fp16 ? __half2float(__float2half_rn(value)) : value;
@@ -44,8 +45,14 @@ __device__ int planar_index(int pixel, int channel, int channels, int area) {
     return (pixel / area * channels + channel) * area + pixel % area;
 }
 
-__device__ float gate_value(const void* expanded, const float* bias, int pixel, int lane, bool fp16, bool fp32) {
-    const float g = biased_value(expanded, pixel * expansion + lane, bias[lane], fp16, fp32);
+__device__ int expanded_index(int pixel, int lane, bool compact) {
+    if (!compact) return pixel * expansion + lane;
+    return pixel * compact_expansion + (lane < hidden ? lane - compact_base : lane - hidden - compact_base + 3 * fourier);
+}
+
+__device__ float gate_value(const void* expanded, const float* bias, int pixel, int lane, bool fp16, bool fp32,
+                            bool compact = false) {
+    const float g = biased_value(expanded, expanded_index(pixel, lane, compact), bias[lane], fp16, fp32);
     return round_half(g / (1.f + expf(-g)), fp16);
 }
 
@@ -134,16 +141,16 @@ __device__ void expand_gate(half* expanded, half* values, float* fft, const half
                 *reinterpret_cast<half2*>(values + pixel * hidden + c) =
                     __floats2half2_rn(apply_gate(c, g.x, v.x), apply_gate(c + 1, g.y, v.y));
             } else {
-                auto* out = reinterpret_cast<half2*>(expanded + pixel * expansion + c);
+                constexpr int first = compact_base;
+                auto* out = reinterpret_cast<half2*>(expanded + pixel * compact_expansion + (c - first));
                 out[0] = __floats2half2_rn(g.x, g.y);
-                constexpr int first = hidden - 4 * fourier;
                 if (c < first + fourier) {
                     const int area = h * w;
                     float* plane = fft + (image * fourier + c - first) * area + y * w + x;
                     plane[0] = expansion_bias(v.x, bias[hidden + c], half_pointwise);
                     plane[area] = expansion_bias(v.y, bias[hidden + c + 1], half_pointwise);
                 } else {
-                    out[hidden / 2] = __floats2half2_rn(v.x, v.y);
+                    out[(3 * fourier) / 2] = __floats2half2_rn(v.x, v.y);
                 }
             }
         }
@@ -243,26 +250,26 @@ extern "C" __global__ void extract_fourier_half(float* dst, const uint4* expande
 }
 
 extern "C" __global__ void split_spatial(void* dst, const void* expanded, const float* bias,
-                                         int offset, int count, bool fp16, bool fp32) {
+                                         int offset, int count, bool fp16, bool fp32, bool compact) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
     const int lane = hidden + offset + i % fourier;
-    write_scalar(dst, i, biased_value(expanded, i / fourier * expansion + lane, bias[lane], fp16, fp32), fp32);
+    write_scalar(dst, i, biased_value(expanded, expanded_index(i / fourier, lane, compact), bias[lane], fp16, fp32), fp32);
 }
 
 extern "C" __global__ void gate_spatial(void* dst, const void* source, const float* bias,
                                         const void* expanded, const float* expanded_bias,
-                                        int offset, int count, bool fp16, bool fp32) {
+                                        int offset, int count, bool fp16, bool fp32, bool compact) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
     const int p = i / fourier, lane = offset + i % fourier;
     const float value = biased_value(source, i, bias[i % fourier], fp16, fp32);
-    write_scalar(dst, p * hidden + lane, value * gate_value(expanded, expanded_bias, p, lane, fp16, fp32), fp32);
+    write_scalar(dst, p * hidden + lane, value * gate_value(expanded, expanded_bias, p, lane, fp16, fp32, compact), fp32);
 }
 
 extern "C" __global__ void row_conv_gate(half* dst, const uint4* source, const unsigned* weight,
                                          const float* bias, const half* expanded, const float* expanded_bias,
-                                         int width, int rows, int offset) {
+                                         int width, int rows, int offset, bool compact) {
     constexpr int tile = 16, taps = 17, window = tile + taps - 1;
     __shared__ __align__(16) uint4 staging[8][window + 1];
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
@@ -297,8 +304,8 @@ extern "C" __global__ void row_conv_gate(half* dst, const uint4* source, const u
         const float left = round_half(round_half(result.x, true) + bias[channel], true);
         const float right = round_half(round_half(result.y, true) + bias[channel + 1], true);
         const int gate = offset + channel;
-        dst[p * hidden + gate] = __float2half_rn(left * gate_value(expanded, expanded_bias, p, gate, false, false));
-        dst[p * hidden + gate + 1] = __float2half_rn(right * gate_value(expanded, expanded_bias, p, gate + 1, false, false));
+        dst[p * hidden + gate] = __float2half_rn(left * gate_value(expanded, expanded_bias, p, gate, false, false, compact));
+        dst[p * hidden + gate + 1] = __float2half_rn(right * gate_value(expanded, expanded_bias, p, gate + 1, false, false, compact));
     }
 }
 
@@ -329,14 +336,15 @@ extern "C" __global__ void spectrum_gelu(float2* dst, const void* source, const 
 
 extern "C" __global__ void inverse_norm(void* dst, const float* source, const float* parameters,
                                         const void* expanded, const float* expanded_bias,
-                                        int area, int pixels, float ortho, bool fp16, bool fp32) {
+                                        int area, int pixels, float ortho, bool fp16, bool fp32, bool compact) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const int p = i / fourier, lane = i % fourier;
     if (p >= pixels) return;
     const float value = round_half(source[(p / area * fourier + lane) * area + p % area] * ortho, fp16);
     const float normalized = round_half(normalize<fourier>(value, parameters, fp16), !fp32);
     const int channel = hidden - 4 * fourier + lane;
-    write_scalar(dst, p * hidden + channel, normalized * gate_value(expanded, expanded_bias, p, channel, fp16, fp32), fp32);
+    write_scalar(dst, p * hidden + channel,
+                 normalized * gate_value(expanded, expanded_bias, p, channel, fp16, fp32, compact), fp32);
 }
 
 extern "C" __global__ void gate_identity(void* dst, const void* expanded, const float* bias,

@@ -114,6 +114,25 @@ constexpr std::array<int, BufferCount> buffer_offsets{
     saved_offset};
 
 class Session final : public umzi::KernelSession {
+    struct Shared {
+        CUdevice device{};
+        CUcontext context = nullptr;
+        CUmodule module = nullptr;
+        cudnnHandle_t cudnn = nullptr;
+        CUdeviceptr weights = 0;
+
+        ~Shared() {
+            if (!context || cuCtxPushCurrent(context) != CUDA_SUCCESS) return;
+            if (cudnn) cudnnDestroy(cudnn);
+            if (weights) cuMemFree(weights);
+            if (module) cuModuleUnload(module);
+            CUcontext previous;
+            cuCtxPopCurrent(&previous);
+            cuDevicePrimaryCtxRelease(device);
+        }
+    };
+    std::shared_ptr<Shared> shared = std::make_shared<Shared>();
+
     Network net;
     bool fp16 = false, fp32 = false, graph = false, pending = false;
     CUdevice device{};
@@ -368,9 +387,6 @@ class Session final : public umzi::KernelSession {
             CHECK(cuMemAlloc(&arena, activation_bytes));
             for (size_t i = 0; i < buffer.size(); ++i)
                 buffer[i] = arena + lane_bytes * buffer_offsets[i];
-            const size_t input_bytes = rgb_bytes(requested);
-            CHECK(cuMemAlloc(&stage_in, input_bytes));
-            CHECK(cuMemAlloc(&stage_out, input_bytes * scale * scale));
             device_used[1] = umzi::device_used_bytes();
             setup_ms[0] = umzi::elapsed_ms(start);
 
@@ -399,13 +415,14 @@ class Session final : public umzi::KernelSession {
             device_used[2] = umzi::device_used_bytes();
             setup_ms[1] = umzi::elapsed_ms(start);
 
-            start = umzi::Clock::now();
             shape = requested;
-            CHECK(cuMemsetD8Async(stage_in, 0, input_bytes, stream));
-            forward(stage_in, stage_out, stream);
-            CHECK(cuStreamSynchronize(stream));
-            setup_ms[2] = umzi::elapsed_ms(start);
             if (graph) {
+                start = umzi::Clock::now();
+                ensure_staging();
+                CHECK(cuMemsetD8Async(stage_in, 0, rgb_bytes(requested), stream));
+                forward(stage_in, stage_out, stream);
+                CHECK(cuStreamSynchronize(stream));
+                setup_ms[2] = umzi::elapsed_ms(start);
                 start = umzi::Clock::now();
                 umzi::capture_cuda_graph(stream, executable, [&] { forward(stage_in, stage_out, stream); });
                 setup_ms[3] = umzi::elapsed_ms(start);
@@ -520,24 +537,53 @@ public:
             launch(stream, InitActivations, half_values, weights + net.bytes);
             CHECK(cuStreamSynchronize(stream));
         }
+        shared->device = device;
+        shared->context = context;
+        shared->module = module;
+        shared->cudnn = cudnn;
+        shared->weights = weights;
     }
 
     ~Session() override {
-        if (!context) return;
-        if (cuCtxPushCurrent(context) == CUDA_SUCCESS) {
+        if (context && cuCtxPushCurrent(context) == CUDA_SUCCESS) {
             if (pending) cuEventSynchronize(complete);
             if (stream) cuStreamSynchronize(stream);
             release_shape();
-            if (weights) cuMemFree(weights);
-            if (cudnn) cudnnDestroy(cudnn);
             if (complete) cuEventDestroy(complete);
             for (auto event : timing) if (event) cuEventDestroy(event);
             if (stream) cuStreamDestroy(stream);
-            if (module) cuModuleUnload(module);
             CUcontext previous;
             cuCtxPopCurrent(&previous);
         }
-        cuDevicePrimaryCtxRelease(device);
+        shared.reset();
+    }
+
+    std::unique_ptr<umzi::KernelSession> clone_shared() const override {
+        auto copy = std::make_unique<Session>();
+        copy->shared = shared;
+        copy->net = net;
+        copy->fp16 = fp16;
+        copy->fp32 = fp32;
+        copy->graph = graph;
+        copy->device = device;
+        copy->context = context;
+        copy->module = module;
+        copy->cudnn = cudnn;
+        copy->functions = functions;
+        copy->weights = weights;
+        copy->tune_convolutions = tune_convolutions;
+        copy->fp16_accumulation = fp16_accumulation;
+        copy->fuse_silu = fuse_silu;
+        copy->cache_dir = cache_dir;
+        copy->cache_environment = cache_environment;
+        copy->cache_status = cache_status;
+        copy->cache_diagnostic = cache_diagnostic;
+        ContextScope scope(context);
+        CHECK(cuStreamCreate(&copy->stream, CU_STREAM_NON_BLOCKING));
+        CHECK(cuEventCreate(&copy->complete, CU_EVENT_DISABLE_TIMING));
+        if (tune_convolutions || fuse_silu)
+            for (auto& event : copy->timing) CHECK(cuEventCreate(&event, CU_EVENT_DEFAULT));
+        return copy;
     }
 
     UmziModelInfo model_info() const override { return {sizeof(UmziModelInfo), "smosr", scale, 0}; }
@@ -563,9 +609,17 @@ public:
         prepare(checked(request));
     }
 
+    void ensure_staging() {
+        if (stage_in) return;
+        const auto bytes = rgb_bytes(shape);
+        CHECK(cuMemAlloc(&stage_in, bytes));
+        CHECK(cuMemAlloc(&stage_out, bytes * scale * scale));
+    }
+
     void run_host(const UmziShape& request, const void* input, void* output) override {
         ContextScope scope(context);
         prepare(checked(request));
+        ensure_staging();
         const auto bytes = rgb_bytes(shape);
         try {
             CHECK(cuMemcpyHtoDAsync(stage_in, input, bytes, stream));
@@ -620,7 +674,7 @@ public:
             info.prepared_input = shape.padded().nchw();
             info.buffer_bytes[1] = activation_bytes;
             info.buffer_bytes[2] = workspace_bytes;
-            info.buffer_bytes[3] = rgb_bytes(shape) * (1 + scale * scale);
+            info.buffer_bytes[3] = stage_in ? rgb_bytes(shape) * (1 + scale * scale) : 0;
             std::copy(setup_ms.begin(), setup_ms.end(), info.shape_setup_ms);
             std::copy(device_used.begin(), device_used.end(), info.startup_device_used_bytes);
         }

@@ -272,6 +272,28 @@ public:
     CUcontext context = nullptr;
     CUmodule module = nullptr;
     std::array<CUfunction, KernelCount> functions{};
+    struct Shared {
+        CUdevice device = 0;
+        CUcontext context = nullptr;
+        CUmodule module = nullptr;
+        CUdeviceptr weights = 0, half_weights = 0;
+        cudnnHandle_t cudnn = nullptr;
+        cublasLtHandle_t blas = nullptr;
+
+        ~Shared() {
+            if (!context || cuCtxPushCurrent(context) != CUDA_SUCCESS) return;
+            if (cudnn) cudnnDestroy(cudnn);
+            if (blas) cublasLtDestroy(blas);
+            if (weights) cuMemFree(weights);
+            if (half_weights) cuMemFree(half_weights);
+            if (module) cuModuleUnload(module);
+            CUcontext previous;
+            cuCtxPopCurrent(&previous);
+            cuDevicePrimaryCtxRelease(device);
+        }
+    };
+    std::shared_ptr<Shared> shared = std::make_shared<Shared>();
+
     CUdeviceptr weights = 0, half_weights = 0;
     CUstream stream = nullptr;
     CUevent completed = nullptr;
@@ -347,6 +369,13 @@ public:
         CHECK(cudnnCreate(&cudnn));
         CHECK(cublasLtCreate(&blas));
         upload_weights(data, package_offsets);
+        shared->device = device;
+        shared->context = context;
+        shared->module = module;
+        shared->weights = weights;
+        shared->half_weights = half_weights;
+        shared->cudnn = cudnn;
+        shared->blas = blas;
         initialize_cache(options.cache_dir, package.digest, image);
     }
 
@@ -506,20 +535,47 @@ public:
     }
 
     ~GateRV2Session() override {
-        if (!context || cuCtxPushCurrent(context) != CUDA_SUCCESS) return;
-        if (pending) cuEventSynchronize(completed);
-        if (stream) cuStreamSynchronize(stream);
-        release_shape();
-        if (cudnn) cudnnDestroy(cudnn);
-        if (blas) cublasLtDestroy(blas);
-        if (completed) cuEventDestroy(completed);
-        if (stream) cuStreamDestroy(stream);
-        if (weights) cuMemFree(weights);
-        if (half_weights) cuMemFree(half_weights);
-        if (module) cuModuleUnload(module);
-        CUcontext previous;
-        cuCtxPopCurrent(&previous);
-        cuDevicePrimaryCtxRelease(device);
+        if (context && cuCtxPushCurrent(context) == CUDA_SUCCESS) {
+            if (pending) cuEventSynchronize(completed);
+            if (stream) cuStreamSynchronize(stream);
+            release_shape();
+            if (completed) cuEventDestroy(completed);
+            if (stream) cuStreamDestroy(stream);
+            CUcontext previous;
+            cuCtxPopCurrent(&previous);
+        }
+        shared.reset();
+    }
+
+    std::unique_ptr<umzi::KernelSession> clone_shared() const override {
+        auto copy = std::make_unique<GateRV2Session>();
+        copy->shared = shared;
+        copy->arch = arch;
+        copy->network = std::make_unique<Network>(arch);
+        copy->offsets32 = offsets32;
+        copy->offsets16 = offsets16;
+        copy->fp16 = fp16;
+        copy->use_graph = use_graph;
+        copy->tune_plans = tune_plans;
+        copy->weight_bytes = weight_bytes;
+        copy->weight32_bytes = weight32_bytes;
+        copy->weight16_bytes = weight16_bytes;
+        copy->workspace_limit = workspace_limit;
+        copy->device = device;
+        copy->context = context;
+        copy->module = module;
+        copy->functions = functions;
+        copy->weights = weights;
+        copy->half_weights = half_weights;
+        copy->cudnn = cudnn;
+        copy->blas = blas;
+        copy->cache_dir = cache_dir;
+        copy->cache_environment = cache_environment;
+        copy->cache_environment_error = cache_environment_error;
+        ContextScope scope(context);
+        CHECK(cuStreamCreate(&copy->stream, CU_STREAM_NON_BLOCKING));
+        CHECK(cuEventCreate(&copy->completed, CU_EVENT_DISABLE_TIMING));
+        return copy;
     }
 
     CUdeviceptr param(size_t index) const {
@@ -730,7 +786,15 @@ public:
             setup_ms[2] = umzi::elapsed_ms(start);
 
             start = Clock::now();
-            if (use_graph) umzi::capture_cuda_graph(stream, executable, [&] { forward(stream); });
+            if (use_graph) {
+                umzi::capture_cuda_graph(stream, executable, [&] { forward(stream); });
+            } else {
+                for (auto* buffer : {&stage_in, &stage_out}) {
+                    if (*buffer) cuMemFree(*buffer);
+                    *buffer = 0;
+                }
+                input_rgb = output_rgb = 0;
+            }
             setup_ms[3] = umzi::elapsed_ms(start);
             startup_used[3] = umzi::device_used_bytes();
         } catch (...) {
@@ -1166,10 +1230,17 @@ public:
 
     void prepare_shape(const UmziShape& shape) override { prepare_exact(checked(shape)); }
 
+    void ensure_staging() {
+        if (stage_in) return;
+        CHECK(cuMemAlloc(&stage_in, io_bytes));
+        CHECK(cuMemAlloc(&stage_out, io_bytes));
+    }
+
     void run_host(const UmziShape& shape, const void* input, void* output) override {
         const auto concrete = checked(shape);
         prepare_exact(concrete);
         ContextScope scope(context);
+        ensure_staging();
         const uint64_t bytes = io_bytes_for(concrete);
         CHECK(cuMemcpyHtoDAsync(stage_in, input, bytes, stream));
         enqueue_shape(concrete, stage_in, stage_out, stream);
@@ -1201,7 +1272,7 @@ public:
             result.prepared_input = {4, {uint32_t(prepared.n), 3, uint32_t(prepared.h), uint32_t(prepared.w)}};
             result.buffer_bytes[1] = activation_bytes;
             result.buffer_bytes[2] = workspace_bytes;
-            result.buffer_bytes[3] = 2 * io_bytes;
+            result.buffer_bytes[3] = stage_in ? 2 * io_bytes : 0;
             std::copy(startup_used.begin(), startup_used.end(), result.startup_device_used_bytes);
             std::copy(setup_ms.begin(), setup_ms.end(), result.shape_setup_ms);
         }

@@ -47,6 +47,11 @@ struct Shape {
 struct ResolvedModel {
     std::vector<Tensor> tensors;
     size_t arena_bytes = 0;
+    std::vector<int> alias_target;
+    std::vector<int> conv_ld_in;
+    std::vector<bool> fused_concat;
+    std::vector<bool> inplace_inception;
+    std::vector<bool> skip_alloc;
 };
 
 class ModelFile {
@@ -265,33 +270,167 @@ public:
 
     ResolvedModel resolve(const Shape& shape) const {
         ResolvedModel plan{tensor_shapes(shape)};
+        const size_t num_tensors = plan.tensors.size();
+        std::vector<int> uses(num_tensors, 0);
+        for (const auto& op : ops) {
+            for (int id : op.input) {
+                if (id >= 0) ++uses[id];
+            }
+        }
+        std::vector<size_t> effective_last = last_use;
+        plan.alias_target.assign(num_tensors, -1);
+        plan.skip_alloc.assign(num_tensors, false);
+        plan.fused_concat.assign(ops.size(), false);
+        plan.inplace_inception.assign(ops.size(), false);
+        plan.conv_ld_in.assign(ops.size(), 0);
+        for (size_t i = 0; i < ops.size(); ++i) {
+            plan.conv_ld_in[i] = plan.tensors[ops[i].input[0]].c;
+        }
+        for (size_t i = 0; i + 1 < ops.size(); ++i) {
+            const auto& cat = ops[i];
+            const auto& next = ops[i + 1];
+            if (cat.kind != Concat || next.kind != Conv || next.x != 1 || next.y != 0
+                || next.input[0] != cat.out || uses[cat.out] != 1)
+                continue;
+            bool internal_inputs = true;
+            for (int id : cat.input) {
+                if (id == 0 || id >= int(num_tensors - 1)) internal_inputs = false;
+            }
+            if (!internal_inputs) continue;
+            plan.fused_concat[i] = true;
+            plan.skip_alloc[cat.out] = true;
+            for (int id : cat.input) {
+                if (id >= 0) effective_last[id] = std::max(effective_last[id], i + 1);
+            }
+        }
+        for (size_t i = 0; i < ops.size(); ++i) {
+            const auto& op = ops[i];
+            if (op.kind != Inception || op.input[1] >= 0 || specs[op.out].level != 0) continue;
+            int in_id = op.input[0];
+            int out_id = op.out;
+            if (in_id <= 0 || in_id + 1 >= int(num_tensors) || uses[in_id] != 1 || effective_last[in_id] != i)
+                continue;
+            bool conv_consumers_only = true;
+            for (size_t c = i + 1; c < ops.size(); ++c) {
+                const auto& consumer = ops[c];
+                for (int slot = 0; slot < 4; ++slot) {
+                    if (consumer.input[slot] != out_id) continue;
+                    if (slot != 0 || consumer.kind != Conv || consumer.x != 1 || consumer.y != 0
+                        || consumer.input[1] >= 0) {
+                        conv_consumers_only = false;
+                    }
+                }
+            }
+            if (!conv_consumers_only) continue;
+            plan.inplace_inception[i] = true;
+            plan.skip_alloc[out_id] = true;
+            plan.alias_target[out_id] = in_id;
+            effective_last[in_id] = std::max(effective_last[in_id], effective_last[out_id]);
+            for (size_t c = i + 1; c < ops.size(); ++c) {
+                if (ops[c].input[0] == out_id) plan.conv_ld_in[c] = plan.tensors[in_id].c;
+            }
+        }
+
         struct Lifetime { size_t id, first, last, bytes; };
         std::vector<Lifetime> tensors;
-        for (size_t i = 1; i + 1 < plan.tensors.size(); ++i) {
+        for (size_t i = 1; i + 1 < num_tensors; ++i) {
+            if (plan.skip_alloc[i]) continue;
             size_t first = i - 1;
             if (ops[first].kind == Rms && ops[first].input[1] >= 0) --first;
             size_t bytes = (size_t(plan.tensors[i].elements()) * 2 + 255) & ~size_t(255);
-            tensors.push_back({i, first, last_use[i], bytes});
+            tensors.push_back({i, first, effective_last[i], bytes});
         }
-        std::stable_sort(tensors.begin(), tensors.end(), [](const auto& a, const auto& b) {
-            return a.bytes != b.bytes ? a.bytes > b.bytes : a.first < b.first;
-        });
-        size_t extent = 0;
-        for (auto cursor = tensors.begin(); cursor != tensors.end(); ++cursor) {
-            std::vector<std::pair<size_t, size_t>> conflicts;
-            for (auto other = tensors.begin(); other != cursor; ++other) {
-                if (cursor->first <= other->last && other->first <= cursor->last)
-                    conflicts.emplace_back(plan.tensors[other->id].offset, other->bytes);
+        auto pack_classic = [&](std::vector<int>& offsets, size_t& extent) {
+            auto ordered = tensors;
+            std::stable_sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) {
+                return a.bytes != b.bytes ? a.bytes > b.bytes : a.first < b.first;
+            });
+            offsets.assign(num_tensors, 0);
+            extent = 0;
+            for (auto cursor = ordered.begin(); cursor != ordered.end(); ++cursor) {
+                std::vector<std::pair<size_t, size_t>> conflicts;
+                for (auto other = ordered.begin(); other != cursor; ++other) {
+                    if (cursor->first <= other->last && other->first <= cursor->last)
+                        conflicts.emplace_back(size_t(offsets[other->id]), other->bytes);
+                }
+                std::sort(conflicts.begin(), conflicts.end());
+                size_t offset = 0;
+                for (const auto& [start, bytes] : conflicts) {
+                    if (offset + cursor->bytes <= start) break;
+                    offset = std::max(offset, start + bytes);
+                }
+                offsets[cursor->id] = offset > INT_MAX ? -1 : static_cast<int>(offset);
+                extent = std::max(extent, offset + cursor->bytes);
             }
-            std::sort(conflicts.begin(), conflicts.end());
-            size_t offset = 0;
-            for (const auto& [start, bytes] : conflicts) {
-                if (offset + cursor->bytes <= start) break;
-                offset = std::max(offset, start + bytes);
+        };
+        auto pack_bounded = [&](std::vector<int>& offsets, size_t& extent) {
+            size_t peak_live = 0;
+            for (size_t step = 0; step < ops.size(); ++step) {
+                size_t live = 0;
+                for (const auto& t : tensors) {
+                    if (t.first <= step && step <= t.last) live += t.bytes;
+                }
+                peak_live = std::max(peak_live, live);
             }
-            if (offset > INT_MAX) throw std::runtime_error("Requested shape exceeds native arena offset limits");
-            plan.tensors[cursor->id].offset = static_cast<int>(offset);
-            extent = std::max(extent, offset + cursor->bytes);
+            auto ordered = tensors;
+            std::stable_sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) {
+                if (a.bytes != b.bytes) return a.bytes > b.bytes;
+                size_t span_a = a.last - a.first, span_b = b.last - b.first;
+                return span_a != span_b ? span_a > span_b : a.first < b.first;
+            });
+            offsets.assign(num_tensors, 0);
+            extent = 0;
+            for (auto cursor = ordered.begin(); cursor != ordered.end(); ++cursor) {
+                std::vector<std::pair<size_t, size_t>> conflicts;
+                for (auto other = ordered.begin(); other != cursor; ++other) {
+                    if (cursor->first <= other->last && other->first <= cursor->last)
+                        conflicts.emplace_back(size_t(offsets[other->id]), other->bytes);
+                }
+                std::sort(conflicts.begin(), conflicts.end());
+                std::vector<std::pair<size_t, size_t>> gaps;
+                size_t off = 0;
+                for (const auto& [start, bytes] : conflicts) {
+                    if (off + cursor->bytes <= start) gaps.emplace_back(off, start);
+                    off = std::max(off, start + bytes);
+                }
+                gaps.emplace_back(off, peak_live);
+                size_t chosen = off;
+                bool placed_top = false;
+                if (cursor->bytes >= peak_live / 2) {
+                    for (auto it = gaps.rbegin(); it != gaps.rend(); ++it) {
+                        size_t hi = std::min(it->second, peak_live);
+                        if (hi >= it->first + cursor->bytes) {
+                            chosen = hi - cursor->bytes;
+                            placed_top = true;
+                            break;
+                        }
+                    }
+                }
+                if (!placed_top) {
+                    for (const auto& [lo, hi] : gaps) {
+                        if (hi >= lo + cursor->bytes) {
+                            chosen = lo;
+                            break;
+                        }
+                    }
+                }
+                offsets[cursor->id] = chosen > INT_MAX ? -1 : static_cast<int>(chosen);
+                extent = std::max(extent, chosen + cursor->bytes);
+            }
+        };
+        std::vector<int> classic_offsets, bounded_offsets;
+        size_t classic_extent = 0, bounded_extent = 0;
+        pack_classic(classic_offsets, classic_extent);
+        pack_bounded(bounded_offsets, bounded_extent);
+        const auto& chosen_offsets = bounded_extent < classic_extent ? bounded_offsets : classic_offsets;
+        size_t extent = std::min(classic_extent, bounded_extent);
+        for (const auto& t : tensors) {
+            if (chosen_offsets[t.id] < 0)
+                throw std::runtime_error("Requested shape exceeds native arena offset limits");
+            plan.tensors[t.id].offset = chosen_offsets[t.id];
+        }
+        for (size_t i = 1; i + 1 < num_tensors; ++i) {
+            if (plan.alias_target[i] >= 0) plan.tensors[i].offset = plan.tensors[plan.alias_target[i]].offset;
         }
         plan.arena_bytes = extent * shape.n;
         return plan;

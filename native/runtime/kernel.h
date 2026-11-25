@@ -31,6 +31,7 @@ public:
     virtual const char* cache_message() const { return ""; }
     virtual const char* kernel_message() const { return ""; }
     virtual void profile(float*, uint32_t) { throw std::runtime_error("Kernel profiling is unavailable"); }
+    virtual std::unique_ptr<KernelSession> clone_shared() const { return nullptr; }
 };
 
 using KernelFactory = std::unique_ptr<KernelSession>(*)(const ModelPackage&, const UmziSessionOptions&);

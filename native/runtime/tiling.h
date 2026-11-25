@@ -11,7 +11,7 @@ struct PageTiler {
     CUcontext context = nullptr;
     CUmodule module = nullptr;
     CUstream stream = nullptr;
-    CUfunction extract = nullptr, copy = nullptr, blend = nullptr, finish = nullptr;
+    CUfunction extract = nullptr, copy = nullptr, blend = nullptr, finish = nullptr, finish_strip = nullptr;
     void* staging = nullptr;
     size_t staging_bytes = 0;
     struct EdgeRunner { UmziShape shape; std::unique_ptr<KernelSession> kernel; };

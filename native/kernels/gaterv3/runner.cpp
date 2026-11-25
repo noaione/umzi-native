@@ -27,7 +27,7 @@
 namespace {
 namespace fs = std::filesystem;
 constexpr int tile = 128;
-constexpr size_t scratch_bytes = 64 * 1024 * 1024;
+constexpr size_t default_workspace_bytes = 64 * 1024 * 1024;
 constexpr int threads = 256;
 constexpr int gate_pool_chunk = 64;
 constexpr float bad_timing = 1e30f;
@@ -97,6 +97,9 @@ struct Matmul {
     cublasLtMatmulAlgo_t algorithm{};
     size_t workspace = 0;
     bool half_compute = false;
+    int input_tensor = 0;
+    size_t weight_offset = 0;
+    bool accumulate = false;
 
     ~Matmul() {
         if (desc) cublasLtMatmulDescDestroy(desc);
@@ -203,7 +206,7 @@ public:
         bytes[0] = weight_bytes;
         bytes[1] = arena_bytes;
         bytes[2] = workspace_bytes;
-        bytes[3] = 2 * io_bytes * batch;
+        bytes[3] = (input ? io_bytes * batch : 0) + (output ? io_bytes * batch : 0);
     }
 
     size_t retained_workspace_bytes() const { return workspace_bytes; }
@@ -229,16 +232,25 @@ public:
 
     void initialize_shape(Shape shape, uint32_t flags, const fs::path& cache_dir,
                           CUdevice selected_device, CUcontext shared_context, CUmodule shared_module,
-                          CUdeviceptr shared_weights, const gt::Digest& build,
-                          const gt::ModelFile& model, gt::ResolvedModel resolved) {
+                          CUdeviceptr shared_weights, cudnnHandle_t shared_cudnn, cublasLtHandle_t shared_blas,
+                          const gt::Digest& build, const gt::ModelFile& model, gt::ResolvedModel resolved,
+                          size_t workspace_limit = default_workspace_bytes) {
         auto stage_start = Clock::now();
         configure(shape, flags);
+        scratch_limit_bytes = workspace_limit;
         device = selected_device;
         context = shared_context;
         module = shared_module;
         weights = shared_weights;
+        cudnn = shared_cudnn;
+        blas = shared_blas;
         weight_bytes = model.weight_bytes;
         tensors = std::move(resolved.tensors);
+        alias_target = std::move(resolved.alias_target);
+        conv_ld_in = std::move(resolved.conv_ld_in);
+        fused_concat = std::move(resolved.fused_concat);
+        inplace_inception = std::move(resolved.inplace_inception);
+        skip_alloc = std::move(resolved.skip_alloc);
         ops = model.ops;
         arena_bytes = resolved.arena_bytes;
         ContextScope scope(context);
@@ -262,15 +274,11 @@ public:
 
     void create_handles() {
         CHECK(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
-        CHECK(cudnnCreate(&cudnn));
-        CHECK(cublasLtCreate(&blas));
         CHECK(cudnnSetStream(cudnn, stream));
     }
 
     void finish_setup(uint32_t flags, const fs::path& cache_dir, Clock::time_point stage_start) {
         record_memory(1);
-        allocate_host(host_input, io_bytes * batch);
-        allocate_host(host_output, io_bytes * batch);
         setup_ms[0] = umzi::elapsed_ms(stage_start);
         stage_start = Clock::now();
         if (plan_cache.status != UMZI_CACHE_UNAVAILABLE) {
@@ -295,12 +303,13 @@ public:
             peak_workspace_bytes = std::max(peak_workspace_bytes, workspace_bytes);
         }
         if (silu_plan) bind_silu();
-        CHECK(cuMemsetD8Async(input, 0, io_bytes * batch, stream));
-        forward(stream);
-        CHECK(cuStreamSynchronize(stream));
-        setup_ms[2] = umzi::elapsed_ms(stage_start);
-        stage_start = Clock::now();
         if (flags & GT_CREATE_GRAPH) {
+            ensure_device_staging();
+            CHECK(cuMemsetD8Async(input, 0, io_bytes * batch, stream));
+            forward(stream);
+            CHECK(cuStreamSynchronize(stream));
+            setup_ms[2] = umzi::elapsed_ms(stage_start);
+            stage_start = Clock::now();
             try {
                 capture_graph();
             } catch (const std::exception& error) {
@@ -310,8 +319,8 @@ public:
                 disable_fusion(error.what());
                 capture_graph();
             }
+            setup_ms[3] = umzi::elapsed_ms(stage_start);
         }
-        setup_ms[3] = umzi::elapsed_ms(stage_start);
         record_memory(3);
         plan_cache.save(plan_key);
     }
@@ -326,8 +335,6 @@ public:
         silu_plan.reset();
         matmuls.clear();
         convolutions.clear();
-        if (cudnn) cudnnDestroy(cudnn);
-        if (blas) cublasLtDestroy(blas);
         for (auto ptr : {arena, scratch, input, output}) if (ptr) cuMemFree(ptr);
         if (host_input) cuMemFreeHost(host_input);
         if (host_output) cuMemFreeHost(host_output);
@@ -349,8 +356,24 @@ public:
         run_host({batch, height, width}, pixels, restored);
     }
 
+    void ensure_device_staging() {
+        if (!input) allocate(input, batch * io_bytes, "device RGB input");
+        if (!output) allocate(output, batch * io_bytes, "device RGB output");
+        if (!addresses.empty()) {
+            addresses.front() = input;
+            addresses.back() = output;
+        }
+    }
+
+    void ensure_host_staging() {
+        if (!host_input) allocate_host(host_input, io_bytes * batch);
+        if (!host_output) allocate_host(host_output, io_bytes * batch);
+    }
+
     void run_host(Shape shape, const void* pixels, void* restored) {
         ContextScope scope(context);
+        ensure_host_staging();
+        ensure_device_staging();
         if (shape.h == height && shape.w == width) {
             std::memcpy(host_input, pixels, batch * io_bytes);
         } else if (fp16) {
@@ -379,11 +402,21 @@ public:
 
     void run_device(Shape shape, CUdeviceptr pixels, CUdeviceptr restored, CUstream target) {
         if (shape.h == height && shape.w == width) {
-            CHECK(cuMemcpyDtoDAsync(input, pixels, batch * io_bytes, target));
-            enqueue(target);
-            CHECK(cuMemcpyDtoDAsync(restored, output, batch * io_bytes, target));
+            if (executable) {
+                ensure_device_staging();
+                CHECK(cuMemcpyDtoDAsync(input, pixels, batch * io_bytes, target));
+                enqueue(target);
+                CHECK(cuMemcpyDtoDAsync(restored, output, batch * io_bytes, target));
+            } else {
+                addresses.front() = pixels;
+                addresses.back() = restored;
+                enqueue(target);
+                addresses.front() = input;
+                addresses.back() = output;
+            }
             return;
         }
+        ensure_device_staging();
         int padded_elements = batch * 3 * height * width;
         int cropped_elements = batch * 3 * shape.h * shape.w;
         launch(lookup(fp16 ? "pad_rgb16" : "pad_rgb"), target,
@@ -457,7 +490,7 @@ private:
         add_u32(gt::plan_schema);
         add_u32(sizeof(void*));
         add_u32(sizeof(cublasLtMatmulAlgo_t));
-        add_u32(static_cast<uint32_t>(scratch_bytes));
+        add_u32(static_cast<uint32_t>(scratch_limit_bytes));
         // The disk cache stores standalone convolutions and projections.
         // Gate/pool dispatch and the cuDNN SiLU graph are prepared separately.
         add_u32(static_cast<uint32_t>(fp16) | (tune_projections << 1) | (fp16_qkv << 2));
@@ -472,19 +505,19 @@ private:
     void allocate_shape() {
         size_t free_bytes, capacity;
         CHECK(cuMemGetInfo(&free_bytes, &capacity));
-        size_t required = arena_bytes + 2 * batch * io_bytes;
+        size_t required = arena_bytes;
         if (required > free_bytes)
             throw AllocationError("Shape buffers require " + std::to_string(required)
                 + " bytes with " + std::to_string(free_bytes)
                 + " bytes available; try a smaller tile or batch");
-        allocate(input, batch * io_bytes, "device RGB input");
-        allocate(output, batch * io_bytes, "device RGB output");
         allocate(arena, arena_bytes, "activation arena");
         addresses.resize(tensors.size());
         addresses.front() = input;
         addresses.back() = output;
-        for (size_t i = 1; i + 1 < tensors.size(); ++i)
-            addresses[i] = arena + size_t(tensors[i].offset) * batch;
+        for (size_t i = 1; i + 1 < tensors.size(); ++i) {
+            if (alias_target[i] >= 0) addresses[i] = addresses[alias_target[i]];
+            else if (!skip_alloc[i]) addresses[i] = arena + size_t(tensors[i].offset) * batch;
+        }
     }
 
     bool variable_pool() const { return height != tile || width != tile; }
@@ -495,10 +528,15 @@ private:
     }
 
     std::vector<Tensor> tensors;
+    std::vector<int> alias_target;
+    std::vector<int> conv_ld_in;
+    std::vector<bool> fused_concat;
+    std::vector<bool> inplace_inception;
+    std::vector<bool> skip_alloc;
     std::vector<Op> ops;
     std::vector<CUdeviceptr> addresses;
     std::vector<Convolution*> conv_by_op;
-    std::vector<std::unique_ptr<Matmul>> matmuls;
+    std::vector<std::vector<std::unique_ptr<Matmul>>> matmuls;
     std::map<ShapeKey, GemmChoice> gemm_algorithms;
     std::map<ShapeKey, std::unique_ptr<Convolution>> convolutions;
     std::map<std::string, CUfunction> kernels;
@@ -511,6 +549,8 @@ private:
     size_t arena_bytes = 0;
     size_t weight_bytes = 0;
     size_t workspace_bytes = 0;
+    size_t scratch_limit_bytes = default_workspace_bytes;
+    bool tuning_arena_cleared = false;
     std::array<uint64_t, 4> startup_used{};
     gt::Digest plan_key{};
     std::unique_ptr<gt::SiluPlan> silu_plan;
@@ -518,10 +558,13 @@ private:
     std::vector<std::unique_ptr<gt::BackendDescriptor>> silu_bindings;
 
     void ensure_tuning_workspace() {
-        if (scratch) return;
-        allocate(scratch, scratch_bytes, "tuning workspace");
-        peak_workspace_bytes = std::max(peak_workspace_bytes, scratch_bytes);
-        CHECK(cuMemsetD8Async(arena, 0x28, arena_bytes, stream));
+        if (!tuning_arena_cleared) {
+            CHECK(cuMemsetD8Async(arena, 0x28, arena_bytes, stream));
+            tuning_arena_cleared = true;
+        }
+        if (scratch || !scratch_limit_bytes) return;
+        allocate(scratch, scratch_limit_bytes, "tuning workspace");
+        peak_workspace_bytes = std::max(peak_workspace_bytes, scratch_limit_bytes);
         record_memory(1);
     }
 
@@ -549,18 +592,26 @@ private:
     cublasStatus_t gemm(const Matmul& p, const Op& op, const cublasLtMatmulAlgo_t& algo,
                         size_t workspace, CUstream target) {
         auto y = pointer(tensor(op.out));
-        return cublasLtMatmul(blas, p.desc, p.half_compute ? static_cast<const void*>(&half_one) : &one,
-            pointer(weight(op.weight[0])), p.kernel, pointer(tensor(op.input[0]) + 2 * op.y),
-            p.input, p.half_compute ? static_cast<const void*>(&half_zero) : &zero, y, p.output,
-            y, p.output, &algo, workspace ? pointer(scratch) : nullptr, workspace, target);
+        const void* alpha_ptr = p.half_compute ? static_cast<const void*>(&half_one) : &one;
+        const void* beta_ptr = p.half_compute
+            ? static_cast<const void*>(p.accumulate ? &half_one : &half_zero)
+            : (p.accumulate ? &one : &zero);
+        return cublasLtMatmul(blas, p.desc, alpha_ptr,
+            pointer(weight(op.weight[0]) + p.weight_offset), p.kernel,
+            pointer(tensor(p.input_tensor) + 2 * op.y), p.input, beta_ptr,
+            y, p.output, y, p.output, &algo, workspace ? pointer(scratch) : nullptr, workspace, target);
     }
 
-    void prepare_matmul(size_t index, const Tensor& a, const Tensor& out, const Op& op, TuningTimer& timer) {
+    std::unique_ptr<Matmul> build_matmul(size_t index, int cin, int cout, int count, int ld_in, int ld_w,
+                                         int bias_offset, int cache_tag, int input_tensor, size_t weight_offset,
+                                         bool accumulate, bool selective, bool replay, TuningTimer& timer,
+                                         const Op& op) {
         auto plan = std::make_unique<Matmul>();
-        bool selective = fp16_qkv && a.c == 512 && out.c == 2560;
-        bool replay = tune_projections && (a.pixels() >= 4096 || a.c >= 512);
         if (selective) ++optimization_stats[GT_OPT_FP16_QKV_PROJECTIONS];
         plan->half_compute = fp16 || selective;
+        plan->input_tensor = input_tensor;
+        plan->weight_offset = weight_offset;
+        plan->accumulate = accumulate;
         CHECK(cublasLtMatmulDescCreate(&plan->desc,
             plan->half_compute ? CUBLAS_COMPUTE_16F : CUBLAS_COMPUTE_32F,
             plan->half_compute ? CUDA_R_16F : CUDA_R_32F));
@@ -569,29 +620,27 @@ private:
         cublasOperation_t transpose = CUBLAS_OP_T;
         CHECK(cublasLtMatmulDescSetAttribute(plan->desc, CUBLASLT_MATMUL_DESC_TRANSA,
                                             &transpose, sizeof(transpose)));
-        int cin = a.c - op.y, count = out.pixels() * batch;
-        CHECK(cublasLtMatrixLayoutCreate(&plan->kernel, CUDA_R_16F, cin, out.c, cin));
-        CHECK(cublasLtMatrixLayoutCreate(&plan->input, CUDA_R_16F, cin, count, a.c));
-        CHECK(cublasLtMatrixLayoutCreate(&plan->output, CUDA_R_16F, out.c, count, out.c));
-        if (op.weight[1] >= 0) {
+        CHECK(cublasLtMatrixLayoutCreate(&plan->kernel, CUDA_R_16F, cin, cout, ld_w));
+        CHECK(cublasLtMatrixLayoutCreate(&plan->input, CUDA_R_16F, cin, count, ld_in));
+        CHECK(cublasLtMatrixLayoutCreate(&plan->output, CUDA_R_16F, cout, count, cout));
+        if (bias_offset >= 0) {
             cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
-            CUdeviceptr ptr = weight(op.weight[1]);
+            CUdeviceptr ptr = weight(bias_offset);
             CHECK(cublasLtMatmulDescSetAttribute(plan->desc, CUBLASLT_MATMUL_DESC_EPILOGUE,
                                                 &epilogue, sizeof(epilogue)));
             CHECK(cublasLtMatmulDescSetAttribute(plan->desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER,
                                                 &ptr, sizeof(ptr)));
         }
-        auto key = ShapeKey{cin, out.c, count, a.c, op.weight[1] >= 0};
+        auto key = ShapeKey{cin, cout, count, ld_in, cache_tag};
         if (auto cached = gemm_algorithms.find(key); cached != gemm_algorithms.end()) {
             plan->algorithm = cached->second.algorithm;
             plan->workspace = cached->second.workspace;
-            matmuls[index] = std::move(plan);
-            return;
+            return plan;
         }
         if (auto saved = plan_cache.gemms.find(key); saved != plan_cache.gemms.end()) {
             const auto& choice = saved->second;
             cublasLtMatmulHeuristicResult_t checked{};
-            if (choice.workspace <= scratch_bytes
+            if (choice.workspace <= scratch_limit_bytes
                 && cublasLtMatmulAlgoCheck(blas, plan->desc, plan->kernel, plan->input, plan->output,
                                            plan->output, &choice.algorithm, &checked) == CUBLAS_STATUS_SUCCESS
                 && checked.state == CUBLAS_STATUS_SUCCESS && checked.workspaceSize == choice.workspace) {
@@ -599,8 +648,7 @@ private:
                 plan->workspace = choice.workspace;
                 workspace_bytes = std::max(workspace_bytes, plan->workspace);
                 gemm_algorithms.emplace(key, choice);
-                matmuls[index] = std::move(plan);
-                return;
+                return plan;
             }
         }
         ensure_tuning_workspace();
@@ -609,7 +657,7 @@ private:
         CHECK(cublasLtMatmulPreferenceCreate(&pref));
         auto preference = std::unique_ptr<std::remove_pointer_t<cublasLtMatmulPreference_t>,
             decltype(&cublasLtMatmulPreferenceDestroy)>(pref, cublasLtMatmulPreferenceDestroy);
-        uint64_t allotted = scratch_bytes;
+        uint64_t allotted = scratch_limit_bytes;
         CHECK(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
                                                    &allotted, sizeof(allotted)));
         std::array<cublasLtMatmulHeuristicResult_t, 24> results{};
@@ -619,10 +667,10 @@ private:
                                             plan->output, plan->output, pref,
                                             replay ? int(results.size()) : baseline_candidates, results.data(), &found));
         float best = bad_timing;
-        auto test_candidates = [&](int count, bool graph_replay) {
-            for (int j = 0; j < count; ++j) {
+        auto test_candidates = [&](int candidates, bool graph_replay) {
+            for (int j = 0; j < candidates; ++j) {
                 auto& candidate = results[j];
-                if (candidate.state != CUBLAS_STATUS_SUCCESS) continue;
+                if (candidate.state != CUBLAS_STATUS_SUCCESS || candidate.workspaceSize > scratch_limit_bytes) continue;
                 auto run = [&] {
                     return gemm(*plan, op, candidate.algo, candidate.workspaceSize, stream) == CUBLAS_STATUS_SUCCESS;
                 };
@@ -645,7 +693,33 @@ private:
         auto selected = GemmChoice{plan->algorithm, plan->workspace};
         gemm_algorithms.emplace(key, selected);
         plan_cache.gemms.insert_or_assign(key, selected);
-        matmuls[index] = std::move(plan);
+        return plan;
+    }
+
+    void prepare_matmul(size_t index, const Tensor& a, const Tensor& out, const Op& op, TuningTimer& timer) {
+        bool selective = fp16_qkv && a.c == 512 && out.c == 2560;
+        bool replay = tune_projections && (a.pixels() >= 4096 || a.c >= 512);
+        int cin = a.c - op.y, count = out.pixels() * batch;
+        int ld_in = conv_ld_in[index];
+        matmuls[index].push_back(build_matmul(index, cin, out.c, count, ld_in, cin, op.weight[1],
+            op.weight[1] >= 0 ? 1 : 0, op.input[0], 0, false, selective, replay, timer, op));
+    }
+
+    void prepare_concat_matmul(size_t index, const Op& cat, const Tensor& cat_out,
+                               const Tensor& out, const Op& op, TuningTimer& timer) {
+        bool selective = fp16_qkv && cat_out.c == 512 && out.c == 2560;
+        bool replay = tune_projections && (cat_out.pixels() >= 4096 || cat_out.c >= 512);
+        int count = out.pixels() * batch;
+        int ld_w = cat_out.c;
+        int ch_off = 0;
+        for (int k = 0; k < 4 && cat.input[k] >= 0; ++k) {
+            const auto& part = tensors[cat.input[k]];
+            int bias_off = (k == 0) ? op.weight[1] : -1;
+            int tag = (k == 0 ? (op.weight[1] >= 0 ? 2 : 6) : 4) | (ld_w << 3);
+            matmuls[index].push_back(build_matmul(index, part.c, out.c, count, part.c, ld_w, bias_off,
+                tag, cat.input[k], size_t(ch_off) * 2, k > 0, selective, replay, timer, op));
+            ch_off += part.c;
+        }
     }
 
     cudnnStatus_t convolution(const Convolution& p, const Op& op) {
@@ -678,7 +752,7 @@ private:
                 auto algorithm = static_cast<cudnnConvolutionFwdAlgo_t>(choice.algorithm);
                 auto math = static_cast<cudnnMathType_t>(choice.math);
                 if (choice.algorithm < CUDNN_CONVOLUTION_FWD_ALGO_COUNT
-                    && choice.math <= CUDNN_FMA_MATH && choice.workspace <= scratch_bytes
+                    && choice.math <= CUDNN_FMA_MATH && choice.workspace <= scratch_limit_bytes
                     && cudnnSetConvolutionMathType(p.conv, math) == CUDNN_STATUS_SUCCESS
                     && cudnnGetConvolutionForwardWorkspaceSize(cudnn, p.input, p.weight, p.conv,
                                                                p.output, algorithm, &required) == CUDNN_STATUS_SUCCESS
@@ -701,7 +775,7 @@ private:
             float best = 1e30f;
             for (int j = 0; j < count; ++j) {
                 const auto& candidate = results[j];
-                if (candidate.status != CUDNN_STATUS_SUCCESS || candidate.memory > scratch_bytes) continue;
+                if (candidate.status != CUDNN_STATUS_SUCCESS || candidate.memory > scratch_limit_bytes) continue;
                 CHECK(cudnnSetConvolutionMathType(p.conv, candidate.mathType));
                 p.algorithm = candidate.algo;
                 p.workspace = candidate.memory;
@@ -746,6 +820,7 @@ private:
             "depthwise", "attention", "gate", "add", "rgb", "shuffle_concat",
         };
         for (size_t i = 0; i < ops.size(); ++i) {
+            if (fused_concat[i]) continue;
             const auto& op = ops[i];
             const auto& out = tensors[op.out];
             if (op.kind == MeanProject) {
@@ -768,8 +843,25 @@ private:
             }
             if (op.kind == Conv) {
                 const auto& in = tensors[op.input[0]];
-                if (op.x == 1) prepare_matmul(i, in, out, op, timer);
-                else prepare_conv(i, in, out, op, timer);
+                if (op.x == 1) {
+                    if (i && fused_concat[i - 1]) {
+                        const auto& cat = ops[i - 1];
+                        if (in.c == 128 && out.c == 32 && cat.input[0] >= 0 && cat.input[1] >= 0
+                            && cat.input[2] >= 0 && cat.input[3] >= 0 && tensors[cat.input[0]].c == 32
+                            && tensors[cat.input[1]].c == 32 && tensors[cat.input[2]].c == 32
+                            && tensors[cat.input[3]].c == 32) {
+                            kernel_by_op[i] = lookup(fp16 ? "concat_conv1x1_32_16" : "concat_conv1x1_32");
+                        } else {
+                            prepare_concat_matmul(i, cat, in, out, op, timer);
+                        }
+                    } else if (conv_ld_in[i] == 96 && in.c == 48 && out.c == 32 && op.y == 0) {
+                        kernel_by_op[i] = lookup(fp16 ? "strided_conv1x1_48_32_16" : "strided_conv1x1_48_32");
+                    } else {
+                        prepare_matmul(i, in, out, op, timer);
+                    }
+                } else {
+                    prepare_conv(i, in, out, op, timer);
+                }
             } else if (op.kind == Attention && op.weight[0] >= 0) {
                 if (out.pixels() == 64) {
                     kernel_by_op[i] = lookup("attention_channels");
@@ -839,7 +931,7 @@ private:
         }
         try {
             auto candidate = std::make_unique<gt::SiluPlan>();
-            candidate->initialize(cudnn, batch, height, width, fp16, scratch_bytes);
+            candidate->initialize(cudnn, batch, height, width, fp16, scratch_limit_bytes);
             workspace_bytes = std::max(workspace_bytes, candidate->workspace);
             silu_plan = std::move(candidate);
         } catch (const std::exception& error) {
@@ -873,6 +965,7 @@ private:
     void forward(CUstream target, const CUevent* timing = nullptr) {
         for (size_t i = 0; i < ops.size(); ++i) {
             if (timing) CHECK(cuEventRecordWithFlags(timing[i], target, CU_EVENT_RECORD_EXTERNAL));
+            if (fused_concat[i]) continue;
             if (fused_silu_count) {
                 if (silu_bindings[i]) {
                     silu_plan->run(cudnn, *silu_bindings[i]);
@@ -905,8 +998,21 @@ private:
             switch (op.kind) {
             case Pack: run(y, a, pixels, total); break;
             case Conv:
-                if (auto* p = matmuls[i].get()) {
-                    CHECK(gemm(*p, op, p->algorithm, p->workspace, target));
+                if (!matmuls[i].empty()) {
+                    for (const auto& p : matmuls[i]) {
+                        CHECK(gemm(*p, op, p->algorithm, p->workspace, target));
+                    }
+                } else if (kernel) {
+                    const int px = o.pixels() * batch;
+                    if (i && fused_concat[i - 1]) {
+                        const auto& cat = ops[i - 1];
+                        launch(kernel, target, unsigned((px + 127) / 128), 1, threads,
+                               y, tensor(cat.input[0]), tensor(cat.input[1]), tensor(cat.input[2]),
+                               tensor(cat.input[3]), w0, w1, px);
+                    } else {
+                        launch(kernel, target, unsigned((px + 127) / 128), 1, threads,
+                               y, a, w0, w1, conv_ld_in[i], px);
+                    }
                 } else {
                     CHECK(convolution(*conv_by_op[i], op));
                     if (w1) launch(add_bias, target, grid, 1, threads, y, w1, o.c, total);
@@ -953,10 +1059,12 @@ private:
                 break;
             }
             case LocalSkip: pairs(y, a, b, c, w0, pixels, o.c / 2); break;
-            case Inception:
-                if (variable_spatial(2 * o.c / 3, o)) pairs(y, a, w0, w1, o.h, o.w);
-                else pairs(y, a, w0, w1);
+            case Inception: {
+                int inplace = inplace_inception[i] ? 1 : 0;
+                if (variable_spatial(2 * o.c / 3, o)) pairs(y, a, w0, w1, o.h, o.w, inplace);
+                else pairs(y, a, w0, w1, inplace);
                 break;
+            }
             case GlobalSkip: pairs(y, a, b, w0, o.c / 2); break;
             case Shuffle: run(y, a, o.h, o.w, o.c, op.x, total); break;
             case Concat:
@@ -1009,25 +1117,52 @@ static_assert(std::size(gate_stats) == GT_OPT_STAT_COUNT + 4);
 
 class GateSession final : public umzi::KernelSession {
 public:
-    gt::ModelFile model;
-    fs::path cache;
-    uint32_t flags = GT_CREATE_GRAPH;
-    CUdevice device = 0;
-    CUcontext context = nullptr;
-    CUmodule module = nullptr;
-    CUdeviceptr weights = 0;
+    struct Shared {
+        gt::ModelFile model;
+        fs::path cache;
+        uint32_t flags = GT_CREATE_GRAPH;
+        size_t workspace_limit = default_workspace_bytes;
+        CUdevice device = 0;
+        CUcontext context = nullptr;
+        CUmodule module = nullptr;
+        CUdeviceptr weights = 0;
+        cudnnHandle_t cudnn = nullptr;
+        cublasLtHandle_t blas = nullptr;
+        gt::Digest build{};
+
+        ~Shared() {
+            if (!context || cuCtxPushCurrent(context) != CUDA_SUCCESS) return;
+            if (cudnn) cudnnDestroy(cudnn);
+            if (blas) cublasLtDestroy(blas);
+            if (module) cuModuleUnload(module);
+            if (weights) cuMemFree(weights);
+            CUcontext previous;
+            cuCtxPopCurrent(&previous);
+            cuDevicePrimaryCtxRelease(device);
+        }
+    };
+
+    std::shared_ptr<Shared> shared = std::make_shared<Shared>();
     CUevent completed = nullptr;
     bool pending = false;
-    gt::Digest build{};
     std::unique_ptr<GtRunner> active;
 
     void open(const umzi::ModelPackage& package, const UmziSessionOptions& options) {
-        flags = (options.flags & UMZI_CUDA_GRAPH ? GT_CREATE_GRAPH : 0)
+        shared->flags = (options.flags & UMZI_CUDA_GRAPH ? GT_CREATE_GRAPH : 0)
             | (options.precision == UMZI_FP16 ? GT_CREATE_FP16 : 0);
-        if (options.cache_dir) cache = fs::u8path(options.cache_dir);
+        shared->workspace_limit = default_workspace_bytes;
+        if (options.cache_dir) shared->cache = fs::u8path(options.cache_dir);
         uint32_t seen = 0;
+        bool seen_workspace = false;
         for (uint32_t i = 0; i < options.kernel_option_count; ++i) {
             const auto& option = options.kernel_options[i];
+            if (option.name && std::strcmp(option.name, "workspace_mib") == 0) {
+                if (seen_workspace || option.value < 0 || option.value > 2048)
+                    throw std::runtime_error("Duplicate or invalid GateRV3 option: workspace_mib");
+                seen_workspace = true;
+                shared->workspace_limit = size_t(option.value) << 20;
+                continue;
+            }
             auto found = std::find_if(std::begin(gate_options), std::end(gate_options), [&](const auto& item) {
                 return option.name && std::strcmp(item.first, option.name) == 0;
             });
@@ -1036,51 +1171,62 @@ public:
             if ((seen & found->second) || (option.value != 0 && option.value != 1))
                 throw std::runtime_error("Duplicate or invalid GateRV3 option: " + std::string(option.name));
             seen |= found->second;
-            if (option.value) flags |= found->second;
+            if (option.value) shared->flags |= found->second;
         }
         GtRunner validator;
-        validator.configure({1, tile, tile}, flags);
-        model.parse(package);
+        validator.configure({1, tile, tile}, shared->flags);
+        shared->model.parse(package);
 
         CHECK(cuInit(0));
-        CHECK(cuDeviceGet(&device, options.device));
-        CHECK(cuDevicePrimaryCtxRetain(&context, device));
-        ContextScope scope(context);
-        const auto& image = umzi::load_kernel_module(device, module, gaterv3_images::embedded_cubins, gaterv3_images::embedded_ptx);
-        if (!cache.empty()) {
+        CHECK(cuDeviceGet(&shared->device, options.device));
+        CHECK(cuDevicePrimaryCtxRetain(&shared->context, shared->device));
+        ContextScope scope(shared->context);
+        const auto& image = umzi::load_kernel_module(shared->device, shared->module, gaterv3_images::embedded_cubins,
+                                                     gaterv3_images::embedded_ptx);
+        if (!shared->cache.empty()) {
             gt::Sha256 hash;
             const char build_id[] = __DATE__ " " __TIME__;
             hash.add(build_id);
             hash.add(package.schema);
             hash.add(image.data, image.size);
-            build = hash.finish();
+            shared->build = hash.finish();
         }
-        allocate(weights, model.weight_bytes, "model weights");
-        CHECK(cuMemcpyHtoD(weights, package.section(3).data(), model.weight_bytes));
+        CHECK(cudnnCreate(&shared->cudnn));
+        CHECK(cublasLtCreate(&shared->blas));
+        allocate(shared->weights, shared->model.weight_bytes, "model weights");
+        CHECK(cuMemcpyHtoD(shared->weights, package.section(3).data(), shared->model.weight_bytes));
         CHECK(cuEventCreate(&completed, CU_EVENT_DISABLE_TIMING));
     }
 
     ~GateSession() override {
-        if (!context || cuCtxPushCurrent(context) != CUDA_SUCCESS) return;
-        if (pending) cuEventSynchronize(completed);
-        active.reset();
-        if (completed) cuEventDestroy(completed);
-        if (module) cuModuleUnload(module);
-        if (weights) cuMemFree(weights);
-        CUcontext previous;
-        cuCtxPopCurrent(&previous);
-        cuDevicePrimaryCtxRelease(device);
+        if (!shared || !shared->context) return;
+        if (cuCtxPushCurrent(shared->context) == CUDA_SUCCESS) {
+            if (pending) cuEventSynchronize(completed);
+            active.reset();
+            if (completed) cuEventDestroy(completed);
+            CUcontext previous;
+            cuCtxPopCurrent(&previous);
+        }
+        shared.reset();
     }
 
-    bool fp16() const { return (flags & GT_CREATE_FP16) != 0; }
+    std::unique_ptr<umzi::KernelSession> clone_shared() const override {
+        auto copy = std::make_unique<GateSession>();
+        copy->shared = shared;
+        ContextScope scope(shared->context);
+        CHECK(cuEventCreate(&copy->completed, CU_EVENT_DISABLE_TIMING));
+        return copy;
+    }
+
+    bool fp16() const { return (shared->flags & GT_CREATE_FP16) != 0; }
 
     bool matches(Shape padded) const {
         return active && active->batch == padded.n && active->height == padded.h && active->width == padded.w;
     }
 
     uint64_t bytes_for(Shape shape) const {
-        auto padded = model.padded(shape);
-        if (!matches(padded)) model.check_shape(padded);
+        auto padded = shared->model.padded(shape);
+        if (!matches(padded)) shared->model.check_shape(padded);
         return shape.rgb_bytes(fp16());
     }
 
@@ -1092,21 +1238,23 @@ public:
     }
 
     GtRunner& prepare(Shape shape) {
-        ContextScope scope(context);
+        ContextScope scope(shared->context);
         wait();
-        auto padded = model.padded(shape);
+        auto padded = shared->model.padded(shape);
         if (!matches(padded)) {
-            auto resolved = model.resolve(padded);
+            auto resolved = shared->model.resolve(padded);
             active.reset();
             auto plan = std::make_unique<GtRunner>();
-            plan->initialize_shape(padded, flags, cache, device, context, module, weights, build, model, std::move(resolved));
+            plan->initialize_shape(padded, shared->flags, shared->cache, shared->device, shared->context,
+                                   shared->module, shared->weights, shared->cudnn, shared->blas,
+                                   shared->build, shared->model, std::move(resolved), shared->workspace_limit);
             active = std::move(plan);
         }
         return *active;
     }
 
     void enqueue(Shape shape, CUdeviceptr input, CUdeviceptr output, CUstream target) {
-        ContextScope scope(context);
+        ContextScope scope(shared->context);
         auto& plan = prepare(shape);
         try {
             plan.run_device(shape, input, output, target);
@@ -1126,10 +1274,10 @@ public:
 
     UmziModelInfo model_info() const override { return {sizeof(UmziModelInfo), "gaterv3", 1, 0}; }
     umzi::TilingConstraints tiling_constraints() const override {
-        const bool fixed_spatial = std::any_of(model.ops.begin(), model.ops.end(), [](const Op& op) {
+        const bool fixed_spatial = std::any_of(shared->model.ops.begin(), shared->model.ops.end(), [](const Op& op) {
             return op.kind == Attention && op.weight[0] >= 0;
         });
-        return {model.padded({1, 1, 1}).h, 1, 0, fixed_spatial ? tile : 0};
+        return {shared->model.padded({1, 1, 1}).h, 1, 0, fixed_spatial ? tile : 0};
     }
 
     UmziIo tensors() const override {
@@ -1160,7 +1308,7 @@ public:
     UmziSessionInfo session_info() const override {
         UmziSessionInfo result{};
         result.struct_size = sizeof(result);
-        result.buffer_bytes[0] = model.weight_bytes;
+        result.buffer_bytes[0] = shared->model.weight_bytes;
         if (active) {
             result.cache_status = active->plan_cache.status;
             result.prepared_input = {4, {static_cast<uint32_t>(active->batch), 3,
@@ -1191,7 +1339,7 @@ public:
 
     void profile(float* milliseconds, uint32_t count) override {
         if (!active) throw std::runtime_error("Prepare a GateRV3 shape before profiling");
-        ContextScope scope(context);
+        ContextScope scope(shared->context);
         wait();
         active->profile(milliseconds, static_cast<int>(count));
     }

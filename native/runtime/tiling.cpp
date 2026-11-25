@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <climits>
 #include <limits>
+#include <numeric>
 
 namespace umzi {
 namespace {
@@ -48,18 +49,19 @@ size_t element_size(uint32_t dtype) {
     throw std::runtime_error("GPU tiling requires FP16 or FP32 model I/O");
 }
 
-void submit_group(KernelSession& model, PageTiler& tiler, const TileGroup& group, TileGrid grid,
-                  CUdeviceptr page, CUdeviceptr tile_input, CUdeviceptr tile_output,
-                  CUdeviceptr sums, CUdeviceptr weights, CUdeviceptr destination) {
+template<class OnBatch>
+void submit_range(KernelSession& model, PageTiler& tiler, uint64_t begin, uint64_t end,
+                  const TileGroup& group, TileGrid grid, CUdeviceptr page, CUdeviceptr tile_input,
+                  CUdeviceptr tile_output, CUdeviceptr sums, CUdeviceptr weights, CUdeviceptr destination,
+                  OnBatch&& on_batch) {
     const int out_width = grid.width * grid.scale, out_height = grid.height * grid.scale;
     const int output_w = (grid.tile_w - 2 * grid.context) * grid.scale;
     const int output_h = (grid.tile_h - 2 * grid.context) * grid.scale;
     const int output_step = grid.step * grid.scale;
     const auto input_plane = multiply(grid.tile_h, grid.tile_w), output_plane = multiply(output_h, output_w);
-    const auto total = group.tiles ? group.first + group.tiles : uint64_t(grid.columns) * grid.rows;
     const auto stream = tiler.stream;
-    for (uint64_t first = group.first; first < total; first += grid.batch) {
-        int real = int(std::min<uint64_t>(grid.batch, total - first));
+    for (uint64_t first = begin; first < end; first += grid.batch) {
+        int real = int(std::min<uint64_t>(grid.batch, end - first));
         int first_column = int(first % grid.columns), first_row = int(first / grid.columns);
         void* extract_args[]{&grid, &page, &tile_input, &first_column, &first_row, &real};
         launch(tiler.extract, stream, input_plane, extract_args, grid.batch);
@@ -82,8 +84,21 @@ void submit_group(KernelSession& model, PageTiler& tiler, const TileGroup& group
         int region_height = bottom_start - top + std::min(output_h, out_height - bottom_start);
         void* blend_args[]{&grid, &tile_output, &sums, &weights, &first, &real, &left, &top,
                            &region_width, &region_height};
-        launch(tiler.blend, stream, multiply(region_width, region_height), blend_args);
+        constexpr unsigned threads = 256;
+        const unsigned bx = static_cast<unsigned>(std::min<int>(1 + (region_width - 1) / int(threads), 65535));
+        const unsigned by = static_cast<unsigned>(std::min<int>(region_height, 65535));
+        check(cuLaunchKernel(tiler.blend, bx, by, 1, threads, 1, 1, 0, stream, blend_args, nullptr),
+              "Launch GPU tiling blend kernel");
+        on_batch(first + real < end ? int((first + real) / grid.columns) : -1);
     }
+}
+
+void submit_group(KernelSession& model, PageTiler& tiler, const TileGroup& group, TileGrid grid,
+                  CUdeviceptr page, CUdeviceptr tile_input, CUdeviceptr tile_output,
+                  CUdeviceptr sums, CUdeviceptr weights, CUdeviceptr destination) {
+    const auto total = group.tiles ? group.first + group.tiles : uint64_t(grid.columns) * grid.rows;
+    submit_range(model, tiler, group.first, total, group, grid, page, tile_input, tile_output, sums, weights,
+                 destination, [](int) {});
 }
 }
 
@@ -97,6 +112,7 @@ PageTiler::PageTiler(int32_t device_id) {
         check(cuModuleGetFunction(&copy, module, "copy_tiles"), "Load tile copy kernel");
         check(cuModuleGetFunction(&blend, module, "blend_tiles"), "Load tile blending kernel");
         check(cuModuleGetFunction(&finish, module, "finish_page"), "Load page finalization kernel");
+        check(cuModuleGetFunction(&finish_strip, module, "finish_strip"), "Load strip finalization kernel");
         check(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING), "Create GPU tiling stream");
     } catch (...) {
         if (module) {
@@ -207,10 +223,58 @@ void run_tiled(KernelSession& kernel, std::unique_ptr<PageTiler>& tiler, int32_t
         throw std::runtime_error("Invalid GPU tiling page buffers");
 
     const int step = int(core - options.overlap);
+    const int output_step = step * int(model.scale);
+    bool sequential = true;
+    for (int i = 0; i < plan.size; ++i) {
+        const auto& group = plan.groups[i];
+        if (group.row != 0 || group.column != 0 || group.rows != plan.rows || group.columns != plan.columns) {
+            sequential = false;
+            break;
+        }
+    }
+    int strip_h = 0;
+    if (options.overlap && !raw) {
+        if (sequential) {
+            int max_batch = 1;
+            for (int i = 0; i < plan.size; ++i)
+                max_batch = std::max(max_batch, int(plan.groups[i].shape.dimensions[0]));
+            const int tile_out_h = (int(options.tile_size) - 2 * int(model.context)) * int(model.scale);
+            const int max_batch_rows = (max_batch - 1 + plan.columns - 1) / plan.columns;
+            strip_h = std::min(out_height, max_batch_rows * output_step + tile_out_h);
+        } else {
+            for (int b_start = 0; b_start < plan.size;) {
+                int b_end = b_start + 1;
+                while (b_end < plan.size && plan.groups[b_end].row == plan.groups[b_start].row) ++b_end;
+                const int band_tile_h = int(plan.groups[b_start].shape.dimensions[2]);
+                const int band_out_h = (band_tile_h - 2 * int(model.context)) * int(model.scale);
+                if (b_end - b_start == 1) {
+                    const auto& g = plan.groups[b_start];
+                    const int g_batch = int(g.shape.dimensions[0]);
+                    const int max_batch_rows = (g_batch - 1 + g.columns - 1) / g.columns;
+                    strip_h = std::max(strip_h, std::min(out_height, max_batch_rows * output_step + band_out_h));
+                } else {
+                    int chunk_rows = 1;
+                    for (int gi = b_start; gi < b_end; ++gi) {
+                        const int g_batch = int(plan.groups[gi].shape.dimensions[0]);
+                        const int g_rows = (g_batch + plan.groups[gi].columns - 1) / plan.groups[gi].columns;
+                        chunk_rows = std::max(chunk_rows, g_rows);
+                    }
+                    const int b0 = int(plan.groups[b_start].shape.dimensions[0]);
+                    const int c0 = plan.groups[b_start].columns;
+                    const int cycle = b0 / std::gcd(b0, c0);
+                    if (cycle <= 4) chunk_rows = std::max(chunk_rows, cycle);
+                    strip_h = std::max(strip_h, std::min(out_height, (chunk_rows - 1) * output_step + band_out_h));
+                }
+                b_start = b_end;
+            }
+        }
+        if (strip_h >= out_height) strip_h = 0;
+    }
+
     TileGrid grid{int(width), int(height), int(channels), int(output_channels), 0, 0, 0,
                   int(options.overlap), int(model.context), int(model.scale), step, 0, 0,
                   int(options.background), input_element == 2, output_element == 2, raw, 0, 0,
-                  plan.rows, plan.columns, plan.replicate};
+                  plan.rows, plan.columns, plan.replicate, strip_h};
     if (!tiler) tiler = std::make_unique<PageTiler>(device_id);
     ContextScope scope(tiler->context);
     try {
@@ -221,8 +285,11 @@ void run_tiled(KernelSession& kernel, std::unique_ptr<PageTiler>& tiler, int32_t
         kernel.prepare_shape(plan.groups[0].shape);
     }
     const auto stream = tiler->stream;
-    const auto sum_size = grid.overlap ? multiply(num_values, sizeof(float)) : 0;
-    const auto weight_size = grid.overlap ? multiply(num_pixels, sizeof(float)) : 0;
+    const bool ring_strip = grid.overlap && !raw && grid.strip_height > 0;
+    const auto accum_pixels = ring_strip ? multiply(out_width, grid.strip_height) : num_pixels;
+    const auto accum_values = multiply(accum_pixels, output_channels);
+    const auto sum_size = grid.overlap ? multiply(accum_values, sizeof(float)) : 0;
+    const auto weight_size = grid.overlap ? multiply(accum_pixels, sizeof(float)) : 0;
     const bool reuse_sums = raw && grid.overlap;
     const size_t host_size = std::max(source_size, result_size);
     HostBuffer raw_staging(raw ? host_size : 0);
@@ -258,11 +325,10 @@ void run_tiled(KernelSession& kernel, std::unique_ptr<PageTiler>& tiler, int32_t
     try {
         check(cuMemcpyHtoDAsync(page, host, source_size, stream), "Upload input page");
         if (grid.overlap) {
-            check(cuMemsetD32Async(sums, 0, num_values, stream), "Clear tile sums");
-            check(cuMemsetD32Async(weights, 0, num_pixels, stream), "Clear tile weights");
+            check(cuMemsetD32Async(sums, 0, accum_values, stream), "Clear tile sums");
+            check(cuMemsetD32Async(weights, 0, accum_pixels, stream), "Clear tile weights");
         }
-        for (int i = 0; i < plan.size; ++i) {
-            const auto& group = plan.groups[i];
+        auto set_group = [&](const TileGroup& group) {
             grid.row = group.row;
             grid.column = group.column;
             grid.rows = group.rows;
@@ -270,12 +336,91 @@ void run_tiled(KernelSession& kernel, std::unique_ptr<PageTiler>& tiler, int32_t
             grid.batch = int(group.shape.dimensions[0]);
             grid.tile_h = int(group.shape.dimensions[2]);
             grid.tile_w = int(group.shape.dimensions[3]);
-            auto& runner = i ? tiler->edge_runner(group.shape, open_edge) : kernel;
-            submit_group(runner, *tiler, group, grid, page, tile_input, tile_output, sums, weights, destination);
-        }
-        if (grid.overlap) {
-            void* finish_args[]{&grid, &sums, &weights, &destination};
-            launch(tiler->finish, stream, num_pixels, finish_args);
+        };
+        int committed_y = 0;
+        auto flush_rows = [&](int ready_y) {
+            ready_y = std::min(out_height, ready_y);
+            if (ready_y <= committed_y) return;
+            int rows_done = ready_y - committed_y;
+            void* strip_args[]{&grid, &sums, &weights, &destination, &committed_y, &rows_done};
+            constexpr unsigned threads = 256;
+            const unsigned bx = static_cast<unsigned>(std::min<int>(1 + (out_width - 1) / int(threads), 65535));
+            const unsigned by = static_cast<unsigned>(std::min<int>(rows_done, 65535));
+            check(cuLaunchKernel(tiler->finish_strip, bx, by, 1, threads, 1, 1, 0, stream, strip_args, nullptr),
+                  "Launch GPU strip finalization kernel");
+            committed_y = ready_y;
+        };
+        if (!ring_strip) {
+            for (int i = 0; i < plan.size; ++i) {
+                const auto& group = plan.groups[i];
+                set_group(group);
+                auto& runner = i ? tiler->edge_runner(group.shape, open_edge) : kernel;
+                submit_group(runner, *tiler, group, grid, page, tile_input, tile_output, sums, weights, destination);
+            }
+            if (grid.overlap) {
+                void* finish_args[]{&grid, &sums, &weights, &destination};
+                launch(tiler->finish, stream, num_pixels, finish_args);
+            }
+        } else if (sequential) {
+            for (int i = 0; i < plan.size; ++i) {
+                const auto& group = plan.groups[i];
+                set_group(group);
+                auto& runner = i ? tiler->edge_runner(group.shape, open_edge) : kernel;
+                const auto total = group.tiles ? group.first + group.tiles : uint64_t(grid.columns) * grid.rows;
+                submit_range(runner, *tiler, group.first, total, group, grid, page, tile_input, tile_output,
+                             sums, weights, destination, [&](int next_row) {
+                    if (next_row >= 0) {
+                        flush_rows(next_row * output_step);
+                    } else if (i + 1 < plan.size) {
+                        flush_rows(int(plan.groups[i + 1].first / grid.columns) * output_step);
+                    } else {
+                        flush_rows(out_height);
+                    }
+                });
+            }
+        } else {
+            for (int b_start = 0; b_start < plan.size;) {
+                int b_end = b_start + 1;
+                while (b_end < plan.size && plan.groups[b_end].row == plan.groups[b_start].row) ++b_end;
+                const int band_rows = plan.groups[b_start].rows;
+                const int band_row = plan.groups[b_start].row;
+                const int next_band_y = b_end < plan.size ? plan.groups[b_end].row * output_step : out_height;
+                if (b_end - b_start == 1) {
+                    const auto& group = plan.groups[b_start];
+                    set_group(group);
+                    auto& runner = b_start ? tiler->edge_runner(group.shape, open_edge) : kernel;
+                    const auto total = group.tiles ? group.first + group.tiles : uint64_t(grid.columns) * grid.rows;
+                    submit_range(runner, *tiler, group.first, total, group, grid, page, tile_input, tile_output,
+                                 sums, weights, destination, [&](int next_row) {
+                        flush_rows(next_row >= 0 ? (band_row + next_row) * output_step : next_band_y);
+                    });
+                } else {
+                    int chunk_rows = 1;
+                    for (int gi = b_start; gi < b_end; ++gi) {
+                        const int g_batch = int(plan.groups[gi].shape.dimensions[0]);
+                        const int g_rows = (g_batch + plan.groups[gi].columns - 1) / plan.groups[gi].columns;
+                        chunk_rows = std::max(chunk_rows, g_rows);
+                    }
+                    const int b0 = int(plan.groups[b_start].shape.dimensions[0]);
+                    const int c0 = plan.groups[b_start].columns;
+                    const int cycle = b0 / std::gcd(b0, c0);
+                    if (cycle <= 4) chunk_rows = std::max(chunk_rows, cycle);
+                    for (int r = 0; r < band_rows; r += chunk_rows) {
+                        const int r_end = std::min(band_rows, r + chunk_rows);
+                        for (int gi = b_start; gi < b_end; ++gi) {
+                            const auto& group = plan.groups[gi];
+                            set_group(group);
+                            auto& runner = gi ? tiler->edge_runner(group.shape, open_edge) : kernel;
+                            submit_range(runner, *tiler, uint64_t(r) * grid.columns, uint64_t(r_end) * grid.columns,
+                                         group, grid, page, tile_input, tile_output, sums, weights, destination,
+                                         [](int) {});
+                        }
+                        const int ready_y = r_end < band_rows ? (band_row + r_end) * output_step : next_band_y;
+                        flush_rows(ready_y);
+                    }
+                }
+                b_start = b_end;
+            }
         }
         check(cuMemcpyDtoHAsync(host, destination, result_size, stream), "Download result page");
         check(cuStreamSynchronize(stream), "Wait for GPU tiling");

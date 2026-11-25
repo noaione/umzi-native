@@ -1,5 +1,6 @@
 #include <cuda_fp16.h>
 #include <mma.h>
+#include "../../common/tensor_core.cuh"
 
 namespace wmma = nvcuda::wmma;
 
@@ -178,7 +179,8 @@ extern "C" __global__ void local_skip(half2* out, const half2* gated, const half
 
 template<int channels, int square>
 __device__ void inception(half2* out, const half2* in, const half2* weight,
-                          const half2* bias, int total, int h = square, int w = square) {
+                          const half2* bias, int total, int h = square, int w = square,
+                          bool inplace = false) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= total) return;
     int hidden = channels * 3 / 2, stride = channels * 3;
@@ -218,14 +220,16 @@ __device__ void inception(half2* out, const half2* in, const half2* weight,
         }
     }
     float2 g = __half22float2(in[pixel * stride + c]);
-    out[i] = __floats2half2_rn(mish(g.x) * v.x, mish(g.y) * v.y);
+    out[inplace ? (pixel * stride + c) : i] = __floats2half2_rn(mish(g.x) * v.x, mish(g.y) * v.y);
 }
 
 #define SPATIAL(C, W) \
 extern "C" __global__ void local_gate##C(half2* y, const half2* x, const half2* k, \
                                         const half2* b, int total) { local_gate<C, W>(y, x, k, b, total); } \
 extern "C" __global__ void inception##C(half2* y, const half2* x, const half2* k, \
-                                       const half2* b, int total) { inception<C / 2, W>(y, x, k, b, total); }
+                                       const half2* b, int inplace, int total) { \
+    inception<C / 2, W>(y, x, k, b, total, W, W, inplace != 0); \
+}
 SPATIAL(32, 128)
 SPATIAL(64, 64)
 SPATIAL(128, 32)
@@ -235,7 +239,9 @@ SPATIAL(256, 16)
 extern "C" __global__ void local_gate##C##_dynamic(half2* y, const half2* x, const half2* k, \
     const half2* b, int h, int w, int total) { local_gate<C, 0>(y, x, k, b, total, h, w); } \
 extern "C" __global__ void inception##C##_dynamic(half2* y, const half2* x, const half2* k, \
-    const half2* b, int h, int w, int total) { inception<C / 2, 0>(y, x, k, b, total, h, w); }
+    const half2* b, int h, int w, int inplace, int total) { \
+    inception<C / 2, 0>(y, x, k, b, total, h, w, inplace != 0); \
+}
 SPATIAL_DYNAMIC(32)
 SPATIAL_DYNAMIC(64)
 SPATIAL_DYNAMIC(128)
@@ -813,4 +819,154 @@ extern "C" __global__ void channel_attention_apply(half* out, const half* in,
         const int position = start + i / C;
         if (position < pixels) out[position * 512 + i % C] = __float2half_rn(result[i % C][i / C]);
     }
+}
+
+template<bool HalfAcc>
+__device__ void concat_conv1x1_32_impl(half* y, const half* x0, const half* x1, const half* x2, const half* x3,
+                                       const half* weight, const half* bias, int pixels) {
+    __shared__ __align__(16) half sW[4][32 * 32];
+    __shared__ __align__(16) half sA[8][16 * 32];
+    for (int i = threadIdx.x; i < 4 * 32 * 4; i += blockDim.x) {
+        const int chunk32 = i / 128, rem = i % 128, row = rem / 4, c8 = rem % 4;
+        copy_async_always(&sW[chunk32][swizzle32(row, c8)], weight + (row * 128 + chunk32 * 32 + c8 * 8));
+    }
+    asm volatile("cp.async.commit_group;");
+    asm volatile("cp.async.wait_group 0;");
+    __syncthreads();
+
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int p_base = (blockIdx.x * 8 + warp) * 16;
+    if (p_base >= pixels) return;
+    const half* ptrs[4] = {x0, x1, x2, x3};
+    Accumulator<HalfAcc> acc[4];
+    for (int chunk32 = 0; chunk32 < 4; ++chunk32) {
+        const half* src = ptrs[chunk32];
+        #pragma unroll
+        for (int u = 0; u < 2; ++u) {
+            const int idx = u * 32 + lane, row = idx / 4, c8 = idx % 4;
+            const int p = p_base + row;
+            *reinterpret_cast<uint4*>(&sA[warp][swizzle32(row, c8)]) =
+                (p < pixels) ? *reinterpret_cast<const uint4*>(src + p * 32 + c8 * 8) : uint4{};
+        }
+        __syncwarp();
+        #pragma unroll
+        for (int k = 0; k < 2; ++k) {
+            unsigned a[4];
+            load_matrix_x4(a, &sA[warp][swizzle32(lane % 16, 2 * k + lane / 16)]);
+            #pragma unroll
+            for (int g = 0; g < 4; ++g) {
+                unsigned b[2];
+                load_matrix_x2(b, &sW[chunk32][swizzle32(g * 8 + lane % 8, 2 * k + (lane / 8) % 2)]);
+                acc[g].mma(a, b[0], b[1]);
+            }
+        }
+        __syncwarp();
+    }
+    const int r0 = lane / 4, c_off = (lane % 4) * 2;
+    #pragma unroll
+    for (int g = 0; g < 4; ++g) {
+        const half2 bh = bias ? *reinterpret_cast<const half2*>(bias + g * 8 + c_off) : __float2half2_rn(0.f);
+        half2 out0, out1;
+        if constexpr (HalfAcc) {
+            const unsigned p0 = acc[g].packed_half2(0), p1 = acc[g].packed_half2(1);
+            out0 = __hadd2(*reinterpret_cast<const half2*>(&p0), bh);
+            out1 = __hadd2(*reinterpret_cast<const half2*>(&p1), bh);
+        } else {
+            const float2 f0 = acc[g].pair(0), f1 = acc[g].pair(1), fb = __half22float2(bh);
+            out0 = __floats2half2_rn(f0.x + fb.x, f0.y + fb.y);
+            out1 = __floats2half2_rn(f1.x + fb.x, f1.y + fb.y);
+        }
+        *reinterpret_cast<half2*>(&sA[warp][swizzle32(r0, g) + c_off]) = out0;
+        *reinterpret_cast<half2*>(&sA[warp][swizzle32(r0 + 8, g) + c_off]) = out1;
+    }
+    __syncwarp();
+    #pragma unroll
+    for (int u = 0; u < 2; ++u) {
+        const int idx = u * 32 + lane, row = idx / 4, c8 = idx % 4;
+        const int p = p_base + row;
+        if (p < pixels)
+            *reinterpret_cast<uint4*>(y + p * 32 + c8 * 8) =
+                *reinterpret_cast<const uint4*>(&sA[warp][swizzle32(row, c8)]);
+    }
+}
+
+template<bool HalfAcc>
+__device__ void strided_conv1x1_48_32_impl(half* y, const half* x, const half* weight, const half* bias,
+                                             int ld_in, int pixels) {
+    __shared__ __align__(16) half sW[3][32 * 16];
+    __shared__ __align__(16) half sA[8][16 * 32];
+    for (int i = threadIdx.x; i < 3 * 32 * 2; i += blockDim.x) {
+        const int k16 = i / 64, rem = i % 64, row = rem / 2, c8 = rem % 2;
+        copy_async_always(&sW[k16][swizzle16(row, c8)], weight + (row * 48 + k16 * 16 + c8 * 8));
+    }
+    asm volatile("cp.async.commit_group;");
+    asm volatile("cp.async.wait_group 0;");
+    __syncthreads();
+
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int p_base = (blockIdx.x * 8 + warp) * 16;
+    if (p_base >= pixels) return;
+    Accumulator<HalfAcc> acc[4];
+    #pragma unroll
+    for (int k16 = 0; k16 < 3; ++k16) {
+        const int row = lane / 2, c8 = lane % 2, p = p_base + row;
+        *reinterpret_cast<uint4*>(&sA[warp][swizzle16(row, c8)]) =
+            (p < pixels) ? *reinterpret_cast<const uint4*>(x + p * ld_in + k16 * 16 + c8 * 8) : uint4{};
+        __syncwarp();
+        unsigned a[4];
+        load_matrix_x4(a, &sA[warp][swizzle16(lane % 16, lane / 16)]);
+        #pragma unroll
+        for (int g = 0; g < 4; ++g) {
+            unsigned b[2];
+            load_matrix_x2(b, &sW[k16][swizzle16(g * 8 + lane % 8, (lane / 8) % 2)]);
+            acc[g].mma(a, b[0], b[1]);
+        }
+        __syncwarp();
+    }
+    const int r0 = lane / 4, c_off = (lane % 4) * 2;
+    #pragma unroll
+    for (int g = 0; g < 4; ++g) {
+        const half2 bh = bias ? *reinterpret_cast<const half2*>(bias + g * 8 + c_off) : __float2half2_rn(0.f);
+        half2 out0, out1;
+        if constexpr (HalfAcc) {
+            const unsigned p0 = acc[g].packed_half2(0), p1 = acc[g].packed_half2(1);
+            out0 = __hadd2(*reinterpret_cast<const half2*>(&p0), bh);
+            out1 = __hadd2(*reinterpret_cast<const half2*>(&p1), bh);
+        } else {
+            const float2 f0 = acc[g].pair(0), f1 = acc[g].pair(1), fb = __half22float2(bh);
+            out0 = __floats2half2_rn(f0.x + fb.x, f0.y + fb.y);
+            out1 = __floats2half2_rn(f1.x + fb.x, f1.y + fb.y);
+        }
+        *reinterpret_cast<half2*>(&sA[warp][swizzle32(r0, g) + c_off]) = out0;
+        *reinterpret_cast<half2*>(&sA[warp][swizzle32(r0 + 8, g) + c_off]) = out1;
+    }
+    __syncwarp();
+    #pragma unroll
+    for (int u = 0; u < 2; ++u) {
+        const int idx = u * 32 + lane, row = idx / 4, c8 = idx % 4;
+        const int p = p_base + row;
+        if (p < pixels)
+            *reinterpret_cast<uint4*>(y + p * 32 + c8 * 8) =
+                *reinterpret_cast<const uint4*>(&sA[warp][swizzle32(row, c8)]);
+    }
+}
+
+extern "C" __global__ void concat_conv1x1_32(half* y, const half* x0, const half* x1, const half* x2,
+                                             const half* x3, const half* weight, const half* bias, int pixels) {
+    concat_conv1x1_32_impl<false>(y, x0, x1, x2, x3, weight, bias, pixels);
+}
+
+extern "C" __global__ void concat_conv1x1_32_16(half* y, const half* x0, const half* x1, const half* x2,
+                                                const half* x3, const half* weight, const half* bias, int pixels) {
+    concat_conv1x1_32_impl<true>(y, x0, x1, x2, x3, weight, bias, pixels);
+}
+
+extern "C" __global__ void strided_conv1x1_48_32(half* y, const half* x, const half* weight, const half* bias,
+                                                 int ld_in, int pixels) {
+    strided_conv1x1_48_32_impl<false>(y, x, weight, bias, ld_in, pixels);
+}
+
+extern "C" __global__ void strided_conv1x1_48_32_16(half* y, const half* x, const half* weight, const half* bias,
+                                                    int ld_in, int pixels) {
+    strided_conv1x1_48_32_impl<true>(y, x, weight, bias, ld_in, pixels);
 }

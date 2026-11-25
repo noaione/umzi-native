@@ -32,7 +32,8 @@ keep the checkpoint, images, and tiling identical across backends.
 ## Report timing, fidelity, and VRAM
 
 - Report inference latency per image, the total, and the median across
-  images, in milliseconds. Identify the measured region and exclude model loading,
+  images, in milliseconds. You need to also calculate the MPx/s for the
+  images. Identify the measured region and exclude model loading,
   compilation, warmup, and metric calculation from steady-state timing.
 - Report ms/tile per image and the median of those per-image values. For
   batch-1 latency, time each tile in a synchronized batch-1 inference call and
