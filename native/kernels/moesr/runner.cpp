@@ -596,8 +596,8 @@ private:
     }
 
     void prepare(Shape requested) {
-        wait();
         if (shape == requested) return;
+        wait(); // Only a shape change frees buffers the previous batch may still use.
         release_shape();
         try {
             auto start = Clock::now();
@@ -881,6 +881,7 @@ public:
     void run_host(const UmziShape& request, const void* input, void* output) override {
         ContextScope scope(context);
         prepare(checked(request));
+        wait();
         ensure_staging();
         const auto input_bytes = shape.rgb_bytes(fp16);
         try {
@@ -899,6 +900,8 @@ public:
         prepare(checked(request));
         auto target = reinterpret_cast<CUstream>(stream_target);
         try {
+            // Order this batch after the previous one on the device instead of blocking the host.
+            if (pending) CHECK(cuStreamWaitEvent(target, complete, CU_EVENT_WAIT_DEFAULT));
             execute(input, output, target);
             CHECK(cuEventRecord(complete, target));
             pending = true;

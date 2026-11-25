@@ -1252,9 +1252,9 @@ public:
 
     GtRunner& prepare(Shape shape) {
         ContextScope scope(shared->context);
-        wait();
         auto padded = shared->model.padded(shape);
         if (!matches(padded)) {
+            wait(); // Only a shape change frees buffers the previous batch may still use.
             auto resolved = shared->model.resolve(padded);
             active.reset();
             auto plan = std::make_unique<GtRunner>();
@@ -1270,6 +1270,8 @@ public:
         ContextScope scope(shared->context);
         auto& plan = prepare(shape);
         try {
+            // Order this batch after the previous one on the device instead of blocking the host.
+            if (pending) CHECK(cuStreamWaitEvent(target, completed, CU_EVENT_WAIT_DEFAULT));
             plan.run_device(shape, input, output, target);
             CHECK(cuEventRecord(completed, target));
             pending = true;
@@ -1311,7 +1313,10 @@ public:
 
     void run_host(const UmziShape& shape, const void* input, void* output) override {
         auto concrete = checked(shape);
-        prepare(concrete).run_host(concrete, input, output);
+        auto& plan = prepare(concrete);
+        ContextScope scope(shared->context);
+        wait();
+        plan.run_host(concrete, input, output);
     }
 
     void enqueue_device(const UmziShape& shape, uint64_t input, uint64_t output, UmziStream stream) override {

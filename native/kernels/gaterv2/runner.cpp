@@ -739,9 +739,9 @@ public:
 
     void prepare(Shape shape) {
         ContextScope scope(context);
-        wait();
         const auto p = padded(shape);
         if (prepared == p) return;
+        wait(); // Only a shape change frees buffers the previous batch may still use.
         release_shape();
         try {
             auto start = Clock::now();
@@ -1221,6 +1221,7 @@ public:
         prepare(shape);
         if (!(request == shape) && executable) {
             ContextScope scope(context);
+            wait(); // The recapture below runs on the internal stream over the shared buffers.
             const auto start = Clock::now();
             cuGraphExecDestroy(executable);
             executable = nullptr;
@@ -1247,6 +1248,7 @@ public:
         const auto concrete = checked(shape);
         prepare_exact(concrete);
         ContextScope scope(context);
+        wait();
         ensure_staging();
         const uint64_t bytes = io_bytes_for(concrete);
         CHECK(cuMemcpyHtoDAsync(stage_in, input, bytes, stream));
@@ -1261,6 +1263,8 @@ public:
         ContextScope scope(context);
         auto selected = reinterpret_cast<CUstream>(stream_target);
         try {
+            // Order this batch after the previous one on the device instead of blocking the host.
+            if (pending) CHECK(cuStreamWaitEvent(selected, completed, CU_EVENT_WAIT_DEFAULT));
             enqueue_shape(concrete, input, output, selected);
             CHECK(cuEventRecord(completed, selected));
             pending = true;

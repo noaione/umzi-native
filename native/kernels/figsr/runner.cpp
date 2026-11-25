@@ -465,8 +465,8 @@ class Session final : public umzi::KernelSession {
     }
 
     void prepare(Shape requested) {
-        wait();
         if (shape == requested) return;
+        wait(); // Only a shape change frees buffers the previous batch may still use.
         release_shape();
         try {
             const auto padded = requested.padded();
@@ -711,6 +711,7 @@ public:
     void run_host(const UmziShape& request, const void* input, void* output) override {
         ContextScope scope(context);
         prepare(checked(request));
+        wait();
         ensure_staging();
         const auto bytes = rgb_bytes(shape);
         try {
@@ -728,6 +729,8 @@ public:
         ContextScope scope(context);
         prepare(checked(request));
         try {
+            // Order this batch after the previous one on the device instead of blocking the host.
+            if (pending) CHECK(cuStreamWaitEvent(target, complete, CU_EVENT_WAIT_DEFAULT));
             execute(input, output, target);
             CHECK(cuEventRecord(complete, target));
             pending = true;
