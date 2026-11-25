@@ -581,11 +581,22 @@ public:
                 throw std::runtime_error("Invalid or duplicate FiGSR kernel option: " + std::string(name));
             }
         }
-        if (!fp32 && fp32_nchw) throw std::runtime_error("FiGSR fp32_nchw requires FP32 precision");
-        if ((fp16 || fp32) && fp16_expand_accumulation)
-            throw std::runtime_error("FiGSR fp16_expand_accumulation requires mixed precision");
-        if ((fp16 || fp32) && fuse_row_gate) throw std::runtime_error("FiGSR fuse_row_gate requires mixed precision");
-        if (fp32 && fuse_expand_gate) throw std::runtime_error("FiGSR fuse_expand_gate requires mixed or FP16 precision");
+        if (!fp32 && fp32_nchw) {
+            warn_option("Disabled FiGSR fp32_nchw: requires FP32 precision");
+            fp32_nchw = false;
+        }
+        if ((fp16 || fp32) && fp16_expand_accumulation) {
+            warn_option("Disabled FiGSR fp16_expand_accumulation: requires mixed precision");
+            fp16_expand_accumulation = false;
+        }
+        if ((fp16 || fp32) && fuse_row_gate) {
+            warn_option("Disabled FiGSR fuse_row_gate: requires mixed precision");
+            fuse_row_gate = false;
+        }
+        if (fp32 && fuse_expand_gate) {
+            warn_option("Disabled FiGSR fuse_expand_gate: requires mixed or FP16 precision");
+            fuse_expand_gate = false;
+        }
         if (!fp32) net = Network(sizeof(uint16_t));
         graph = (options.flags & UMZI_CUDA_GRAPH) != 0;
         CHECK(cuInit(0));
@@ -635,6 +646,7 @@ public:
 
     std::unique_ptr<umzi::KernelSession> clone_shared() const override {
         auto copy = std::make_unique<Session>();
+        copy->copy_warnings(*this);
         copy->shared = shared;
         copy->net = net;
         copy->fp16 = fp16;

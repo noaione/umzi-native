@@ -32,6 +32,22 @@ public:
     virtual const char* kernel_message() const { return ""; }
     virtual void profile(float*, uint32_t) { throw std::runtime_error("Kernel profiling is unavailable"); }
     virtual std::unique_ptr<KernelSession> clone_shared() const { return nullptr; }
+
+    // kernel_message() plus any ignored-option warnings, for the C API.
+    const char* kernel_report() const {
+        report_ = kernel_message();
+        if (!warnings_.empty()) report_ += (report_.empty() ? "" : "; ") + warnings_;
+        return report_.c_str();
+    }
+
+protected:
+    void copy_warnings(const KernelSession& source) { warnings_ = source.warnings_; }
+    // Ignore a bad kernel option instead of failing the session; surfaced via kernel_report().
+    void warn_option(const std::string& text) { warnings_ += (warnings_.empty() ? "" : "; ") + text; }
+
+private:
+    std::string warnings_;
+    mutable std::string report_;
 };
 
 using KernelFactory = std::unique_ptr<KernelSession>(*)(const ModelPackage&, const UmziSessionOptions&);

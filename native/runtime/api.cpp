@@ -198,7 +198,7 @@ const char* umzi_session_cache_message(const UmziSession* session) {
 }
 
 const char* umzi_session_kernel_message(const UmziSession* session) {
-    return session ? session->kernel->kernel_message() : "";
+    return session ? session->kernel->kernel_report() : "";
 }
 
 int umzi_session_profile(UmziSession* session, float* milliseconds, uint32_t count) {

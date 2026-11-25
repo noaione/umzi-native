@@ -482,10 +482,18 @@ public:
                 throw std::runtime_error("Invalid or duplicate SMoSR kernel option: " + std::string(name));
             }
         }
-        if (fp32 && tune_convolutions) throw std::runtime_error("SMoSR tune_convolutions requires mixed or FP16 precision");
-        if ((fp16 || fp32) && fp16_accumulation)
-            throw std::runtime_error("SMoSR fp16_accumulation requires mixed precision");
-        if (fuse_silu && fp32) throw std::runtime_error("SMoSR fuse_silu requires mixed or FP16 precision");
+        if (fp32 && tune_convolutions) {
+            warn_option("Disabled SMoSR tune_convolutions: requires mixed or FP16 precision");
+            tune_convolutions = false;
+        }
+        if ((fp16 || fp32) && fp16_accumulation) {
+            warn_option("Disabled SMoSR fp16_accumulation: requires mixed precision");
+            fp16_accumulation = false;
+        }
+        if (fuse_silu && fp32) {
+            warn_option("Disabled SMoSR fuse_silu: requires mixed or FP16 precision");
+            fuse_silu = false;
+        }
         graph = (options.flags & UMZI_CUDA_GRAPH) != 0;
         CHECK(cuInit(0));
         CHECK(cuDeviceGet(&device, options.device));
@@ -560,6 +568,7 @@ public:
 
     std::unique_ptr<umzi::KernelSession> clone_shared() const override {
         auto copy = std::make_unique<Session>();
+        copy->copy_warnings(*this);
         copy->shared = shared;
         copy->net = net;
         copy->fp16 = fp16;
