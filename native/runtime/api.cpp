@@ -16,10 +16,17 @@ struct UmziSession {
     std::string cache;
     std::vector<std::pair<std::string, int64_t>> kernel_options;
 
+    // Read and hashed once, on the first edge session, instead of once per edge session.
+    mutable std::unique_ptr<umzi::ModelPackage> edge_package;
+
     std::unique_ptr<umzi::KernelSession> open_edge() const {
-        const umzi::ModelPackage package(path);
-        if (package.digest != digest)
-            throw std::runtime_error("The Umzi model package changed while the variable tiler session was open");
+        if (!edge_package) {
+            auto loaded = std::make_unique<umzi::ModelPackage>(path);
+            if (loaded->digest != digest)
+                throw std::runtime_error("The Umzi model package changed while the variable tiler session was open");
+            edge_package = std::move(loaded);
+        }
+        const umzi::ModelPackage& package = *edge_package;
         std::vector<UmziOption> settings;
         for (const auto& option : kernel_options) settings.push_back({option.first.c_str(), option.second});
         auto view = options;
