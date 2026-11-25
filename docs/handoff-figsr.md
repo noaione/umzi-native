@@ -700,15 +700,15 @@ precision and kernel-option combinations were rejected at session open.
 
 ## Final Torch and native comparison
 
-Rerun the three Torch backends and four tuned native configurations in
+The rerun covered three Torch backends and four tuned native configurations in
 separate processes on the RTX 3050 Laptop GPU. Use batch 1, fixed 256×256
 tiles, zero overlap, and all three `samples/2x-test` images. The fresh
 eager FP32 outputs are the common reference for raw PSNR and rendered
 SSIMULACRA2. Reports and renders for this comparison are under
-`output/figsr-final-comparison/figsr/batch-1/`.
+`output/figsr-final-rerun/figsr/batch-1/`.
 
 Use the commands in [Reproduce](#reproduce) with
-`--output output/figsr-final-comparison` for each backend. For the native
+`--output output/figsr-final-rerun` for each backend. For the native
 runs, this comparison used `output/figsr-session/figsr-benchmark.ummodel`
 and `output/figsr-session/pass12-expand-fft/umzi_native.dll`. Pass
 `--tune-convolutions` with these options.
@@ -724,43 +724,44 @@ All seven reports completed and matched the checkpoint hash, image
 hashes, tile coordinates, input sizes, and device. Each configuration
 timed 242 synchronized forwards. The totals below sum the three image
 latencies. NVML is the device-wide reading, and the increase is relative
-to each process's pre-backend reading.
+to each process's pre-backend reading. Each native half-storage mode
+peaked at 124 MiB above its own starting reading.
 
 | Backend | Total ms | Median ms/image | Median ms/tile | Median page mean ms/tile | PSNR dB | Mean SSIMULACRA2 | NVML peak MiB | Peak increase MiB |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Torch eager FP32 | 44591.40 | 14202.38 | 183.961 | 184.446 | Reference | Reference | 1598.20 | 206.94 |
-| TorchInductor FP32 | 50951.98 | 16235.14 | 209.746 | 210.432 | 99.80 | 90.68 | 1693.45 | 304.38 |
-| TorchInductor FP16 | 16488.16 | 5428.21 | 66.734 | 67.120 | 66.49 | 88.50 | 1537.50 | 155.37 |
-| Native FP32 | 40138.27 | 13096.80 | 164.425 | 165.252 | 100.27 | 90.69 | 1590.13 | 208.63 |
-| Native FP16 | 10388.63 | 3487.93 | 42.285 | 42.888 | 62.82 | 88.33 | 1634.38 | 213.56 |
-| Native mixed | 11152.26 | 3560.97 | 45.878 | 46.246 | 68.08 | 88.69 | 1569.79 | 120.34 |
-| Native mixed with FP16 expansion | 10344.84 | 3306.23 | 42.469 | 42.893 | 64.64 | 88.54 | 1568.29 | 124.00 |
+| Torch eager FP32 | 44749.80 | 14240.18 | 184.680 | 184.937 | Reference | Reference | 1667.59 | 207.56 |
+| TorchInductor FP32 | 51331.50 | 16453.90 | 210.420 | 211.611 | 99.80 | 90.68 | 1747.47 | 288.13 |
+| TorchInductor FP16 | 16489.09 | 5417.74 | 66.729 | 67.264 | 66.49 | 88.50 | 1602.91 | 156.00 |
+| Native FP32 | 39393.94 | 12531.69 | 162.426 | 162.749 | 100.27 | 90.69 | 1622.11 | 196.00 |
+| Native FP16 | 9897.19 | 3157.23 | 40.706 | 40.900 | 62.82 | 88.33 | 1550.11 | 124.00 |
+| Native mixed | 11151.03 | 3562.42 | 45.891 | 46.265 | 68.08 | 88.69 | 1549.79 | 124.00 |
+| Native mixed with FP16 expansion | 10357.25 | 3294.05 | 42.673 | 42.780 | 64.64 | 88.54 | 1549.48 | 124.00 |
 
 ### Per-image final results
 
 | Backend | Image | Inference ms | Mean ms/tile | PSNR dB | SSIMULACRA2 | NVML peak MiB |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| Torch eager FP32 | `9798855404661.jpg` | 14107.05 | 183.208 | Reference | Reference | 1598.20 |
-| Torch eager FP32 | `9798855424195.jpg` | 14202.38 | 184.446 | Reference | Reference | 1597.95 |
-| Torch eager FP32 | `9798855444216.jpg` | 16281.97 | 185.022 | Reference | Reference | 1597.95 |
-| TorchInductor FP32 | `9798855404661.jpg` | 16235.14 | 210.846 | 117.89 | 89.68 | 1688.51 |
-| TorchInductor FP32 | `9798855424195.jpg` | 16203.25 | 210.432 | 121.38 | 91.07 | 1693.45 |
-| TorchInductor FP32 | `9798855444216.jpg` | 18513.59 | 210.382 | 95.19 | 91.27 | 1688.51 |
-| TorchInductor FP16 | `9798855404661.jpg` | 5153.34 | 66.927 | 66.31 | 87.35 | 1537.50 |
-| TorchInductor FP16 | `9798855424195.jpg` | 5428.21 | 70.496 | 66.88 | 89.21 | 1537.50 |
-| TorchInductor FP16 | `9798855444216.jpg` | 5906.60 | 67.120 | 66.31 | 88.94 | 1537.50 |
-| Native FP32 | `9798855404661.jpg` | 12499.29 | 162.328 | 116.84 | 89.68 | 1577.50 |
-| Native FP32 | `9798855424195.jpg` | 13096.80 | 170.088 | 121.94 | 91.18 | 1590.13 |
-| Native FP32 | `9798855444216.jpg` | 14542.18 | 165.252 | 95.67 | 91.21 | 1580.32 |
-| Native FP16 | `9798855404661.jpg` | 3487.93 | 45.298 | 62.32 | 87.19 | 1544.82 |
-| Native FP16 | `9798855424195.jpg` | 3302.36 | 42.888 | 63.29 | 89.01 | 1634.38 |
-| Native FP16 | `9798855444216.jpg` | 3598.34 | 40.890 | 62.89 | 88.80 | 1573.44 |
-| Native mixed | `9798855404661.jpg` | 3518.98 | 45.701 | 67.38 | 87.44 | 1569.79 |
-| Native mixed | `9798855424195.jpg` | 3560.97 | 46.246 | 68.54 | 89.33 | 1569.79 |
-| Native mixed | `9798855444216.jpg` | 4072.31 | 46.276 | 68.41 | 89.28 | 1569.79 |
-| Native mixed with FP16 expansion | `9798855404661.jpg` | 3264.06 | 42.390 | 63.74 | 87.36 | 1568.29 |
-| Native mixed with FP16 expansion | `9798855424195.jpg` | 3306.23 | 42.938 | 65.08 | 89.37 | 1567.29 |
-| Native mixed with FP16 expansion | `9798855444216.jpg` | 3774.56 | 42.893 | 65.24 | 88.87 | 1567.29 |
+| Torch eager FP32 | `9798855404661.jpg` | 14172.45 | 184.058 | Reference | Reference | 1667.59 |
+| Torch eager FP32 | `9798855424195.jpg` | 14240.18 | 184.937 | Reference | Reference | 1667.59 |
+| Torch eager FP32 | `9798855444216.jpg` | 16337.17 | 185.650 | Reference | Reference | 1667.34 |
+| TorchInductor FP32 | `9798855404661.jpg` | 16453.90 | 213.687 | 117.89 | 89.68 | 1747.47 |
+| TorchInductor FP32 | `9798855424195.jpg` | 16294.06 | 211.611 | 121.38 | 91.07 | 1746.91 |
+| TorchInductor FP32 | `9798855444216.jpg` | 18583.54 | 211.177 | 95.19 | 91.27 | 1746.91 |
+| TorchInductor FP16 | `9798855404661.jpg` | 5152.16 | 66.911 | 66.31 | 87.35 | 1602.91 |
+| TorchInductor FP16 | `9798855424195.jpg` | 5417.74 | 70.360 | 66.88 | 89.21 | 1602.91 |
+| TorchInductor FP16 | `9798855444216.jpg` | 5919.20 | 67.264 | 66.31 | 88.94 | 1602.91 |
+| Native FP32 | `9798855404661.jpg` | 12519.53 | 162.591 | 116.84 | 89.68 | 1622.11 |
+| Native FP32 | `9798855424195.jpg` | 12531.69 | 162.749 | 121.94 | 91.18 | 1622.11 |
+| Native FP32 | `9798855444216.jpg` | 14342.72 | 162.985 | 95.67 | 91.21 | 1622.11 |
+| Native FP16 | `9798855404661.jpg` | 3140.77 | 40.789 | 62.32 | 87.19 | 1550.11 |
+| Native FP16 | `9798855424195.jpg` | 3157.23 | 41.003 | 63.29 | 89.01 | 1550.11 |
+| Native FP16 | `9798855444216.jpg` | 3599.20 | 40.900 | 62.89 | 88.80 | 1550.11 |
+| Native mixed | `9798855404661.jpg` | 3517.02 | 45.676 | 67.38 | 87.44 | 1549.79 |
+| Native mixed | `9798855424195.jpg` | 3562.42 | 46.265 | 68.54 | 89.33 | 1549.79 |
+| Native mixed | `9798855444216.jpg` | 4071.59 | 46.268 | 68.41 | 89.28 | 1549.48 |
+| Native mixed with FP16 expansion | `9798855404661.jpg` | 3272.61 | 42.501 | 63.74 | 87.36 | 1549.48 |
+| Native mixed with FP16 expansion | `9798855424195.jpg` | 3294.05 | 42.780 | 65.08 | 89.37 | 1549.48 |
+| Native mixed with FP16 expansion | `9798855444216.jpg` | 3790.59 | 43.075 | 65.24 | 88.87 | 1549.48 |
 
 Each backend directory contains `report.json`, including setup timings
 and every tile's synchronized latency. Directory names are
@@ -768,10 +769,30 @@ and every tile's synchronized latency. Directory names are
 `native-fp16`, `native-mixed`, and
 `native-mixed-fp16-expand`.
 
-The original native FP16 run peaked at 1634.38 MiB on `9798855424195.jpg`.
-A full repeat with the same package, library, and options peaked at
-1550.59 MiB on every page, 124 MiB above its background. The repeat took
-10210.30 ms total, with medians of 3265.27 ms/image and 42.049 ms/tile.
-The per-image fidelity values matched the first run. Both sessions
-reported zero native convolution workspace. See
-`native-fp16-repeat/report.json` in the same directory.
+The first final comparison is archived under
+`output/figsr-final-comparison/figsr/batch-1/`. Its original native FP16
+run peaked at 1634.38 MiB on `9798855424195.jpg`, 213.56 MiB above its
+starting usage. The exact repeat and the full matrix rerun both peaked
+at 124 MiB above their respective starting readings. FiGSR's own
+session buffers totaled 61.11 MiB for FP16 and 62.99 MiB for mixed.
+Both reported zero convolution workspace.
+
+### Native CUDA Graph timing check
+
+Prepare all three native half-storage configurations with their final
+options and rotate their execution order on each tile. The three sessions
+use CUDA Graphs and the same 242-tile grid as the separate backend runs.
+
+| Image | FP16 mean ms/tile | Mixed mean ms/tile | Mixed with FP16 expansion mean ms/tile |
+| --- | ---: | ---: | ---: |
+| `9798855404661.jpg` | 40.314 | 46.931 | 43.024 |
+| `9798855424195.jpg` | 40.359 | 47.183 | 42.978 |
+| `9798855444216.jpg` | 40.397 | 47.112 | 43.167 |
+| Median across all tiles | 40.255 | 46.947 | 42.990 |
+
+FP16 was faster on all 242 tiles against standard mixed and on 240 of
+242 against mixed with FP16 expansion. The original separate runs
+showed 45.298 ms/tile for FP16 and 42.390 ms/tile for mixed with FP16
+expansion on `9798855404661.jpg`. The separate matrix rerun moved those
+page means to 40.789 and 42.501 ms/tile, respectively. Individual samples
+from the rotating-order check are in `native-interleaved.json`.
