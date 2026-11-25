@@ -38,7 +38,7 @@ size_t multiply(size_t value, size_t factor) {
 
 void launch(CUfunction function, CUstream stream, size_t work, void** args, unsigned tiles = 1) {
     constexpr unsigned threads = 256;
-    const auto blocks = static_cast<unsigned>(std::min<size_t>(1 + (work - 1) / threads, 65535));
+    const auto blocks = static_cast<unsigned>(std::min<size_t>(work ? 1 + (work - 1) / threads : 1, 65535));
     check(cuLaunchKernel(function, blocks, std::min(tiles, 65535u), 1, threads, 1, 1, 0, stream, args, nullptr),
           "Launch GPU tiling kernel");
 }
@@ -53,7 +53,7 @@ template<class OnBatch>
 void submit_range(KernelSession& model, PageTiler& tiler, uint64_t begin, uint64_t end,
                   const TileGroup& group, TileGrid grid, CUdeviceptr page, CUdeviceptr tile_input,
                   CUdeviceptr tile_output, CUdeviceptr sums, CUdeviceptr weights, CUdeviceptr destination,
-                  OnBatch&& on_batch) {
+                  OnBatch&& on_batch, const int* committed_y = nullptr) {
     const int out_width = grid.width * grid.scale, out_height = grid.height * grid.scale;
     const int output_w = (grid.tile_w - 2 * grid.context) * grid.scale;
     const int output_h = (grid.tile_h - 2 * grid.context) * grid.scale;
@@ -82,6 +82,9 @@ void submit_range(KernelSession& model, PageTiler& tiler, uint64_t begin, uint64
         const int bottom_start = (grid.row + last_row) * output_step;
         int region_width = right_start - left + std::min(output_w, out_width - right_start);
         int region_height = bottom_start - top + std::min(output_h, out_height - bottom_start);
+        // A ring slot holds one row; rows still unfinished must fit in the strip or two rows would share a slot.
+        if (committed_y && grid.strip_height > 0 && top + region_height - *committed_y > grid.strip_height)
+            throw std::runtime_error("GPU tiling strip is smaller than the rows still being blended");
         void* blend_args[]{&grid, &tile_output, &sums, &weights, &first, &real, &left, &top,
                            &region_width, &region_height};
         constexpr unsigned threads = 256;
@@ -126,6 +129,7 @@ PageTiler::PageTiler(int32_t device_id) {
 PageTiler::~PageTiler() {
     try {
         ContextScope scope(context);
+        cuStreamSynchronize(stream); // Queued copies may still read the pinned staging buffer.
         if (staging) cuMemFreeHost(staging);
         cuStreamDestroy(stream);
         cuModuleUnload(module);
@@ -161,13 +165,16 @@ KernelSession& PageTiler::edge_runner(const UmziShape& shape, const OpenTileRunn
         if (!runner) runner = open();
         runner->prepare_shape(shape);
     };
-    try {
-        prepare();
-    } catch (const AllocationError&) {
-        if (edges.empty()) throw;
-        check(cuStreamSynchronize(stream), "Synchronize GPU tiling stream");
-        edges.clear();
-        prepare();
+    for (;;) {
+        try {
+            prepare();
+            break;
+        } catch (const AllocationError&) {
+            if (edges.empty()) throw;
+            // Free the least recently used runner and retry; clearing every runner would reload the model per tile group.
+            check(cuStreamSynchronize(stream), "Synchronize GPU tiling stream");
+            edges.erase(edges.begin());
+        }
     }
     edges.push_back({shape, std::move(runner)});
     return *edges.back().kernel;
@@ -378,7 +385,7 @@ void run_tiled(KernelSession& kernel, std::unique_ptr<PageTiler>& tiler, int32_t
                     } else {
                         flush_rows(out_height);
                     }
-                });
+                }, &committed_y);
             }
         } else {
             for (int b_start = 0; b_start < plan.size;) {
@@ -395,7 +402,7 @@ void run_tiled(KernelSession& kernel, std::unique_ptr<PageTiler>& tiler, int32_t
                     submit_range(runner, *tiler, group.first, total, group, grid, page, tile_input, tile_output,
                                  sums, weights, destination, [&](int next_row) {
                         flush_rows(next_row >= 0 ? (band_row + next_row) * output_step : next_band_y);
-                    });
+                    }, &committed_y);
                 } else {
                     int chunk_rows = 1;
                     for (int gi = b_start; gi < b_end; ++gi) {
@@ -415,7 +422,7 @@ void run_tiled(KernelSession& kernel, std::unique_ptr<PageTiler>& tiler, int32_t
                             auto& runner = gi ? tiler->edge_runner(group.shape, open_edge) : kernel;
                             submit_range(runner, *tiler, uint64_t(r) * grid.columns, uint64_t(r_end) * grid.columns,
                                          group, grid, page, tile_input, tile_output, sums, weights, destination,
-                                         [](int) {});
+                                         [](int) {}, &committed_y);
                         }
                         const int ready_y = r_end < band_rows ? (band_row + r_end) * output_step : next_band_y;
                         flush_rows(ready_y);
