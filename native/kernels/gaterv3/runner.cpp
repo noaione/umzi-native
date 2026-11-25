@@ -551,6 +551,7 @@ private:
     std::vector<bool> fused_concat;
     std::vector<bool> inplace_inception;
     std::vector<bool> skip_alloc;
+    std::vector<uint8_t> conv3x3_fused;
     std::vector<Op> ops;
     std::vector<CUdeviceptr> addresses;
     std::vector<Convolution*> conv_by_op;
@@ -823,6 +824,40 @@ private:
         matmuls.resize(ops.size());
         kernel_by_op.resize(ops.size());
         pool_fused.resize(ops.size());
+        conv3x3_fused.assign(ops.size(), 0);
+        std::vector<int> tensor_uses(tensors.size(), 0);
+        for (const auto& op : ops) {
+            for (int id : op.input) {
+                if (id >= 0) ++tensor_uses[id];
+            }
+        }
+        auto distinct_storage = [&](int a_id, int b_id) {
+            if (a_id == b_id) return false;
+            const auto pa = addresses[a_id], pb = addresses[b_id];
+            if (!pa || !pb) return true;
+            const auto ea = pa + size_t(tensors[a_id].elements()) * 2 * batch;
+            const auto eb = pb + size_t(tensors[b_id].elements()) * 2 * batch;
+            return std::max(pa, pb) >= std::min(ea, eb);
+        };
+        for (size_t i = 0; i + 1 < ops.size(); ++i) {
+            if (fused_concat[i]) continue;
+            const auto& op = ops[i];
+            const auto& next = ops[i + 1];
+            if (op.kind != Conv || op.x != 3 || op.y != 0 || op.weight[1] >= 0 || tensor_uses[op.out] != 1)
+                continue;
+            const auto& in = tensors[op.input[0]];
+            const auto& conv_out = tensors[op.out];
+            if (in.c != 32 || conv_out.c != 32 || in.h != conv_out.h || in.w != conv_out.w || batch > 65535)
+                continue;
+            if (next.kind == Silu && next.input[0] == op.out && distinct_storage(op.input[0], next.out)) {
+                conv3x3_fused[i] = 1;
+                conv3x3_fused[i + 1] = 3;
+            } else if (next.kind == Span && next.input[0] == op.out && next.input[1] >= 0
+                       && distinct_storage(op.input[0], next.out) && distinct_storage(next.input[1], next.out)) {
+                conv3x3_fused[i] = 2;
+                conv3x3_fused[i + 1] = 3;
+            }
+        }
         TuningTimer timer;
         timer.initialize();
         add_bias = lookup(fp16 ? "bias16" : "bias");
@@ -838,7 +873,7 @@ private:
             "depthwise", "attention", "gate", "add", "rgb", "shuffle_concat",
         };
         for (size_t i = 0; i < ops.size(); ++i) {
-            if (fused_concat[i]) continue;
+            if (fused_concat[i] || conv3x3_fused[i] == 3) continue;
             const auto& op = ops[i];
             const auto& out = tensors[op.out];
             if (op.kind == MeanProject) {
@@ -872,11 +907,13 @@ private:
                         } else {
                             prepare_concat_matmul(i, cat, in, out, op, timer);
                         }
-                    } else if (conv_ld_in[i] == 96 && in.c == 48 && out.c == 32 && op.y == 0) {
-                        kernel_by_op[i] = lookup(fp16 ? "strided_conv1x1_48_32_16" : "strided_conv1x1_48_32");
                     } else {
                         prepare_matmul(i, in, out, op, timer);
                     }
+                } else if (conv3x3_fused[i] == 1) {
+                    kernel_by_op[i] = lookup("conv3x3_32_silu");
+                } else if (conv3x3_fused[i] == 2) {
+                    kernel_by_op[i] = lookup("conv3x3_32_span");
                 } else {
                     prepare_conv(i, in, out, op, timer);
                 }
@@ -930,6 +967,7 @@ private:
             for (int id : op.input)
                 if (id >= 0) ++uses[id];
         for (size_t i = 0; i + 1 < ops.size(); ++i) {
+            if (conv3x3_fused[i]) continue;
             const auto& conv = ops[i];
             const auto& silu = ops[i + 1];
             if (conv.kind != Conv || conv.x != 3 || conv.weight[1] >= 0 || silu.kind != Silu
@@ -980,10 +1018,17 @@ private:
         CHECK(cuLaunchKernel(kernel, grid_x, grid_y, 1, block, 1, 1, 0, target, params, nullptr));
     }
 
+    template<class... Args>
+    void launch3d(CUfunction kernel, CUstream target, unsigned grid_x, unsigned grid_y, unsigned grid_z,
+                  unsigned block, Args... args) {
+        void* params[] = {static_cast<void*>(&args)...};
+        CHECK(cuLaunchKernel(kernel, grid_x, grid_y, grid_z, block, 1, 1, 0, target, params, nullptr));
+    }
+
     void forward(CUstream target, const CUevent* timing = nullptr) {
         for (size_t i = 0; i < ops.size(); ++i) {
             if (timing) CHECK(cuEventRecordWithFlags(timing[i], target, CU_EVENT_RECORD_EXTERNAL));
-            if (fused_concat[i]) continue;
+            if (fused_concat[i] || conv3x3_fused[i] == 3) continue;
             if (fused_silu_count) {
                 if (silu_bindings[i]) {
                     silu_plan->run(cudnn, *silu_bindings[i]);
@@ -1021,13 +1066,19 @@ private:
                         CHECK(gemm(*p, op, p->algorithm, p->workspace, target));
                     }
                 } else if (kernel) {
-                    const int px = o.pixels() * batch;
-                    if (i && fused_concat[i - 1]) {
+                    if (conv3x3_fused[i]) {
+                        const auto& target_op = ops[i + 1];
+                        const auto skip_ptr = conv3x3_fused[i] == 2 ? tensor(target_op.input[1]) : CUdeviceptr(0);
+                        launch3d(kernel, target, unsigned((o.w + 15) / 16), unsigned((o.h + 15) / 16),
+                                 unsigned(batch), threads, tensor(target_op.out), a, skip_ptr, w0, o.h, o.w);
+                    } else if (i && fused_concat[i - 1]) {
+                        const int px = o.pixels() * batch;
                         const auto& cat = ops[i - 1];
                         launch(kernel, target, unsigned((px + 127) / 128), 1, threads,
                                y, tensor(cat.input[0]), tensor(cat.input[1]), tensor(cat.input[2]),
                                tensor(cat.input[3]), w0, w1, px);
                     } else {
+                        const int px = o.pixels() * batch;
                         launch(kernel, target, unsigned((px + 127) / 128), 1, threads,
                                y, a, w0, w1, conv_ld_in[i], px);
                     }

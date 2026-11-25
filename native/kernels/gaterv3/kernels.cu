@@ -970,3 +970,108 @@ extern "C" __global__ void strided_conv1x1_48_32_16(half* y, const half* x, cons
                                                     int ld_in, int pixels) {
     strided_conv1x1_48_32_impl<true>(y, x, weight, bias, ld_in, pixels);
 }
+
+template<bool IsSpan>
+__device__ void conv3x3_32_fused_impl(half* y, const half* x, const half* skip, const half* weight, int h, int w) {
+    __shared__ __align__(16) half sX[18 * 18 * 32];
+    union SharedWS {
+        half sW[9][32 * 32];
+        half sOut[8][16 * 32];
+    };
+    __shared__ __align__(16) SharedWS smem;
+
+    const int x0 = int(blockIdx.x) * 16, y0 = int(blockIdx.y) * 16, n = int(blockIdx.z);
+    const half* x_img = x + size_t(n) * h * w * 32;
+    for (int i = threadIdx.x; i < 18 * 18 * 4; i += 256) {
+        const int r = i / 4, c8 = i % 4;
+        const int py = r / 18, px = r % 18;
+        const int iy = y0 - 1 + py, ix = x0 - 1 + px;
+        const bool valid = (unsigned(iy) < unsigned(h)) && (unsigned(ix) < unsigned(w));
+        const half* src = valid ? (x_img + (size_t(iy) * w + ix) * 32 + c8 * 8) : x_img;
+        copy_async(&sX[swizzle32(r, c8)], src, valid);
+    }
+    for (int i = threadIdx.x; i < 9 * 32 * 4; i += 256) {
+        const int t = i / 128, rem = i % 128, k = rem / 4, c8 = rem % 4;
+        copy_async_always(&smem.sW[t][swizzle32(k, c8)], weight + (k * 9 + t) * 32 + c8 * 8);
+    }
+    asm volatile("cp.async.commit_group;\n");
+    asm volatile("cp.async.wait_group 0;\n");
+    __syncthreads();
+
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    Accumulator<false> acc[2][4];
+    #pragma unroll
+    for (int t = 0; t < 9; ++t) {
+        const int ky = t / 3, kx = t % 3;
+        const int r0 = (warp * 2 + ky) * 18 + kx + (lane % 16);
+        const int r1 = (warp * 2 + 1 + ky) * 18 + kx + (lane % 16);
+        #pragma unroll
+        for (int k = 0; k < 2; ++k) {
+            unsigned a0[4], a1[4];
+            load_matrix_x4(a0, &sX[swizzle32(r0, 2 * k + lane / 16)]);
+            load_matrix_x4(a1, &sX[swizzle32(r1, 2 * k + lane / 16)]);
+            #pragma unroll
+            for (int g = 0; g < 4; ++g) {
+                unsigned b[2];
+                load_matrix_x2(b, &smem.sW[t][swizzle32(g * 8 + (lane % 8), 2 * k + (lane / 8) % 2)]);
+                acc[0][g].mma(a0, b[0], b[1]);
+                acc[1][g].mma(a1, b[0], b[1]);
+            }
+        }
+    }
+    __syncthreads();
+
+    half* y_img = y + size_t(n) * h * w * 32;
+    #pragma unroll
+    for (int m_row = 0; m_row < 2; ++m_row) {
+        const int py = warp * 2 + m_row, oy = y0 + py;
+        const int r0 = lane / 4, c_off = (lane % 4) * 2;
+        const bool y_ok = oy < h;
+        const half* skip_row = (IsSpan && y_ok) ? (skip + (size_t(n) * h * w + size_t(oy) * w) * 32) : nullptr;
+        #pragma unroll
+        for (int g = 0; g < 4; ++g) {
+            const float2 f0 = acc[m_row][g].pair(0), f1 = acc[m_row][g].pair(1);
+            half2 out0, out1;
+            if constexpr (IsSpan) {
+                float2 b0 = make_float2(0.f, 0.f), b1 = make_float2(0.f, 0.f);
+                if (skip_row) {
+                    if (x0 + r0 < w)
+                        b0 = __half22float2(*reinterpret_cast<const half2*>(skip_row + (x0 + r0) * 32 + g * 8 + c_off));
+                    if (x0 + r0 + 8 < w)
+                        b1 = __half22float2(*reinterpret_cast<const half2*>(skip_row + (x0 + r0 + 8) * 32 + g * 8 + c_off));
+                }
+                out0 = __floats2half2_rn((f0.x + b0.x) * (sigmoid(f0.x) - 0.5f),
+                                          (f0.y + b0.y) * (sigmoid(f0.y) - 0.5f));
+                out1 = __floats2half2_rn((f1.x + b1.x) * (sigmoid(f1.x) - 0.5f),
+                                          (f1.y + b1.y) * (sigmoid(f1.y) - 0.5f));
+            } else {
+                out0 = __floats2half2_rn(f0.x * sigmoid(f0.x), f0.y * sigmoid(f0.y));
+                out1 = __floats2half2_rn(f1.x * sigmoid(f1.x), f1.y * sigmoid(f1.y));
+            }
+            *reinterpret_cast<half2*>(&smem.sOut[warp][swizzle32(r0, g) + c_off]) = out0;
+            *reinterpret_cast<half2*>(&smem.sOut[warp][swizzle32(r0 + 8, g) + c_off]) = out1;
+        }
+        __syncwarp();
+        if (y_ok) {
+            #pragma unroll
+            for (int u = 0; u < 2; ++u) {
+                const int idx = u * 32 + lane, px = idx / 4, c8 = idx % 4;
+                const int ox = x0 + px;
+                if (ox < w)
+                    *reinterpret_cast<uint4*>(y_img + (size_t(oy) * w + ox) * 32 + c8 * 8) =
+                        *reinterpret_cast<const uint4*>(&smem.sOut[warp][swizzle32(px, c8)]);
+            }
+        }
+        __syncwarp();
+    }
+}
+
+extern "C" __global__ void conv3x3_32_silu(half* y, const half* x, const half* skip, const half* weight,
+                                           int h, int w) {
+    conv3x3_32_fused_impl<false>(y, x, skip, weight, h, w);
+}
+
+extern "C" __global__ void conv3x3_32_span(half* y, const half* x, const half* skip, const half* weight,
+                                           int h, int w) {
+    conv3x3_32_fused_impl<true>(y, x, skip, weight, h, w);
+}
