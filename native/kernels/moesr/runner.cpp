@@ -350,6 +350,8 @@ class Session final : public umzi::KernelSession {
     int timed_plans = 0;
     uint64_t workspace_limit = default_workspace_mib << 20;
     bool accumulate_fp16 = false, fused_gate = true;
+    // Weights repacked without fused_gate after a fallback; shared with clones.
+    std::shared_ptr<umzi::DeviceAllocation> unfused_weights;
     // Device memory in use (cuMemGetInfo) at shape setup, after workspace
     // allocation, after tuning, and after warmup/capture.
     std::array<uint64_t, 4> device_used{};
@@ -475,12 +477,15 @@ public:
             CUcontext previous;
             cuCtxPopCurrent(&previous);
         }
+        unfused_weights.reset();
         shared.reset();
     }
 
     std::unique_ptr<umzi::KernelSession> clone_shared() const override {
         auto copy = std::make_unique<Session>();
+        copy->copy_base_state(*this);
         copy->shared = shared;
+        copy->unfused_weights = unfused_weights;
         copy->model = model;
         copy->device_model = device_model;
         copy->fp16 = fp16;
@@ -653,11 +658,40 @@ private:
                 setup_ms[3] = umzi::elapsed_ms(start);
             }
             device_used[3] = umzi::device_used_bytes();
+        } catch (const umzi::AllocationError&) {
+            // Out of memory is for the tiler to handle, not a reason to drop fusion.
+            cuStreamSynchronize(stream);
+            release_shape();
+            throw;
+        } catch (const std::exception& error) {
+            cuStreamSynchronize(stream);
+            release_shape();
+            if (!fused_gate) throw;
+            disable_fused_gate(error.what());
+            prepare(requested);
         } catch (...) {
             cuStreamSynchronize(stream);
             release_shape();
             throw;
         }
+    }
+
+    // Repacks the weights for the unfused layout into a buffer this session (and its clones) own.
+    void disable_fused_gate(const char* reason) {
+        auto layout = Network(true, false);
+        const auto package = reload_package();
+        const auto packed = device_weights(model, layout, package.section(3).data(), false, accumulate_fp16);
+        unfused_weights = std::make_shared<umzi::DeviceAllocation>(context, packed.data(), packed.size());
+        weights = unfused_weights->pointer;
+        device_model = std::move(layout);
+        fused_gate = false;
+        if (cache_environment_error.empty() && !cache_dir.empty()) {
+            umzi::Sha256 hash;
+            hash.add(cache_environment);
+            hash.add(uint32_t(0)); // fused_gate off; plans differ from the fused environment
+            cache_environment = hash.finish();
+        }
+        warn_option(std::string("Disabled MoESR fused_gate: ") + reason);
     }
 
     template<class... Args>

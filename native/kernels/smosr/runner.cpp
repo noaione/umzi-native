@@ -428,6 +428,18 @@ class Session final : public umzi::KernelSession {
                 setup_ms[3] = umzi::elapsed_ms(start);
             }
             device_used[3] = umzi::device_used_bytes();
+        } catch (const umzi::AllocationError&) {
+            // Out of memory is for the tiler to handle, not a reason to drop fusion.
+            cuStreamSynchronize(stream);
+            release_shape();
+            throw;
+        } catch (const std::exception& error) {
+            cuStreamSynchronize(stream);
+            release_shape();
+            if (!fuse_silu) throw;
+            fuse_silu = false;
+            warn_option(std::string("Disabled SMoSR fuse_silu: ") + error.what());
+            prepare(requested);
         } catch (...) {
             cuStreamSynchronize(stream);
             release_shape();
@@ -568,7 +580,7 @@ public:
 
     std::unique_ptr<umzi::KernelSession> clone_shared() const override {
         auto copy = std::make_unique<Session>();
-        copy->copy_warnings(*this);
+        copy->copy_base_state(*this);
         copy->shared = shared;
         copy->net = net;
         copy->fp16 = fp16;

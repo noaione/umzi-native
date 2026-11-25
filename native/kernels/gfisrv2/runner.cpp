@@ -467,6 +467,8 @@ class Session final : public umzi::KernelSession {
     std::array<CUfunction, KernelCount> functions{};
     CUdeviceptr weights = 0;
     size_t weight_bytes = 0;
+    // Weights repacked without fused_conv after a fallback; shared with clones.
+    std::shared_ptr<umzi::DeviceAllocation> unfused_weights;
 
     Shape shape{};
     int bins = 0;
@@ -595,12 +597,15 @@ public:
             cuCtxPopCurrent(&previous);
         }
         fft.reset();
+        unfused_weights.reset();
         shared.reset();
     }
 
     std::unique_ptr<umzi::KernelSession> clone_shared() const override {
         auto copy = std::make_unique<Session>();
+        copy->copy_base_state(*this);
         copy->shared = shared;
+        copy->unfused_weights = unfused_weights;
         copy->model = model;
         copy->dev_model = dev_model;
         copy->graph_enabled = graph_enabled;
@@ -887,11 +892,39 @@ private:
                 setup_ms[3] = umzi::elapsed_ms(start);
             }
             device_used[3] = umzi::device_used_bytes();
+        } catch (const umzi::AllocationError&) {
+            // Out of memory is for the tiler to handle, not a reason to drop fusion.
+            cuStreamSynchronize(stream);
+            release_shape();
+            throw;
+        } catch (const std::exception& error) {
+            cuStreamSynchronize(stream);
+            release_shape();
+            if (!fused_conv || !reduced()) throw; // only the reduced-precision path has a fused layout
+            disable_fused_conv(error.what());
+            prepare(requested);
         } catch (...) {
             cuStreamSynchronize(stream);
             release_shape();
             throw;
         }
+    }
+
+    // Repacks the weights for the unfused layout into a buffer this session (and its clones) own.
+    void disable_fused_conv(const char* reason) {
+        const auto package = reload_package();
+        const auto packed = build_device_weights(model, dev_model, package.section(3).data(), half_io(), false);
+        unfused_weights = std::make_shared<umzi::DeviceAllocation>(context, packed.data(), packed.size());
+        weights = unfused_weights->pointer;
+        weight_bytes = packed.size();
+        fused_conv = false;
+        if (cache_environment_error.empty() && !cache_dir.empty()) {
+            umzi::Sha256 hash;
+            hash.add(cache_environment);
+            hash.add(uint32_t(0)); // fused_conv off; plans differ from the fused environment
+            cache_environment = hash.finish();
+        }
+        warn_option(std::string("Disabled GFISRv2 fused_conv: ") + reason);
     }
 
     template<class... Args>

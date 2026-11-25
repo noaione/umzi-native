@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <stdexcept>
 #include <string>
 
@@ -57,6 +58,31 @@ struct ContextScope {
             CUcontext previous = nullptr;
             cuCtxPopCurrent(&previous);
         }
+    }
+};
+
+// Device copy of weights repacked for the unfused path after a fusion fallback.
+// Shared with clones, so it outlives the session that created it.
+struct DeviceAllocation {
+    CUcontext context;
+    CUdeviceptr pointer = 0;
+
+    DeviceAllocation(CUcontext owner, const void* data, size_t bytes) : context(owner) {
+        check(cuMemAlloc(&pointer, bytes), "cuMemAlloc");
+        try {
+            check(cuMemcpyHtoD(pointer, data, bytes), "cuMemcpyHtoD");
+        } catch (...) {
+            cuMemFree(pointer);
+            throw;
+        }
+    }
+    DeviceAllocation(const DeviceAllocation&) = delete;
+    DeviceAllocation& operator=(const DeviceAllocation&) = delete;
+    ~DeviceAllocation() {
+        if (!pointer || cuCtxPushCurrent(context) != CUDA_SUCCESS) return;
+        cuMemFree(pointer);
+        CUcontext previous = nullptr;
+        cuCtxPopCurrent(&previous);
     }
 };
 

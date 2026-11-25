@@ -40,13 +40,33 @@ public:
         return report_.c_str();
     }
 
+    // Where this session's package came from; set by the API so a fallback can re-read the weights.
+    void set_package_source(std::filesystem::path path, const Digest& digest) {
+        package_path_ = std::move(path);
+        package_digest_ = digest;
+    }
+
 protected:
-    void copy_warnings(const KernelSession& source) { warnings_ = source.warnings_; }
+    void copy_base_state(const KernelSession& source) {
+        warnings_ = source.warnings_;
+        package_path_ = source.package_path_;
+        package_digest_ = source.package_digest_;
+    }
+    // Re-reads the package this session was opened from, refusing a file that changed since.
+    ModelPackage reload_package() const {
+        if (package_path_.empty()) throw std::runtime_error("The model package path is unknown");
+        ModelPackage package(package_path_);
+        if (package.digest != package_digest_)
+            throw std::runtime_error("The Umzi model package changed while the session was open");
+        return package;
+    }
     // Ignore a bad kernel option instead of failing the session; surfaced via kernel_report().
     void warn_option(const std::string& text) { warnings_ += (warnings_.empty() ? "" : "; ") + text; }
 
 private:
     std::string warnings_;
+    std::filesystem::path package_path_;
+    Digest package_digest_{};
     mutable std::string report_;
 };
 

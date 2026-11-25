@@ -25,7 +25,9 @@ struct UmziSession {
         auto view = options;
         view.cache_dir = cache.empty() ? nullptr : cache.c_str();
         view.kernel_options = settings.data();
-        return umzi::kernel_factory(package.family)(package, view);
+        auto edge = umzi::kernel_factory(package.family)(package, view);
+        edge->set_package_source(path, digest);
+        return edge;
     }
 };
 
@@ -96,6 +98,7 @@ UmziSession* umzi_session_open(const char* path, const UmziSessionOptions* optio
         const umzi::ModelPackage package(session->path);
         session->kernel = umzi::kernel_factory(package.family)(package, *options);
         session->digest = package.digest;
+        session->kernel->set_package_source(session->path, package.digest);
         session->options = *options;
         session->options.cache_dir = nullptr;
         session->options.kernel_options = nullptr;
