@@ -62,7 +62,7 @@ Shape checked(const UmziShape& shape) {
         throw std::runtime_error("MoESR requires positive RGB NCHW dimensions that fit native indexing");
     if (h == 1 || w == 1)
         throw std::runtime_error("MoESR reflection padding requires both spatial dimensions to be at least two");
-    if (uint64_t(n) * ((h + 1) & ~1u) * ((w + 1) & ~1u) * (8 * ((full_hidden + 3) / 4)) > INT_MAX - threads)
+    if (uint64_t(n) * ((h + 1) & ~1u) * ((w + 1) & ~1u) * expand_width(full_hidden) > INT_MAX - threads)
         throw std::runtime_error("Requested MoESR shape exceeds native tensor indexing limits");
     return {int(n), int(h), int(w)};
 }
@@ -117,7 +117,8 @@ struct Network {
         Block block;
         block.norm_weight = take(channels * 4);
         block.norm_bias = take(channels * 4);
-        block.expand = {take(size_t(channels) * weight_cout * 9 * 2), take(size_t(expand_cout) * 4)};
+        // The bias covers every packed output row, including the pad group, so an epilogue read cannot pass its end.
+        block.expand = {take(size_t(channels) * weight_cout * 9 * 2), take(size_t(weight_cout) * 4)};
         block.square = depthwise(9);
         block.row = depthwise(11);
         block.column = depthwise(11);
