@@ -1025,7 +1025,13 @@ public:
     // Per-pixel channel work with an optional RMSNorm; see pixel_norm in kernels.cu.
     void pixel_norm(KernelId mode, CUdeviceptr out_x, CUdeviceptr out_norm, CUdeviceptr a, CUdeviceptr b,
                     CUdeviceptr vec, size_t scale, size_t offset, int channels, int pixels, int width) {
-        const int lanes = std::max(1, channels / 32);
+        // The kernel masks with lanes - 1 and keeps at most four 8-channel vectors per lane, so lanes must be a
+        // power of two that divides the vector count (48-based widths give 6 * 2^k vectors, not a multiple of 4).
+        const int vectors = channels / 8;
+        int lanes = 1;
+        while (vectors > 4 * lanes) lanes *= 2;
+        if (channels % 8 || vectors % lanes || lanes > 32)
+            throw std::runtime_error("GateRV2 cannot normalize " + std::to_string(channels) + " channels");
         const int total = prepared.n * pixels;
         const CUdeviceptr scale_pointer = out_norm ? param(scale) : 0, offset_pointer = out_norm ? param(offset) : 0;
         launch(mode, unsigned((uint64_t(total) * lanes + threads - 1) / threads), 1, threads, out_x, out_norm, a, b,
