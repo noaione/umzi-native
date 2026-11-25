@@ -307,11 +307,11 @@ class Session final : public umzi::KernelSession {
         auto candidates = selected.graph->candidates(cudnn, conv_bytes);
         if (candidates.size() < 2) return;
         CHECK(cuMemsetD8Async(buffers[input], 0, size_t(padded.pixels()) * filter.cin * element_bytes(), stream));
-        size_t scratch_bytes = conv_bytes;
         const auto elapsed = [&](const umzi::CudnnBackendPlan& plan, float best) {
             ++timed_candidates;
+            // Pass the member size so it stays in step with conv_workspace if the scratch is ever regrown.
             return umzi::time_cudnn_backend_plan(cudnn, stream, tuning_events, plan, buffers[input],
-                weights + filter.weight, buffers[output], conv_workspace, scratch_bytes, best);
+                weights + filter.weight, buffers[output], conv_workspace, conv_bytes, best);
         };
         const auto control = elapsed(selected, std::numeric_limits<float>::infinity());
         float fastest = control;
