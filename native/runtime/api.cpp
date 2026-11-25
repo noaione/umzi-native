@@ -1,5 +1,6 @@
 #define UMZI_BUILD
 #include "kernel.h"
+#include "tiling.h"
 
 #include <chrono>
 #include <limits>
@@ -7,7 +8,9 @@
 
 struct UmziSession {
     std::unique_ptr<umzi::KernelSession> kernel;
+    std::unique_ptr<umzi::PageTiler> tiler;
     double model_load_ms = 0;
+    int32_t device = 0;
 };
 
 namespace {
@@ -75,6 +78,7 @@ UmziSession* umzi_session_open(const char* path, const UmziSessionOptions* optio
         const umzi::ModelPackage package(std::filesystem::u8path(path));
         auto session = std::make_unique<UmziSession>();
         session->kernel = umzi::kernel_factory(package.family)(package, *options);
+        session->device = options->device;
         session->model_load_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - start).count();
         result = session.release();
@@ -117,6 +121,18 @@ int umzi_session_enqueue(UmziSession* session, const UmziShape* shape,
         const auto& concrete = checked_shape(shape);
         check_buffers(implementation.describe(concrete), input && output, input_bytes, output_bytes);
         implementation.enqueue_device(concrete, input, output, stream);
+    });
+}
+
+int umzi_session_run_tiled(UmziSession* session, uint32_t height, uint32_t width,
+                           const UmziTilingOptions* options, const uint8_t* input,
+                           uint64_t input_bytes, void* output, uint64_t output_bytes) {
+    return report([&] {
+        auto& implementation = kernel(session);
+        if (!options || options->struct_size < sizeof(*options))
+            throw std::runtime_error("Invalid Umzi tiling options");
+        umzi::run_tiled(implementation, session->tiler, session->device, height, width,
+                        *options, input, input_bytes, output, output_bytes);
     });
 }
 

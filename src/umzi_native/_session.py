@@ -13,7 +13,17 @@ from typing import Self
 
 import numpy as np
 
-from ._abi import IoABI, ModelABI, ShapeABI, TensorABI, check_status, open_session, read_session_info, session_setup
+from ._abi import (
+    IoABI,
+    ModelABI,
+    ShapeABI,
+    TensorABI,
+    TilingABI,
+    check_status,
+    open_session,
+    read_session_info,
+    session_setup,
+)
 from ._loader import PathArg, find_session_library, load_cuda_libraries, load_session_library
 from ._model import FIGSR_FAMILY, GFISRV2_FAMILY, MAGIC, PREFIX
 
@@ -227,3 +237,70 @@ class InferenceSession:
                 ),
             )
         return [restored]
+
+    def run_tiled(
+        self,
+        image: np.ndarray,
+        *,
+        tile_size: int,
+        batch_size: int,
+        overlap: int = 0,
+        background: str = "white",
+        output_dtype: type[np.uint8] | type[np.float32] = np.uint8,
+    ) -> np.ndarray:
+        """Restore a contiguous HWC uint8 image with fixed CUDA tiles.
+
+        Overlap is the total shared width in source pixels. Float32 output
+        contains stitched values before clipping and quantization.
+        """
+        if not isinstance(image, np.ndarray) or image.dtype != np.uint8:
+            raise TypeError("The GPU tiler expects a uint8 NumPy image")
+        if image.ndim != 3 or not image.flags.c_contiguous or image.shape[2] != self._input.shape[1]:
+            raise ValueError("The GPU tiler expects a contiguous HWC image with the model's input channels")
+        output_channels = self._output.shape[1]
+        if not isinstance(output_channels, int) or output_channels < 1:
+            raise ValueError("The GPU tiler requires a known output channel count")
+        tile_size, batch_size, overlap = map(operator.index, (tile_size, batch_size, overlap))
+        height, width = image.shape[:2]
+        scale = self.scale_factor
+        if (
+            min(height, width, tile_size, batch_size, scale) < 1
+            or max(height, width, tile_size) * scale >= 2**31
+            or batch_size >= 2**31
+            or not 0 <= overlap < tile_size - 2 * self.context
+        ):
+            raise ValueError("Invalid GPU tiling dimensions or overlap")
+        if background not in ("white", "black"):
+            raise ValueError("background must be 'white' or 'black'")
+        dtype = np.dtype(output_dtype)
+        if dtype not in (np.dtype(np.uint8), np.dtype(np.float32)):
+            raise ValueError("output_dtype must be uint8 or float32")
+        options = TilingABI(
+            ctypes.sizeof(TilingABI),
+            tile_size,
+            batch_size,
+            overlap,
+            255 if background == "white" else 0,
+            int(dtype == np.dtype(np.float32)),
+        )
+
+        with self._lock:
+            self._ensure_open()
+            tiled = getattr(self._dll, "umzi_session_run_tiled", None)
+            if tiled is None:
+                raise RuntimeError("This Umzi native library does not support GPU tiling")
+            restored = np.empty((height * scale, width * scale, output_channels), dtype=dtype)
+            check_status(
+                self._dll,
+                tiled(
+                    self._handle,
+                    height,
+                    width,
+                    ctypes.byref(options),
+                    image.ctypes.data,
+                    image.nbytes,
+                    restored.ctypes.data,
+                    restored.nbytes,
+                ),
+            )
+        return restored

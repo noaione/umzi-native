@@ -86,6 +86,13 @@ typedef struct UmziDiagnostic {
     int64_t value;
 } UmziDiagnostic;
 
+typedef enum UmziPageFormat { UMZI_PAGE_U8 = 0, UMZI_PAGE_FLOAT32 = 1 } UmziPageFormat;
+
+typedef struct UmziTilingOptions {
+    uint32_t struct_size, tile_size, batch_size, overlap;
+    uint32_t background, output_format;
+} UmziTilingOptions;
+
 UMZI_API uint32_t umzi_abi_version(void);
 UMZI_API const char* umzi_error(void);
 UMZI_API int umzi_error_code(void);
@@ -103,6 +110,10 @@ UMZI_API int umzi_session_run(UmziSession* session, const UmziShape* shape,
 UMZI_API int umzi_session_enqueue(UmziSession* session, const UmziShape* shape,
                                   uint64_t input, uint64_t input_bytes, uint64_t output,
                                   uint64_t output_bytes, UmziStream stream);
+// Synchronous page inference. The buffers are contiguous HWC at input and scaled output size.
+UMZI_API int umzi_session_run_tiled(UmziSession* session, uint32_t height, uint32_t width,
+                                    const UmziTilingOptions* options, const uint8_t* input,
+                                    uint64_t input_bytes, void* output, uint64_t output_bytes);
 UMZI_API int umzi_session_info(const UmziSession* session, UmziSessionInfo* info);
 UMZI_API uint32_t umzi_session_diagnostic_count(const UmziSession* session);
 UMZI_API int umzi_session_diagnostic(const UmziSession* session, uint32_t index, UmziDiagnostic* diagnostic);

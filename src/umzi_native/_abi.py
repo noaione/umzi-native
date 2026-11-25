@@ -79,6 +79,13 @@ class DiagnosticABI(ctypes.Structure):
     _fields_ = [("struct_size", ctypes.c_uint32), ("name", ctypes.c_char_p), ("value", ctypes.c_int64)]
 
 
+class TilingABI(ctypes.Structure):
+    _fields_ = [
+        (name, ctypes.c_uint32)
+        for name in ("struct_size", "tile_size", "batch_size", "overlap", "background", "output_format")
+    ]
+
+
 def bind_session_api(dll: ctypes.CDLL) -> None:
     pointer = ctypes.c_void_p
     shape = ctypes.POINTER(ShapeABI)
@@ -107,6 +114,19 @@ def bind_session_api(dll: ctypes.CDLL) -> None:
         function.restype = result
     if dll.umzi_abi_version() != 1:
         raise OSError("Unsupported Umzi native ABI version")
+    tiled = getattr(dll, "umzi_session_run_tiled", None)
+    if tiled is not None:
+        tiled.argtypes = [
+            pointer,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.POINTER(TilingABI),
+            pointer,
+            ctypes.c_uint64,
+            pointer,
+            ctypes.c_uint64,
+        ]
+        tiled.restype = ctypes.c_int
 
 
 def check_status(dll: ctypes.CDLL, status: int) -> None:

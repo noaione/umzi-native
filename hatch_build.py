@@ -30,6 +30,7 @@ EXACT_MATH_FAMILIES = frozenset({"gaterv2", "moesr", "gfisrv2", "smosr", "figsr"
 HOST_SOURCES = (
     *(source / "runner.cpp" for source in KERNEL_SOURCES.values()),
     NATIVE / "runtime" / "api.cpp",
+    NATIVE / "runtime" / "tiling.cpp",
     NATIVE / "runtime" / "registry.cpp",
     NATIVE / "runtime" / "model_package.cpp",
     NATIVE / "runtime" / "plan_cache_file.cpp",
@@ -414,8 +415,8 @@ def build(output: Path, settings: BuildSettings | None = None) -> Path:
     output = output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     nvrtc = _load_nvrtc(toolchain.nvrtc)
-    for family, source in KERNEL_SOURCES.items():
-        fast_math = family not in EXACT_MATH_FAMILIES
+    for family, source in (*KERNEL_SOURCES.items(), ("tiling", NATIVE / "tiling")):
+        fast_math = family != "tiling" and family not in EXACT_MATH_FAMILIES
         cubins = {
             arch: _compile_kernels(nvrtc, toolchain.includes, arch, source, fast_math=fast_math)
             for arch in dict.fromkeys(settings.arches)

@@ -55,6 +55,20 @@ Image.fromarray(png).save("output/restored-tile.png")
 - **Pre-warming a shape:** Call `session.prepare((N, 3, H, W))` ahead of time if you want GPU allocation, algorithm tuning, and CUDA Graph capture to finish before the first `run()`.
 - **Cleanup and OOM recovery:** Use `with umzi.InferenceSession(...) as session:` (or call `session.close()`) to release GPU memory. If a batch or tile size runs out of VRAM, `prepare()` or `run()` raises `MemoryError`, and you can immediately retry with a smaller batch on the same session.
 
+### Fixed GPU tiling
+
+Pass a decoded page as a contiguous HWC `uint8` array. The session extracts and
+stitches tiles on CUDA and returns the scaled HWC page.
+
+```python
+restored = session.run_tiled(rgb_page, tile_size=128, batch_size=16, overlap=16)
+```
+
+`overlap` is the total shared width in source pixels. With overlap enabled,
+the tiler replicates page edges and feathers the shared output in FP32. Use
+`output_dtype=np.float32` to retrieve raw stitched values. See the
+[GPU tiling plan and measurements](gpu-tiling-plan.md) for the tested workloads.
+
 For full-page tiling and stitching, see the [manga tiling benchmark](gaterv3-manga-tiling.md).
 
 ## 3. Session options (`SessionOptions`)
