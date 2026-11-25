@@ -264,8 +264,14 @@ class Session final : public umzi::KernelSession {
             cudnn, padded.n, padded.h, padded.w, f.cin, f.cout, f.k, fp32 ? CUDNN_DATA_FLOAT : CUDNN_DATA_HALF,
             fp16 || body_accumulates_in_fp16,
             fp32 ? CUDNN_TENSOR_NCHW : CUDNN_TENSOR_NHWC, bias != 0, !fp16);
-        const bool tune = bias || (tune_convolutions && f.cin == features && f.k == 3);
+        bool tune = bias || (tune_convolutions && f.cin == features && f.k == 3);
+        // Tuning deliberately times only zero-workspace engines; see docs/handoff-smosr.md.
         auto candidates = plan.graph->candidates(cudnn, tune ? 0 : limit, !tune);
+        if (tune && candidates.empty() && !bias) {
+            // No zero-workspace engine exists: take the default planner's first plan instead of failing the shape.
+            tune = false;
+            candidates = plan.graph->candidates(cudnn, limit, true);
+        }
         size_t selected = 0;
         if (tune) {
             CUdeviceptr scratch = 0;
