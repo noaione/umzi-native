@@ -1274,8 +1274,8 @@ public:
             // Order this batch after the previous one on the device instead of blocking the host.
             if (pending) CHECK(cuStreamWaitEvent(target, completed, CU_EVENT_WAIT_DEFAULT));
             plan.run_device(shape, input, output, target);
+            pending = true; // Before the record, so teardown waits even if recording fails.
             CHECK(cuEventRecord(completed, target));
-            pending = true;
         } catch (...) {
             cuStreamSynchronize(target);
             throw;
