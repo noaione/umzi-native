@@ -2,6 +2,7 @@
 
 #include <cuda.h>
 #include <array>
+#include <atomic>
 #include <cstdlib>
 #include <filesystem>
 #include <stdexcept>
@@ -119,10 +120,15 @@ inline void hash_driver_version(Sha256& hash) {
 
 inline std::filesystem::path temporary_cache_path(const std::filesystem::path& directory) {
 #ifdef _WIN32
-    std::array<wchar_t, MAX_PATH> name{};
-    if (!GetTempFileNameW(directory.c_str(), L"gtp", 0, name.data()))
-        throw std::runtime_error("Could not create a temporary cache file");
-    return name.data();
+    // GetTempFileNameW rejects directories longer than MAX_PATH - 14, so name the file here.
+    // CREATE_NEW reserves the name; process id, tick count and a counter keep concurrent writers apart.
+    static std::atomic<uint32_t> counter{0};
+    auto name = directory / (L"gtp" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64())
+                             + L"-" + std::to_wstring(counter++) + L".tmp");
+    HANDLE file = CreateFileW(name.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) throw std::runtime_error("Could not create a temporary cache file");
+    CloseHandle(file);
+    return name;
 #else
     auto name = (directory / ".gtp-XXXXXX").string();
     int file = mkstemp(name.data());
