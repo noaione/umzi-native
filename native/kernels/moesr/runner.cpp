@@ -871,10 +871,11 @@ public:
     }
 
     void ensure_staging() {
-        if (stage_in) return;
+        if (stage_in && stage_out) return;
         const auto input_bytes = shape.rgb_bytes(fp16);
-        CHECK(cuMemAlloc(&stage_in, input_bytes));
-        CHECK(cuMemAlloc(&stage_out, input_bytes * scale * scale));
+        // Allocate only what is missing: a failed second allocation must not leave a half-built pair that passes the early return.
+        if (!stage_out) CHECK(cuMemAlloc(&stage_out, input_bytes * scale * scale));
+        if (!stage_in) CHECK(cuMemAlloc(&stage_in, input_bytes));
     }
 
     void run_host(const UmziShape& request, const void* input, void* output) override {

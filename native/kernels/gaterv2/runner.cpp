@@ -1231,9 +1231,10 @@ public:
     void prepare_shape(const UmziShape& shape) override { prepare_exact(checked(shape)); }
 
     void ensure_staging() {
-        if (stage_in) return;
-        CHECK(cuMemAlloc(&stage_in, io_bytes));
-        CHECK(cuMemAlloc(&stage_out, io_bytes));
+        if (stage_in && stage_out) return;
+        // Allocate only what is missing: a failed second allocation must not leave a half-built pair that passes the early return.
+        if (!stage_out) CHECK(cuMemAlloc(&stage_out, io_bytes));
+        if (!stage_in) CHECK(cuMemAlloc(&stage_in, io_bytes));
     }
 
     void run_host(const UmziShape& shape, const void* input, void* output) override {
