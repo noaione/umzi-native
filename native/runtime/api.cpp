@@ -35,19 +35,32 @@ namespace {
 thread_local std::string error_text;
 thread_local int error_code = UMZI_OK;
 
+// Runs inside noexcept handlers, often because memory is already exhausted, so it must not throw.
+void set_error(const char* text) noexcept {
+    try {
+        error_text = text;
+    } catch (...) {
+        error_text = "out of memory"; // Fits the small-string buffer, so this assignment cannot allocate.
+    }
+}
+
 template<class Action>
 int report(Action action) noexcept {
     try {
         action();
+        error_text.clear();
         return error_code = UMZI_OK;
     } catch (const umzi::AllocationError& error) {
-        error_text = error.what();
+        set_error(error.what());
         return error_code = UMZI_OUT_OF_MEMORY;
     } catch (const std::bad_alloc& error) {
-        error_text = error.what();
+        set_error(error.what());
         return error_code = UMZI_OUT_OF_MEMORY;
     } catch (const std::exception& error) {
-        error_text = error.what();
+        set_error(error.what());
+        return error_code = UMZI_ERROR;
+    } catch (...) {
+        set_error("Unknown native error");
         return error_code = UMZI_ERROR;
     }
 }
@@ -189,7 +202,7 @@ int umzi_session_info(const UmziSession* session, UmziSessionInfo* info) {
 }
 
 uint32_t umzi_session_diagnostic_count(const UmziSession* session) {
-    return session ? session->kernel->diagnostic_count() : 0;
+    return session && session->kernel ? session->kernel->diagnostic_count() : 0;
 }
 
 int umzi_session_diagnostic(const UmziSession* session, uint32_t index, UmziDiagnostic* diagnostic) {
@@ -197,11 +210,11 @@ int umzi_session_diagnostic(const UmziSession* session, uint32_t index, UmziDiag
 }
 
 const char* umzi_session_cache_message(const UmziSession* session) {
-    return session ? session->kernel->cache_message() : "";
+    return session && session->kernel ? session->kernel->cache_message() : "";
 }
 
 const char* umzi_session_kernel_message(const UmziSession* session) {
-    return session ? session->kernel->kernel_report() : "";
+    return session && session->kernel ? session->kernel->kernel_report() : "";
 }
 
 int umzi_session_profile(UmziSession* session, float* milliseconds, uint32_t count) {
