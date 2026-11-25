@@ -285,6 +285,10 @@ struct CudnnBackendPlan {
 inline bool ensure_device_scratch(CUstream stream, CUdeviceptr& scratch, size_t& scratch_bytes, size_t required,
                                   size_t* peak_bytes = nullptr) {
     if (required <= scratch_bytes) return true;
+    // Allocate in the stream's context, not whichever one the caller left current.
+    CUcontext owner = nullptr;
+    check(cuStreamGetCtx(stream, &owner), "cuStreamGetCtx");
+    ContextScope scope(owner);
     check(cuStreamSynchronize(stream), "cuStreamSynchronize");
     if (scratch) check(cuMemFree(scratch), "cuMemFree");
     scratch = 0;
