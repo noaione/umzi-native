@@ -70,12 +70,15 @@ private:
         return reinterpret_cast<T>(entry);
     }
 
+    // Callers keep the API alive (shared_ptr) for as long as any plan exists; closing twice must stay harmless.
     void close() {
+        if (!library) return;
 #ifdef _WIN32
         FreeLibrary(library);
 #else
         dlclose(library);
 #endif
+        library = nullptr;
     }
 };
 #undef UMZI_FFT_CALL
