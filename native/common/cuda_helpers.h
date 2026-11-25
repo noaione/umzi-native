@@ -74,6 +74,7 @@ struct DeviceAllocation {
     CUdeviceptr pointer = 0;
 
     DeviceAllocation(CUcontext owner, const void* data, size_t bytes) : context(owner) {
+        ContextScope scope(owner); // Allocate in the context the destructor frees from.
         check(cuMemAlloc(&pointer, bytes), "cuMemAlloc");
         try {
             check(cuMemcpyHtoD(pointer, data, bytes), "cuMemcpyHtoD");
