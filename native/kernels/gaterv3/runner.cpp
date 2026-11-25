@@ -457,6 +457,7 @@ public:
         CHECK(cuStreamEndCapture(stream, &timed.graph));
         CHECK(cuGraphInstantiate(&timed.executable, timed.graph, 0));
         constexpr int iterations = 8;
+        std::fill_n(milliseconds, count, 0.f);
         for (int run = 0; run <= iterations; ++run) {
             CHECK(cuGraphLaunch(timed.executable, stream));
             CHECK(cuStreamSynchronize(stream));
