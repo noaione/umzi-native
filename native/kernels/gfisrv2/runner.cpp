@@ -913,7 +913,7 @@ private:
     // Repacks the weights for the unfused layout into a buffer this session (and its clones) own.
     void disable_fused_conv(const char* reason) {
         const auto package = reload_package();
-        const auto packed = build_device_weights(model, dev_model, package.section(3).data(), half_io(), false);
+        const auto packed = build_device_weights(model, dev_model, package->section(3).data(), half_io(), false);
         unfused_weights = std::make_shared<umzi::DeviceAllocation>(context, packed.data(), packed.size());
         weights = unfused_weights->pointer;
         weight_bytes = packed.size();

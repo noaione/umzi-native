@@ -680,7 +680,7 @@ private:
     void disable_fused_gate(const char* reason) {
         auto layout = Network(true, false);
         const auto package = reload_package();
-        const auto packed = device_weights(model, layout, package.section(3).data(), false, accumulate_fp16);
+        const auto packed = device_weights(model, layout, package->section(3).data(), false, accumulate_fp16);
         unfused_weights = std::make_shared<umzi::DeviceAllocation>(context, packed.data(), packed.size());
         weights = unfused_weights->pointer;
         device_model = std::move(layout);

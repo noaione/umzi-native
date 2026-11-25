@@ -53,10 +53,10 @@ protected:
         package_digest_ = source.package_digest_;
     }
     // Re-reads the package this session was opened from, refusing a file that changed since.
-    ModelPackage reload_package() const {
+    std::unique_ptr<ModelPackage> reload_package() const {
         if (package_path_.empty()) throw std::runtime_error("The model package path is unknown");
-        ModelPackage package(package_path_);
-        if (package.digest != package_digest_)
+        auto package = std::make_unique<ModelPackage>(package_path_);
+        if (package->digest != package_digest_)
             throw std::runtime_error("The Umzi model package changed while the session was open");
         return package;
     }
