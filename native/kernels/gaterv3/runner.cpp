@@ -1158,6 +1158,7 @@ public:
     CUevent completed = nullptr;
     bool pending = false;
     std::unique_ptr<GtRunner> active;
+    mutable std::string cache_text, kernel_text;
 
     void open(const umzi::ModelPackage& package, const UmziSessionOptions& options) {
         shared->flags = (options.flags & UMZI_CUDA_GRAPH ? GT_CREATE_GRAPH : 0)
@@ -1346,8 +1347,15 @@ public:
         return {sizeof(UmziDiagnostic), gate_stats[index], value};
     }
 
-    const char* cache_message() const override { return active ? active->plan_cache.diagnostic.c_str() : ""; }
-    const char* kernel_message() const override { return active ? active->fusion_diagnostic.c_str() : ""; }
+    // Copies owned by the session: prepare() destroys the runner the live text belongs to.
+    const char* cache_message() const override {
+        cache_text = active ? active->plan_cache.diagnostic : std::string();
+        return cache_text.c_str();
+    }
+    const char* kernel_message() const override {
+        kernel_text = active ? active->fusion_diagnostic : std::string();
+        return kernel_text.c_str();
+    }
 
     void profile(float* milliseconds, uint32_t count) override {
         if (!active) throw std::runtime_error("Prepare a GateRV3 shape before profiling");
