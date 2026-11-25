@@ -677,12 +677,17 @@ public:
         }
     }
 
+    // True once a shape is prepared and at least one fused plan exists; before that, whatever was requested.
+    bool fusing() const {
+        return fuse_silu && (plans.empty() || std::any_of(plans.begin(), plans.end(), [](const auto& plan) { return plan.first[3]; }));
+    }
+
     const char* kernel_message() const override {
-        if (fuse_silu && fp16_accumulation)
+        if (fusing() && fp16_accumulation)
             return "SMoSR NHWC mixed precision with FP16 body accumulation and convolution and SiLU fusion";
-        if (fuse_silu && !fp16) return "SMoSR NHWC mixed precision with convolution and SiLU fusion";
+        if (fusing() && !fp16) return "SMoSR NHWC mixed precision with convolution and SiLU fusion";
         if (fp16_accumulation) return "SMoSR NHWC mixed precision with FP16 accumulation in body convolutions";
-        if (fuse_silu) return "SMoSR NHWC FP16 with convolution and SiLU fusion";
+        if (fusing()) return "SMoSR NHWC FP16 with convolution and SiLU fusion";
         return fp32 ? "SMoSR NCHW FP32" : fp16 ? "SMoSR NHWC FP16" : "SMoSR NHWC mixed precision";
     }
 
