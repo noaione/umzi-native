@@ -591,16 +591,22 @@ public:
         CHECK(cuInit(0));
         CHECK(cuDeviceGet(&device, options.device));
         CHECK(cuDevicePrimaryCtxRetain(&context, device));
+        shared->device = device;
+        shared->context = context;
         ContextScope scope(context);
         fft = std::make_shared<umzi::CufftApi>();
+        shared->fft = fft;
         umzi::load_kernel_module(device, module, figsr_images::embedded_cubins, figsr_images::embedded_ptx);
+        shared->module = module;
         for (size_t i = 0; i < names.size(); ++i) CHECK(cuModuleGetFunction(&functions[i], module, names[i]));
         CHECK(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
         CHECK(cuEventCreate(&complete, CU_EVENT_DISABLE_TIMING));
         if (tune_convolutions)
             for (auto& event : tuning_events) CHECK(cuEventCreate(&event, CU_EVENT_DEFAULT));
         CHECK(cudnnCreate(&cudnn));
+        shared->cudnn = cudnn;
         CHECK(cuMemAlloc(&weights, net.bytes));
+        shared->weights = weights;
         if (fp32_nchw) {
             const auto packed = net.nchw_body_weights(data);
             CHECK(cuMemcpyHtoD(weights, packed.data(), packed.size()));
@@ -610,12 +616,6 @@ public:
             const auto packed = net.half_weights(Network{}, data);
             CHECK(cuMemcpyHtoD(weights, packed.data(), packed.size()));
         }
-        shared->device = device;
-        shared->context = context;
-        shared->module = module;
-        shared->cudnn = cudnn;
-        shared->fft = fft;
-        shared->weights = weights;
     }
 
     ~Session() override {

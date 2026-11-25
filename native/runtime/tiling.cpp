@@ -153,6 +153,7 @@ KernelSession& PageTiler::edge_runner(const UmziShape& shape, const OpenTileRunn
     }
     std::unique_ptr<KernelSession> runner;
     if (edges.size() == 3) {
+        check(cuStreamSynchronize(stream), "Synchronize GPU tiling stream");
         runner = std::move(edges.front().kernel);
         edges.erase(edges.begin());
     }
@@ -164,6 +165,7 @@ KernelSession& PageTiler::edge_runner(const UmziShape& shape, const OpenTileRunn
         prepare();
     } catch (const AllocationError&) {
         if (edges.empty()) throw;
+        check(cuStreamSynchronize(stream), "Synchronize GPU tiling stream");
         edges.clear();
         prepare();
     }

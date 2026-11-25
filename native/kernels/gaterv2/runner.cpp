@@ -360,22 +360,20 @@ public:
         CHECK(cuInit(0));
         CHECK(cuDeviceGet(&device, options.device));
         CHECK(cuDevicePrimaryCtxRetain(&context, device));
+        shared->device = device;
+        shared->context = context;
         ContextScope scope(context);
         const auto& image = umzi::load_kernel_module(
             device, module, gaterv2_images::embedded_cubins, gaterv2_images::embedded_ptx);
+        shared->module = module;
         for (int i = 0; i < KernelCount; ++i) CHECK(cuModuleGetFunction(&functions[i], module, kernel_names[i]));
         CHECK(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
         CHECK(cuEventCreate(&completed, CU_EVENT_DISABLE_TIMING));
         CHECK(cudnnCreate(&cudnn));
-        CHECK(cublasLtCreate(&blas));
-        upload_weights(data, package_offsets);
-        shared->device = device;
-        shared->context = context;
-        shared->module = module;
-        shared->weights = weights;
-        shared->half_weights = half_weights;
         shared->cudnn = cudnn;
+        CHECK(cublasLtCreate(&blas));
         shared->blas = blas;
+        upload_weights(data, package_offsets);
         initialize_cache(options.cache_dir, package.digest, image);
     }
 
@@ -529,7 +527,9 @@ public:
         weight32_bytes = packed32.size() * 4;
         weight16_bytes = packed16.size() * 2;
         CHECK(cuMemAlloc(&weights, std::max<size_t>(weight32_bytes, 256)));
+        shared->weights = weights;
         CHECK(cuMemAlloc(&half_weights, std::max<size_t>(weight16_bytes, 256)));
+        shared->half_weights = half_weights;
         CHECK(cuMemcpyHtoD(weights, packed32.data(), weight32_bytes));
         CHECK(cuMemcpyHtoD(half_weights, packed16.data(), weight16_bytes));
     }

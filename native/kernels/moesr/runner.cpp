@@ -402,35 +402,35 @@ public:
         CHECK(cuInit(0));
         CHECK(cuDeviceGet(&device, options.device));
         CHECK(cuDevicePrimaryCtxRetain(&context, device));
+        shared->device = device;
+        shared->context = context;
         ContextScope scope(context);
         const auto& image =
             umzi::load_kernel_module(device, module, moesr_images::embedded_cubins, moesr_images::embedded_ptx);
+        shared->module = module;
         for (int i = 0; i < KernelCount; ++i) CHECK(cuModuleGetFunction(&functions[i], module, kernel_names[i]));
-        for (auto [kernel, shared] : {std::pair{ExpandGateFullF16, fused_shared_full_f16},
-                                      std::pair{ExpandGateFullF32, fused_shared_full_f32},
-                                      std::pair{ExpandGateReducedF16, fused_shared_reduced_f16},
-                                      std::pair{ExpandGateReducedF32, fused_shared_reduced_f32},
-                                      std::pair{ProjectFullNormF16, project_shared_bytes},
-                                      std::pair{ProjectFullResF16, project_shared_bytes},
-                                      std::pair{ProjectFullNormF32, project_shared_bytes},
-                                      std::pair{ProjectFullResF32, project_shared_bytes},
-                                      std::pair{ProjectReducedNormF16, project_shared_bytes},
-                                      std::pair{ProjectReducedResF16, project_shared_bytes},
-                                      std::pair{ProjectReducedNormF32, project_shared_bytes},
-                                      std::pair{ProjectReducedResF32, project_shared_bytes}})
-            CHECK(cuFuncSetAttribute(functions[kernel], CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, shared));
+        for (auto [kernel, shared_bytes] : {std::pair{ExpandGateFullF16, fused_shared_full_f16},
+                                            std::pair{ExpandGateFullF32, fused_shared_full_f32},
+                                            std::pair{ExpandGateReducedF16, fused_shared_reduced_f16},
+                                            std::pair{ExpandGateReducedF32, fused_shared_reduced_f32},
+                                            std::pair{ProjectFullNormF16, project_shared_bytes},
+                                            std::pair{ProjectFullResF16, project_shared_bytes},
+                                            std::pair{ProjectFullNormF32, project_shared_bytes},
+                                            std::pair{ProjectFullResF32, project_shared_bytes},
+                                            std::pair{ProjectReducedNormF16, project_shared_bytes},
+                                            std::pair{ProjectReducedResF16, project_shared_bytes},
+                                            std::pair{ProjectReducedNormF32, project_shared_bytes},
+                                            std::pair{ProjectReducedResF32, project_shared_bytes}})
+            CHECK(cuFuncSetAttribute(functions[kernel], CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, shared_bytes));
         CHECK(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
         CHECK(cuEventCreate(&complete, CU_EVENT_DISABLE_TIMING));
         for (auto& event : timing) CHECK(cuEventCreate(&event, CU_EVENT_DEFAULT));
         CHECK(cudnnCreate(&cudnn));
+        shared->cudnn = cudnn;
         const auto padded_weights = device_weights(model, device_model, data.data(), fused_gate, accumulate_fp16);
         CHECK(cuMemAlloc(&weights, padded_weights.size()));
-        CHECK(cuMemcpyHtoD(weights, padded_weights.data(), padded_weights.size()));
-        shared->device = device;
-        shared->context = context;
-        shared->module = module;
-        shared->cudnn = cudnn;
         shared->weights = weights;
+        CHECK(cuMemcpyHtoD(weights, padded_weights.data(), padded_weights.size()));
         initialize_cache(options.cache_dir, package.digest, image);
     }
 

@@ -490,9 +490,12 @@ public:
         CHECK(cuInit(0));
         CHECK(cuDeviceGet(&device, options.device));
         CHECK(cuDevicePrimaryCtxRetain(&context, device));
+        shared->device = device;
+        shared->context = context;
         ContextScope scope(context);
         const auto& image = umzi::load_kernel_module(device, module, smosr_images::embedded_cubins,
                                                      smosr_images::embedded_ptx);
+        shared->module = module;
         if (fuse_silu && options.cache_dir && *options.cache_dir) {
             try {
                 cache_dir = std::filesystem::absolute(std::filesystem::u8path(options.cache_dir));
@@ -512,7 +515,9 @@ public:
         if (tune_convolutions || fuse_silu)
             for (auto& event : timing) CHECK(cuEventCreate(&event, CU_EVENT_DEFAULT));
         CHECK(cudnnCreate(&cudnn));
+        shared->cudnn = cudnn;
         CHECK(cuMemAlloc(&weights, persistent_bytes()));
+        shared->weights = weights;
         if (package.schema == 2) {
             const auto packed = net.device_weights(source, data, fp32);
             CHECK(cuMemcpyHtoD(weights, packed.data(), packed.size()));
@@ -537,11 +542,6 @@ public:
             launch(stream, InitActivations, half_values, weights + net.bytes);
             CHECK(cuStreamSynchronize(stream));
         }
-        shared->device = device;
-        shared->context = context;
-        shared->module = module;
-        shared->cudnn = cudnn;
-        shared->weights = weights;
     }
 
     ~Session() override {

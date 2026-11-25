@@ -533,14 +533,18 @@ public:
         dev_model = DeviceNetwork(half_io());
 
         fft = std::make_shared<umzi::CufftApi>();
+        shared->fft = fft;
         FFT_CHECK(fft->version(&fft_version));
         CHECK(cuInit(0));
         CHECK(cuDeviceGet(&device, options.device));
         CHECK(cuDevicePrimaryCtxRetain(&context, device));
+        shared->device = device;
+        shared->context = context;
         ContextScope scope(context);
 
         const auto& image =
             umzi::load_kernel_module(device, module, gfisrv2_images::embedded_cubins, gfisrv2_images::embedded_ptx);
+        shared->module = module;
         for (int i = 0; i < KernelCount; ++i) {
             const char* name = kernel_names[i];
             if (unexact_erf && i == Unpack) name = "unpack_fft_unexact";
@@ -561,24 +565,21 @@ public:
         CHECK(cuEventCreate(&timing[0], CU_EVENT_DEFAULT));
         CHECK(cuEventCreate(&timing[1], CU_EVENT_DEFAULT));
         CHECK(cudnnCreate(&cudnn));
+        shared->cudnn = cudnn;
 
         if (!reduced()) {
             weight_bytes = data.size();
             CHECK(cuMemAlloc(&weights, weight_bytes));
+            shared->weights = weights;
             CHECK(cuMemcpyHtoD(weights, data.data(), weight_bytes));
         } else {
             const auto packed = build_device_weights(model, dev_model, data.data(), half_io(), fused_conv);
             weight_bytes = packed.size();
             CHECK(cuMemAlloc(&weights, weight_bytes));
+            shared->weights = weights;
             CHECK(cuMemcpyHtoD(weights, packed.data(), weight_bytes));
             init_cache_environment(options.cache_dir, package.digest, image);
         }
-        shared->device = device;
-        shared->context = context;
-        shared->module = module;
-        shared->cudnn = cudnn;
-        shared->fft = fft;
-        shared->weights = weights;
     }
 
     ~Session() override {

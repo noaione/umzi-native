@@ -408,11 +408,17 @@ public:
                 enqueue(target);
                 CHECK(cuMemcpyDtoDAsync(restored, output, batch * io_bytes, target));
             } else {
+                struct RestoreAddresses {
+                    std::vector<CUdeviceptr>& addresses;
+                    CUdeviceptr input, output;
+                    ~RestoreAddresses() {
+                        addresses.front() = input;
+                        addresses.back() = output;
+                    }
+                } restore{addresses, input, output};
                 addresses.front() = pixels;
                 addresses.back() = restored;
                 enqueue(target);
-                addresses.front() = input;
-                addresses.back() = output;
             }
             return;
         }
@@ -920,9 +926,9 @@ private:
             const auto& y = tensors[silu.out];
             if (x.h != height || x.w != width || x.c != 32 || y.h != height || y.w != width || y.c != 32)
                 continue;
-            const auto x_end = x.offset + x.elements() * 2;
-            const auto y_end = y.offset + y.elements() * 2;
-            if (std::max(x.offset, y.offset) < std::min(x_end, y_end)) continue;
+            const auto x_end = size_t(x.offset) + size_t(x.elements()) * 2;
+            const auto y_end = size_t(y.offset) + size_t(y.elements()) * 2;
+            if (std::max(size_t(x.offset), size_t(y.offset)) < std::min(x_end, y_end)) continue;
             silu_sites.push_back(i);
         }
         if (silu_sites.empty()) {
