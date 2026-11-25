@@ -166,6 +166,8 @@ jobs:
               "umzi_session_describe",
               "umzi_session_prepare",
               "umzi_session_run",
+              "umzi_session_run_tiled",
+              "umzi_session_run_tiled_variable",
               "umzi_session_enqueue",
               "umzi_session_info",
               "umzi_session_diagnostic_count",
