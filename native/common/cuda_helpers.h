@@ -29,12 +29,16 @@ inline void check(CUresult status, const char* operation) {
 }
 
 inline void check(cudnnStatus_t status, const char* operation) {
+    if (status == CUDNN_STATUS_ALLOC_FAILED)
+        throw AllocationError(std::string(operation) + ": cuDNN out of memory; try a smaller tile or batch");
     if (status != CUDNN_STATUS_SUCCESS)
         throw std::runtime_error(std::string(operation) + ": " + cudnnGetErrorString(status));
 }
 
 #if defined(CUBLAS_API_H_) || defined(CUBLASLT_H_)
 inline void check(cublasStatus_t status, const char* operation) {
+    if (status == CUBLAS_STATUS_ALLOC_FAILED)
+        throw AllocationError(std::string(operation) + ": cuBLASLt out of memory; try a smaller tile or batch");
     if (status != CUBLAS_STATUS_SUCCESS)
         throw std::runtime_error(std::string(operation) + ": cuBLASLt status " + std::to_string(int(status)));
 }
