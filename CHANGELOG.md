@@ -4,6 +4,42 @@
 
 Nothing yet!
 
+## [0.0.6] - 2026-11-25
+
+### Added
+
+- GPU page tiling (`tiling="fixed"` and `tiling="variable"`) via
+  `InferenceSession.run_tiled()`, `umzi_session_run_tiled()`, and
+  `umzi_session_run_tiled_variable()`, with overlap feathering, a consolidated
+  device arena, ring-buffered strip blending (`blend_tiles` / `finish_strip`),
+  and shared immutable session state (`clone_shared()`) across variable-tiling
+  edge shapes.
+- Expanded GateRV3 tile-size support (including non-128 and dynamic spatial
+  shapes) plus a `workspace_mib` kernel option (default `64` MiB).
+
+### Changed
+
+- Reduced VRAM usage and improved kernel throughput across native runners:
+  - **GateRV3:** bounded activation arena packing, Level-0 in-place
+    `Inception`, fused `Concat+Conv1x1`, and Tensor Core FP32-accumulated
+    `Conv3x3+SiLU` / `Conv3x3+Span` kernels.
+  - **GFISRv2 & MoESR:** aliased `freq_a`/`freq_b` inside `fft_buf` for reduced
+    GFISRv2 precisions, and lean package-backed weight repacking on `fused_conv`
+    / `fused_gate` fallback instead of retaining dual weight buffers.
+  - **FiGSR:** compacted `Expanded`/`Values` staging with `fuse_expand_gate`.
+  - **All kernels:** lazy host/device I/O staging and non-graph direct device
+    execution.
+- Unsupported precision/option combinations in **FiGSR** and **SMoSR** (e.g.,
+  `fp32` with `fuse_silu`, `tune_convolutions`, or `fuse_expand_gate`) now log
+  a warning via `kernel_message` and disable the option instead of throwing.
+
+### Fixed
+
+- Resolved native runtime and kernel audit issues covering CUDA context/handle
+  lifetimes and per-clone cuDNN/cuBLASLt isolation, GPU tiler stream
+  synchronization and single-runner OOM eviction, C ABI / diagnostic thread
+  safety, Windows cache path handling, and edge-case shape/buffer bounds.
+
 ## [0.0.5] - 2026-11-25
 
 ### Added

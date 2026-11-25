@@ -55,28 +55,39 @@ Image.fromarray(png).save("output/restored-tile.png")
 - **Pre-warming a shape:** Call `session.prepare((N, 3, H, W))` ahead of time if you want GPU allocation, algorithm tuning, and CUDA Graph capture to finish before the first `run()`.
 - **Cleanup and OOM recovery:** Use `with umzi.InferenceSession(...) as session:` (or call `session.close()`) to release GPU memory. If a batch or tile size runs out of VRAM, `prepare()` or `run()` raises `MemoryError`, and you can immediately retry with a smaller batch on the same session.
 
-### Fixed GPU tiling
+### Full-page GPU tiling (`run_tiled`)
 
-Pass a decoded page as a contiguous HWC `uint8` array. The session extracts and
-stitches tiles on CUDA and returns the scaled HWC page.
+Instead of slicing tiles on the CPU, you can pass a full contiguous HWC `uint8` page directly to `session.run_tiled()`. The runtime extracts tiles, runs batched GPU inference, feathers overlaps (when `overlap > 0`), and returns the scaled `(scale * H, scale * W, 3)` page without extra CPU-GPU staging copies on the main runner.
 
 ```python
-restored = session.run_tiled(rgb_page, tile_size=128, batch_size=16, overlap=16)
+with Image.open("samples/input/page-001.jpg") as page:
+    rgb_page = np.ascontiguousarray(page.convert("RGB"), dtype=np.uint8)
+
+with umzi.InferenceSession("output/native/gaterv3.ummodel", sess_options=options) as session:
+    restored = session.run_tiled(
+        rgb_page,
+        tile_size=128,
+        batch_size=16,
+        overlap=0,
+        tiling="fixed",
+    )
+
+Image.fromarray(restored).save("output/restored-page.png")
 ```
 
-`overlap` is the total shared width in source pixels. With overlap enabled,
-the tiler replicates page edges and feathers the shared output in FP32. Use
-`output_dtype=np.float32` to retrieve raw stitched values. See the
-[GPU tiling plan and measurements](gpu-tiling-plan.md) for the tested workloads.
+| Parameter | Default | What it does |
+| --- | --- | --- |
+| `tile_size` | *(required)* | Square nominal tile edge in source pixels (`>= 1`). |
+| `batch_size` | *(required)* | Maximum tiles per GPU batch (`>= 1`). |
+| `overlap` | `0` | Shared source pixels between adjacent tiles (`0 <= overlap < tile_size - 2 * session.context`). `0` copies tiles directly; `> 0` replicates page edges and feathers overlaps in FP32. |
+| `tiling` | `"fixed"` | `"fixed"` keeps every batch at `(batch_size, 3, tile_size, tile_size)` using `background` padding at edges. `"variable"` trims/absorbs partial edge tiles and final batches to cut wasted pixel work. |
+| `background` | `"white"` | Out-of-bounds pad color for `"fixed"` tiling (`"white"` = `255`, `"black"` = `0`). |
+| `output_dtype` | `np.uint8` | `np.uint8` quantizes to RGB `[0, 255]` (using a ring-buffered FP32 strip accumulator when `overlap > 0`). `np.float32` returns raw unclipped FP32 stitched values. |
 
-Use `tiling="variable"` to shrink partial edge tiles and absorb small tails
-when doing so saves model work or calls. Variable tiling replicates page edges
-and reuses up to three prepared edge runners. Keep the model package available
-while the session is open so the runtime can prepare new edge shapes.
-GateRV3 Original preserves its spatial tile shape through nominal size 128
-and uses an exact final batch. Larger nominal tiles can use rectangular edges.
+- **`"fixed"` vs. `"variable"`:** `"variable"` caches up to three edge runners in an LRU cache sharing model weights and immutable CUDA/cuDNN handles with the main session, evicting runners automatically if VRAM gets tight. On **GateRV3 Original**, nominal `tile_size <= 128` keeps the fixed square spatial shape (adapting only the tail batch size), while larger tiles (`> 128`) and other families can shrink rectangular edge dimensions too. Keep the `.ummodel` file readable while the session is open.
+- **Overlap memory:** With `overlap > 0` and `output_dtype=np.uint8`, the tiler keeps only a rolling strip of rows in FP32 instead of allocating a full-page FP32 accumulation buffer. Setting `output_dtype=np.float32` uses a full-page FP32 output buffer instead.
 
-For full-page tiling and stitching, see the [manga tiling benchmark](gaterv3-manga-tiling.md).
+See the [GPU tiling plan and measurements](gpu-tiling-plan.md) and [manga tiling benchmark](gaterv3-manga-tiling.md) for workload results.
 
 ## 3. Session options (`SessionOptions`)
 
