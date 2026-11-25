@@ -48,7 +48,7 @@ inline TilePlan plan_tiles(const KernelSession& model, int height, int width, in
     if (!variable) return fixed();
 
     const auto constraints = model.tiling_constraints();
-    if (constraints.fixed_spatial) {
+    if (tile <= constraints.fixed_spatial_through) {
         auto plan = fixed();
         const uint64_t useful = uint64_t(rows) * columns;
         const auto tail = uint32_t(useful % batch);

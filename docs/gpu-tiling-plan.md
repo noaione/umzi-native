@@ -258,10 +258,10 @@ CUDA Graphs for subsequent pages. This reuses plans at the cost of separate
 edge runner weights and workspaces. Variable edge padding replicates image
 pixels, matching the `nmanga` variable layout convention.
 
-GateRV3 checkpoints with the legacy channel-attention kernel require exactly
-64 latent spatial positions. For these checkpoints the variable mode preserves
-the fixed geometry and padding and uses an exact final batch. A page with a
-full final batch still uses one prepared shape.
+For GateRV3 Original, variable mode preserves the fixed geometry and padding
+through nominal size 128 and submits an exact final batch. A page with a full
+final batch uses one prepared shape. Larger nominal sizes can use rectangular
+edge shapes with the larger-tile attention path.
 
 Validate against a CPU stitch using the chosen geometry, exercise a tiny
 sliver that can be absorbed, and compare paired fixed and variable page time
@@ -322,3 +322,191 @@ elapsed time.
 
 [GateRV3 model call timings](../output/gpu-tiling/variable-gaterv3-calls.json)
 [SMoSR model call timings](../output/gpu-tiling/variable-smosr-calls.json)
+
+## GateRV3 Original tile and batch sweep
+
+Use the three established `samples/input/` pages, native FP16, and CUDA Graphs.
+Keep GateRV3 Original shape sweeps at zero overlap. Screen both tiling modes
+on `page-001.jpg`. Try batches 8, 11, 12, 16, 18, 22, 24, 26, 32, 39, 44,
+48, 64, and 88 with a 128-pixel tile. Screen 120-, 124-, and 127-pixel tiles
+with batches 16, 22, 26, and 32. Confirm the baseline and the two fastest
+screen settings for each policy on all three pages over three warmed repetitions. Time
+from a decoded HWC array through the returned `uint8` page. Keep first-page
+setup and model-only inference timing separate.
+
+The native build used for this sweep specialized its channel-attention kernel
+to 64 spatial positions. The runner aligns each side to 16 pixels, so the supported
+square input range for this checkpoint is 113–128. Smaller candidates in
+that range still execute as padded 128×128 model tiles. At a nominal size of
+128, the zero-overlap page grid contains 176 tiles.
+
+### Zero-overlap sweep results
+
+All 26 screened configurations ran successfully in both tiling modes on the
+RTX 3050 Laptop GPU. The fastest settings on the screen page for each tile
+size were as follows. Screening used one warmed measurement per setting.
+
+| Tile | Tiles per page | Fastest fixed setting | Fastest variable setting |
+| ---: | ---: | ---: | ---: |
+| 120 | 204 | Batch 26, 649.4 ms | Batch 32, 634.5 ms |
+| 124 | 204 | Batch 26, 647.7 ms | Batch 32, 639.2 ms |
+| 127 | 192 | Batch 32, 593.6 ms | Batch 32, 596.3 ms |
+| 128 | 176 | Batch 22, 547.6 ms | Batch 32, 544.5 ms |
+
+Batch 44 was fastest in the three-page confirmation. It beat batch 16 on
+every page in a subsequent paired comparison with five interleaved warmed
+runs per configuration. The times sum the three page medians.
+
+| Tiling | 128×128, batch 16 | 128×128, batch 44 | Page time reduction |
+| --- | ---: | ---: | ---: |
+| Fixed | 1.669 s | 1.636 s | 1.9% |
+| Variable | 1.673 s | 1.637 s | 2.2% |
+
+Batch 44 covers each page in four full batches. Batch 16 needs eleven full
+batches. Both tiling modes submit exactly 176 tiles at either batch size.
+
+[Screening data](../output/gpu-tiling/gaterv3-zero-overlap-sweep/screen.json)
+[Confirmation data](../output/gpu-tiling/gaterv3-zero-overlap-sweep/confirm.json)
+[Paired batch 16 and batch 44 results](../output/gpu-tiling/gaterv3-zero-overlap-sweep/paired.json)
+
+The matching Torch CUDA FP32 reference gave 71.573 dB raw PSNR at both batch
+sizes. Mean SSIMULACRA2 changed from 91.985 to 91.915 with batch 44. A separate
+batch-1 session measured all 528 tiles individually, averaging 4.387 ms.
+Device-wide NVML peaks and first-page timings below were measured separately
+from the paired runs. The first-page timing starts after opening the session
+with the disk plan cache available and includes in-memory preparation.
+
+| Tiling | Batch | First page | Device-wide peak | Model inference, 3 pages | Useful tiles/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Fixed | 16 | 625 ms | 2704 MiB | 1.661 s | 317.9 |
+| Fixed | 44 | 701 ms | 2947 MiB | 1.612 s | 327.6 |
+| Variable | 16 | 618 ms | 2703 MiB | 1.669 s | 316.3 |
+| Variable | 44 | 706 ms | 2958 MiB | 1.661 s | 317.9 |
+
+[Fidelity, VRAM, and individual tile timings](../output/gpu-tiling/gaterv3-zero-overlap-sweep/validation.json)
+
+### Larger square tile compatibility before dynamic attention
+
+The requested sweep was 256, 512, and 1024 pixels at batches 1, 4, 8, 16, and
+32. A zero-overlap batch-1 probe through `run_tiled` on `page-001.jpg`
+failed during shape preparation for each tile size in both fixed and variable
+tiling. The error was `Channel attention prototype needs 64 latent positions`.
+
+| Tile | Latent grid | Spatial positions |
+| ---: | ---: | ---: |
+| 256 | 16×16 | 256 |
+| 512 | 32×32 | 1,024 |
+| 1024 | 64×64 | 4,096 |
+
+The check counts positions per tile regardless of batch count. That blocks
+batches 4, 8, 16, and 32 for the same three shapes. No page timing was
+produced for this matrix.
+
+[Larger tile compatibility probes](../output/gpu-tiling/gaterv3-zero-overlap-sweep/large-tile-compatibility.json)
+
+## VRAM added by GPU tiling
+
+The comparison holds native FP16 inference and CUDA Graphs constant. It uses
+the median NVML peak across three warmed runs per path on the RTX 3050 Laptop
+GPU. CPU tiling still runs the model on CUDA. GateRV3 uses the 1404×2000
+`page-001.jpg` at zero overlap. The SMoSR cases use the 1733×2600 and
+1812×2600 pages in `samples/2x-test/`.
+
+| Model and setting | Fixed GPU peak above CPU tiling | Variable GPU peak above CPU tiling |
+| --- | ---: | ---: |
+| GateRV3 Original, 128 px, batch 16, zero overlap | +23 MiB | +20 MiB |
+| GateRV3 Original, 128 px, batch 44, zero overlap | +26 MiB | +26 MiB |
+| SMoSR, 256 px, batch 1, zero overlap | +68–70 MiB | +124–132 MiB |
+| SMoSR, 256 px, batch 1, 32 px overlap | +342–358 MiB | +382–408 MiB |
+
+The calculated per-page arena for GateRV3 is identical in both modes at each
+batch size, at 19.1 MiB for batch 16 and 24.3 MiB for batch 44. Both batches
+fill exactly, so neither needs extra edge runners. The 3 MiB difference in
+the batch-16 NVML reading reflects a change in the device-wide baseline.
+
+SMoSR needs about 66–70 MiB for page and tile buffers at zero overlap. Its
+overlap buffers add about 275–288 MiB for FP32 RGB sums and per-pixel weights.
+Variable tiling retains an additional 24–66 MiB for the edge runners on the
+tested layouts. Pinned host staging uses system RAM.
+
+[VRAM samples and calculated page arenas](../output/gpu-tiling/tiler-vram-comparison.json)
+
+## Larger GateRV3 Original tiles
+
+Extend the existing channel-attention operation to arbitrary supported latent
+heights and widths. Keep the original kernel for 64 latent positions. For other
+shapes, accumulate Q/K dot products and norms in FP32, softmax over each
+head's 32 channels, and apply the resulting probabilities to V in parallel
+spatial blocks. Use the runner's existing scratch allocation for probabilities.
+
+Preserve the existing variable tiling policy through nominal size 128. Enable
+rectangular edge planning for larger nominal tiles. Validate the attention
+operation directly and check whole-page output against the original Resselt
+channel-attention forward in CUDA FP32. GateRV3 testing uses zero overlap and
+`samples/input/`. Exercise 256, 512, and 1024 with batches 1, 4, 8, 16, and 32
+where the selected GPU has enough memory.
+
+The CUDA cubin can be checked separately with
+`scripts/verify_gaterv3_channel_attention.py <gaterv3-sm_86.cubin>`. It tests
+multiple batches, a partial spatial block, zero Q/K vectors, and 256, 1024,
+and 4096 latent positions against Torch CUDA FP32. The largest absolute
+output difference in the NVIDIA run was 0.000488.
+
+### Larger tile page validation
+
+The screen ran the requested 30 tile, batch, and tiling-mode combinations on
+`page-001.jpg` with native FP16, CUDA Graphs, and zero overlap. The RTX 3050
+Laptop GPU completed these configurations.
+
+| Tile | Fixed batches | Variable batch limits |
+| ---: | --- | --- |
+| 256 | 1, 4, 8, 16, 32 | 1, 4, 8, 16, 32 |
+| 512 | 1, 4, 8, 16 | 1, 4, 8, 16, 32 |
+| 1024 | 1, 4 | 1, 4, 8, 16, 32 |
+
+Fixed 512×512 batch 32 and 1024×1024 batch 8 each needed 4,395,630,592 bytes
+for the model buffers and failed the available-memory check. Fixed 1024×1024
+at batches 16 and 32 exceeded the runner's tensor indexing limits. Variable
+batch limits can submit smaller batches. On the test page, the 1024 grid has
+four distinct rectangular shapes, each submitted individually. The fixed
+1024 batch-4 first page took about 100 seconds including cold preparation.
+
+[Larger tile screening matrix](../output/gpu-tiling/gaterv3-large-tiles/screen.json)
+
+The fastest screened profiles were run on all three pages with two warmed
+calls per page. Timings sum the per-image medians and include the page tiler,
+model inference, transfers, and stitched `uint8` output.
+
+| Tile | Fixed batch and page time | Variable batch limit and page time |
+| ---: | ---: | ---: |
+| 128 control | 44, 1.646 s | 44, 1.656 s |
+| 256 | 16, 1.874 s | 4, 1.938 s |
+| 512 | 1, 1.924 s | 16, 1.666 s |
+| 1024 | 4, 2.509 s | 1, 1.708 s |
+
+[Three-page measurements and sampled VRAM](../output/gpu-tiling/gaterv3-large-tiles/confirm.json)
+
+Raw float output at 128 pixels matched the previous DLL bit for bit on all
+three pages in both modes. The new tile sizes were compared against the
+unchanged Resselt channel-attention model with matching fixed or rectangular
+tiles at batch 1. Torch and native ran in separate GPU passes for the largest
+tiles so PyTorch's cached activations would not consume native VRAM.
+
+| Tile | Fixed PSNR / mean SSIMULACRA2 | Variable PSNR / mean SSIMULACRA2 |
+| ---: | ---: | ---: |
+| 256 | 72.056 dB / 92.021 | 72.044 dB / 92.020 |
+| 512 | 72.146 dB / 92.161 | 72.123 dB / 92.169 |
+| 1024 | 71.089 dB / 91.933 | 71.597 dB / 91.996 |
+
+A 256×384 mixed-precision tile also ran with CUDA Graphs disabled and
+measured 87.949 dB against the matching eager FP32 output. The independent
+batch-1 calls averaged 13.740, 50.519, and 199.992 ms for fixed 256, 512,
+and 1024. Variable layout means were 12.517, 45.442, and 135.145 ms over
+their actual rectangular tiles. For fixed batch 16, model-only totals on
+the three pages were 1.795 s at 256 and 2.385 s at 512, equivalent to 80.23
+and 15.10 useful tiles/s. The reports record the individual latencies,
+tile indices, coordinates, and per-image fidelity.
+
+[Matched FP32 fidelity and 128-pixel regression](../output/gpu-tiling/gaterv3-large-tiles/fidelity.json)
+[Mixed-precision direct check](../output/gpu-tiling/gaterv3-large-tiles/mixed-direct.json)
+[Independent batch and per-tile timings](../output/gpu-tiling/gaterv3-large-tiles/model-calls.json)

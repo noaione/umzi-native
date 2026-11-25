@@ -12,7 +12,7 @@ struct AllocationError : std::runtime_error {
 
 struct TilingConstraints {
     int alignment = 1, minimum = 1, internal_border = 0;
-    bool fixed_spatial = false;
+    int fixed_spatial_through = 0;
 };
 
 class KernelSession {

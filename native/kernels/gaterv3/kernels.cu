@@ -719,3 +719,98 @@ extern "C" __global__ void attention_channels(half* out, const half* in, const f
     for (int i = tid; i < C * P; i += 256)
         out[i / C * 512 + i % C] = __float2half_rn(result[i % C][i / C]);
 }
+
+extern "C" __global__ void channel_attention_probabilities(half* probabilities, const half* in,
+                                                             const float* temperatures, int pixels) {
+    constexpr int C = 32, P = 64, LD = P + 8, warps = 8;
+    __shared__ __align__(32) half q[C][LD], k[C][LD];
+    __shared__ __align__(32) float scores[C][C], q_norm[warps][C], k_norm[warps][C];
+    const int head = blockIdx.x % 16, image = blockIdx.x / 16;
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    in += image * pixels * 1536 + head * C;
+    probabilities += blockIdx.x * C * C;
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> dot;
+    wmma::fill_fragment(dot, 0.0f);
+    const int row = warp / 2 * 16, col = warp % 2 * 16;
+    float q_squared = 0.0f, k_squared = 0.0f;
+    for (int start = 0; start < pixels; start += P) {
+        for (int p = warp; p < P; p += warps) {
+            const int position = start + p;
+            const half q_value = position < pixels ? in[position * 1536 + lane] : __float2half(0.0f);
+            const half k_value = position < pixels ? in[position * 1536 + lane + 512] : __float2half(0.0f);
+            q[lane][p] = q_value;
+            k[lane][p] = k_value;
+            const float qf = __half2float(q_value), kf = __half2float(k_value);
+            q_squared = fmaf(qf, qf, q_squared);
+            k_squared = fmaf(kf, kf, k_squared);
+        }
+        __syncthreads();
+        if (warp < 4) {
+            #pragma unroll
+            for (int p = 0; p < P; p += 16) {
+                wmma::load_matrix_sync(a, &q[row][p], LD);
+                wmma::load_matrix_sync(b, &k[col][p], LD);
+                wmma::mma_sync(dot, a, b, dot);
+            }
+        }
+        __syncthreads();
+    }
+    if (warp < 4) wmma::store_matrix_sync(&scores[row][col], dot, C, wmma::mem_row_major);
+    q_norm[warp][lane] = q_squared;
+    k_norm[warp][lane] = k_squared;
+    __syncthreads();
+
+    float k_total = 0.0f;
+    for (int w = 0; w < warps; ++w) k_total += k_norm[w][lane];
+    const float k_length = fmaxf(sqrtf(k_total), 1e-12f);
+    for (int channel = warp; channel < C; channel += warps) {
+        float q_total = 0.0f;
+        for (int w = 0; w < warps; ++w) q_total += q_norm[w][channel];
+        const float q_length = fmaxf(sqrtf(q_total), 1e-12f);
+        // Normalizing the dot product here avoids rounding the normalized Q and K to half.
+        float score = scores[channel][lane] * temperatures[head] / (q_length * k_length);
+        float max_score = score;
+        for (int d = 16; d; d /= 2) max_score = fmaxf(max_score, __shfl_xor_sync(0xffffffff, max_score, d));
+        score = expf(score - max_score);
+        probabilities[channel * C + lane] = __float2half_rn(score / warp_sum(score));
+    }
+}
+
+extern "C" __global__ void channel_attention_apply(half* out, const half* in,
+                                                     const half* probabilities, int pixels) {
+    constexpr int C = 32, P = 64, LD = P + 8;
+    __shared__ __align__(32) half values[C][LD];
+    __shared__ __align__(32) float result[C][P];
+    const int groups = (pixels + P - 1) / P;
+    const int head_slot = blockIdx.x / groups, head = head_slot % 16, image = head_slot / 16;
+    const int start = blockIdx.x % groups * P;
+    in += image * pixels * 1536 + 1024 + head * C;
+    out += image * pixels * 512 + head * C;
+    probabilities += head_slot * C * C;
+    for (int i = threadIdx.x; i < C * P; i += blockDim.x) {
+        const int position = start + i / C;
+        values[i % C][i / C] = position < pixels ? in[position * 1536 + i % C] : __float2half(0.0f);
+    }
+    __syncthreads();
+
+    const int warp = threadIdx.x / 32, row = warp / 4 * 16, col = warp % 4 * 16;
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+    wmma::fill_fragment(acc, 0.0f);
+    #pragma unroll
+    for (int s = 0; s < C; s += 16) {
+        wmma::load_matrix_sync(a, probabilities + row * C + s, C);
+        wmma::load_matrix_sync(b, &values[s][col], LD);
+        wmma::mma_sync(acc, a, b, acc);
+    }
+    wmma::store_matrix_sync(&result[row][col], acc, P, wmma::mem_row_major);
+    __syncthreads();
+    for (int i = threadIdx.x; i < C * P; i += blockDim.x) {
+        const int position = start + i / C;
+        if (position < pixels) out[position * 512 + i % C] = __float2half_rn(result[i % C][i / C]);
+    }
+}

@@ -506,6 +506,7 @@ private:
     CUfunction add_bias = nullptr;
     CUfunction mean_project = nullptr;
     CUfunction gate_pool_kernel = nullptr;
+    CUfunction apply_channel_attention = nullptr;
     std::vector<bool> pool_fused;
     size_t arena_bytes = 0;
     size_t weight_bytes = 0;
@@ -770,8 +771,14 @@ private:
                 if (op.x == 1) prepare_matmul(i, in, out, op, timer);
                 else prepare_conv(i, in, out, op, timer);
             } else if (op.kind == Attention && op.weight[0] >= 0) {
-                if (out.pixels() != 64) throw std::runtime_error("Channel attention prototype needs 64 latent positions");
-                kernel_by_op[i] = lookup("attention_channels");
+                if (out.pixels() == 64) {
+                    kernel_by_op[i] = lookup("attention_channels");
+                } else {
+                    kernel_by_op[i] = lookup("channel_attention_probabilities");
+                    apply_channel_attention = lookup("channel_attention_apply");
+                    const size_t probabilities_bytes = size_t(batch) * 16 * 32 * 32 * sizeof(uint16_t);
+                    workspace_bytes = std::max(workspace_bytes, probabilities_bytes);
+                }
             } else if (op.kind == Rms) {
                 std::string name = fp16 ? "rms16_" : "rms";
                 if (fused_norm(i)) {
@@ -964,7 +971,11 @@ private:
                 else run(y, a, w0, w1, in.c, o.h, o.w, total);
                 break;
             case Attention:
-                if (w0) launch(kernel, target, batch * 16, 1, 256, y, a, w0);
+                if (w0 && pixels != 64) {
+                    launch(kernel, target, batch * 16, 1, threads, scratch, a, w0, pixels);
+                    launch(apply_channel_attention, target, batch * 16 * ((pixels + 63) / 64), 1, threads,
+                           y, a, scratch, pixels);
+                } else if (w0) launch(kernel, target, batch * 16, 1, threads, y, a, w0);
                 else if (pixels == 64) launch(kernel, target, batch * 16, 1, threads, y, a);
                 else launch(kernel, target, batch * 16 * ((pixels + 3) / 4), 1, 128, y, a, pixels);
                 break;
@@ -1118,7 +1129,7 @@ public:
         const bool fixed_spatial = std::any_of(model.ops.begin(), model.ops.end(), [](const Op& op) {
             return op.kind == Attention && op.weight[0] >= 0;
         });
-        return {model.padded({1, 1, 1}).h, 1, 0, fixed_spatial};
+        return {model.padded({1, 1, 1}).h, 1, 0, fixed_spatial ? tile : 0};
     }
 
     UmziIo tensors() const override {
