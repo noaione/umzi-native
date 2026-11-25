@@ -114,6 +114,9 @@ UMZI_API int umzi_session_enqueue(UmziSession* session, const UmziShape* shape,
 UMZI_API int umzi_session_run_tiled(UmziSession* session, uint32_t height, uint32_t width,
                                     const UmziTilingOptions* options, const uint8_t* input,
                                     uint64_t input_bytes, void* output, uint64_t output_bytes);
+UMZI_API int umzi_session_run_tiled_variable(UmziSession* session, uint32_t height, uint32_t width,
+                                             const UmziTilingOptions* options, const uint8_t* input,
+                                             uint64_t input_bytes, void* output, uint64_t output_bytes);
 UMZI_API int umzi_session_info(const UmziSession* session, UmziSessionInfo* info);
 UMZI_API uint32_t umzi_session_diagnostic_count(const UmziSession* session);
 UMZI_API int umzi_session_diagnostic(const UmziSession* session, uint32_t index, UmziDiagnostic* diagnostic);

@@ -9,7 +9,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
-from typing import Self
+from typing import Literal, Self
 
 import numpy as np
 
@@ -245,13 +245,15 @@ class InferenceSession:
         tile_size: int,
         batch_size: int,
         overlap: int = 0,
+        tiling: Literal["fixed", "variable"] = "fixed",
         background: str = "white",
         output_dtype: type[np.uint8] | type[np.float32] = np.uint8,
     ) -> np.ndarray:
-        """Restore a contiguous HWC uint8 image with fixed CUDA tiles.
+        """Restore a contiguous HWC uint8 image with CUDA tiles.
 
         Overlap is the total shared width in source pixels. Float32 output
-        contains stitched values before clipping and quantization.
+        contains stitched values before clipping and quantization. Variable tiling
+        adapts edge shapes and uses replicated edge padding.
         """
         if not isinstance(image, np.ndarray) or image.dtype != np.uint8:
             raise TypeError("The GPU tiler expects a uint8 NumPy image")
@@ -272,6 +274,8 @@ class InferenceSession:
             raise ValueError("Invalid GPU tiling dimensions or overlap")
         if background not in ("white", "black"):
             raise ValueError("background must be 'white' or 'black'")
+        if tiling not in ("fixed", "variable"):
+            raise ValueError("tiling must be 'fixed' or 'variable'")
         dtype = np.dtype(output_dtype)
         if dtype not in (np.dtype(np.uint8), np.dtype(np.float32)):
             raise ValueError("output_dtype must be uint8 or float32")
@@ -286,9 +290,11 @@ class InferenceSession:
 
         with self._lock:
             self._ensure_open()
-            tiled = getattr(self._dll, "umzi_session_run_tiled", None)
+            symbol = "umzi_session_run_tiled_variable" if tiling == "variable" else "umzi_session_run_tiled"
+            tiled = getattr(self._dll, symbol, None)
             if tiled is None:
-                raise RuntimeError("This Umzi native library does not support GPU tiling")
+                feature = "variable GPU tiling" if tiling == "variable" else "GPU tiling"
+                raise RuntimeError(f"This Umzi native library does not support {feature}")
             restored = np.empty((height * scale, width * scale, output_channels), dtype=dtype)
             check_status(
                 self._dll,

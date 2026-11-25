@@ -10,7 +10,23 @@ struct UmziSession {
     std::unique_ptr<umzi::KernelSession> kernel;
     std::unique_ptr<umzi::PageTiler> tiler;
     double model_load_ms = 0;
-    int32_t device = 0;
+    std::filesystem::path path;
+    umzi::Digest digest{};
+    UmziSessionOptions options{};
+    std::string cache;
+    std::vector<std::pair<std::string, int64_t>> kernel_options;
+
+    std::unique_ptr<umzi::KernelSession> open_edge() const {
+        const umzi::ModelPackage package(path);
+        if (package.digest != digest)
+            throw std::runtime_error("The Umzi model package changed while the variable tiler session was open");
+        std::vector<UmziOption> settings;
+        for (const auto& option : kernel_options) settings.push_back({option.first.c_str(), option.second});
+        auto view = options;
+        view.cache_dir = cache.empty() ? nullptr : cache.c_str();
+        view.kernel_options = settings.data();
+        return umzi::kernel_factory(package.family)(package, view);
+    }
 };
 
 namespace {
@@ -75,10 +91,20 @@ UmziSession* umzi_session_open(const char* path, const UmziSessionOptions* optio
             || options->precision > UMZI_FP32 || (options->flags & ~UMZI_CUDA_GRAPH)
             || options->kernel_option_count > 64 || (options->kernel_option_count && !options->kernel_options))
             throw std::runtime_error("Invalid Umzi session options");
-        const umzi::ModelPackage package(std::filesystem::u8path(path));
         auto session = std::make_unique<UmziSession>();
+        session->path = std::filesystem::absolute(std::filesystem::u8path(path));
+        const umzi::ModelPackage package(session->path);
         session->kernel = umzi::kernel_factory(package.family)(package, *options);
-        session->device = options->device;
+        session->digest = package.digest;
+        session->options = *options;
+        session->options.cache_dir = nullptr;
+        session->options.kernel_options = nullptr;
+        if (options->cache_dir) session->cache = options->cache_dir;
+        for (uint32_t i = 0; i < options->kernel_option_count; ++i) {
+            const auto& option = options->kernel_options[i];
+            if (!option.name) throw std::runtime_error("Invalid Umzi kernel option name");
+            session->kernel_options.emplace_back(option.name, option.value);
+        }
         session->model_load_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - start).count();
         result = session.release();
@@ -131,8 +157,20 @@ int umzi_session_run_tiled(UmziSession* session, uint32_t height, uint32_t width
         auto& implementation = kernel(session);
         if (!options || options->struct_size < sizeof(*options))
             throw std::runtime_error("Invalid Umzi tiling options");
-        umzi::run_tiled(implementation, session->tiler, session->device, height, width,
+        umzi::run_tiled(implementation, session->tiler, session->options.device, height, width,
                         *options, input, input_bytes, output, output_bytes);
+    });
+}
+
+int umzi_session_run_tiled_variable(UmziSession* session, uint32_t height, uint32_t width,
+                                    const UmziTilingOptions* options, const uint8_t* input,
+                                    uint64_t input_bytes, void* output, uint64_t output_bytes) {
+    return report([&] {
+        auto& implementation = kernel(session);
+        if (!options || options->struct_size < sizeof(*options))
+            throw std::runtime_error("Invalid Umzi tiling options");
+        umzi::run_tiled(implementation, session->tiler, session->options.device, height, width,
+                        *options, input, input_bytes, output, output_bytes, [&] { return session->open_edge(); });
     });
 }
 

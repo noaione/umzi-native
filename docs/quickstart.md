@@ -69,6 +69,12 @@ the tiler replicates page edges and feathers the shared output in FP32. Use
 `output_dtype=np.float32` to retrieve raw stitched values. See the
 [GPU tiling plan and measurements](gpu-tiling-plan.md) for the tested workloads.
 
+Use `tiling="variable"` to shrink partial edge tiles and absorb small tails
+when doing so saves model work or calls. Variable tiling replicates page edges
+and reuses up to three prepared edge runners. Keep the model package available
+while the session is open so the runtime can prepare new edge shapes.
+GateRV3 Original keeps its spatial tile shape and uses an exact final batch.
+
 For full-page tiling and stitching, see the [manga tiling benchmark](gaterv3-manga-tiling.md).
 
 ## 3. Session options (`SessionOptions`)

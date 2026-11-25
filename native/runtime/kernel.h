@@ -10,10 +10,16 @@ struct AllocationError : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+struct TilingConstraints {
+    int alignment = 1, minimum = 1, internal_border = 0;
+    bool fixed_spatial = false;
+};
+
 class KernelSession {
 public:
     virtual ~KernelSession() = default;
     virtual UmziModelInfo model_info() const = 0;
+    virtual TilingConstraints tiling_constraints() const { return {}; }
     virtual UmziIo tensors() const = 0;
     virtual UmziIo describe(const UmziShape& shape) const = 0;
     virtual void prepare_shape(const UmziShape& shape) = 0;

@@ -588,6 +588,7 @@ public:
     }
 
     UmziModelInfo model_info() const override { return {sizeof(UmziModelInfo), "figsr", scale, 0}; }
+    umzi::TilingConstraints tiling_constraints() const override { return {2, 6, 8}; }
 
     UmziIo tensors() const override {
         const auto dtype = uint32_t(fp16 ? UMZI_FLOAT16 : UMZI_FLOAT32);

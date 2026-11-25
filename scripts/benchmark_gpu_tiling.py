@@ -33,7 +33,15 @@ MODELS = {
 
 
 def cpu_page(
-    backend: ModuleType, image: Image.Image, session: Any, tile: int, batch: int, overlap: int, background: str
+    backend: ModuleType,
+    image: Image.Image,
+    session: Any,
+    tile: int,
+    batch: int,
+    overlap: int,
+    background: str,
+    policy: Any = None,
+    pad_final_batch: bool = True,
 ):
     return backend.denoise_single_image_with_overlap(
         image,
@@ -42,8 +50,9 @@ def cpu_page(
         batch_size=batch,
         tile_overlap=overlap,
         background=background,
-        pad_final_batch=True,
+        pad_final_batch=pad_final_batch,
         use_fp32=session.get_inputs()[0].type == "tensor(float)",
+        tiling_policy=policy,
     )
 
 
@@ -56,16 +65,22 @@ def cpu_raw(
     batch: int,
     overlap: int,
     background: str,
+    policy: Any = None,
+    pad_final_batch: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     if overlap:
         capture = CaptureBeforeClip()
         with patch.object(backend, "get_numpy", return_value=capture):
-            with cpu_page(backend, image, session, tile, batch, overlap, background) as rendered:
+            with cpu_page(
+                backend, image, session, tile, batch, overlap, background, policy, pad_final_batch
+            ) as rendered:
                 assert capture.image is not None
                 return np.moveaxis(capture.image, 0, -1), np.array(rendered)
 
     # The CPU no-overlap path converts each valid tile straight into the byte canvas.
-    boxes = iter(tiler.plan_tiles(*image.size, tile_size=tile))
+    planned = tiler.plan_tiles(*image.size, tile_size=tile, policy=policy)
+    groups = tiler.group_tiles_by_shape(planned, primary_shape=(tile, tile))
+    boxes = (box for _, group in groups for box in group)
     scale = session.scale_factor
     raw = np.empty((image.height * scale, image.width * scale, 3), np.float32)
     quantize = backend._quantize_tile_to_uint8
@@ -78,7 +93,7 @@ def cpu_raw(
         return quantize(output)
 
     with patch.object(backend, "_quantize_tile_to_uint8", side_effect=capture_tile):
-        with cpu_page(backend, image, session, tile, batch, overlap, background) as rendered:
+        with cpu_page(backend, image, session, tile, batch, overlap, background, policy, pad_final_batch) as rendered:
             assert next(boxes, None) is None
             return raw, np.array(rendered)
 
@@ -109,6 +124,39 @@ def smoke(backend: ModuleType, tiler: ModuleType, session: InferenceSession, til
         except ValueError:
             continue
         raise AssertionError(f"Expected validation error for {limit}, {blend}, {fill}")
+    return rows
+
+
+def variable_smoke(
+    backend: ModuleType, tiler: ModuleType, session: InferenceSession, tile: int, batch: int
+) -> list[dict]:
+    # These pages give independent nmanga layouts with unambiguous shrink/absorb decisions.
+    cases = (
+        (tile + 5, tile + 7, 0, tile // 8, tile, batch),
+        (tile + 37, tile + 43, 16, 0, tile, batch),
+        (11, 9, 0, 0, tile, batch),
+    )
+    variable_spatial = session.kernel != "gaterv3"  # The benchmark uses the Original checkpoint.
+    if variable_spatial:
+        # Absorbing the one-pixel tail would leave two equally padded interior batches.
+        cases += ((64, 129, 0, 0, 32, 4),)
+    rows = []
+    for height, width, overlap, expand, tile, batch in cases:
+        pixels = np.random.default_rng(9).integers(0, 256, (height, width, 3), dtype=np.uint8)
+        policy = (
+            tiler.TilingPolicy(mode="variable", bucket_step=16, expand_tolerance=expand) if variable_spatial else None
+        )
+        with Image.fromarray(pixels) as image:
+            expected, quantized = cpu_raw(
+                backend, tiler, image, session, tile, batch, overlap, "white", policy, variable_spatial
+            )
+        actual = session.run_tiled(
+            pixels, tile_size=tile, batch_size=batch, overlap=overlap, tiling="variable", output_dtype=np.float32
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
+        rendered = session.run_tiled(pixels, tile_size=tile, batch_size=batch, overlap=overlap, tiling="variable")
+        assert np.max(np.abs(rendered.astype(np.int16) - quantized)) <= int(overlap != 0)
+        rows.append({"size": [width, height], "overlap": overlap, "max_abs": float(np.max(np.abs(actual - expected)))})
     return rows
 
 
@@ -251,6 +299,7 @@ def main() -> None:
     parser.add_argument("--manga-repo", type=Path, default=ROOT.parent / "nao-manga-rls")
     parser.add_argument("--rounds", type=int, default=2)
     parser.add_argument("--smoke-only", action="store_true")
+    parser.add_argument("--variable-smoke", action="store_true")
     parser.add_argument("--no-cuda-graph", action="store_true")
     args = parser.parse_args()
     if args.rounds < 1:
@@ -289,6 +338,8 @@ def main() -> None:
         }
         with InferenceSession(args.model, options) as session:
             report["smoke"] = smoke(backend, tiler, session, tile, batch)
+            if args.variable_smoke:
+                report["variable_smoke"] = variable_smoke(backend, tiler, session, tile, batch)
             print("GPU/CPU smoke cases passed", flush=True)
             if not args.smoke_only:
                 model = (

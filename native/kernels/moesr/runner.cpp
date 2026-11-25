@@ -770,6 +770,7 @@ private:
 
 public:
     UmziModelInfo model_info() const override { return {sizeof(UmziModelInfo), "moesr", scale, 0}; }
+    umzi::TilingConstraints tiling_constraints() const override { return {2, 2, 0}; }
 
     UmziIo tensors() const override {
         const auto dtype = uint32_t(fp16 ? UMZI_FLOAT16 : UMZI_FLOAT32);

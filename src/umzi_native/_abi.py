@@ -114,8 +114,10 @@ def bind_session_api(dll: ctypes.CDLL) -> None:
         function.restype = result
     if dll.umzi_abi_version() != 1:
         raise OSError("Unsupported Umzi native ABI version")
-    tiled = getattr(dll, "umzi_session_run_tiled", None)
-    if tiled is not None:
+    for name in ("umzi_session_run_tiled", "umzi_session_run_tiled_variable"):
+        tiled = getattr(dll, name, None)
+        if tiled is None:
+            continue
         tiled.argtypes = [
             pointer,
             ctypes.c_uint32,

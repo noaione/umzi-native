@@ -1114,6 +1114,12 @@ public:
     }
 
     UmziModelInfo model_info() const override { return {sizeof(UmziModelInfo), "gaterv3", 1, 0}; }
+    umzi::TilingConstraints tiling_constraints() const override {
+        const bool fixed_spatial = std::any_of(model.ops.begin(), model.ops.end(), [](const Op& op) {
+            return op.kind == Attention && op.weight[0] >= 0;
+        });
+        return {model.padded({1, 1, 1}).h, 1, 0, fixed_spatial};
+    }
 
     UmziIo tensors() const override {
         auto dtype = static_cast<uint32_t>(fp16() ? UMZI_FLOAT16 : UMZI_FLOAT32);

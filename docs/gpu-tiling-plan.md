@@ -238,3 +238,87 @@ the tiler. The optimized DLL matched the original DLL bit for bit in raw
 float output and rendered bytes on all 12 page cases.
 [Paired page timings](../output/gpu-tiling/ab-tiler.json)
 [GPU profile summary](../output/gpu-tiling/ab-tiler-profile-summary.json)
+
+## Variable edge tiling
+
+Expose `tiling="variable"` as an opt-in on `run_tiled`. Keep the interior grid
+and overlap widths. Shrink right and bottom tiles to aligned rectangles.
+Evaluate a second layout for each axis when its last tile adds at most
+`min(64, tile_size // 8)` pixels beyond the previous tile. Select the valid
+layout with the fewest submitted input pixels after bucketing, batch padding,
+and model padding. Break ties by model calls and then shape groups. Each
+small edge group gets a batch no larger than its useful tile count. Include
+the regular grid in the comparison so variable shapes can be skipped when
+they would increase submitted work.
+
+Group at most four rectangles by shape. Upload the source page once and keep
+extraction, blending, and clipping on the GPU. The primary runner handles the
+first group, and up to three least-recently-used edge runners retain prepared
+CUDA Graphs for subsequent pages. This reuses plans at the cost of separate
+edge runner weights and workspaces. Variable edge padding replicates image
+pixels, matching the `nmanga` variable layout convention.
+
+GateRV3 checkpoints with the legacy channel-attention kernel require exactly
+64 latent spatial positions. For these checkpoints the variable mode preserves
+the fixed geometry and padding and uses an exact final batch. A page with a
+full final batch still uses one prepared shape.
+
+Validate against a CPU stitch using the chosen geometry, exercise a tiny
+sliver that can be absorbed, and compare paired fixed and variable page time
+on GateRV3 Original (`samples/input`, 128×128, batch 16) and SMoSR
+(`samples/2x-test`, 256×256, batch 1), with and without overlap. Use separate
+fidelity references for different layouts because edge context can change
+model output.
+
+### Variable tiling results
+
+The fixed and variable CUDA paths were paired on the same RTX 3050 Laptop GPU
+and native FP16 build. Page timings sum the three per-image medians of five
+alternating, warmed runs. Submitted input pixels include batch padding and the
+model's own alignment or reflection border.
+
+| Model | Overlap | Fixed page time | Variable page time | Submitted input pixels saved |
+| --- | ---: | ---: | ---: | ---: |
+| GateRV3 Original | 0 px | 1.700 s | 1.714 s | 0% |
+| GateRV3 Original | 16 px | 2.278 s | 2.227 s | 2.50% |
+| SMoSR | 0 px | 1.834 s | 1.610 s | 12.53% |
+| SMoSR | 32 px | 2.220 s | 2.106 s | 6.06% |
+
+The GPU and CPU stitches matched exactly in raw values on all 12 page cases
+using the selected layouts. At zero overlap, SMoSR absorbed a 20-pixel right
+tail on the 1812-pixel page and removed one tile column. A synthetic test also
+verified that the planner kept a one-pixel tail separate when merging it
+would add model work through batch padding.
+
+GateRV3 used batch 10 for the 16-pixel-overlap tail, saving six repeated tiles
+per page. The first overlapping variable page took 4.30 s with preparation.
+The next two first passes reused the edge runner and took 736 ms each. Without
+overlap every GateRV3 batch was already full.
+
+[GateRV3 variable page results](../output/gpu-tiling/variable-gaterv3.json)
+[SMoSR variable page results](../output/gpu-tiling/variable-smosr.json)
+
+| Model | Overlap | Raw PSNR vs. matched Torch FP32 | Mean SSIMULACRA2 |
+| --- | ---: | ---: | ---: |
+| GateRV3 Original | 0 px | 71.573 dB | 91.985 |
+| GateRV3 Original | 16 px | 71.478 dB | 91.982 |
+| SMoSR | 0 px | 61.798 dB | 88.711 |
+| SMoSR | 32 px | 61.831 dB | 88.717 |
+
+[GateRV3 variable fidelity](../output/gpu-tiling/variable-gaterv3-quality.json)
+[SMoSR variable fidelity](../output/gpu-tiling/variable-smosr-quality.json)
+
+The independent model-only run synchronizes each device-resident call.
+GateRV3 batch-1 calls use a separate prepared session. SMoSR already runs
+one tile per call. The reports retain each image, tile index, origin, and
+elapsed time.
+
+| Model | Overlap | Batched model time | Useful tiles/s | Mean batch-1 tile latency |
+| --- | ---: | ---: | ---: | ---: |
+| GateRV3 Original | 0 px | 1.625 s | 324.9 | 4.361 ms |
+| GateRV3 Original | 16 px | 2.161 s | 324.9 | 4.378 ms |
+| SMoSR | 0 px | 1.539 s | 150.1 | 6.663 ms |
+| SMoSR | 32 px | 1.930 s | 149.3 | 6.700 ms |
+
+[GateRV3 model call timings](../output/gpu-tiling/variable-gaterv3-calls.json)
+[SMoSR model call timings](../output/gpu-tiling/variable-smosr-calls.json)
