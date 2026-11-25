@@ -441,7 +441,12 @@ public:
         ContextScope scope(context);
         TimedGraph timed(ops.size() + 1);
         for (auto& event : timed.events) CHECK(cuEventCreate(&event, CU_EVENT_DEFAULT));
+        // Non-graph sessions have no staging buffers yet, and cuDNN cannot create plans inside stream capture.
+        ensure_device_staging();
+        CHECK(cuMemsetD8Async(input, 0, io_bytes * batch, stream));
         CHECK(cudnnSetStream(cudnn, stream));
+        forward(stream);
+        CHECK(cuStreamSynchronize(stream));
         CHECK(cuStreamBeginCapture(stream, CU_STREAM_CAPTURE_MODE_THREAD_LOCAL));
         try {
             forward(stream, timed.events.data());
