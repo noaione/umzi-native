@@ -281,7 +281,9 @@ public:
         cublasLtHandle_t blas = nullptr;
 
         ~Shared() {
-            if (!context || cuCtxPushCurrent(context) != CUDA_SUCCESS) return;
+            if (!context) return;
+            const umzi::PrimaryContextRelease release{device};
+            if (cuCtxPushCurrent(context) != CUDA_SUCCESS) return;
             if (cudnn) cudnnDestroy(cudnn);
             if (blas) cublasLtDestroy(blas);
             if (weights) cuMemFree(weights);
@@ -289,7 +291,6 @@ public:
             if (module) cuModuleUnload(module);
             CUcontext previous;
             cuCtxPopCurrent(&previous);
-            cuDevicePrimaryCtxRelease(device);
         }
     };
     std::shared_ptr<Shared> shared = std::make_shared<Shared>();

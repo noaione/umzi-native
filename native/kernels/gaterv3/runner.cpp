@@ -1143,14 +1143,15 @@ public:
         gt::Digest build{};
 
         ~Shared() {
-            if (!context || cuCtxPushCurrent(context) != CUDA_SUCCESS) return;
+            if (!context) return;
+            const umzi::PrimaryContextRelease release{device};
+            if (cuCtxPushCurrent(context) != CUDA_SUCCESS) return;
             if (cudnn) cudnnDestroy(cudnn);
             if (blas) cublasLtDestroy(blas);
             if (module) cuModuleUnload(module);
             if (weights) cuMemFree(weights);
             CUcontext previous;
             cuCtxPopCurrent(&previous);
-            cuDevicePrimaryCtxRelease(device);
         }
     };
 

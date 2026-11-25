@@ -61,6 +61,12 @@ struct ContextScope {
     }
 };
 
+// Balances cuDevicePrimaryCtxRetain at scope exit, even when the context can no longer be made current.
+struct PrimaryContextRelease {
+    CUdevice device;
+    ~PrimaryContextRelease() { cuDevicePrimaryCtxRelease(device); }
+};
+
 // Device copy of weights repacked for the unfused path after a fusion fallback.
 // Shared with clones, so it outlives the session that created it.
 struct DeviceAllocation {
