@@ -755,7 +755,8 @@ private:
                     backend_plans.emplace(key, std::move(plan));
                     return;
                 }
-                p.plan.reset();
+                // Give the plan back so the tuning loop below still sees every candidate.
+                candidate.plan = std::move(p.plan);
             }
         }
         plan_cache.record_tuning();
