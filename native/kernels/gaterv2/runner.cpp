@@ -220,7 +220,12 @@ struct Events {
     CUevent start = nullptr, stop = nullptr;
     Events() {
         CHECK(cuEventCreate(&start, CU_EVENT_DEFAULT));
-        CHECK(cuEventCreate(&stop, CU_EVENT_DEFAULT));
+        try {
+            CHECK(cuEventCreate(&stop, CU_EVENT_DEFAULT));
+        } catch (...) {
+            cuEventDestroy(start); // The destructor does not run when the constructor throws.
+            throw;
+        }
     }
     ~Events() {
         if (start) cuEventDestroy(start);
