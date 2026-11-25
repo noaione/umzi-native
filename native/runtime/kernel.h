@@ -4,6 +4,7 @@
 #include "model_package.h"
 
 #include <memory>
+#include <mutex>
 
 namespace umzi {
 struct AllocationError : std::runtime_error {
@@ -35,6 +36,7 @@ public:
 
     // kernel_message() plus any ignored-option warnings, for the C API.
     const char* kernel_report() const {
+        const std::lock_guard<std::mutex> lock(report_lock_); // Concurrent polls would race on report_.
         report_ = kernel_message();
         if (!warnings_.empty()) report_ += (report_.empty() ? "" : "; ") + warnings_;
         return report_.c_str();
@@ -68,6 +70,7 @@ private:
     std::filesystem::path package_path_;
     Digest package_digest_{};
     mutable std::string report_;
+    mutable std::mutex report_lock_;
 };
 
 using KernelFactory = std::unique_ptr<KernelSession>(*)(const ModelPackage&, const UmziSessionOptions&);
