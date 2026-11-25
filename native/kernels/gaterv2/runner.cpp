@@ -300,6 +300,8 @@ public:
     CUevent completed = nullptr;
     cudnnHandle_t cudnn = nullptr;
     cublasLtHandle_t blas = nullptr;
+    // Clones own their handles: a handle carries its stream, so sessions on different streams cannot share one.
+    bool own_handles = false;
     bool pending = false;
     std::filesystem::path cache_dir;
     umzi::Digest cache_environment{}, plan_key{};
@@ -540,6 +542,10 @@ public:
             if (pending) cuEventSynchronize(completed);
             if (stream) cuStreamSynchronize(stream);
             release_shape();
+            if (own_handles) {
+                if (cudnn) cudnnDestroy(cudnn);
+                if (blas) cublasLtDestroy(blas);
+            }
             if (completed) cuEventDestroy(completed);
             if (stream) cuStreamDestroy(stream);
             CUcontext previous;
@@ -568,12 +574,13 @@ public:
         copy->functions = functions;
         copy->weights = weights;
         copy->half_weights = half_weights;
-        copy->cudnn = cudnn;
-        copy->blas = blas;
         copy->cache_dir = cache_dir;
         copy->cache_environment = cache_environment;
         copy->cache_environment_error = cache_environment_error;
         ContextScope scope(context);
+        copy->own_handles = true;
+        CHECK(cudnnCreate(&copy->cudnn));
+        CHECK(cublasLtCreate(&copy->blas));
         CHECK(cuStreamCreate(&copy->stream, CU_STREAM_NON_BLOCKING));
         CHECK(cuEventCreate(&copy->completed, CU_EVENT_DISABLE_TIMING));
         return copy;

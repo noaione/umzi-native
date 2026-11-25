@@ -463,6 +463,8 @@ class Session final : public umzi::KernelSession {
     CUevent complete = nullptr;
     std::array<CUevent, 2> timing{};
     cudnnHandle_t cudnn = nullptr;
+    // Clones own their handle: it carries its stream, so sessions on different streams cannot share one.
+    bool own_cudnn = false;
     std::shared_ptr<umzi::CufftApi> fft;
     int fft_version = 0;
     std::array<CUfunction, KernelCount> functions{};
@@ -590,6 +592,7 @@ public:
             if (pending) cuEventSynchronize(complete);
             if (stream) cuStreamSynchronize(stream);
             release_shape();
+            if (own_cudnn && cudnn) cudnnDestroy(cudnn);
             for (auto& ev : timing)
                 if (ev) cuEventDestroy(ev);
             if (complete) cuEventDestroy(complete);
@@ -617,7 +620,6 @@ public:
         copy->device = device;
         copy->context = context;
         copy->module = module;
-        copy->cudnn = cudnn;
         copy->fft = fft;
         copy->fft_version = fft_version;
         copy->functions = functions;
@@ -627,6 +629,8 @@ public:
         copy->cache_environment = cache_environment;
         copy->cache_environment_error = cache_environment_error;
         ContextScope scope(context);
+        copy->own_cudnn = true;
+        CHECK(cudnnCreate(&copy->cudnn));
         CHECK(cuStreamCreate(&copy->stream, CU_STREAM_NON_BLOCKING));
         CHECK(cuEventCreate(&copy->complete, CU_EVENT_DISABLE_TIMING));
         CHECK(cuEventCreate(&copy->timing[0], CU_EVENT_DEFAULT));

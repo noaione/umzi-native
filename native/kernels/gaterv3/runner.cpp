@@ -1160,6 +1160,10 @@ public:
     bool pending = false;
     std::unique_ptr<GtRunner> active;
     mutable std::string cache_text, kernel_text;
+    // Clones own their handles: a handle carries its stream, so sessions on different streams cannot share one.
+    // The original session keeps using the handles in Shared.
+    cudnnHandle_t clone_cudnn = nullptr;
+    cublasLtHandle_t clone_blas = nullptr;
 
     void open(const umzi::ModelPackage& package, const UmziSessionOptions& options) {
         shared->flags = (options.flags & UMZI_CUDA_GRAPH ? GT_CREATE_GRAPH : 0)
@@ -1217,6 +1221,8 @@ public:
         if (cuCtxPushCurrent(shared->context) == CUDA_SUCCESS) {
             if (pending) cuEventSynchronize(completed);
             active.reset();
+            if (clone_cudnn) cudnnDestroy(clone_cudnn);
+            if (clone_blas) cublasLtDestroy(clone_blas);
             if (completed) cuEventDestroy(completed);
             CUcontext previous;
             cuCtxPopCurrent(&previous);
@@ -1228,6 +1234,8 @@ public:
         auto copy = std::make_unique<GateSession>();
         copy->shared = shared;
         ContextScope scope(shared->context);
+        CHECK(cudnnCreate(&copy->clone_cudnn));
+        CHECK(cublasLtCreate(&copy->clone_blas));
         CHECK(cuEventCreate(&copy->completed, CU_EVENT_DISABLE_TIMING));
         return copy;
     }
@@ -1260,7 +1268,8 @@ public:
             active.reset();
             auto plan = std::make_unique<GtRunner>();
             plan->initialize_shape(padded, shared->flags, shared->cache, shared->device, shared->context,
-                                   shared->module, shared->weights, shared->cudnn, shared->blas,
+                                   shared->module, shared->weights, clone_cudnn ? clone_cudnn : shared->cudnn,
+                                   clone_blas ? clone_blas : shared->blas,
                                    shared->build, shared->model, std::move(resolved), shared->workspace_limit);
             active = std::move(plan);
         }
