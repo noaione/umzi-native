@@ -709,11 +709,16 @@ def main() -> None:
     if args.native_cache_dir and not native:
         parser.error("--native-cache-dir requires a native backend")
     if native and (
-        args.family not in ("smosr", "figsr") or batch != 1 or not args.native_model or not args.native_library
+        args.family not in ("smosr", "figsr", "gfisrv2")
+        or batch != 1
+        or not args.native_model
+        or not args.native_library
     ):
-        parser.error("Native baselines require SMoSR or FiGSR, batch 1, --native-model, and --native-library")
-    if args.family != "smosr" and (args.native_cache_dir or args.mixed_fp16_accumulation or args.fuse_silu):
-        parser.error("The native plan cache, FP16 accumulation, and SiLU fusion options require SMoSR")
+        parser.error("Native baselines require SMoSR, FiGSR, or GFISRv2, batch 1, --native-model, and --native-library")
+    if args.family not in ("smosr", "gfisrv2") and args.native_cache_dir:
+        parser.error("--native-cache-dir requires SMoSR or GFISRv2")
+    if args.family != "smosr" and (args.mixed_fp16_accumulation or args.fuse_silu):
+        parser.error("The FP16 accumulation and SiLU fusion options require SMoSR")
     if args.tag is not None:
         if not native and args.backend not in RTX_BACKENDS:
             parser.error("--tag requires a native or TensorRT-RTX backend")

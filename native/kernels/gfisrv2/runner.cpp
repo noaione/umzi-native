@@ -29,10 +29,10 @@
 namespace {
 constexpr int channels = 48, blocks = 24, scale = 4, hidden = 128, fourier = 30, band = 6, threads = 256;
 constexpr int rgb_lanes = 8, freq_lanes = 64;
-constexpr int expand_shared_bytes = (3 * 180 * 16 + 2 * 3 * 128 * 16) * 2; // 41,856 B
+constexpr int expand_shared_bytes = (2 * 324 * 16 + 2 * 3 * 64 * 16) * 2; // 33,024 B
 constexpr int project_shared_bytes = (2 * 324 * 16 + 2 * 3 * 48 * 16) * 2; // 29,952 B
 constexpr uint64_t default_workspace_mib = 512, max_workspace_mib = 4096;
-constexpr uint32_t plan_schema = 4;
+constexpr uint32_t plan_schema = 5;
 constexpr uint32_t saved_plan_marker = 0x4742;
 constexpr std::array<uint32_t, 7> configuration{3, 3, scale, channels, blocks, hidden, fourier};
 constexpr int r2c = 0x2a, c2r = 0x2c;
@@ -192,12 +192,12 @@ void pack_oihw_to_krsc_float(float* dst_w, float* dst_b, const char* in, Filter 
     }
 }
 
-// Pack logical [256, 9, 48] KRSC FP16 -> [2 passes][3 ks][3 dy][3 dx][128 rows][2 chunks][8 halves] swizzle16.
+// Pack logical [256, 9, 48] KRSC FP16 -> [4 passes][3 ks][3 dy][3 dx][64 rows][2 chunks][8 halves] swizzle16.
 void pack_swizzle16_expand(char* dst, const uint16_t* logical) {
-    constexpr int ntile = 128;
+    constexpr int ntile = 64;
     auto* out = reinterpret_cast<uint16_t*>(dst);
     size_t stage = 0;
-    for (int pass = 0; pass < 2; ++pass) {
+    for (int pass = 0; pass < 4; ++pass) {
         for (int ks = 0; ks < 3; ++ks) {
             for (int dy = 0; dy < 3; ++dy) {
                 uint16_t* stage_dst = out + stage * (3 * ntile * 16);
@@ -404,6 +404,7 @@ constexpr const char* kernel_names[] = {
     "expand_gate_f16", "expand_gate_f32",
     "branch_dw_gate_compact", "scale_post_rms_gate_compact",
     "project_res_norm_f16", "project_res_f16",
+    "project_res_norm_f16_acc32", "project_res_f16_acc32",
     "project_res_norm_f32", "project_res_to_half_f32",
     "spectral_proj_gelu_unpack_f16", "spectral_proj_gelu_unpack_f32",
 };
@@ -423,6 +424,7 @@ enum Kernel {
     ExpandGateF16, ExpandGateF32,
     BranchDwGateCompact, ScalePostRmsGateCompact,
     ProjectResNormF16, ProjectResF16,
+    ProjectResNormF16Acc32, ProjectResF16Acc32,
     ProjectResNormF32, ProjectResToHalfF32,
     SpectralProjGeluUnpackF16, SpectralProjGeluUnpackF32,
     KernelCount
@@ -433,6 +435,7 @@ class Session final : public umzi::KernelSession {
     Network model;
     DeviceNetwork dev_model{false};
     bool graph_enabled = false, pending = false, unexact_erf = false, fused_conv = true;
+    bool fp32_accum = false, fp32_project_accum = false;
     uint32_t precision = UMZI_FP32;
     uint64_t workspace_limit = default_workspace_mib << 20;
     struct Shared {
@@ -511,7 +514,7 @@ public:
         if (!package.section(2).empty() || data.size() != model.bytes)
             throw std::runtime_error("Invalid GFISRv2 weight layout");
         precision = options.precision;
-        bool seen_erf = false, seen_ws = false, seen_fused = false;
+        bool seen_erf = false, seen_ws = false, seen_fused = false, seen_fp32_acc = false, seen_proj_acc = false;
         for (uint32_t i = 0; i < options.kernel_option_count; ++i) {
             const auto& option = options.kernel_options[i];
             const std::string_view name = option.name ? option.name : "";
@@ -533,6 +536,18 @@ public:
                     throw std::runtime_error("GFISRv2 fused_conv must be 0 or 1");
                 fused_conv = option.value == 1;
                 seen_fused = true;
+            } else if (name == "fp32_accum") {
+                if (seen_fp32_acc) throw std::runtime_error("Duplicate GFISRv2 option: fp32_accum");
+                if (option.value != 0 && option.value != 1)
+                    throw std::runtime_error("GFISRv2 fp32_accum must be 0 or 1");
+                fp32_accum = option.value == 1;
+                seen_fp32_acc = true;
+            } else if (name == "fp32_project_accum") {
+                if (seen_proj_acc) throw std::runtime_error("Duplicate GFISRv2 option: fp32_project_accum");
+                if (option.value != 0 && option.value != 1)
+                    throw std::runtime_error("GFISRv2 fp32_project_accum must be 0 or 1");
+                fp32_project_accum = option.value == 1;
+                seen_proj_acc = true;
             } else {
                 throw std::runtime_error("Unknown GFISRv2 option: " + std::string(name));
             }
@@ -564,9 +579,16 @@ public:
                                       std::pair{ExpandGateF32, expand_shared_bytes},
                                       std::pair{ProjectResNormF16, project_shared_bytes},
                                       std::pair{ProjectResF16, project_shared_bytes},
+                                      std::pair{ProjectResNormF16Acc32, project_shared_bytes},
+                                      std::pair{ProjectResF16Acc32, project_shared_bytes},
                                       std::pair{ProjectResNormF32, project_shared_bytes},
-                                      std::pair{ProjectResToHalfF32, project_shared_bytes}})
+                                      std::pair{ProjectResToHalfF32, project_shared_bytes}}) {
             CHECK(cuFuncSetAttribute(functions[kernel], CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, shared));
+            CHECK(cuFuncSetAttribute(functions[kernel], CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+                                     CU_SHAREDMEM_CARVEOUT_MAX_SHARED));
+        }
+        CHECK(cuFuncSetAttribute(functions[SpectralDwResF16], CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+                                 CU_SHAREDMEM_CARVEOUT_MAX_SHARED));
 
         CHECK(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
         CHECK(cuEventCreate(&complete, CU_EVENT_DISABLE_TIMING));
@@ -618,6 +640,8 @@ public:
         copy->graph_enabled = graph_enabled;
         copy->unexact_erf = unexact_erf;
         copy->fused_conv = fused_conv;
+        copy->fp32_accum = fp32_accum;
+        copy->fp32_project_accum = fp32_project_accum;
         copy->precision = precision;
         copy->workspace_limit = workspace_limit;
         copy->device = device;
@@ -659,6 +683,8 @@ private:
             hash.add(workspace_limit);
             hash.add(static_cast<uint32_t>(unexact_erf));
             hash.add(static_cast<uint32_t>(fused_conv));
+            hash.add(static_cast<uint32_t>(fp32_accum));
+            hash.add(static_cast<uint32_t>(fp32_project_accum));
             cache_environment = hash.finish();
         } catch (const std::exception& error) {
             cache_environment_error = error.what();
@@ -866,15 +892,17 @@ private:
             } else {
                 launch(stream, FillNoiseF16, int(pixels * hidden), gated);
                 load_plan_cache();
-                const bool fp16_acc = half_io();
-                make_backend_plan(h, w, rgb_lanes, channels, 3, CUDNN_DATA_HALF, fp16_acc, gated, projected);
+                // Keep FP32 Tensor Core accumulation on the non-residual bookend convolutions
+                // (first, tail_expand, tail_project, last) for +3.2 dB PSNR at ~1 ms cost.
+                const bool fp16_acc = half_io() && !fp32_accum && !fp32_project_accum;
+                make_backend_plan(h, w, rgb_lanes, channels, 3, CUDNN_DATA_HALF, false, gated, projected);
                 if (!fused_conv) {
                     make_backend_plan(h, w, channels, 2 * hidden, 3, CUDNN_DATA_HALF, fp16_acc, gated, projected);
                     make_backend_plan(h, w, hidden, channels, 3, CUDNN_DATA_HALF, fp16_acc, gated, projected);
                 }
-                make_backend_plan(h, w, channels, 2 * channels, 3, CUDNN_DATA_HALF, fp16_acc, gated, projected);
-                make_backend_plan(h, w, 2 * channels, channels, 3, CUDNN_DATA_HALF, fp16_acc, gated, projected);
-                make_backend_plan(h, w, channels, 3 * scale * scale, 3, CUDNN_DATA_HALF, fp16_acc, gated, projected);
+                make_backend_plan(h, w, channels, 2 * channels, 3, CUDNN_DATA_HALF, false, gated, projected);
+                make_backend_plan(h, w, 2 * channels, channels, 3, CUDNN_DATA_HALF, false, gated, projected);
+                make_backend_plan(h, w, channels, 3 * scale * scale, 3, CUDNN_DATA_HALF, false, gated, projected);
                 CHECK(cuStreamSynchronize(stream));
                 device_used[2] = umzi::device_used_bytes();
                 if (cudnn_scratch) CHECK(cuMemFree(cudnn_scratch));
@@ -1044,10 +1072,12 @@ private:
         const int pix_tiles_per_image = (pixels_per_image + 31) / 32;
         const int bin_tiles_32 = (bins + 31) / 32;
         const int bin_tiles_64 = (bins + 63) / 64;
-        const int expand_tx = (w + 15) / 16, expand_ty = (h + 7) / 8;
         const int tile16_tx = (w + 15) / 16, tile16_ty = (h + 15) / 16;
-        const int spec_tx = (w_freq + 7) / 8, spec_ty = (h + 7) / 8;
+        const int spec_tx = half_io() ? (w_freq + 15) / 16 : (w_freq + 7) / 8;
+        const int spec_ty = half_io() ? tile16_ty : (h + 7) / 8;
         const int rms48_blocks = (total_pixels * 8 + threads - 1) / threads;
+        const bool expand_half_acc = half_io() && !fp32_accum;
+        const bool project_half_acc = half_io() && !fp32_accum && !fp32_project_accum;
 
         // Compact Fourier/branch sub-buffers aliased inside `projected` when fused_conv is active.
         const CUdeviceptr fourier_gate = projected;
@@ -1063,11 +1093,11 @@ private:
         for (int i = 0; i < blocks; ++i) {
             const auto& block = dev_model.body[i];
             if (fused_conv) {
-                launch_grid(target, half_io() ? ExpandGateF16 : ExpandGateF32, shape.n * expand_tx * expand_ty,
-                            threads, expand_shared_bytes,
+                launch_grid(target, expand_half_acc ? ExpandGateF16 : ExpandGateF32,
+                            shape.n * tile16_tx * tile16_ty * 4, threads, expand_shared_bytes,
                             gated, fft_buf, fourier_gate, branch_val, branch_gate, norm,
                             dev_ptr(block.expand.weight), dev_ptr(block.expand.bias),
-                            h, w, pixels_per_image, total_pixels, expand_tx, expand_ty);
+                            h, w, pixels_per_image, total_pixels, tile16_tx, tile16_ty);
 
                 launch_grid(target, BranchDwGateCompact, shape.n * tile16_tx * tile16_ty, threads, 0,
                             gated, branch_val, branch_gate,
@@ -1111,14 +1141,18 @@ private:
 
                 if (i + 1 < blocks) {
                     const auto& next_norm = dev_model.body[i + 1].norm;
-                    launch_grid(target, half_io() ? ProjectResNormF16 : ProjectResNormF32,
+                    const Kernel project_k = !half_io() ? ProjectResNormF32
+                        : project_half_acc ? ProjectResNormF16 : ProjectResNormF16Acc32;
+                    launch_grid(target, project_k,
                                 shape.n * tile16_tx * tile16_ty, 128, project_shared_bytes,
                                 state, norm, gated, dev_ptr(block.project.weight), dev_ptr(block.project.bias),
                                 dev_ptr(block.gamma), dev_ptr(next_norm.scale), dev_ptr(next_norm.offset),
                                 h, w, tile16_tx, tile16_ty);
                 } else {
                     const CUdeviceptr null_ptr = 0;
-                    launch_grid(target, half_io() ? ProjectResF16 : ProjectResToHalfF32,
+                    const Kernel project_k = !half_io() ? ProjectResToHalfF32
+                        : project_half_acc ? ProjectResF16 : ProjectResF16Acc32;
+                    launch_grid(target, project_k,
                                 shape.n * tile16_tx * tile16_ty, 128, project_shared_bytes,
                                 state, norm, gated, dev_ptr(block.project.weight), dev_ptr(block.project.bias),
                                 dev_ptr(block.gamma), null_ptr, null_ptr,
@@ -1256,7 +1290,7 @@ public:
 
     const char* cache_message() const override { return plan_cache.diagnostic.c_str(); }
 
-    uint32_t diagnostic_count() const override { return 7; }
+    uint32_t diagnostic_count() const override { return 9; }
     UmziDiagnostic diagnostic(uint32_t index) const override {
         if (index == 0) return {sizeof(UmziDiagnostic), "cufft_version", fft_version};
         if (index == 1)
@@ -1266,6 +1300,8 @@ public:
         if (index == 4) return {sizeof(UmziDiagnostic), "plan_workspace_bytes", int64_t(cudnn_workspace)};
         if (index == 5) return {sizeof(UmziDiagnostic), "fused_conv", int64_t(fused_conv)};
         if (index == 6) return {sizeof(UmziDiagnostic), "peak_plan_workspace_bytes", int64_t(peak_workspace_bytes)};
+        if (index == 7) return {sizeof(UmziDiagnostic), "fp32_accum", int64_t(fp32_accum)};
+        if (index == 8) return {sizeof(UmziDiagnostic), "fp32_project_accum", int64_t(fp32_project_accum)};
         throw std::runtime_error("Invalid GFISRv2 diagnostic index");
     }
     const char* kernel_message() const override {

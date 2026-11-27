@@ -376,3 +376,70 @@ Local builds and reports are ignored by Git. The current Windows DLL is in
 `output/gfisrv2-session/precision-final-win/`. Results are in the sibling
 directories `precision-final-fp32/`, `precision-final-fp16/`, and
 `precision-final-mixed/` under `output/gfisrv2-session/`.
+
+## Pass 4: 512px Tile=512 Batch=1 Overlap=64 Optimization (`samples/mscale`, `fixed` / `even` / `fewest-even`)
+
+### Goal and Hardware/Software Context
+
+- Target workload: `models/4x_wtp_MangaScale_GfisrV2.pth` at `tile=512`, `batch=1`, `overlap=64`, `FP16` on `samples/mscale` (`lb-page-003.png`, `lb-page-004.png`, `lb-page-005.png`, each `900x1350`).
+- Test machine: `NVIDIA GeForce RTX 3050 Laptop GPU` (`sm_86`, 4 GiB), Windows, `C:\Python314\python.exe`, Torch `2.15.0+cu132`, CUDA `13.2`, NVRTC `13.0` (`output/nvrtc-13.0/nvidia/cu13`), `C:\Tools\imaging\ssimulacra2.exe`, baseline commit `de808ec`.
+- Multi-arch release DLL: `output/gfisrv2-512-opt/final-win/umzi_native.dll` (embedded `sm_86`, `sm_89`, `sm_120`, `compute_86`).
+
+### Kernel and Runner Changes
+
+- `native/kernels/gfisrv2/kernels.cu` & `native/kernels/gfisrv2/runner.cpp`:
+  - **`expand_gate_impl`** (`expand_gate_f16` / `expand_gate_f32`): moved from `8x16` (`N=128`, 2 passes) to `16x16` pixel tiles (`18x18` halo, double-buffered `K=16`), 4 grid blocks per tile (`p64 = 0..3`, `N=64`, 9 barriers), `expand_shared_bytes = 33,024 B`, `__launch_bounds__(256, 3)` on `expand_gate_f16` (3 blocks/SM = 24 warps/SM on `sm_86`), `__launch_bounds__(256, 2)` on `expand_gate_f32`, and updated `pack_swizzle16_expand` to `[4 passes][3 ks][3 dy][3 dx][64 rows][2 chunks][8 halves]`. Cuts `expand_gate_f16` at `512x512` from `~81.5 ms` down to `~71.4–72.5 ms` per forward (`24` calls).
+  - **`spectral_dw_res_nhwc_f16`**: upgraded from `8x8` tiles to `16x16` tiles (`18x18` halo, `cp.async`, `44,032 B` smem), cutting `512x512` time from `~9.56 ms` to `~6.8–7.2 ms`.
+  - **`scale_post_rms_gate_compact`**: use `__ldg` loads for `scale` and `offset`.
+  - **`project_res_norm_f16_acc32` / `project_res_f16_acc32`**: bumped launch bounds from `(128, 2)` to `(128, 3)` (`54.3 ms` vs `60.1 ms` at `512x512`).
+  - **SMEM carveout**: set `CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT = CU_SHAREDMEM_CARVEOUT_MAX_SHARED` on `ExpandGate*`, `ProjectRes*`, and `SpectralDwResF16`.
+  - **Fidelity**: enabled FP32 Tensor Core accumulation (`fp16_compute = false`) on the non-residual bookend cuDNN convolutions (`first`, `tail_expand`, `tail_project`, `last`) and bumped `plan_schema` (`4 -> 5`). On a `512x512` crop against eager FP32, this improved PSNR from `59.62 dB -> 62.81 dB` (`+3.19 dB`) at ~1 ms cost while keeping `fp32_project_accum=1` (`65.52 dB`, faster than `eager-fp16` with higher PSNR) and `fp32_accum=1` (`68.75 dB`) available.
+- `scripts/benchmark_architectures.py`: allowed `gfisrv2` with `native-*` backends and `--native-cache-dir`.
+
+### Session Validation (`final-win`)
+
+All 18 stress checks, host/device alternate stream parity, and CLI output parity (`umzi_native.exe`) passed across all three precisions (`output/gfisrv2-512-opt/val-{fp32,fp16,mixed}/report.json`):
+
+```powershell
+C:\Python314\python.exe scripts/validate_gfisrv2_session.py --library output/gfisrv2-512-opt/final-win/umzi_native.dll --cli output/gfisrv2-512-opt/final-win/umzi_native.exe --output output/gfisrv2-512-opt/val-fp32 --precision fp32
+C:\Python314\python.exe scripts/validate_gfisrv2_session.py --library output/gfisrv2-512-opt/final-win/umzi_native.dll --cli output/gfisrv2-512-opt/final-win/umzi_native.exe --output output/gfisrv2-512-opt/val-fp16 --precision fp16
+C:\Python314\python.exe scripts/validate_gfisrv2_session.py --library output/gfisrv2-512-opt/final-win/umzi_native.dll --cli output/gfisrv2-512-opt/final-win/umzi_native.exe --output output/gfisrv2-512-opt/val-mixed --precision mixed
+```
+
+### Fixed `512x512` Benchmark (`benchmark_architectures.py`, `samples/mscale`, `tile=512`, `batch=1`, `overlap=64`)
+
+Artifacts under `output/gfisrv2-512-baseline/gfisrv2/batch-1/tile-512/` (`inductor` is blocked inside the Windows sandbox due to Triton `tcc.exe` compile `PermissionError`; TensorRT-RTX is skipped for GFISRv2):
+
+| Backend | Total (3 pages) | Median image | Input MPx/s | Avg B1 tile lat | Raw PSNR (vs FP32) | Max abs | SSIMULACRA2 mean (min) | VRAM above bg |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `fp32` (Torch CUDA) | 19.920 s | 6554.2 ms | 0.1830 | 1106.67 ms | ref | ref | ref | +1120.1 MiB |
+| `eager-fp16` | 13.208 s | 4420.9 ms | 0.2760 | 733.76 ms | 59.671 dB | 0.05721 | 86.428 (85.545) | +592.0 MiB |
+| `native-fp16` (`HEAD` `baseline-win`) | 3.734 s | 1258.6 ms | 0.9761 | 207.45 ms | 54.969 dB | 0.12214 | 86.055 (85.197) | +399.8 MiB |
+| `native-fp16` (`final-win`) | **3.647 s** | **1197.5 ms** | **0.9996** | **202.58 ms** | **56.383 dB** | **0.09106** | **86.267 (85.402)** | **+335.4 MiB** |
+| `native-mixed` (`final-win`) | 5.537 s | 1852.4 ms | 0.6582 | 307.64 ms | 67.036 dB | 0.02893 | 86.582 (85.650) | +477.3 MiB |
+
+### Full-Page Tiling Comparison: `fixed` vs `even` vs `fewest-even` (`samples/mscale`, `tile=512`, `batch=1`, `overlap=64`)
+
+Measured end-to-end via `InferenceSession.run_tiled` (linear and centered overlap blending) plus synchronized individual batch-1 tile calls (`18` tiles across 3 pages) against matched Torch CUDA FP32 references (`output/gfisrv2-512-opt/mscale-tiling-report.json`):
+
+On `900x1350` at `tile=512, overlap=64`, all three layouts produce 6 tiles per page:
+- `fixed`: `512x512` (`ys=[0, 448, 896]`, `xs=[0, 448]`)
+- `even`: `496x496` (`ys=[0, 427, 854]`, `xs=[0, 404]`)
+- `fewest-even`: `493x482` (`ys=[0, 428, 857]`, `xs=[0, 418]`)
+
+| Layout (Tile) | Variant | Linear total (med page) | Centered total (med page) | Linear ms/tile | Avg B1 tile lat | Raw PSNR | Max abs | SSIMULACRA2 mean (min) | VRAM above bg |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `fixed` (`512x512`) | `baseline-head-fp16` | 3.936 s (1325.5 ms) | 3.953 s (1325.2 ms) | 218.64 ms | 215.40 ms | 55.284 dB | 0.11413 | 86.104 (85.292) | +198.0 MiB |
+| `fixed` (`512x512`) | `final-fp16` | **3.823 s (1262.2 ms)** | **3.818 s (1257.0 ms)** | **212.37 ms** | **206.48 ms** | **56.384 dB** | **0.09106** | **86.201 (85.350)** | +198.0 MiB |
+| `fixed` (`512x512`) | `final-fp16-proj32` | 4.195 s (1413.8 ms) | 4.191 s (1392.3 ms) | 233.04 ms | 226.70 ms | 59.365 dB | 0.08520 | 86.419 (85.516) | +198.0 MiB |
+| `fixed` (`512x512`) | `final-mixed` | 5.741 s (1916.4 ms) | 5.765 s (1923.6 ms) | 318.96 ms | 316.67 ms | 67.027 dB | 0.02893 | 86.631 (85.759) | +224.0 MiB |
+| `even` (`496x496`) | `baseline-head-fp16` | 3.930 s (1294.9 ms) | 3.916 s (1313.3 ms) | 218.34 ms | 212.28 ms | 55.770 dB | 0.10733 | 86.080 (85.112) | +194.0 MiB |
+| `even` (`496x496`) | `final-fp16` | **3.820 s (1259.8 ms)** | **3.820 s (1251.1 ms)** | **212.25 ms** | **205.69 ms** | **57.044 dB** | **0.09260** | **86.269 (85.323)** | +194.0 MiB |
+| `even` (`496x496`) | `final-fp16-proj32` | 4.130 s (1368.8 ms) | 4.151 s (1377.1 ms) | 229.46 ms | 224.52 ms | 60.025 dB | 0.06182 | 86.332 (85.403) | +194.0 MiB |
+| `even` (`496x496`) | `final-mixed` | 5.634 s (1873.5 ms) | 5.632 s (1875.4 ms) | 313.00 ms | 306.91 ms | 67.228 dB | 0.03831 | 86.662 (85.817) | +216.0 MiB |
+| `fewest-even` (`493x482`) | `baseline-head-fp16` | 4.417 s (1465.6 ms) | 4.488 s (1500.3 ms) | 245.39 ms | 244.23 ms | 55.610 dB | 0.11697 | 86.110 (85.141) | +192.0 MiB |
+| `fewest-even` (`493x482`) | `final-fp16` | **4.387 s (1450.4 ms)** | **4.417 s (1476.9 ms)** | **243.73 ms** | **235.36 ms** | **56.778 dB** | **0.08469** | **86.160 (85.251)** | +192.0 MiB |
+| `fewest-even` (`493x482`) | `final-fp16-proj32` | 4.776 s (1605.2 ms) | 4.693 s (1565.6 ms) | 265.35 ms | 254.71 ms | 59.755 dB | 0.07094 | 86.367 (85.497) | +192.0 MiB |
+| `fewest-even` (`493x482`) | `final-mixed` | 6.133 s (2043.7 ms) | 6.203 s (2074.4 ms) | 340.73 ms | 339.44 ms | 67.125 dB | 0.04009 | 86.683 (85.785) | +214.0 MiB |
+
+Key finding for tiling choice on GFISRv2 (`900x1350`, `tile=512`, `overlap=64`): **`even` (`496x496`) is faster and higher PSNR than both `fixed` (`512x512`) and `fewest-even` (`493x482`)**, because all three use 6 tiles/page while `fewest-even`'s `493x482` (`482 = 2 * 241`, `493 = 17 * 29`) pushes cuFFT onto Bluestein FFTs (`~+30 ms/tile` slower than `496 = 16 * 31` mixed-radix FFTs). Using `final-fp16-proj32` (`fp32_project_accum=1`) with `even` tiling hits `60.025 dB` PSNR (exceeding `eager-fp16`'s `59.671 dB`) at `224.52 ms` per batch-1 tile (`3.27x` faster than `eager-fp16`).

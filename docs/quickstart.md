@@ -91,6 +91,7 @@ Image.fromarray(restored).save("output/restored-page.png")
 - For example, `tiling="even"`, `tile_size=512`, and `overlap=64` on a 900×1350 page use 2×3 tiles of 496×496 for a model with no extra context or spatial constraints. That uses about 6% fewer model-input pixels than six 512×512 tiles, excluding batch padding.
 - **Older native libraries:** Set `overlap_method="linear"` to use nonzero overlap with an ABI 1 library.
 - **`"fewest-even"`** uses the smallest equal rectangular tiles allowed by the page, overlap, and model constraints. For a 1733×2600 page with `tile_size=512` and `overlap=64`, it uses 24 tiles of 482×487 for a model with no extra context or spatial constraints.
+- **Choosing between `"even"` and `"fewest-even"` for FFT models:** On **GFISRv2** (which runs cuFFT on the exact tile dimensions), prefer `"even"` when both modes emit the same tile count—rounding to multiples of 16 (such as 496×496 vs. 493×482 on a 900×1350 page at `tile_size=512`, `overlap=64`) keeps cuFFT on fast mixed-radix kernels and avoids Bluestein FFT overhead and extra FFT workspace.
 - **Native library requirements:** `"even"` and `"fewest-even"` require the ABI 3 runtime. Model runners prepare the actual rectangular shape and final batch shape, with plan reuse where the model backend supports it.
 - **Overlap memory:** With `overlap > 0` and `output_dtype=np.uint8`, the tiler keeps only a rolling strip of rows in FP32 instead of allocating a full-page FP32 accumulation buffer. Setting `output_dtype=np.float32` uses a full-page FP32 output buffer instead.
 
@@ -231,22 +232,32 @@ More detail: [MoESR measurements](handoff-moesr.md).
 - **Runtime dependency:** Requires cuFFT 12 (`cufft64_12.dll` / `libcufft.so.12`).
   - `"fp32"`: full FP32 weights, convolutions, and cuFFT.
   - `"mixed"`: FP16 spatial convolutions with FP32 accumulation; Fourier unit, residuals, and NumPy I/O stay FP32.
-  - `"fp16"`: FP16 weights, activations, and NumPy I/O; Fourier transforms stay FP32 for stability.
+  - `"fp16"`: FP16 weights, activations, and NumPy I/O with FP32 accumulation on non-residual bookend convolutions (`first`, `tail`, `last`); Fourier transforms stay FP32 for stability.
 
-| Option | Default | Values | What it does |
-| --- | ---: | --- | --- |
-| `fused_conv` | `1` | `0` or `1` | `1` (recommended) runs custom fused tensor-core kernels in `"mixed"` and `"fp16"` modes. Set `0` to fall back to separate cuDNN convolutions. Ignored in `"fp32"`. |
-| `workspace_mib` | `512` | `0` to `4096` | Max temporary cuDNN workspace (MiB) used during tuning in `"mixed"` and `"fp16"` modes. |
-| `unexact_erf` | `0` | `0` or `1` | `0` matches PyTorch's exact `erf` rounding in the Fourier unit; `1` uses CUDA's `erff` (slightly faster, minor numeric difference). |
+| Option | Default | Values | Precision scope | What it does |
+| --- | ---: | --- | --- | --- |
+| `fused_conv` | `1` | `0` or `1` | `"mixed"`, `"fp16"` | `1` (recommended) runs custom fused tensor-core kernels. Set `0` to fall back to separate cuDNN convolutions. Ignored in `"fp32"`. |
+| `fp32_project_accum` | `0` | `0` or `1` | `"fp16"` | `1` accumulates residual body projection convolutions in FP32 instead of FP16—higher PSNR/SSIMULACRA2 (matching or beating eager FP16) with modest latency overhead vs. default `"fp16"`. |
+| `fp32_accum` | `0` | `0` or `1` | `"fp16"` | `1` accumulates both body expansion and projection convolutions in FP32 for highest `"fp16"` fidelity (slower than `fp32_project_accum=1`, still faster than `"mixed"`). |
+| `workspace_mib` | `512` | `0` to `4096` | `"mixed"`, `"fp16"` | Max temporary cuDNN workspace (MiB) used during tuning. |
+| `unexact_erf` | `0` | `0` or `1` | All | `0` matches PyTorch's exact `erf` rounding in the Fourier unit; `1` uses CUDA's `erff` (slightly faster, minor numeric difference). |
 
-All three options are part of the `gfisrv2_<key>.umplan` cache key in `"mixed"` and `"fp16"` modes (`"fp32"` does not use plan caching).
+All five options are part of the `gfisrv2_<key>.umplan` cache key in `"mixed"` and `"fp16"` modes (`"fp32"` does not use plan caching).
 
-- **Diagnostics (`get_session_info()["diagnostics"]`):** `cufft_version`, `cufft_workspace_bytes`, `unexact_erf`, `timed_plans`, `plan_workspace_bytes`, `fused_conv`, `peak_plan_workspace_bytes`.
+- **Diagnostics (`get_session_info()["diagnostics"]`):** `cufft_version`, `cufft_workspace_bytes`, `unexact_erf`, `timed_plans`, `plan_workspace_bytes`, `fused_conv`, `peak_plan_workspace_bytes`, `fp32_accum`, `fp32_project_accum`.
 
 ```python
+# Default balanced mixed precision
 options = umzi.SessionOptions(
     precision="mixed",
     cache_dir=Path("output/cache/gfisrv2"),
+)
+
+# High-fidelity FP16 (FP32 accumulation on residual body projections + bookends)
+fp16_proj32 = umzi.SessionOptions(
+    precision="fp16",
+    cache_dir=Path("output/cache/gfisrv2"),
+    kernel_options={"fp32_project_accum": 1},
 )
 ```
 

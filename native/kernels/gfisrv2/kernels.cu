@@ -302,6 +302,8 @@ SHUFFLE_KERNEL(shuffle_rgb_mixed, Half, float)
 // Optimized NHWC kernels for reduced precision (FP16 and Mixed).
 // ===========================================================================
 
+#include "../../common/tensor_core.cuh"
+
 __device__ __forceinline__ float fast_silu(float value) {
     return __fdividef(value, 1.f + __expf(-value));
 }
@@ -704,38 +706,149 @@ extern "C" __global__ void pack_rms_fft_nhwc_f32(float* out, const float2* spect
     pack_rms_fft_nhwc_impl(out, spectrum, scale, offset, bins, tiles_per_image, fft_scale);
 }
 
-// Tiled 8x8 NHWC 60-channel 3x3 spectral depthwise + bias + residual.
-// Input/output: [N, H, W_freq, 64] (ch 60..63 = 0). Block = 256 threads (4 threads/pixel x 64 pixels).
-// Keeps tile_in in storage type T (12.8 KB for FP16 -> high occupancy) and caches 64x9 weights in smem.
+// Tiled NHWC 60-channel 3x3 spectral depthwise + bias + residual.
+// FP16 uses 16x16 tiles (18x18 halo, 44,032 B smem -> 2 blocks/SM, 1.27x halo overfetch, 4x fewer blocks).
+// FP32 uses 8x8 tiles (10x10 halo, 28,160 B smem -> 3 blocks/SM).
 template<class T>
 __device__ void spectral_dw_res_nhwc_impl(T* out, const T* in, const float* weight, const float* bias, int h, int w,
                                           int tiles_x, int tiles_y) {
-    __shared__ __align__(16) T tile_in[10 * 10 * 64];
-    __shared__ __align__(16) float w_smem[9][64];
-    __shared__ __align__(16) float b_smem[64];
-    const int tid = threadIdx.x;
-    const int tile = blockIdx.x;
-    const int tx = tile % tiles_x, ty = tile / tiles_x % tiles_y, image = tile / (tiles_x * tiles_y);
-    const int x0 = tx * 8, y0 = ty * 8;
-
-    for (int idx = tid; idx < 9 * 64; idx += 256) {
-        const int tap = idx >> 6, c = idx & 63;
-        w_smem[tap][c] = c < 60 ? weight[c * 9 + tap] : 0.f;
-    }
-    if (tid < 64) b_smem[tid] = tid < 60 ? bias[tid] : 0.f;
-
     if constexpr (sizeof(T) == 2) {
-        for (int idx = tid; idx < 100 * 8; idx += 256) {
+        __shared__ __align__(16) half tile_in[18 * 18 * 64];
+        __shared__ __align__(16) float w_smem[9][64];
+        __shared__ __align__(16) float b_smem[64];
+        const int tid = threadIdx.x;
+        const int tile = blockIdx.x;
+        const int tx = tile % tiles_x, ty = tile / tiles_x % tiles_y, image = tile / (tiles_x * tiles_y);
+        const int x0 = tx * 16, y0 = ty * 16;
+
+        for (int idx = tid; idx < 9 * 64; idx += 256) {
+            const int tap = idx >> 6, c = idx & 63;
+            w_smem[tap][c] = c < 60 ? weight[c * 9 + tap] : 0.f;
+        }
+        if (tid < 64) b_smem[tid] = tid < 60 ? bias[tid] : 0.f;
+
+        const half* in_h = reinterpret_cast<const half*>(in);
+        half* out_h = reinterpret_cast<half*>(out);
+        for (int idx = tid; idx < 324 * 8; idx += 256) {
             const int p = idx >> 3, chunk = idx & 7;
-            const int py = y0 - 1 + p / 10, px = x0 - 1 + p % 10;
-            uint4* dst = reinterpret_cast<uint4*>(tile_in + idx * 8);
-            if (unsigned(py) < unsigned(h) && unsigned(px) < unsigned(w)) {
-                *dst = *reinterpret_cast<const uint4*>(in + ((size_t(image) * h + py) * w + px) * 64 + chunk * 8);
-            } else {
-                *dst = make_uint4(0, 0, 0, 0);
+            const int py = y0 - 1 + p / 18, px = x0 - 1 + p % 18;
+            const bool valid = unsigned(py) < unsigned(h) && unsigned(px) < unsigned(w);
+            const half* src = valid ? in_h + ((size_t(image) * h + py) * w + px) * 64 + chunk * 8 : in_h;
+            copy_async(tile_in + idx * 8, src, valid);
+        }
+        asm volatile("cp.async.commit_group;\n");
+        asm volatile("cp.async.wait_group 0;\n");
+        __syncthreads();
+
+        const int pix_slot = tid >> 2, q = tid & 3;
+        const int ly0 = pix_slot >> 4, lx = pix_slot & 15;
+        const int x = x0 + lx;
+        const int c0 = q * 16;
+        float acc[4][16];
+        {
+            float b_reg[16];
+#pragma unroll
+            for (int grp = 0; grp < 4; ++grp) {
+                const float4 bv = *reinterpret_cast<const float4*>(b_smem + c0 + grp * 4);
+                b_reg[grp * 4 + 0] = bv.x;
+                b_reg[grp * 4 + 1] = bv.y;
+                b_reg[grp * 4 + 2] = bv.z;
+                b_reg[grp * 4 + 3] = bv.w;
+            }
+#pragma unroll
+            for (int ry = 0; ry < 4; ++ry)
+#pragma unroll
+                for (int c = 0; c < 16; ++c) acc[ry][c] = b_reg[c];
+        }
+
+#pragma unroll
+        for (int ky = 0; ky < 3; ++ky) {
+#pragma unroll
+            for (int kx = 0; kx < 3; ++kx) {
+                const int tap = ky * 3 + kx;
+                const float* wt = w_smem[tap] + c0;
+                const float4 w0 = *reinterpret_cast<const float4*>(wt);
+                const float4 w1 = *reinterpret_cast<const float4*>(wt + 4);
+                const float4 w2 = *reinterpret_cast<const float4*>(wt + 8);
+                const float4 w3 = *reinterpret_cast<const float4*>(wt + 12);
+#pragma unroll
+                for (int ry = 0; ry < 4; ++ry) {
+                    const int ly = ly0 + ry * 4;
+                    const half* sp = tile_in + ((ly + ky) * 18 + (lx + kx)) * 64 + c0;
+                    const uint4 u0 = *reinterpret_cast<const uint4*>(sp);
+                    const uint4 u1 = *reinterpret_cast<const uint4*>(sp + 8);
+                    const half2* p0 = reinterpret_cast<const half2*>(&u0);
+                    const half2* p1 = reinterpret_cast<const half2*>(&u1);
+                    const float2 f0 = __half22float2(p0[0]), f1 = __half22float2(p0[1]);
+                    const float2 f2 = __half22float2(p0[2]), f3 = __half22float2(p0[3]);
+                    const float2 f4 = __half22float2(p1[0]), f5 = __half22float2(p1[1]);
+                    const float2 f6 = __half22float2(p1[2]), f7 = __half22float2(p1[3]);
+                    acc[ry][0] = fmaf(w0.x, f0.x, acc[ry][0]);
+                    acc[ry][1] = fmaf(w0.y, f0.y, acc[ry][1]);
+                    acc[ry][2] = fmaf(w0.z, f1.x, acc[ry][2]);
+                    acc[ry][3] = fmaf(w0.w, f1.y, acc[ry][3]);
+                    acc[ry][4] = fmaf(w1.x, f2.x, acc[ry][4]);
+                    acc[ry][5] = fmaf(w1.y, f2.y, acc[ry][5]);
+                    acc[ry][6] = fmaf(w1.z, f3.x, acc[ry][6]);
+                    acc[ry][7] = fmaf(w1.w, f3.y, acc[ry][7]);
+                    acc[ry][8] = fmaf(w2.x, f4.x, acc[ry][8]);
+                    acc[ry][9] = fmaf(w2.y, f4.y, acc[ry][9]);
+                    acc[ry][10] = fmaf(w2.z, f5.x, acc[ry][10]);
+                    acc[ry][11] = fmaf(w2.w, f5.y, acc[ry][11]);
+                    acc[ry][12] = fmaf(w3.x, f6.x, acc[ry][12]);
+                    acc[ry][13] = fmaf(w3.y, f6.y, acc[ry][13]);
+                    acc[ry][14] = fmaf(w3.z, f7.x, acc[ry][14]);
+                    acc[ry][15] = fmaf(w3.w, f7.y, acc[ry][15]);
+                }
             }
         }
+        if (x >= w) return;
+#pragma unroll
+        for (int ry = 0; ry < 4; ++ry) {
+            const int ly = ly0 + ry * 4;
+            const int y = y0 + ly;
+            if (y >= h) continue;
+            const half* center = tile_in + ((ly + 1) * 18 + (lx + 1)) * 64 + c0;
+            const uint4 c_u0 = *reinterpret_cast<const uint4*>(center);
+            const uint4 c_u1 = *reinterpret_cast<const uint4*>(center + 8);
+            const half2* cp0 = reinterpret_cast<const half2*>(&c_u0);
+            const half2* cp1 = reinterpret_cast<const half2*>(&c_u1);
+            uint4 o0, o1;
+            half2* h0 = reinterpret_cast<half2*>(&o0);
+            half2* h1 = reinterpret_cast<half2*>(&o1);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float2 cf = __half22float2(cp0[j]);
+                h0[j] = __floats2half2_rn(acc[ry][2 * j] + cf.x, acc[ry][2 * j + 1] + cf.y);
+            }
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float2 cf = __half22float2(cp1[j]);
+                if (c0 + 8 + 2 * j < 60) {
+                    h1[j] = __floats2half2_rn(acc[ry][8 + 2 * j] + cf.x, acc[ry][8 + 2 * j + 1] + cf.y);
+                } else {
+                    h1[j] = __floats2half2_rn(0.f, 0.f);
+                }
+            }
+            half* dst = out_h + ((size_t(image) * h + y) * w + x) * 64 + c0;
+            *reinterpret_cast<uint4*>(dst) = o0;
+            *reinterpret_cast<uint4*>(dst + 8) = o1;
+        }
     } else {
+        __shared__ __align__(16) float tile_in[10 * 10 * 64];
+        __shared__ __align__(16) float w_smem[9][64];
+        __shared__ __align__(16) float b_smem[64];
+        const int tid = threadIdx.x;
+        const int tile = blockIdx.x;
+        const int tx = tile % tiles_x, ty = tile / tiles_x % tiles_y, image = tile / (tiles_x * tiles_y);
+        const int x0 = tx * 8, y0 = ty * 8;
+
+        for (int idx = tid; idx < 9 * 64; idx += 256) {
+            const int tap = idx >> 6, c = idx & 63;
+            w_smem[tap][c] = c < 60 ? weight[c * 9 + tap] : 0.f;
+        }
+        if (tid < 64) b_smem[tid] = tid < 60 ? bias[tid] : 0.f;
+
         for (int idx = tid; idx < 100 * 16; idx += 256) {
             const int p = idx >> 4, chunk = idx & 15;
             const int py = y0 - 1 + p / 10, px = x0 - 1 + p % 10;
@@ -746,88 +859,22 @@ __device__ void spectral_dw_res_nhwc_impl(T* out, const T* in, const float* weig
                 *dst = make_float4(0.f, 0.f, 0.f, 0.f);
             }
         }
-    }
-    __syncthreads();
+        __syncthreads();
 
-    const int pix_local = tid >> 2, q = tid & 3;
-    const int ly = pix_local >> 3, lx = pix_local & 7;
-    const int y = y0 + ly, x = x0 + lx;
-    if (y >= h || x >= w) return;
-    const int c0 = q * 16;
-    float acc[16];
+        const int pix_local = tid >> 2, q = tid & 3;
+        const int ly = pix_local >> 3, lx = pix_local & 7;
+        const int y = y0 + ly, x = x0 + lx;
+        if (y >= h || x >= w) return;
+        const int c0 = q * 16;
+        float acc[16];
 #pragma unroll
-    for (int grp = 0; grp < 4; ++grp) {
-        const float4 bv = *reinterpret_cast<const float4*>(b_smem + c0 + grp * 4);
-        acc[grp * 4 + 0] = bv.x;
-        acc[grp * 4 + 1] = bv.y;
-        acc[grp * 4 + 2] = bv.z;
-        acc[grp * 4 + 3] = bv.w;
-    }
-
-    if constexpr (sizeof(T) == 2) {
-#pragma unroll
-        for (int ky = 0; ky < 3; ++ky) {
-#pragma unroll
-            for (int kx = 0; kx < 3; ++kx) {
-                const int tap = ky * 3 + kx;
-                const T* sp = tile_in + ((ly + ky) * 10 + (lx + kx)) * 64 + c0;
-                const uint4 u0 = *reinterpret_cast<const uint4*>(sp);
-                const uint4 u1 = *reinterpret_cast<const uint4*>(sp + 8);
-                const half2* p0 = reinterpret_cast<const half2*>(&u0);
-                const half2* p1 = reinterpret_cast<const half2*>(&u1);
-                const float* wt = w_smem[tap] + c0;
-                const float4 w0 = *reinterpret_cast<const float4*>(wt);
-                const float4 w1 = *reinterpret_cast<const float4*>(wt + 4);
-                const float4 w2 = *reinterpret_cast<const float4*>(wt + 8);
-                const float4 w3 = *reinterpret_cast<const float4*>(wt + 12);
-                const float2 f0 = __half22float2(p0[0]), f1 = __half22float2(p0[1]);
-                const float2 f2 = __half22float2(p0[2]), f3 = __half22float2(p0[3]);
-                const float2 f4 = __half22float2(p1[0]), f5 = __half22float2(p1[1]);
-                const float2 f6 = __half22float2(p1[2]), f7 = __half22float2(p1[3]);
-                acc[0] = fmaf(w0.x, f0.x, acc[0]);
-                acc[1] = fmaf(w0.y, f0.y, acc[1]);
-                acc[2] = fmaf(w0.z, f1.x, acc[2]);
-                acc[3] = fmaf(w0.w, f1.y, acc[3]);
-                acc[4] = fmaf(w1.x, f2.x, acc[4]);
-                acc[5] = fmaf(w1.y, f2.y, acc[5]);
-                acc[6] = fmaf(w1.z, f3.x, acc[6]);
-                acc[7] = fmaf(w1.w, f3.y, acc[7]);
-                acc[8] = fmaf(w2.x, f4.x, acc[8]);
-                acc[9] = fmaf(w2.y, f4.y, acc[9]);
-                acc[10] = fmaf(w2.z, f5.x, acc[10]);
-                acc[11] = fmaf(w2.w, f5.y, acc[11]);
-                acc[12] = fmaf(w3.x, f6.x, acc[12]);
-                acc[13] = fmaf(w3.y, f6.y, acc[13]);
-                acc[14] = fmaf(w3.z, f7.x, acc[14]);
-                acc[15] = fmaf(w3.w, f7.y, acc[15]);
-            }
+        for (int grp = 0; grp < 4; ++grp) {
+            const float4 bv = *reinterpret_cast<const float4*>(b_smem + c0 + grp * 4);
+            acc[grp * 4 + 0] = bv.x;
+            acc[grp * 4 + 1] = bv.y;
+            acc[grp * 4 + 2] = bv.z;
+            acc[grp * 4 + 3] = bv.w;
         }
-        const T* center = tile_in + ((ly + 1) * 10 + (lx + 1)) * 64 + c0;
-        const uint4 c_u0 = *reinterpret_cast<const uint4*>(center);
-        const uint4 c_u1 = *reinterpret_cast<const uint4*>(center + 8);
-        const half2* cp0 = reinterpret_cast<const half2*>(&c_u0);
-        const half2* cp1 = reinterpret_cast<const half2*>(&c_u1);
-        uint4 o0, o1;
-        half2* h0 = reinterpret_cast<half2*>(&o0);
-        half2* h1 = reinterpret_cast<half2*>(&o1);
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const float2 cf = __half22float2(cp0[j]);
-            h0[j] = __floats2half2_rn(acc[2 * j] + cf.x, acc[2 * j + 1] + cf.y);
-        }
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const float2 cf = __half22float2(cp1[j]);
-            if (c0 + 8 + 2 * j < 60) {
-                h1[j] = __floats2half2_rn(acc[8 + 2 * j] + cf.x, acc[8 + 2 * j + 1] + cf.y);
-            } else {
-                h1[j] = __floats2half2_rn(0.f, 0.f);
-            }
-        }
-        T* dst = out + ((size_t(image) * h + y) * w + x) * 64 + c0;
-        *reinterpret_cast<uint4*>(dst) = o0;
-        *reinterpret_cast<uint4*>(dst + 8) = o1;
-    } else {
 #pragma unroll
         for (int ky = 0; ky < 3; ++ky) {
 #pragma unroll
@@ -1065,7 +1112,6 @@ extern "C" __global__ void bias_shuffle_rgb_nhwc_f32(float* out, const half* in,
 }
 
 // Deterministic pseudo-random fill for realistic cuDNN plan timing.
-#include "../../common/tensor_core.cuh"
 
 extern "C" __global__ void fill_noise_f16(half* out, int total) {
     const int i = index_1d();
@@ -1085,34 +1131,35 @@ extern __shared__ __align__(16) half gfi_shared[];
 
 // Fused 48 -> 256 expansion + 80-ch plain SiLU gate + FP32 planar Fourier extraction
 // + compact branch value/gate packing.
-// 8x16 pixel tile (10x18 = 180 halo pixels, 3 K-slices of 16 -> 17,280 B),
-// 2 uniform passes of 128 output channels, 2-stage 3-tap weight ring (24,576 B, 18 barriers total).
-// Total shared memory: 41,856 B -> 2 active blocks/SM on sm_86.
-// 8 warps (256 threads): 4x2 warp grid (each warp: 2 rows x 64 ch = 2 x 8 m16n8 tiles).
+// 16x16 pixel tile (18x18 = 324 halo pixels, double-buffered K=16 -> 20,736 B),
+// 4 grid blocks per tile (p64 = 0..3), double-buffered 3-tap weight ring (12,288 B, 9 barriers).
+// Total shared memory: 33,024 B -> 3 active blocks/SM (24 warps/SM, 50% occupancy) on sm_86 with max shared carveout.
+// 8 warps (256 threads): 4x2 warp grid (each warp: 4 rows x 32 ch = 4 x 4 m16n8 tiles).
 template<bool HalfAccumulate>
 __device__ void expand_gate_impl(half* gated, float* fft_buf, half* fourier_gate, half* branch_val, half* branch_gate,
                                  const half* in, const half* weight, const float* bias, int h, int w,
                                  int pixels_per_image, int total_pixels, int tiles_x, int tiles_y) {
-    constexpr int halo_cols = 18, halo_count = 180, a_slice_halves = halo_count * 16;
-    constexpr int b_tap_halves = 128 * 16, b_3tap_halves = 3 * b_tap_halves;
+    constexpr int halo_cols = 18, halo_count = 324, a_slice_halves = halo_count * 16;
+    constexpr int b_tap_halves = 64 * 16, b_3tap_halves = 3 * b_tap_halves;
 
-    half* const a_tile = gfi_shared;
-    half* const b_ring = gfi_shared + 3 * a_slice_halves;
+    half* const a_bufs = gfi_shared;
+    half* const b_bufs = gfi_shared + 2 * a_slice_halves;
     const int thread = threadIdx.x, lane = thread & 31, warp = thread >> 5;
     const int warp_m = warp & 3, warp_n = warp >> 2;
-    const int tile = blockIdx.x;
+    const int tile = blockIdx.x >> 2, p64 = blockIdx.x & 3;
     const int tx = tile % tiles_x, ty = tile / tiles_x % tiles_y, image = tile / (tiles_x * tiles_y);
-    const int y0 = ty * 8, x0 = tx * 16;
+    const int y0 = ty * 16, x0 = tx * 16;
 
-    for (int idx = thread; idx < halo_count * 6; idx += 256) {
-        const int p = idx / 6, ch_chunk = idx % 6;
-        const int ks = ch_chunk >> 1, chunk = ch_chunk & 1;
-        const int py = y0 - 1 + p / halo_cols, px = x0 - 1 + p % halo_cols;
-        const bool valid = unsigned(py) < unsigned(h) && unsigned(px) < unsigned(w);
-        const half* src = valid ? in + ((size_t(image) * h + py) * w + px) * 48 + ch_chunk * 8 : in;
-        copy_async(a_tile + ks * a_slice_halves + swizzle16(p, chunk), src, valid);
-    }
-
+    auto load_a = [&](int ks, half* dst) {
+        const int k_base = ks * 16;
+        for (int idx = thread; idx < halo_count * 2; idx += 256) {
+            const int p = idx >> 1, chunk = idx & 1;
+            const int py = y0 - 1 + p / halo_cols, px = x0 - 1 + p % halo_cols;
+            const bool valid = unsigned(py) < unsigned(h) && unsigned(px) < unsigned(w);
+            const half* src = valid ? in + ((size_t(image) * h + py) * w + px) * 48 + k_base + chunk * 8 : in;
+            copy_async(dst + swizzle16(p, chunk), src, valid);
+        }
+    };
     auto load_b3 = [&](int step_g, half* dst) {
         const half* base = weight + size_t(step_g) * b_3tap_halves;
 #pragma unroll
@@ -1120,149 +1167,134 @@ __device__ void expand_gate_impl(half* gated, float* fft_buf, half* fourier_gate
             copy_async_always(dst + idx * 8, base + idx * 8);
     };
 
-    load_b3(0, b_ring);
+    const int base_step = p64 * 9;
+    load_a(0, a_bufs);
+    load_b3(base_step, b_bufs);
     asm volatile("cp.async.commit_group;\n");
 
     const int q = lane & 3;
-    int step_g = 0;
+    int step = 0;
 
+    Accumulator<HalfAccumulate> acc[4][4];
+    for (int ks = 0; ks < 3; ++ks) {
+        const half* a_slice = a_bufs + (ks & 1) * a_slice_halves;
+        for (int dy = 0; dy < 3; ++dy) {
+            asm volatile("cp.async.wait_group 0;\n");
+            __syncthreads();
+            const int cb = step & 1;
+            if (step + 1 < 9) load_b3(base_step + step + 1, b_bufs + (cb ^ 1) * b_3tap_halves);
+            if (dy == 0 && ks + 1 < 3) load_a(ks + 1, a_bufs + ((ks + 1) & 1) * a_slice_halves);
+            if (step + 1 < 9) asm volatile("cp.async.commit_group;\n");
+            const half* b3 = b_bufs + cb * b_3tap_halves;
+            ++step;
+
+            unsigned a_frag[2][4][4], b_frag[2][2][4];
+            auto load_dx = [&](int dx, int buf) {
+                const half* b_tile = b3 + dx * b_tap_halves;
 #pragma unroll
-    for (int pass = 0; pass < 2; ++pass) {
-        Accumulator<HalfAccumulate> acc[2][8];
-        for (int ks = 0; ks < 3; ++ks) {
-            const half* a_slice = a_tile + ks * a_slice_halves;
-            for (int dy = 0; dy < 3; ++dy) {
-                asm volatile("cp.async.wait_group 0;\n");
-                __syncthreads();
-                const int cb = step_g & 1;
-                if (step_g + 1 < 18) {
-                    load_b3(step_g + 1, b_ring + (cb ^ 1) * b_3tap_halves);
-                    asm volatile("cp.async.commit_group;\n");
+                for (int mt = 0; mt < 4; ++mt) {
+                    const int p = (warp_m * 4 + mt + dy) * halo_cols + (lane & 15) + dx;
+                    load_matrix_x4(a_frag[buf][mt], a_slice + swizzle16(p, lane >> 4));
                 }
-                const half* b3 = b_ring + cb * b_3tap_halves;
-                ++step_g;
+#pragma unroll
+                for (int j = 0; j < 2; ++j) {
+                    const int row = 32 * warp_n + 16 * j + (lane >> 4) * 8 + (lane & 7);
+                    load_matrix_x4(b_frag[buf][j], b_tile + swizzle16(row, (lane >> 3) & 1));
+                }
+            };
+            load_dx(0, 0);
+#pragma unroll
+            for (int dx = 0; dx < 3; ++dx) {
+                if (dx + 1 < 3) load_dx(dx + 1, (dx + 1) & 1);
+                const int cur = dx & 1;
+#pragma unroll
+                for (int mt = 0; mt < 4; ++mt)
+#pragma unroll
+                    for (int j = 0; j < 2; ++j) {
+                        acc[mt][2 * j].mma(a_frag[cur][mt], b_frag[cur][j][0], b_frag[cur][j][1]);
+                        acc[mt][2 * j + 1].mma(a_frag[cur][mt], b_frag[cur][j][2], b_frag[cur][j][3]);
+                    }
+            }
+        }
+    }
 
-                unsigned a_frag[2][2][4], b_frag[2][4][4];
-                auto load_dx = [&](int dx, int buf) {
-                    const half* b_tile = b3 + dx * b_tap_halves;
+    const int base_group = p64 * 8 + 4 * warp_n;
+    if (p64 < 2 || (p64 == 2 && warp_n == 0)) {
 #pragma unroll
-                    for (int mt = 0; mt < 2; ++mt) {
-                        const int p = (warp_m * 2 + mt + dy) * halo_cols + (lane & 15) + dx;
-                        load_matrix_x4(a_frag[buf][mt], a_slice + swizzle16(p, lane >> 4));
-                    }
+        for (int mt = 0; mt < 4; ++mt) {
+            const int y = y0 + warp_m * 4 + mt;
+            if (y >= h) continue;
+            half* row_gated = gated + (size_t(image) * h + y) * w * 128;
 #pragma unroll
-                    for (int j = 0; j < 4; ++j) {
-                        const int row = 64 * warp_n + 16 * j + (lane >> 4) * 8 + (lane & 7);
-                        load_matrix_x4(b_frag[buf][j], b_tile + swizzle16(row, (lane >> 3) & 1));
-                    }
+            for (int half_row = 0; half_row < 2; ++half_row) {
+                const int x = x0 + (lane >> 2) + 8 * half_row;
+                unsigned p0, p1, p2, p3;
+                auto do_pair = [&](int nt_idx, unsigned& out_a, unsigned& out_b) {
+                    const float2 o0 = acc[mt][nt_idx].pair(half_row);
+                    const float2 o1 = acc[mt][nt_idx + 1].pair(half_row);
+                    const float2 send = (q < 2) ? o1 : o0;
+                    const float2 recv = make_float2(__shfl_xor_sync(0xffffffff, send.x, 2),
+                                                    __shfl_xor_sync(0xffffffff, send.y, 2));
+                    const float2 gv = (q < 2) ? o0 : recv;
+                    const float2 vv = (q < 2) ? recv : o1;
+                    const int my_g = base_group + nt_idx + (q >> 1);
+                    const float* bp = bias + 8 * my_g + 2 * (q & 1);
+                    const half2 r = __floats2half2_rn(fast_silu(gv.x + bp[0]) * (vv.x + bp[4]),
+                                                      fast_silu(gv.y + bp[1]) * (vv.y + bp[5]));
+                    const unsigned my_h2 = *reinterpret_cast<const unsigned*>(&r);
+                    const unsigned other_h2 = __shfl_xor_sync(0xffffffff, my_h2, 2);
+                    out_a = (q < 2) ? my_h2 : other_h2;
+                    out_b = (q < 2) ? other_h2 : my_h2;
                 };
-                load_dx(0, 0);
-#pragma unroll
-                for (int dx = 0; dx < 3; ++dx) {
-                    if (dx + 1 < 3) load_dx(dx + 1, (dx + 1) & 1);
-                    const int cur = dx & 1;
-#pragma unroll
-                    for (int mt = 0; mt < 2; ++mt)
-#pragma unroll
-                        for (int j = 0; j < 4; ++j) {
-                            acc[mt][2 * j].mma(a_frag[cur][mt], b_frag[cur][j][0], b_frag[cur][j][1]);
-                            acc[mt][2 * j + 1].mma(a_frag[cur][mt], b_frag[cur][j][2], b_frag[cur][j][3]);
-                        }
+                do_pair(0, p0, p1);
+                do_pair(2, p2, p3);
+                const unsigned s0 = __shfl_xor_sync(0xffffffff, q == 0 ? p2 : p0, 1);
+                const unsigned s1 = __shfl_xor_sync(0xffffffff, q == 0 ? p3 : p1, 1);
+                if (q < 2 && x < w) {
+                    const int g_out = base_group + 2 * q;
+                    half* dst = row_gated + size_t(x) * 128 + 4 * g_out;
+                    *reinterpret_cast<uint4*>(dst) =
+                        (q == 0) ? make_uint4(p0, s0, p1, s1) : make_uint4(s0, p2, s1, p3);
                 }
             }
         }
-
-        const int base_group = pass * 16 + 8 * warp_n;
-        if (pass == 0) {
+    } else {
 #pragma unroll
-            for (int mt = 0; mt < 2; ++mt) {
-                const int y = y0 + warp_m * 2 + mt;
-                if (y >= h) continue;
-                half* row_out = gated + (size_t(image) * h + y) * w * 128;
+        for (int mt = 0; mt < 4; ++mt) {
+            const int y = y0 + warp_m * 4 + mt;
+            if (y >= h) continue;
+            const int row_in_image = y * w;
+            const size_t row_global = (size_t(image) * h + y) * w;
 #pragma unroll
-                for (int half_row = 0; half_row < 2; ++half_row) {
-                    const int x = x0 + (lane >> 2) + 8 * half_row;
-                    auto do_pair = [&](int nt_idx, unsigned& out_a, unsigned& out_b) {
-                        const float2 o0 = acc[mt][nt_idx].pair(half_row);
-                        const float2 o1 = acc[mt][nt_idx + 1].pair(half_row);
-                        const float2 send = (q < 2) ? o1 : o0;
-                        const float2 recv = make_float2(__shfl_xor_sync(0xffffffff, send.x, 2),
-                                                        __shfl_xor_sync(0xffffffff, send.y, 2));
-                        const float2 gv = (q < 2) ? o0 : recv;
-                        const float2 vv = (q < 2) ? recv : o1;
-                        const int my_g = base_group + nt_idx + (q >> 1);
-                        const float* bp = bias + 8 * my_g + 2 * (q & 1);
-                        const half2 r = __floats2half2_rn(fast_silu(gv.x + bp[0]) * (vv.x + bp[4]),
-                                                          fast_silu(gv.y + bp[1]) * (vv.y + bp[5]));
-                        const unsigned my_h2 = *reinterpret_cast<const unsigned*>(&r);
-                        const unsigned other_h2 = __shfl_xor_sync(0xffffffff, my_h2, 2);
-                        out_a = (q < 2) ? my_h2 : other_h2;
-                        out_b = (q < 2) ? other_h2 : my_h2;
-                    };
-#pragma unroll
-                    for (int blk = 0; blk < 8; blk += 4) {
-                        unsigned p0, p1, p2, p3;
-                        do_pair(blk, p0, p1);
-                        do_pair(blk + 2, p2, p3);
-                        const unsigned s0 = __shfl_xor_sync(0xffffffff, q == 0 ? p2 : p0, 1);
-                        const unsigned s1 = __shfl_xor_sync(0xffffffff, q == 0 ? p3 : p1, 1);
-                        if (q < 2 && x < w) {
-                            const int g_out = base_group + blk + 2 * q;
-                            half* dst = row_out + size_t(x) * 128 + 4 * g_out;
-                            *reinterpret_cast<uint4*>(dst) =
-                                (q == 0) ? make_uint4(p0, s0, p1, s1) : make_uint4(s0, p2, s1, p3);
-                        }
-                    }
-                }
-            }
-        } else {
-#pragma unroll
-            for (int mt = 0; mt < 2; ++mt) {
-                const int y = y0 + warp_m * 2 + mt;
-                if (y >= h) continue;
-                const int row_in_image = y * w;
-                const size_t row_global = (size_t(image) * h + y) * w;
-                half* row_gated = gated + row_global * 128;
-#pragma unroll
-                for (int half_row = 0; half_row < 2; ++half_row) {
-                    const int x = x0 + (lane >> 2) + 8 * half_row;
+            for (int half_row = 0; half_row < 2; ++half_row) {
+                const int x = x0 + (lane >> 2) + 8 * half_row;
+                if (x < w) {
                     const int pix_in_image = row_in_image + x;
                     const size_t global_pix = row_global + x;
 #pragma unroll
-                    for (int nt = 0; nt < 8; ++nt) {
+                    for (int nt = 0; nt < 4; ++nt) {
                         const int g = base_group + nt;
                         const float2 own = acc[mt][nt].pair(half_row);
-                        if (g < 20) {
-                            const float2 partner = make_float2(__shfl_xor_sync(0xffffffff, own.x, 2),
-                                                               __shfl_xor_sync(0xffffffff, own.y, 2));
-                            if (q < 2 && x < w) {
-                                const float* bp = bias + 8 * g + 2 * q;
-                                const half2 r = __floats2half2_rn(fast_silu(own.x + bp[0]) * (partner.x + bp[4]),
-                                                                  fast_silu(own.y + bp[1]) * (partner.y + bp[5]));
-                                *reinterpret_cast<half2*>(row_gated + size_t(x) * 128 + 4 * g + 2 * q) = r;
-                            }
-                        } else if (x < w) {
-                            const int sub0 = 2 * (q & 1);
-                            const int slot0 = 4 * (g - 20) + sub0;
-                            const float* bp = bias + 8 * g + 2 * q;
-                            const float v0 = own.x + bp[0], v1 = own.y + bp[1];
-                            if (q < 2) {
-                                const half2 h2 = __floats2half2_rn(v0, v1);
-                                if (slot0 < 30) {
-                                    *reinterpret_cast<half2*>(fourier_gate + global_pix * 32 + slot0) = h2;
-                                } else {
-                                    const int b0 = slot0 - 30, type = b0 / 6, ch = b0 % 6;
-                                    *reinterpret_cast<half2*>(branch_gate + global_pix * 24 + type * 8 + ch) = h2;
-                                }
+                        const int sub0 = 2 * (q & 1);
+                        const int slot0 = 4 * (g - 20) + sub0;
+                        const float* bp = bias + 8 * g + 2 * q;
+                        const float v0 = own.x + bp[0], v1 = own.y + bp[1];
+                        if (q < 2) {
+                            const half2 h2 = __floats2half2_rn(v0, v1);
+                            if (slot0 < 30) {
+                                *reinterpret_cast<half2*>(fourier_gate + global_pix * 32 + slot0) = h2;
                             } else {
-                                if (slot0 < 30) {
-                                    fft_buf[(size_t(image) * 30 + slot0) * pixels_per_image + pix_in_image] = v0;
-                                    fft_buf[(size_t(image) * 30 + slot0 + 1) * pixels_per_image + pix_in_image] = v1;
-                                } else {
-                                    const int b0 = slot0 - 30, type = b0 / 6, ch = b0 % 6;
-                                    *reinterpret_cast<half2*>(branch_val + (size_t(type) * total_pixels + global_pix) * 8
-                                                              + ch) = __floats2half2_rn(v0, v1);
-                                }
+                                const int b0 = slot0 - 30, type = b0 / 6, ch = b0 % 6;
+                                *reinterpret_cast<half2*>(branch_gate + global_pix * 24 + type * 8 + ch) = h2;
+                            }
+                        } else {
+                            if (slot0 < 30) {
+                                fft_buf[(size_t(image) * 30 + slot0) * pixels_per_image + pix_in_image] = v0;
+                                fft_buf[(size_t(image) * 30 + slot0 + 1) * pixels_per_image + pix_in_image] = v1;
+                            } else {
+                                const int b0 = slot0 - 30, type = b0 / 6, ch = b0 % 6;
+                                *reinterpret_cast<half2*>(branch_val + (size_t(type) * total_pixels + global_pix) * 8
+                                                          + ch) = __floats2half2_rn(v0, v1);
                             }
                         }
                     }
@@ -1280,7 +1312,7 @@ __device__ void expand_gate_impl(half* gated, float* fft_buf, half* fourier_gate
     gated, fft_buf, fourier_gate, branch_val, branch_gate, in, weight, bias, h, w, pixels_per_image, total_pixels, \
         tiles_x, tiles_y
 
-extern "C" __global__ void __launch_bounds__(256, 2) expand_gate_f16(EXPAND_GATE_ARGS) {
+extern "C" __global__ void __launch_bounds__(256, 3) expand_gate_f16(EXPAND_GATE_ARGS) {
     expand_gate_impl<true>(EXPAND_GATE_PASS);
 }
 extern "C" __global__ void __launch_bounds__(256, 2) expand_gate_f32(EXPAND_GATE_ARGS) {
@@ -1444,22 +1476,22 @@ extern "C" __global__ void scale_post_rms_gate_compact(half* gated, const float*
         const float2 g01 = __half22float2(gh[0]), g23 = __half22float2(gh[1]);
         uint2 packed;
         half2* h2 = reinterpret_cast<half2*>(&packed);
-        h2[0] = __floats2half2_rn(fast_silu(g01.x) * fmaf(vals[0] * inv, scale[c0 + 0], offset[c0 + 0]),
-                                  fast_silu(g01.y) * fmaf(vals[1] * inv, scale[c0 + 1], offset[c0 + 1]));
-        h2[1] = __floats2half2_rn(fast_silu(g23.x) * fmaf(vals[2] * inv, scale[c0 + 2], offset[c0 + 2]),
-                                  fast_silu(g23.y) * fmaf(vals[3] * inv, scale[c0 + 3], offset[c0 + 3]));
+        h2[0] = __floats2half2_rn(fast_silu(g01.x) * fmaf(vals[0] * inv, __ldg(scale + c0 + 0), __ldg(offset + c0 + 0)),
+                                  fast_silu(g01.y) * fmaf(vals[1] * inv, __ldg(scale + c0 + 1), __ldg(offset + c0 + 1)));
+        h2[1] = __floats2half2_rn(fast_silu(g23.x) * fmaf(vals[2] * inv, __ldg(scale + c0 + 2), __ldg(offset + c0 + 2)),
+                                  fast_silu(g23.y) * fmaf(vals[3] * inv, __ldg(scale + c0 + 3), __ldg(offset + c0 + 3)));
         *reinterpret_cast<uint2*>(dst) = packed;
     } else if (c0 < 30) {
         const float2 g01 = __half22float2(*reinterpret_cast<const half2*>(gp));
         *reinterpret_cast<half2*>(dst) =
-            __floats2half2_rn(fast_silu(g01.x) * fmaf(vals[0] * inv, scale[c0 + 0], offset[c0 + 0]),
-                              fast_silu(g01.y) * fmaf(vals[1] * inv, scale[c0 + 1], offset[c0 + 1]));
+            __floats2half2_rn(fast_silu(g01.x) * fmaf(vals[0] * inv, __ldg(scale + c0 + 0), __ldg(offset + c0 + 0)),
+                              fast_silu(g01.y) * fmaf(vals[1] * inv, __ldg(scale + c0 + 1), __ldg(offset + c0 + 1)));
     }
 }
 
 // Fused 128 -> 48 projection + bias + SiLU + gamma residual (+ optional next RMSNorm or half copy).
 // 4 warps (128 threads), 16x16 pixel tile (18x18 = 324 halo), 4 rows per warp, all 48 output channels.
-// Shared memory: 2*324*16*2 + 2*3*48*16*2 = 29,952 B (3 blocks/SM in FP16, 2 blocks/SM in FP32).
+// Shared memory: 2*324*16*2 + 2*3*48*16*2 = 29,952 B (3 blocks/SM -> 12 warps/SM on sm_86 with max shared carveout).
 template<bool HalfAccumulate, class StateT, bool DoNorm, bool WriteHalfState>
 __device__ void project_res_norm_impl(StateT* state, half* norm, const half* in, const half* weight, const float* bias,
                                       const float* gamma, const float* scale, const float* offset, int h, int w,
@@ -1616,6 +1648,12 @@ extern "C" __global__ void __launch_bounds__(128, 3) project_res_norm_f16(PROJEC
 extern "C" __global__ void __launch_bounds__(128, 3) project_res_f16(PROJECT_RES_ARGS(half)) {
     project_res_norm_impl<true, half, false, false>(PROJECT_RES_PASS);
 }
+extern "C" __global__ void __launch_bounds__(128, 3) project_res_norm_f16_acc32(PROJECT_RES_ARGS(half)) {
+    project_res_norm_impl<false, half, true, false>(PROJECT_RES_PASS);
+}
+extern "C" __global__ void __launch_bounds__(128, 3) project_res_f16_acc32(PROJECT_RES_ARGS(half)) {
+    project_res_norm_impl<false, half, false, false>(PROJECT_RES_PASS);
+}
 extern "C" __global__ void __launch_bounds__(128, 2) project_res_norm_f32(PROJECT_RES_ARGS(float)) {
     project_res_norm_impl<false, float, true, false>(PROJECT_RES_PASS);
 }
@@ -1679,7 +1717,6 @@ __device__ void spectral_proj_gelu_unpack_f16_impl(float2* spectrum, const half*
     // Wait for all warps to finish reading gemm smem before overwriting with out[30][65].
     __syncthreads();
 
-    // Each lane already holds adjacent pairs (2k, 2k+1) in acc[nt].pair(half_row)!
     const int q = lane & 3;
 #pragma unroll
     for (int half_row = 0; half_row < 2; ++half_row) {

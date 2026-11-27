@@ -2,7 +2,16 @@
 
 ## Unreleased
 
-- Add GPU `tiling="even"` and `tiling="fewest-even"` for equal rectangular tiles under a size cap (ABI 3).
+### Added
+
+- Add GPU `tiling="even"` and `tiling="fewest-even"` for equal rectangular tiles under a size cap (ABI 3), plus GFISRv2 `fp32_project_accum`, `fp32_accum`, and `even` vs. `fewest-even` guidance in `docs/quickstart.md`.
+
+### Changed
+
+- Improved **GFISRv2** FP16 throughput and fidelity across 512px (`fixed`, `even`, `fewest-even`) tiling (`native/kernels/gfisrv2/`):
+  - Switched `expand_gate_f16`/`expand_gate_f32` to 16×16 tiles (4 blocks/tile, `N=64`, `expand_gate_f16` at 3 blocks/SM) and upgraded `spectral_dw_res_nhwc_f16` to 16×16 `cp.async` tiles.
+  - Raised `project_res_norm_f16_acc32`/`project_res_f16_acc32` occupancy (`(128, 3)`), added `__ldg` weight/offset reads in `scale_post_rms_gate_compact`, and requested `CU_SHAREDMEM_CARVEOUT_MAX_SHARED` for the high-smem custom kernels.
+  - Kept FP32 Tensor Core accumulation on non-residual FP16 bookend convolutions (`first`, `tail_expand`, `tail_project`, `last`) with `plan_schema` bumped to `5`, improving both latency (`3.734s -> 3.647s` at `512x512`, `3.930s -> 3.820s` at `496x496`) and raw PSNR (`+1.1–1.4 dB` on `samples/mscale`).
 
 ## [0.0.7] - 2026-11-26
 
