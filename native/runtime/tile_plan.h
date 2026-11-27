@@ -23,9 +23,10 @@ inline int64_t align_tile(int64_t length, int alignment) {
     return ((length + alignment - 1) / alignment) * alignment;
 }
 
-inline int even_tile_size(int length, int count, int overlap, int context, int minimum, int maximum) {
+inline int even_tile_size(int length, int count, int overlap, int context, int minimum, int maximum, bool align) {
     const auto covered = int64_t(length) + int64_t(count - 1) * overlap;
     const auto needed = std::max<int64_t>(minimum, (covered + count - 1) / count + 2 * context);
+    if (!align) return int(needed);
     const auto aligned = align_tile(needed, 16);
     return int(aligned <= maximum ? aligned : needed);
 }
@@ -39,7 +40,7 @@ struct TilePlan {
 };
 
 inline TilePlan plan_tiles(const KernelSession& model, int height, int width, int tile, int batch,
-                           int overlap, int context, int scale, bool variable, bool even = false) {
+                           int overlap, int context, int scale, bool variable, bool even = false, bool align_even = true) {
     const int core = tile - 2 * context, step = core - overlap;
     const int columns = tile_count(width, overlap, step), rows = tile_count(height, overlap, step);
     const uint32_t channels = model.tensors().input.shape.dimensions[1];
@@ -62,8 +63,8 @@ inline TilePlan plan_tiles(const KernelSession& model, int height, int width, in
         const auto useful = uint64_t(rows) * columns;
         const auto n = uint32_t(std::min<uint64_t>(useful, batch));
         UmziShape shape{4, {n, channels,
-            uint32_t(even_tile_size(height, rows, overlap, context, minimum, tile)),
-            uint32_t(even_tile_size(width, columns, overlap, context, minimum, tile))}};
+            uint32_t(even_tile_size(height, rows, overlap, context, minimum, tile, align_even)),
+            uint32_t(even_tile_size(width, columns, overlap, context, minimum, tile, align_even))}};
         TilePlan plan;
         plan.rows = rows;
         plan.columns = columns;

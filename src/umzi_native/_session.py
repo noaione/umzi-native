@@ -245,7 +245,7 @@ class InferenceSession:
         tile_size: int,
         batch_size: int,
         overlap: int = 0,
-        tiling: Literal["fixed", "variable", "even"] = "fixed",
+        tiling: Literal["fixed", "variable", "even", "fewest-even"] = "fixed",
         overlap_method: Literal["centered", "linear"] = "centered",
         background: str = "white",
         output_dtype: type[np.uint8] | type[np.float32] = np.uint8,
@@ -257,10 +257,11 @@ class InferenceSession:
         tiles, it also places the last tile flush and mirrors short axes.
         Variable tiling adapts edge shapes and uses replicated edge padding.
         Even tiling uses equal rectangular tiles with tile_size as the maximum edge.
+        Fewest-even skips rounding the tile dimensions up to multiples of 16.
         Float32 output contains stitched values before clipping and quantization.
         """
-        if tiling not in ("fixed", "variable", "even"):
-            raise ValueError("tiling must be 'fixed', 'variable', or 'even'")
+        if tiling not in ("fixed", "variable", "even", "fewest-even"):
+            raise ValueError("tiling must be 'fixed', 'variable', 'even', or 'fewest-even'")
         if overlap_method not in ("centered", "linear"):
             raise ValueError("overlap_method must be 'centered' or 'linear'")
         if not isinstance(image, np.ndarray) or image.dtype != np.uint8:
@@ -285,6 +286,7 @@ class InferenceSession:
         dtype = np.dtype(output_dtype)
         if dtype not in (np.dtype(np.uint8), np.dtype(np.float32)):
             raise ValueError("output_dtype must be uint8 or float32")
+        layout = 2 if tiling == "fewest-even" else int(tiling == "even")
         options = TilingABI(
             ctypes.sizeof(TilingABI),
             tile_size,
@@ -293,14 +295,14 @@ class InferenceSession:
             255 if background == "white" else 0,
             int(dtype == np.dtype(np.float32)),
             int(overlap_method == "linear"),
-            int(tiling == "even"),
+            layout,
         )
 
         with self._lock:
             self._ensure_open()
             abi_version = self._dll.umzi_abi_version()
-            if tiling == "even" and abi_version < 3:
-                raise RuntimeError("Even tiling requires a native library with ABI 3")
+            if layout and abi_version < 3:
+                raise RuntimeError(f"Tiling mode {tiling!r} requires a native library with ABI 3")
             symbol = "umzi_session_run_tiled_variable" if tiling == "variable" else "umzi_session_run_tiled"
             tiled = getattr(self._dll, symbol, None)
             if tiled is None:

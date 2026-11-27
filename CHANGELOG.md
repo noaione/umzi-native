@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Add GPU `tiling="even"` for equal rectangular tiles under a size cap (ABI 3).
+- Add GPU `tiling="even"` and `tiling="fewest-even"` for equal rectangular tiles under a size cap (ABI 3).
 
 ## [0.0.7] - 2026-11-26
 

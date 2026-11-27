@@ -196,13 +196,13 @@ void run_tiled(KernelSession& kernel, std::unique_ptr<PageTiler>& tiler, int32_t
                const OpenTileRunner& open_edge) {
     const auto model = kernel.model_info();
     const bool use_centered = options.overlap_method == UMZI_OVERLAP_CENTERED;
-    const bool even = options.layout == UMZI_TILE_EVEN;
+    const bool even = options.layout != UMZI_TILE_DEFAULT;
     if (!model.scale || !height || !width || !options.tile_size || !options.batch_size
         || std::max({height, width, options.tile_size}) > INT_MAX / model.scale || options.batch_size > INT_MAX
         || model.context > (options.tile_size - 1) / 2 || (model.context && model.scale != 1)
         || (!use_centered && options.overlap >= options.tile_size - 2 * model.context)
         || options.overlap_method > UMZI_OVERLAP_LINEAR
-        || options.layout > UMZI_TILE_EVEN
+        || options.layout > UMZI_TILE_FEWEST_EVEN
         || (options.background != 0 && options.background != 255) || options.output_format > UMZI_PAGE_FLOAT32)
         throw std::runtime_error("Invalid GPU tiling dimensions, overlap, background, or output format");
 
@@ -212,7 +212,8 @@ void run_tiled(KernelSession& kernel, std::unique_ptr<PageTiler>& tiler, int32_t
     const bool centered = use_centered && overlap > 0;
     const bool flush_edges = centered && !open_edge;
     const auto plan = plan_tiles(kernel, int(height), int(width), int(options.tile_size), int(options.batch_size),
-                                 int(overlap), int(model.context), int(model.scale), bool(open_edge), even);
+                                 int(overlap), int(model.context), int(model.scale), bool(open_edge), even,
+                                 options.layout == UMZI_TILE_EVEN);
     const auto io = plan.groups[0].io;
     const auto output_channels = io.output.shape.dimensions[1];
     const auto input_element = element_size(io.input.dtype), output_element = element_size(io.output.dtype);

@@ -22,6 +22,24 @@ SSIMULACRA2. Record the memory and fidelity tradeoffs next to speed.
 | Native tuning | `samples/mscale/lb-page-00{3,4,5}.png` | 2 | 256×256 | 64 px | Synchronized batch-2 throughput and separately measured batch-1 tile latency |
 | Matched TRT comparison | `samples/mscale/lb-page-003.png` | 1 | 128×128 | 32 px | Full-page median including tiling, transfers, inference and stitching |
 
+### Single-call 512 px even-layout comparison
+
+One exploratory call per layout on `lb-page-003.png` used the ABI 3 native
+runtime, FP16, batch 1, 64 px overlap, CUDA Graphs, and `fused_conv=1`.
+Both calls sent six tiles. Even used 496×496 tiles and processed 1,476,096
+tile pixels, including 261,096 overlap pixels. Fewest-even used 482×493
+tiles and processed 1,425,756 pixels, including 210,756 overlap pixels.
+
+| Layout | Page call (ms) | Source MPx/s | Sampled device peak (MiB) |
+| --- | ---: | ---: | ---: |
+| Even | 5,802.1 | 0.209 | 2245 |
+| Fewest-even | 5,859.0 | 0.207 | 2291 |
+
+The page call includes convolution-plan tuning and first-use shape setup.
+This one-call sample is too small to rank steady-state speed. Both 4× RGB
+renders are in `output/fewest-even-check/gfisrv2-lb-page-003/`. The raw
+timings and runtime diagnostics are in its `report.json`.
+
 Use 64 px as the working overlap for native tuning. It provides a 256 px
 blend region at 4× and a 192 px input stride. On each 900×1350 page, the
 native grid increases from 24 real tiles at 32 px overlap to 35 at 64 px,

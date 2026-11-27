@@ -111,7 +111,7 @@ int run_tiled_page(UmziSession* session, uint32_t height, uint32_t width, const 
                 ? options->overlap_method : uint32_t(UMZI_OVERLAP_LINEAR),
             options->struct_size >= sizeof(*options) ? options->layout : uint32_t(UMZI_TILE_DEFAULT)};
         umzi::OpenTileRunner open_edge;
-        if (variable || settings.layout == UMZI_TILE_EVEN) {
+        if (variable || settings.layout != UMZI_TILE_DEFAULT) {
             open_edge = [&] {
                 if (auto cloned = implementation.clone_shared()) return cloned;
                 return session->open_edge();

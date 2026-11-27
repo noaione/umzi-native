@@ -569,3 +569,30 @@ Run the local benchmark with
 The [report](../output/even-tiling-check/smosr-512/report.json) records the
 model and image hashes, per-shape diagnostics, all timing samples, and batch-1
 tile coordinates. The nine rendered PNGs are alongside the report.
+
+### Fewest-even comparison
+
+Repeat the three-page SMoSR workload with `even` and `fewest-even` at
+`tile_size=512` for both. Alternate the modes over ten warm rounds per page
+and use separate initially empty plan caches to measure first-call setup.
+
+| Page | Mode | Tile (W×H) | Tiles | Padding pixels | Warm median / best (ms) | Mean model call (ms) | First page (s) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 900×1350 | Even | 464×464 | 6 | 76,776 | 129.1 / 127.2 | 20.05 | 26.49 |
+| 900×1350 | Fewest-even | 450×450 | 6 | 0 | 122.8 / 120.8 | 19.32 | 26.02 |
+| 1812×2600 | Even | 464×448 | 24 | 277,728 | 505.8 / 498.0 | 19.91 | 27.15 |
+| 1812×2600 | Fewest-even | 453×434 | 24 | 7,248 | 480.1 / 475.3 | 18.93 | 26.33 |
+| 1733×2600 | Even | 448×448 | 24 | 311,096 | 490.0 / 483.5 | 19.03 | 26.45 |
+| 1733×2600 | Fewest-even | 434×434 | 24 | 14,744 | 454.9 / 451.9 | 18.03 | 26.60 |
+
+Fewest-even won all 30 paired warm rounds. The sum of the page medians
+dropped from 1.125 s to 1.058 s (6.0% less time). Padding fell from 665,600
+to 21,992 pixels across the same 54 tiles. Source throughput rose from
+9.27 to 9.86 MPx/s. Sampled solo device peaks were 1878 MiB even and
+1892 MiB fewest-even, with a 1660 MiB device-wide background.
+
+Run the local comparison with
+`& C:/Python314/python.exe -u output/fewest-even-check/bench_smosr_512.py`.
+The [raw report](../output/fewest-even-check/smosr-512/report.json) includes
+the individual round times, model-call samples and tile coordinates. All six
+2× RGB PNGs are alongside the report.
