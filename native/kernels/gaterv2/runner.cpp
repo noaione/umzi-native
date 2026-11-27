@@ -1212,7 +1212,9 @@ public:
     }
 
     UmziModelInfo model_info() const override { return {sizeof(UmziModelInfo), "gaterv2", 1, 0}; }
-    umzi::TilingConstraints tiling_constraints() const override { return {int(arch.alignment), 1, 0}; }
+    umzi::TilingConstraints tiling_constraints() const override {
+        return {int(arch.alignment), int(arch.alignment / 2) + 1, 0};
+    }
 
     UmziIo tensors() const override {
         const auto dtype = static_cast<uint32_t>(fp16 ? UMZI_FLOAT16 : UMZI_FLOAT32);

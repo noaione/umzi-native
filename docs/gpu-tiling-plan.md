@@ -510,3 +510,62 @@ tile indices, coordinates, and per-image fidelity.
 [Matched FP32 fidelity and 128-pixel regression](../output/gpu-tiling/gaterv3-large-tiles/fidelity.json)
 [Mixed-precision direct check](../output/gpu-tiling/gaterv3-large-tiles/mixed-direct.json)
 [Independent batch and per-tile timings](../output/gpu-tiling/gaterv3-large-tiles/model-calls.json)
+
+## SMoSR zero-overlap layout comparison at a 512 px limit
+
+Compare fixed, variable, and even CUDA tiling on `samples/4x-test/image_001.jpg`
+and `samples/2x-test/{9798855444216,9798855404661}.jpg`. Use the 2× SMoSR
+checkpoint, FP16, batch 1, CUDA Graphs, `tune_convolutions=1`, and `fuse_silu=1`.
+Check the actual model's tile shapes against the 512 px cap. Start from
+`tile_size=512` and lower the variable-mode setting for pages where it would
+otherwise absorb the bottom edge into a tile taller than 512 px.
+
+Measure each decoded page through synchronous `run_tiled()` and record the
+first call separately from the warmed repetitions. Record direct synchronized
+batch-1 model calls for the planned tile shapes, along with sampled device-wide
+VRAM. This FP16-only comparison uses speed as its primary metric.
+
+Use nine warmed rounds per image with rotating mode order. The first page
+includes convolution tuning and graph capture. The warmed page time includes
+host-to-device input transfer, extraction, inference, output placement, and
+synchronous download of the stitched `uint8` RGB page. JPEG decoding and PNG
+saving run outside the timed region.
+
+The Windows ABI 3 runtime ran on an NVIDIA RTX 3050 Laptop GPU (4 GiB,
+driver 610.62). All actual tiles fit within 512 px. Variable used
+`tile_size=453` for 1812×2600 and `434` for 1733×2600 after screening the
+native SMoSR plans for the fewest tiles and then the fewest input pixels.
+All other configurations used `512`. Diagnostics recorded 118 timed
+convolution candidates and two fused SiLU plans per prepared shape.
+
+| Page | Mode | Tiles | Padding pixels | Warm median / best (ms) | Source MPx/s | Mean batch-1 model call (ms) | First page (s) | Sampled solo peak (MiB) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 900×1350 | Fixed | 6 | 357,864 | 177.8 / 171.7 | 6.83 | 27.21 | 32.9 | 2263 |
+| 900×1350 | Variable | 6 | 25,320 | 148.9 / 145.4 | 8.16 | 23.20 | 112.8 | 2607 |
+| 900×1350 | Even | 6 | 76,776 | 146.3 / 142.8 | 8.30 | 23.04 | 30.0 | 2146 |
+| 1812×2600 | Fixed | 24 | 1,580,256 | 677.9 / 671.4 | 6.95 | 26.89 | 29.5 | 1942 |
+| 1812×2600 | Variable | 24 | 1,812 | 514.2 / 512.6 | 9.16 | 20.37 | 64.5 | 1970 |
+| 1812×2600 | Even | 24 | 277,728 | 542.4 / 538.8 | 8.69 | 21.59 | 29.5 | 1912 |
+| 1733×2600 | Fixed | 24 | 1,785,656 | 648.6 / 642.9 | 6.95 | 25.68 | 28.5 | 2052 |
+| 1733×2600 | Variable | 24 | 6,068 | 474.1 / 470.1 | 9.50 | 18.96 | 113.4 | 2315 |
+| 1733×2600 | Even | 24 | 311,096 | 502.1 / 498.0 | 8.97 | 19.89 | 27.1 | 2001 |
+
+Across the three pages, the sum of warmed medians was 1.504 s fixed,
+1.137 s variable, and 1.191 s even. Aggregate source throughput was
+6.93, 9.17, and 8.76 MPx/s, respectively. The first page was 2.6 ms faster
+with even than variable at the median, with overlapping timing ranges.
+Variable won on both larger pages. Every mode sent 54 tiles total.
+Padding counts cover pixels outside the source page. SMoSR's internal
+reflection border is excluded.
+
+Solo VRAM is sampled device-wide during a separate first-page call with saved
+plans. Background use before CUDA setup was 1615 MiB. The individual batch-1
+calls use the same planned crops and padding, with shape setup and input
+upload outside their timed region. The FP16-only run checked all nine RGB
+output files at 2× dimensions. It did not measure visual fidelity.
+
+Run the local benchmark with
+`& C:/Python314/python.exe -u output/even-tiling-check/bench_smosr_512.py`.
+The [report](../output/even-tiling-check/smosr-512/report.json) records the
+model and image hashes, per-shape diagnostics, all timing samples, and batch-1
+tile coordinates. The nine rendered PNGs are alongside the report.

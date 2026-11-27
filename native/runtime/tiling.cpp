@@ -57,12 +57,14 @@ void submit_range(KernelSession& model, PageTiler& tiler, uint64_t begin, uint64
     const int out_width = grid.width * grid.scale, out_height = grid.height * grid.scale;
     const int output_w = (grid.tile_w - 2 * grid.context) * grid.scale;
     const int output_h = (grid.tile_h - 2 * grid.context) * grid.scale;
-    const int output_step = grid.step * grid.scale;
+    const int even_scale = grid.even ? grid.scale : 0;
     const auto column_start = [&](int column) {
-        return tile_origin(grid.column + column, grid.page_columns, out_width, output_w, output_step, grid.flush_edges);
+        return tile_origin(grid.column + column, grid.page_columns, out_width, output_w,
+                           grid.step_x * grid.scale, grid.flush_edges, even_scale);
     };
     const auto row_start = [&](int row) {
-        return tile_origin(grid.row + row, grid.page_rows, out_height, output_h, output_step, grid.flush_edges);
+        return tile_origin(grid.row + row, grid.page_rows, out_height, output_h,
+                           grid.step_y * grid.scale, grid.flush_edges, even_scale);
     };
     const auto input_plane = multiply(grid.tile_h, grid.tile_w), output_plane = multiply(output_h, output_w);
     const auto stream = tiler.stream;
@@ -194,11 +196,13 @@ void run_tiled(KernelSession& kernel, std::unique_ptr<PageTiler>& tiler, int32_t
                const OpenTileRunner& open_edge) {
     const auto model = kernel.model_info();
     const bool use_centered = options.overlap_method == UMZI_OVERLAP_CENTERED;
+    const bool even = options.layout == UMZI_TILE_EVEN;
     if (!model.scale || !height || !width || !options.tile_size || !options.batch_size
         || std::max({height, width, options.tile_size}) > INT_MAX / model.scale || options.batch_size > INT_MAX
         || model.context > (options.tile_size - 1) / 2 || (model.context && model.scale != 1)
         || (!use_centered && options.overlap >= options.tile_size - 2 * model.context)
         || options.overlap_method > UMZI_OVERLAP_LINEAR
+        || options.layout > UMZI_TILE_EVEN
         || (options.background != 0 && options.background != 255) || options.output_format > UMZI_PAGE_FLOAT32)
         throw std::runtime_error("Invalid GPU tiling dimensions, overlap, background, or output format");
 
@@ -208,7 +212,7 @@ void run_tiled(KernelSession& kernel, std::unique_ptr<PageTiler>& tiler, int32_t
     const bool centered = use_centered && overlap > 0;
     const bool flush_edges = centered && !open_edge;
     const auto plan = plan_tiles(kernel, int(height), int(width), int(options.tile_size), int(options.batch_size),
-                                 int(overlap), int(model.context), int(model.scale), bool(open_edge));
+                                 int(overlap), int(model.context), int(model.scale), bool(open_edge), even);
     const auto io = plan.groups[0].io;
     const auto output_channels = io.output.shape.dimensions[1];
     const auto input_element = element_size(io.input.dtype), output_element = element_size(io.output.dtype);
@@ -244,8 +248,13 @@ void run_tiled(KernelSession& kernel, std::unique_ptr<PageTiler>& tiler, int32_t
     if (!input || !output || input_bytes < source_size || output_bytes < result_size)
         throw std::runtime_error("Invalid GPU tiling page buffers");
 
-    const int step = int(core - overlap);
-    const int output_step = step * int(model.scale);
+    const int tile_h = int(plan.groups[0].shape.dimensions[2]);
+    const int tile_w = int(plan.groups[0].shape.dimensions[3]);
+    const int core_h = (even ? tile_h : int(options.tile_size)) - 2 * int(model.context);
+    const int core_w = (even ? tile_w : int(options.tile_size)) - 2 * int(model.context);
+    const int step_y = std::max(1, core_h - int(overlap));
+    const int step_x = std::max(1, core_w - int(overlap));
+    const int output_step = step_y * int(model.scale);
     bool sequential = true;
     for (int i = 0; i < plan.size; ++i) {
         const auto& group = plan.groups[i];
@@ -260,7 +269,7 @@ void run_tiled(KernelSession& kernel, std::unique_ptr<PageTiler>& tiler, int32_t
             int max_batch = 1;
             for (int i = 0; i < plan.size; ++i)
                 max_batch = std::max(max_batch, int(plan.groups[i].shape.dimensions[0]));
-            const int tile_out_h = (int(options.tile_size) - 2 * int(model.context)) * int(model.scale);
+            const int tile_out_h = core_h * int(model.scale);
             const int max_batch_rows = max_batch > 1 ? 1 + (max_batch - 2) / plan.columns : 0;
             strip_h = int(std::min<int64_t>(out_height, int64_t(max_batch_rows) * output_step + tile_out_h));
         } else {
@@ -294,9 +303,9 @@ void run_tiled(KernelSession& kernel, std::unique_ptr<PageTiler>& tiler, int32_t
     }
 
     TileGrid grid{int(width), int(height), int(channels), int(output_channels), 0, 0, 0,
-                  int(overlap), int(model.context), int(model.scale), step, 0, 0,
+                  int(overlap), int(model.context), int(model.scale), step_x, step_y, 0, 0,
                   int(options.background), input_element == 2, output_element == 2, raw, 0, 0,
-                  plan.rows, plan.columns, plan.replicate, strip_h, centered, flush_edges};
+                  plan.rows, plan.columns, plan.replicate, strip_h, centered, flush_edges, even && overlap > 0};
     if (!tiler) tiler = std::make_unique<PageTiler>(device_id);
     ContextScope scope(tiler->context);
     try {
@@ -384,6 +393,10 @@ void run_tiled(KernelSession& kernel, std::unique_ptr<PageTiler>& tiler, int32_t
                 launch(tiler->finish, stream, num_pixels, finish_args);
             }
         } else if (sequential) {
+            const auto row_start = [&](int row) {
+                return tile_origin(row, plan.rows, out_height, core_h * int(model.scale), output_step,
+                                   flush_edges, grid.even ? grid.scale : 0);
+            };
             for (int i = 0; i < plan.size; ++i) {
                 const auto& group = plan.groups[i];
                 set_group(group);
@@ -392,10 +405,9 @@ void run_tiled(KernelSession& kernel, std::unique_ptr<PageTiler>& tiler, int32_t
                 submit_range(runner, *tiler, group.first, total, group, grid, page, tile_input, tile_output,
                              sums, weights, destination, [&](int next_row) {
                     if (next_row >= 0) {
-                        flush_rows(tile_origin(next_row, plan.rows, out_height, int(core * model.scale), output_step,
-                                              flush_edges));
+                        flush_rows(row_start(next_row));
                     } else if (i + 1 < plan.size) {
-                        flush_rows(int(plan.groups[i + 1].first / grid.columns) * output_step);
+                        flush_rows(row_start(int(plan.groups[i + 1].first / grid.columns)));
                     } else {
                         flush_rows(out_height);
                     }

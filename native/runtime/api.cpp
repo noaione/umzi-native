@@ -107,9 +107,11 @@ int run_tiled_page(UmziSession* session, uint32_t height, uint32_t width, const 
             throw std::runtime_error("Invalid Umzi tiling options");
         const UmziTilingOptions settings{sizeof(UmziTilingOptions), options->tile_size, options->batch_size,
             options->overlap, options->background, options->output_format,
-            options->struct_size >= sizeof(*options) ? options->overlap_method : uint32_t(UMZI_OVERLAP_LINEAR)};
+            options->struct_size >= offsetof(UmziTilingOptions, layout)
+                ? options->overlap_method : uint32_t(UMZI_OVERLAP_LINEAR),
+            options->struct_size >= sizeof(*options) ? options->layout : uint32_t(UMZI_TILE_DEFAULT)};
         umzi::OpenTileRunner open_edge;
-        if (variable) {
+        if (variable || settings.layout == UMZI_TILE_EVEN) {
             open_edge = [&] {
                 if (auto cloned = implementation.clone_shared()) return cloned;
                 return session->open_edge();
@@ -121,7 +123,7 @@ int run_tiled_page(UmziSession* session, uint32_t height, uint32_t width, const 
 }
 }
 
-uint32_t umzi_abi_version() { return 2; }
+uint32_t umzi_abi_version() { return 3; }
 const char* umzi_error() { return error_text.c_str(); }
 int umzi_error_code() { return error_code; }
 

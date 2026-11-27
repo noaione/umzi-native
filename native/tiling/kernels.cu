@@ -22,9 +22,9 @@ extern "C" __global__ void extract_tiles(TileGrid grid, const unsigned char* pag
     for (Index slot = blockIdx.y; slot < grid.batch; slot += gridDim.y) {
         const unsigned tile = unsigned(first_column) + min(int(slot), real - 1);
         const int left = tile_origin(grid.column + int(tile % grid.columns), grid.page_columns, grid.width,
-                                     grid.tile_w - 2 * grid.context, grid.step, grid.flush_edges) - grid.context;
+                                     grid.tile_w - 2 * grid.context, grid.step_x, grid.flush_edges, grid.even) - grid.context;
         const int top = tile_origin(grid.row + first_row + int(tile / grid.columns), grid.page_rows, grid.height,
-                                    grid.tile_h - 2 * grid.context, grid.step, grid.flush_edges) - grid.context;
+                                    grid.tile_h - 2 * grid.context, grid.step_y, grid.flush_edges, grid.even) - grid.context;
         for (Index pixel = thread_index(); pixel < plane; pixel += thread_stride()) {
             const long long x = (long long)left + int(pixel % grid.tile_w);
             const long long y = (long long)top + int(pixel / grid.tile_w);
@@ -69,6 +69,32 @@ __device__ float centered_feather(int offset, int core, int overlap, int last_ov
     return weight;
 }
 
+__device__ int even_last_tile(int position, int count, int length, int core, int scale) {
+    if (position < 0) return -1;
+    if (count == 1 || position >= length - core) return count - 1;
+    // Invert the rounded-down origin in source-pixel coordinates.
+    const auto numerator = (static_cast<long long>(position / scale) + 1) * (count - 1) - 1;
+    return int(numerator / ((length - core) / scale));
+}
+
+__device__ float even_feather(int position, int origin, int tile, int count, int length, int core,
+                             int scale, bool centered) {
+    const auto ramp = [=](int offset, int overlap) {
+        return centered ? centered_ramp(offset, overlap, scale)
+                        : min(1.f, __fdiv_rn(float(offset + 1), float(overlap + 1)));
+    };
+    float before = 1.f, after = 1.f;
+    if (tile > 0) {
+        const int previous = tile_origin(tile - 1, count, length, core, 0, false, scale);
+        before = ramp(position - origin, core - (origin - previous));
+    }
+    if (tile + 1 < count) {
+        const int next = tile_origin(tile + 1, count, length, core, 0, false, scale);
+        after = ramp(core - 1 - (position - origin), core - (next - origin));
+    }
+    return centered ? min(before, after) : before * after;
+}
+
 __device__ void store_pixel(void* output, Index index, float value, bool raw) {
     if (raw) static_cast<float*>(output)[index] = value;
     else static_cast<unsigned char*>(output)[index] = __float2uint_rn(__saturatef(value) * 255.0f);
@@ -83,12 +109,11 @@ extern "C" __global__ void copy_tiles(TileGrid grid, const void* tiles, void* ou
     const int width = grid.width * grid.scale, height = grid.height * grid.scale;
     const int core_w = (grid.tile_w - 2 * grid.context) * grid.scale;
     const int core_h = (grid.tile_h - 2 * grid.context) * grid.scale;
-    const int step = grid.step * grid.scale;
     const Index plane = Index(core_w) * core_h;
     for (Index slot = blockIdx.y; slot < real; slot += gridDim.y) {
         const unsigned tile = unsigned(first_column) + unsigned(slot);
-        const int left = (grid.column + int(tile % grid.columns)) * step;
-        const int top = (grid.row + first_row + int(tile / grid.columns)) * step;
+        const int left = (grid.column + int(tile % grid.columns)) * grid.step_x * grid.scale;
+        const int top = (grid.row + first_row + int(tile / grid.columns)) * grid.step_y * grid.scale;
         const int valid_width = min(core_w, width - left), valid_height = min(core_h, height - top);
         for (Index pixel = thread_index(); pixel < plane; pixel += thread_stride()) {
             const int x = pixel % core_w, y = pixel / core_w;
@@ -109,13 +134,15 @@ extern "C" __global__ void blend_tiles(TileGrid grid, const void* tiles, float* 
     const int width = grid.width * grid.scale, height = grid.height * grid.scale;
     const int core_w = (grid.tile_w - 2 * grid.context) * grid.scale;
     const int core_h = (grid.tile_h - 2 * grid.context) * grid.scale;
-    const int overlap = grid.overlap * grid.scale, step = grid.step * grid.scale;
-    const int last_left = tile_origin(grid.page_columns - 1, grid.page_columns, width, core_w, step, grid.flush_edges);
-    const int last_top = tile_origin(grid.page_rows - 1, grid.page_rows, height, core_h, step, grid.flush_edges);
+    const int overlap = grid.overlap * grid.scale;
+    const int step_x = grid.step_x * grid.scale, step_y = grid.step_y * grid.scale;
+    const int even_scale = grid.even ? grid.scale : 0;
+    const int last_left = tile_origin(grid.page_columns - 1, grid.page_columns, width, core_w, step_x, grid.flush_edges);
+    const int last_top = tile_origin(grid.page_rows - 1, grid.page_rows, height, core_h, step_y, grid.flush_edges);
     const int last_overlap_x = grid.flush_edges && grid.page_columns > 1
-        ? core_w - (last_left - (grid.page_columns - 2) * step) : overlap;
+        ? core_w - (last_left - (grid.page_columns - 2) * step_x) : overlap;
     const int last_overlap_y = grid.flush_edges && grid.page_rows > 1
-        ? core_h - (last_top - (grid.page_rows - 2) * step) : overlap;
+        ? core_h - (last_top - (grid.page_rows - 2) * step_y) : overlap;
     const Index plane = Index(core_w) * core_h;
     const Index last = first + real - 1;
     const int x0 = left + int(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -123,34 +150,42 @@ extern "C" __global__ void blend_tiles(TileGrid grid, const void* tiles, float* 
     const int x_stride = int(gridDim.x) * blockDim.x;
     for (int dy_reg = int(blockIdx.y); dy_reg < region_height; dy_reg += int(gridDim.y)) {
         const int y = top + dy_reg;
-        const int local_y = y - grid.row * step;
-        const int y_min = max(local_y < core_h ? 0 : (local_y - core_h) / step + 1, int(first / grid.columns));
-        const int last_row = grid.flush_edges && y >= last_top ? grid.rows - 1 : min(local_y / step, grid.rows - 1);
-        const int y_max = min(last_row, int(last / grid.columns));
+        const int local_y = y - grid.row * step_y;
+        const int first_row = grid.even ? even_last_tile(y - core_h, grid.rows, height, core_h, grid.scale) + 1
+            : (local_y < core_h ? 0 : (local_y - core_h) / step_y + 1);
+        const int last_row = grid.even ? even_last_tile(y, grid.rows, height, core_h, grid.scale)
+            : (grid.flush_edges && y >= last_top ? grid.rows - 1 : min(local_y / step_y, grid.rows - 1));
+        const int y_min = max(first_row, int(first / grid.columns)), y_max = min(last_row, int(last / grid.columns));
         const int ring_y = grid.strip_height ? (y % grid.strip_height) : y;
         const Index ring_row = Index(ring_y) * width;
         for (int x = x0; x < x_end; x += x_stride) {
-            const int local_x = x - grid.column * step;
-            const int x_min = local_x < core_w ? 0 : (local_x - core_w) / step + 1;
-            const int x_max = grid.flush_edges && x >= last_left ? grid.columns - 1 : min(local_x / step, grid.columns - 1);
+            const int local_x = x - grid.column * step_x;
+            const int x_min = grid.even ? even_last_tile(x - core_w, grid.columns, width, core_w, grid.scale) + 1
+                : (local_x < core_w ? 0 : (local_x - core_w) / step_x + 1);
+            const int x_max = grid.even ? even_last_tile(x, grid.columns, width, core_w, grid.scale)
+                : (grid.flush_edges && x >= last_left ? grid.columns - 1 : min(local_x / step_x, grid.columns - 1));
             const Index pixel = ring_row + x;
             for (int row = y_min; row <= y_max; ++row) {
                 const Index row_start = Index(row) * grid.columns;
                 const int start = row_start < first ? max(x_min, int(first - row_start)) : x_min;
                 const int end = min(x_max, int(min(last - row_start, Index(grid.columns - 1))));
                 const int page_row = grid.row + row;
-                const int tile_top = tile_origin(page_row, grid.page_rows, height, core_h, step, grid.flush_edges);
+                const int tile_top = tile_origin(page_row, grid.page_rows, height, core_h, step_y, grid.flush_edges, even_scale);
                 const int dy = y - tile_top;
-                const float wy = grid.centered
+                const float wy = grid.even
+                    ? even_feather(y, tile_top, page_row, grid.page_rows, height, core_h, grid.scale, grid.centered)
+                    : grid.centered
                     ? centered_feather(dy, core_h, overlap, last_overlap_y, grid.scale, page_row, grid.page_rows)
                     : feather(dy, min(core_h, height - tile_top), overlap, page_row > 0, page_row + 1 < grid.page_rows);
                 for (int column = start; column <= end; ++column) {
                     const int page_column = grid.column + column;
-                    const int tile_left = tile_origin(page_column, grid.page_columns, width, core_w, step, grid.flush_edges);
+                    const int tile_left = tile_origin(page_column, grid.page_columns, width, core_w, step_x, grid.flush_edges, even_scale);
                     const int dx = x - tile_left;
                     const Index sample = row_start + column - first;
                     const Index source = sample * grid.output_channels * plane + Index(dy) * core_w + dx;
-                    const float wx = grid.centered
+                    const float wx = grid.even
+                        ? even_feather(x, tile_left, page_column, grid.page_columns, width, core_w, grid.scale, grid.centered)
+                        : grid.centered
                         ? centered_feather(dx, core_w, overlap, last_overlap_x, grid.scale, page_column, grid.page_columns)
                         : feather(dx, min(core_w, width - tile_left), overlap,
                                   page_column > 0, page_column + 1 < grid.page_columns);

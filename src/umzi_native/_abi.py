@@ -90,6 +90,7 @@ class TilingABI(ctypes.Structure):
             "background",
             "output_format",
             "overlap_method",
+            "layout",
         )
     ]
 
@@ -120,7 +121,7 @@ def bind_session_api(dll: ctypes.CDLL) -> None:
         function = getattr(dll, name)
         function.argtypes = args
         function.restype = result
-    if dll.umzi_abi_version() not in (1, 2):
+    if dll.umzi_abi_version() not in (1, 2, 3):
         raise OSError("Unsupported Umzi native ABI version")
     for name in ("umzi_session_run_tiled", "umzi_session_run_tiled_variable"):
         tiled = getattr(dll, name, None)
