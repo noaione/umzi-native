@@ -366,4 +366,76 @@ inline float time_cudnn_backend_plan(cudnnHandle_t cudnn, CUstream stream, const
     if (!(first < 2.f * best)) return first;
     return measure(5);
 }
+// Finalize a cuDNN execution plan directly from serialized JSON without building
+// a heuristic candidate list. Returns nullptr when invalid or exceeding `limit`.
+inline std::unique_ptr<CudnnDescriptor> finalize_cudnn_plan_json(cudnnHandle_t cudnn, std::string_view json,
+                                                                 uint64_t limit, size_t& workspace_out) {
+    if (json.empty() || json.find('\0') != std::string_view::npos) return {};
+    try {
+        std::string buffer(json);
+        buffer.push_back('\0');
+        auto plan = std::make_unique<CudnnDescriptor>(CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR);
+        plan->set(CUDNN_ATTR_EXECUTION_PLAN_HANDLE, CUDNN_TYPE_HANDLE, &cudnn);
+        plan->set(CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION, CUDNN_TYPE_CHAR, buffer.data(),
+                  int64_t(buffer.size()));
+        plan->finalize();
+        int64_t bytes = 0, count = 0;
+        check(cudnnBackendGetAttribute(plan->get(), CUDNN_ATTR_EXECUTION_PLAN_WORKSPACE_SIZE, CUDNN_TYPE_INT64, 1,
+                                       &count, &bytes),
+              "cudnnBackendGetAttribute");
+        if (count != 1 || bytes < 0 || uint64_t(bytes) > limit) return {};
+        workspace_out = size_t(bytes);
+        return plan;
+    } catch (const std::exception&) {
+        return {};
+    }
+}
+
+// Restore a cached execution plan from JSON and validate it with one execution.
+inline std::unique_ptr<CudnnDescriptor> restore_cudnn_plan_json(cudnnHandle_t cudnn, CUstream stream,
+                                                                std::string_view json, uint64_t expected_workspace,
+                                                                uint64_t limit, CUdeviceptr in_buf,
+                                                                CUdeviceptr weight_buf, CUdeviceptr out_buf,
+                                                                CUdeviceptr& scratch, size_t& scratch_bytes,
+                                                                size_t* peak_bytes = nullptr,
+                                                                uint64_t* peak_device_used = nullptr,
+                                                                CUdeviceptr bias = 0) {
+    if (expected_workspace > limit) return {};
+    size_t workspace = 0;
+    auto plan = finalize_cudnn_plan_json(cudnn, json, limit, workspace);
+    if (!plan || uint64_t(workspace) != expected_workspace) return {};
+    if (!run_cudnn_backend_plan(cudnn, stream, *plan, workspace, in_buf, weight_buf, out_buf, scratch, scratch_bytes,
+                                peak_bytes, peak_device_used, bias))
+        return {};
+    return plan;
+}
+
+// Time candidate execution plans in `candidates` and assign the fastest valid plan to `selected`.
+// Returns false if no candidate executed within VRAM constraints.
+inline bool select_fastest_cudnn_plan(cudnnHandle_t cudnn, CUstream stream, const std::array<CUevent, 2>& timing,
+                                      std::vector<CudnnCandidate>& candidates, CudnnBackendPlan& selected,
+                                      CUdeviceptr in_buf, CUdeviceptr weight_buf, CUdeviceptr out_buf,
+                                      CUdeviceptr& scratch, size_t& scratch_bytes, size_t* peak_bytes = nullptr,
+                                      uint64_t* peak_device_used = nullptr, CUdeviceptr bias = 0,
+                                      float* best_ms_out = nullptr) {
+    float best = std::numeric_limits<float>::infinity();
+    size_t fastest = candidates.size();
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        selected.plan = std::move(candidates[i].plan);
+        selected.workspace = size_t(candidates[i].workspace);
+        const float elapsed = time_cudnn_backend_plan(cudnn, stream, timing, selected, in_buf, weight_buf, out_buf,
+                                                      scratch, scratch_bytes, best, peak_bytes, peak_device_used, bias);
+        candidates[i].plan = std::move(selected.plan);
+        if (elapsed < best) {
+            best = elapsed;
+            fastest = i;
+        }
+    }
+    if (fastest >= candidates.size()) return false;
+    selected.plan = std::move(candidates[fastest].plan);
+    selected.workspace = size_t(candidates[fastest].workspace);
+    if (best_ms_out) *best_ms_out = best;
+    return true;
+}
+
 } // namespace umzi

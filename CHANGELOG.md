@@ -5,13 +5,15 @@
 ### Added
 
 - **MoSR** native CUDA support (`fp32`, `mixed`, `fp16`) for `mosr`, `mosr-l`, and `mosr-t` (`gps` and `dys` DySample tails), including `MoSRModel` inspection, plan caching (`mosr_*.umplan`), and `fused_gate`, `dw_fp16`, `fold_gps`, and `workspace_mib` kernel options.
-- **SMoSR** disk plan caching for tuned unfused body convolutions (`smosr-conv_*.umplan` alongside `smosr-silu_*.umplan`).
+- **SMoSR** and **FiGSR** disk plan caching for tuned convolutions (`smosr-conv_*.umplan` alongside `smosr-silu_*.umplan`, and `figsr_*.umplan` when `tune_convolutions=1`).
 - Pre-allocation shape memory estimation (ABI 4): `umzi_session_estimate_memory()` / `UmziMemoryInfo` in the C ABI and `InferenceSession.estimate_memory()` in Python, reporting weights, activations, workspace upper bound, staging I/O, and available device VRAM without allocating GPU buffers or tuning plans (using `cufftEstimateMany` for cuFFT models).
 - VRAM-budgeted tiling helpers in Python: `whole_page_tile()`, `InferenceSession.estimate_tiled_memory()`, and `InferenceSession.fit_tile_size()`.
 
 ### Changed
 
-- Improved **SMoSR** cold and warm plan setup (`native/kernels/smosr/`, `native/common/cudnn_conv_plan.h`): cached tuned unfused `48→48`/`48→96` plans alongside `fuse_silu`, skipped fallback heuristics when heuristic A yields candidates, and capped `48→96` tuning to top 4 candidates—cutting `1600×2176` FP16 setup from `70.0s` → `31.4s` cold and `35.2s` → `0.86s` warm (`34.5s → 97.5 ms` `plans`) while preserving `~391 ms/tile` warm throughput.
+- Eliminated cold and warm cuDNN tuning bottlenecks across **MoSR**, **GFISRv2**, **MoESR**, **SMoSR**, and **FiGSR** (`native/common/cuda_plan_cache.h`, `native/common/cudnn_conv_plan.h`):
+  - Stored serialized cuDNN execution plan JSON in `CudaPlanCache` (`StoreJson=true`) so warm `cache_dir` hits finalize and verify the cached plan directly instead of enumerating/finalizing up to 128 heuristic candidates (`mosr` `2491.5 → 18.4 ms`, `gfisrv2` `2198.1 → 145.8 ms`, `moesr` `1614.8 → 11.8 ms`, `figsr` `2645.8 → 155.2 ms`, `smosr` `1600×2176` `34.5s → 92–107 ms` warm `plans`).
+  - Stopped before `CUDNN_HEUR_MODE_FALLBACK` when heuristic A yields valid plans (plus `48→96` top-4 cap in **SMoSR**), cutting cold setup by `2.2×–8.5×` with full warm throughput intact.
 - Optimized **MoSR** (`native/kernels/mosr/`): Tensor Core fused gating (`dim=64/hidden=96` and `dim=48/hidden=72`), `16×32` planar depthwise gating with packed `half2` math (`dw_fp16=1`), and shrunken activation scratch—running `1.8×–2.6×` faster than TensorRT-RTX FP16 across `mosr`, `mosr-l`, and `mosr-t` with higher PSNR and `137–296 MiB` lower peak VRAM (`docs/handoff-mosr.md`).
 - Consistent pre-allocation free-VRAM checks (`require_device_memory` / `allocate_device_checked`) across all kernel families, `PageTiler` arena allocations, and `ensure_device_scratch()` during cuDNN plan tuning, raising `AllocationError` (`MemoryError`) cleanly instead of spilling into shared system RAM.
 - NVML-aware device free-VRAM reporting (`device_vram_info` dynamically loading `nvml.dll` / `libnvidia-ml.so.1` and matching the CUDA device by UUID) so Windows WDDM cross-process VRAM usage is accounted for when available, falling back to `cuMemGetInfo` otherwise.

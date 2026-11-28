@@ -42,7 +42,7 @@ constexpr int fused_shared_reduced_f32 = (halo_halves + 3 * 96 * 32) * 2;
 constexpr int project_shared_bytes = (2 * 324 * 16 + 2 * 3 * 64 * 16) * 2;
 constexpr uint64_t default_workspace_mib = 512, max_workspace_mib = 4096;
 // Bump when plan keys, descriptor semantics, or the choice format change.
-constexpr uint32_t plan_schema = 6;
+constexpr uint32_t plan_schema = 7;
 constexpr std::array<uint32_t, 10> configuration{3, 3, scale, 2, channels, 9, 4, 3, full_hidden, reduced_hidden};
 using umzi::Clock;
 using umzi::ContextScope;
@@ -345,7 +345,7 @@ class Session final : public umzi::KernelSession {
     // ConvChoice.math value marking a backend-plan record (index into the
     // deduplicated candidate list) rather than a legacy algorithm.
     static constexpr uint32_t saved_plan_marker = 0x4d42;
-    umzi::CudaPlanCache<umzi::moesr_id, plan_schema> plan_cache;
+    umzi::CudaPlanCache<umzi::moesr_id, plan_schema, true> plan_cache;
     std::filesystem::path cache_dir;
     umzi::Digest cache_environment{}, plan_key{};
     std::string cache_environment_error;
@@ -563,56 +563,39 @@ private:
     void make_plan(int h, int w, int cin, int cout) {
         auto plan = std::make_unique<umzi::CudnnBackendPlan>();
         auto& p = *plan;
-        // Mixed accumulates in FP32. FP16 mode accumulates in FP16, which the
-        // backend engines run about 1.4x faster on Ampere.
-        p.graph = std::make_unique<umzi::CudnnConvGraph>(cudnn, padded.n, h, w, cin, cout, accumulate_fp16);
-        auto candidates = p.graph->candidates(cudnn, workspace_limit);
         const umzi::PlanShape key{padded.n, h, w, cin, cout};
-        auto time_candidate = [&](float best) {
-            return umzi::time_cudnn_backend_plan(cudnn, stream, timing, p, gated, weights, projected, scratch,
-                                                 scratch_bytes, best, &peak_workspace_bytes, &device_used[1]);
-        };
-        if (auto saved = plan_cache.convolutions.find(key); saved != plan_cache.convolutions.end()) {
+        if (auto saved = plan_cache.json_plans.find(key); saved != plan_cache.json_plans.end()) {
             const auto& choice = saved->second;
-            if (choice.math == saved_plan_marker && choice.algorithm < candidates.size()
-                && uint64_t(candidates[choice.algorithm].workspace) == choice.workspace) {
-                auto& candidate = candidates[choice.algorithm];
-                p.plan = std::move(candidate.plan);
-                p.workspace = size_t(candidate.workspace);
-                // One run proves the saved plan executes before it is trusted.
-                if (time_candidate(0.f) < std::numeric_limits<float>::infinity()) {
+            if (choice.math == saved_plan_marker) {
+                p.plan = umzi::restore_cudnn_plan_json(cudnn, stream, choice.json, choice.workspace, workspace_limit,
+                                                       gated, weights, projected, scratch, scratch_bytes,
+                                                       &peak_workspace_bytes, &device_used[1]);
+                if (p.plan) {
+                    p.workspace = size_t(choice.workspace);
                     workspace_bytes = std::max(workspace_bytes, p.workspace);
                     plans.emplace(key, std::move(plan));
                     return;
                 }
-                p.plan.reset();
             }
         }
+        // Mixed accumulates in FP32. FP16 mode accumulates in FP16, which the
+        // backend engines run about 1.4x faster on Ampere.
+        p.graph = std::make_unique<umzi::CudnnConvGraph>(cudnn, padded.n, h, w, cin, cout, accumulate_fp16);
+        auto candidates = p.graph->candidates_matching(
+            cudnn, workspace_limit, 0, [](const umzi::CudnnDescriptor&, int64_t) { return true; },
+            /*stop_before_fallback=*/true);
         plan_cache.record_tuning();
-        // Heuristic order is not reliable for these shapes, so time every engine
-        // configuration that fits the workspace on the real buffers. gated holds
-        // at least cin features per pixel and projected at least cout.
-        float best = std::numeric_limits<float>::infinity();
-        size_t fastest = candidates.size();
-        for (size_t i = 0; i < candidates.size(); ++i) {
-            p.plan = std::move(candidates[i].plan);
-            p.workspace = size_t(candidates[i].workspace);
-            const float elapsed = time_candidate(best);
-            candidates[i].plan = std::move(p.plan);
-            if (elapsed < best) {
-                best = elapsed;
-                fastest = i;
-            }
-        }
-        if (fastest == candidates.size())
+        // Heuristic order is not reliable for these shapes, so time heuristic A
+        // engines that fit the workspace on the real buffers.
+        if (!umzi::select_fastest_cudnn_plan(cudnn, stream, timing, candidates, p, gated, weights, projected, scratch,
+                                             scratch_bytes, &peak_workspace_bytes, &device_used[1]))
             throw std::runtime_error("No cuDNN convolution for MoESR " + std::to_string(cin) + " to "
                                      + std::to_string(cout) + " channels within the workspace limit");
-        p.plan = std::move(candidates[fastest].plan);
-        p.workspace = size_t(candidates[fastest].workspace);
         workspace_bytes = std::max(workspace_bytes, p.workspace);
         ++timed_plans;
-        plan_cache.convolutions.insert_or_assign(key,
-                                                 umzi::ConvChoice{uint32_t(fastest), saved_plan_marker, p.workspace});
+        if (auto json = umzi::CudnnConvGraph::plan_json(*p.plan); !json.empty())
+            plan_cache.json_plans.insert_or_assign(
+                key, umzi::JsonPlanChoice{saved_plan_marker, p.workspace, std::move(json)});
         plans.emplace(key, std::move(plan));
     }
 

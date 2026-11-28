@@ -1,3 +1,4 @@
+#include "../../common/cuda_plan_cache.h"
 #include "../../runtime/binary.h"
 #include "../../runtime/kernel.h"
 #include "cudnn_conv_plan.h"
@@ -16,6 +17,8 @@ using umzi::ContextScope;
 constexpr int scale = 2, border = 4, features = 32, hidden = 80, fourier = 8, group_blocks = 12;
 constexpr int compact_expansion = 7 * fourier;
 constexpr int r2c = 0x2a, c2r = 0x2c;
+constexpr uint32_t plan_schema = 1;
+constexpr uint32_t saved_plan_marker = 0x4647;
 constexpr std::array<uint32_t, 11> configuration{3, 3, scale, border, 2, features, group_blocks, hidden, fourier, 13, 17};
 
 void check_fft(int status, const char* operation) {
@@ -191,6 +194,10 @@ class Session final : public umzi::KernelSession {
     int32_t timed_candidates = 0, changed_plans = 0;
     std::array<double, 4> setup_ms{};
     std::array<uint64_t, 4> device_used{};
+    std::filesystem::path cache_dir;
+    umzi::Digest cache_environment{}, plan_key{};
+    std::string cache_environment_error;
+    umzi::CudaPlanCache<umzi::figsr_id, plan_schema, true> plan_cache;
     using PlanKey = std::array<int, 7>;
     std::map<PlanKey, umzi::CudnnBackendPlan> plans;
     std::map<std::array<CUdeviceptr, 3>, std::unique_ptr<umzi::CudnnDescriptor>> variants;
@@ -233,6 +240,7 @@ class Session final : public umzi::KernelSession {
         executable = nullptr;
         variants.clear();
         plans.clear();
+        plan_cache = {};
         for (size_t i = 0; i < fft_plans.size(); ++i) {
             if (fft_created[i]) fft->destroy(fft_plans[i]);
             fft_created[i] = false;
@@ -280,9 +288,29 @@ class Session final : public umzi::KernelSession {
         return {shape.h, shape.w, filter.cin, filter.cout, filter.kh, filter.kw, filter.groups};
     }
 
-    void prepare_conv(Shape shape, const Filter& filter, size_t limit) {
+    static umzi::PlanShape cache_shape_key(Shape shape, const Filter& filter) {
+        return {shape.h, shape.w, filter.cin, filter.cout, filter.kh * 256 + filter.kw};
+    }
+
+    void prepare_conv(Shape shape, const Filter& filter, size_t limit, bool allow_cache = true) {
         const auto index = key(shape, filter);
         if (plans.find(index) != plans.end()) return;
+        if (allow_cache && tune_convolutions) {
+            if (auto saved = plan_cache.json_plans.find(cache_shape_key(shape, filter));
+                saved != plan_cache.json_plans.end()) {
+                const auto& choice = saved->second;
+                if (choice.math == saved_plan_marker && choice.workspace <= limit) {
+                    umzi::CudnnBackendPlan selected;
+                    if (auto restored = umzi::finalize_cudnn_plan_json(cudnn, choice.json, limit, selected.workspace);
+                        restored && selected.workspace == choice.workspace) {
+                        selected.plan = std::move(restored);
+                        conv_bytes = std::max(conv_bytes, selected.workspace);
+                        plans.emplace(index, std::move(selected));
+                        return;
+                    }
+                }
+            }
+        }
         const auto& body = net.blocks.front();
         const auto layout = fp32_nchw && (&filter == &body.expand || &filter == &body.project)
             ? CUDNN_TENSOR_NCHW : CUDNN_TENSOR_NHWC;
@@ -319,35 +347,57 @@ class Session final : public umzi::KernelSession {
         CHECK(cudnnBackendExecute(cudnn, plans.at(key(grid, filter)).plan->get(), bound->second->get()));
     }
 
-    void tune_conv(Shape padded, const Filter& filter, Buffer input, Buffer output) {
+    void tune_conv(Shape padded, const Filter& filter, Buffer input, Buffer output, size_t cap) {
         auto& selected = plans.at(key(padded, filter));
-        auto candidates = selected.graph->candidates(cudnn, conv_bytes);
-        if (candidates.size() < 2) return;
         CHECK(cuMemsetD8Async(buffers[input], 0, size_t(padded.pixels()) * filter.cin * element_bytes(), stream));
-        const auto elapsed = [&](const umzi::CudnnBackendPlan& plan, float best) {
-            ++timed_candidates;
-            // Pass the member size so it stays in step with conv_workspace if the scratch is ever regrown.
-            return umzi::time_cudnn_backend_plan(cudnn, stream, tuning_events, plan, buffers[input],
-                weights + filter.weight, buffers[output], conv_workspace, conv_bytes, best);
-        };
-        const auto control = elapsed(selected, std::numeric_limits<float>::infinity());
-        float fastest = control;
-        umzi::CudnnBackendPlan winner;
-        for (auto& candidate : candidates) {
-            umzi::CudnnBackendPlan trial;
-            trial.plan = std::move(candidate.plan);
-            trial.workspace = size_t(candidate.workspace);
-            const auto elapsed_ms = elapsed(trial, fastest);
-            if (elapsed_ms < fastest) {
-                fastest = elapsed_ms;
-                winner = std::move(trial);
+        if (!selected.graph) {
+            if (umzi::run_cudnn_backend_plan(cudnn, stream, *selected.plan, selected.workspace, buffers[input],
+                                             weights + filter.weight, buffers[output], conv_workspace, conv_bytes))
+                return;
+            plans.erase(key(padded, filter));
+            size_t allocated_bytes = conv_bytes;
+            prepare_conv(padded, filter, cap, /*allow_cache=*/false);
+            if (conv_bytes > allocated_bytes || (conv_bytes && !conv_workspace)) {
+                if (!umzi::ensure_device_scratch(stream, conv_workspace, allocated_bytes, conv_bytes))
+                    throw umzi::AllocationError("FiGSR cuDNN workspace: CUDA out of memory");
+                conv_bytes = allocated_bytes;
             }
         }
-        if (winner.plan && fastest < 0.97f * control) {
-            selected.plan = std::move(winner.plan);
-            selected.workspace = winner.workspace;
-            ++changed_plans;
+        auto& active = plans.at(key(padded, filter));
+        plan_cache.record_tuning();
+        auto candidates = active.graph->candidates_matching(
+            cudnn, conv_bytes, 0, [](const umzi::CudnnDescriptor&, int64_t) { return true; },
+            /*stop_before_fallback=*/true);
+        if (candidates.size() >= 2) {
+            const auto elapsed = [&](const umzi::CudnnBackendPlan& plan, float best) {
+                ++timed_candidates;
+                // Pass the member size so it stays in step with conv_workspace if the scratch is ever regrown.
+                return umzi::time_cudnn_backend_plan(cudnn, stream, tuning_events, plan, buffers[input],
+                    weights + filter.weight, buffers[output], conv_workspace, conv_bytes, best);
+            };
+            const auto control = elapsed(active, std::numeric_limits<float>::infinity());
+            float fastest = control;
+            umzi::CudnnBackendPlan winner;
+            for (auto& candidate : candidates) {
+                umzi::CudnnBackendPlan trial;
+                trial.plan = std::move(candidate.plan);
+                trial.workspace = size_t(candidate.workspace);
+                const auto elapsed_ms = elapsed(trial, fastest);
+                if (elapsed_ms < fastest) {
+                    fastest = elapsed_ms;
+                    winner = std::move(trial);
+                }
+            }
+            if (winner.plan && fastest < 0.97f * control) {
+                active.plan = std::move(winner.plan);
+                active.workspace = winner.workspace;
+                ++changed_plans;
+            }
         }
+        if (auto json = umzi::CudnnConvGraph::plan_json(*active.plan); !json.empty())
+            plan_cache.json_plans.insert_or_assign(
+                cache_shape_key(padded, filter),
+                umzi::JsonPlanChoice{saved_plan_marker, active.workspace, std::move(json)});
     }
 
     template<class... Args>
@@ -509,6 +559,7 @@ class Session final : public umzi::KernelSession {
             setup_ms[0] = umzi::elapsed_ms(start);
 
             start = umzi::Clock::now();
+            if (tune_convolutions) load_plan_cache(requested);
             prepare_fft(padded);
             bind_stream(stream);
             const size_t available = umzi::device_vram_info(device).free_bytes;
@@ -522,10 +573,11 @@ class Session final : public umzi::KernelSession {
             prepare_conv(frequency, block.fdc, cap);
             if (conv_bytes) umzi::allocate_device_checked(conv_workspace, conv_bytes, "FiGSR cuDNN workspace", device);
             if (tune_convolutions) {
-                if (!fuse_expand_gate) tune_conv(padded, block.expand, Normalized, Expanded);
-                tune_conv(padded, block.project, Values, Normalized);
+                if (!fuse_expand_gate) tune_conv(padded, block.expand, Normalized, Expanded, cap);
+                tune_conv(padded, block.project, Values, Normalized, cap);
                 for (const auto* filter : {&block.square, &block.row, &block.column})
-                    if (!fuse_row_gate || filter != &block.row) tune_conv(padded, *filter, Spectral, Fourier);
+                    if (!fuse_row_gate || filter != &block.row) tune_conv(padded, *filter, Spectral, Fourier, cap);
+                plan_cache.save(plan_key);
             }
             device_used[2] = umzi::device_used_bytes();
             setup_ms[1] = umzi::elapsed_ms(start);
@@ -637,7 +689,7 @@ public:
         ContextScope scope(context);
         fft = std::make_shared<umzi::CufftApi>();
         shared->fft = fft;
-        umzi::load_kernel_module(device, module, figsr_images::embedded_cubins, figsr_images::embedded_ptx);
+        const auto& image = umzi::load_kernel_module(device, module, figsr_images::embedded_cubins, figsr_images::embedded_ptx);
         shared->module = module;
         for (size_t i = 0; i < names.size(); ++i) CHECK(cuModuleGetFunction(&functions[i], module, names[i]));
         CHECK(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
@@ -656,6 +708,35 @@ public:
         } else {
             const auto packed = net.half_weights(Network{}, data);
             CHECK(cuMemcpyHtoD(weights, packed.data(), packed.size()));
+        }
+        if (tune_convolutions) initialize_cache(options.cache_dir, package.digest, image);
+    }
+
+    void initialize_cache(const char* directory, const umzi::Digest& model_digest, const umzi::KernelImage& image) {
+        if (!directory || !*directory) return;
+        try {
+            cache_dir = std::filesystem::u8path(directory);
+            umzi::Sha256 hash;
+            umzi::hash_plan_environment(hash, umzi::figsr_id, plan_schema, model_digest, image, device);
+            hash.add(std::array<int, 6>{int(fp32), int(fp16), int(fp32_nchw), int(fp16_expand_accumulation),
+                                        int(fuse_row_gate), int(fuse_expand_gate)});
+            cache_environment = hash.finish();
+        } catch (const std::exception& error) {
+            cache_environment_error = error.what();
+        }
+    }
+
+    void load_plan_cache(Shape requested) {
+        try {
+            if (!cache_environment_error.empty()) throw std::runtime_error(cache_environment_error);
+            if (cache_dir.empty()) return;
+            umzi::Sha256 hash;
+            hash.add(cache_environment);
+            hash.add(std::array<int, 3>{requested.n, requested.h, requested.w});
+            plan_key = hash.finish();
+            plan_cache.open(cache_dir, "figsr", plan_key);
+        } catch (const std::exception& error) {
+            plan_cache.unavailable(error);
         }
     }
 
@@ -688,6 +769,9 @@ public:
         copy->fp16_expand_accumulation = fp16_expand_accumulation;
         copy->fuse_row_gate = fuse_row_gate;
         copy->fuse_expand_gate = fuse_expand_gate;
+        copy->cache_dir = cache_dir;
+        copy->cache_environment = cache_environment;
+        copy->cache_environment_error = cache_environment_error;
         copy->device = device;
         copy->context = context;
         copy->module = module;
@@ -802,9 +886,12 @@ public:
         throw std::runtime_error("Invalid FiGSR diagnostic index");
     }
 
+    const char* cache_message() const override { return plan_cache.diagnostic.c_str(); }
+
     UmziSessionInfo session_info() const override {
         UmziSessionInfo info{};
         info.struct_size = sizeof(info);
+        info.cache_status = tune_convolutions ? plan_cache.status : UMZI_CACHE_DISABLED;
         info.buffer_bytes[0] = net.bytes;
         if (shape.n) {
             info.prepared_input = shape.padded().nchw();

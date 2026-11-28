@@ -27,7 +27,7 @@ namespace {
 constexpr int rgb_lanes = 8, threads = 256;
 constexpr int lanes(int count) { return (count + 7) & ~7; }
 constexpr uint64_t default_workspace_mib = 512, max_workspace_mib = 4096;
-constexpr uint32_t plan_schema = 4;
+constexpr uint32_t plan_schema = 5;
 using umzi::Clock;
 using umzi::ContextScope;
 #define CHECK(expr) umzi::check((expr), #expr)
@@ -481,8 +481,8 @@ class Session final : public umzi::KernelSession {
     CUgraphExec executable = nullptr;
     std::map<umzi::PlanShape, std::unique_ptr<umzi::CudnnBackendPlan>> plans;
     std::map<std::array<CUdeviceptr, 4>, std::unique_ptr<umzi::CudnnDescriptor>> variants;
-    static constexpr uint32_t saved_plan_marker = 0x4d4f;
-    umzi::CudaPlanCache<umzi::mosr_id, plan_schema> plan_cache;
+    static constexpr uint32_t saved_plan_marker = 0x4d4f, saved_fallback_marker = 0x4d46;
+    umzi::CudaPlanCache<umzi::mosr_id, plan_schema, true> plan_cache;
     std::filesystem::path cache_dir;
     umzi::Digest cache_environment{}, plan_key{};
     std::string cache_environment_error;
@@ -732,60 +732,49 @@ private:
         if (plans.count(key)) return;
         auto plan = std::make_unique<umzi::CudnnBackendPlan>();
         auto& p = *plan;
+        if (auto saved = plan_cache.json_plans.find(key); saved != plan_cache.json_plans.end()) {
+            const auto& choice = saved->second;
+            if (choice.math == saved_plan_marker || (fp16 && choice.math == saved_fallback_marker)) {
+                p.plan = umzi::restore_cudnn_plan_json(cudnn, stream, choice.json, choice.workspace, workspace_limit,
+                                                       in_buf, weights, out_buf, scratch, scratch_bytes,
+                                                       &peak_workspace_bytes, &device_used[1]);
+                if (p.plan) {
+                    p.workspace = size_t(choice.workspace);
+                    if (choice.math == saved_fallback_marker) ++fp16_fallback_plans;
+                    workspace_bytes = std::max(workspace_bytes, p.workspace);
+                    plans.emplace(key, std::move(plan));
+                    return;
+                }
+            }
+        }
         const auto io_type = fp32 ? CUDNN_DATA_FLOAT : CUDNN_DATA_HALF;
         const auto layout = fp32 ? CUDNN_TENSOR_NCHW : CUDNN_TENSOR_NHWC;
         bool half_compute = fp16;
         p.graph = std::make_unique<umzi::CudnnConvGraph>(cudnn, shape.n, h, w, cin, cout, k, io_type, half_compute,
                                                          layout);
-        auto candidates = p.graph->candidates(cudnn, workspace_limit);
+        auto candidates = p.graph->candidates_matching(
+            cudnn, workspace_limit, 0, [](const umzi::CudnnDescriptor&, int64_t) { return true; },
+            /*stop_before_fallback=*/true);
         if (candidates.empty() && half_compute) {
             half_compute = false;
             p.graph = std::make_unique<umzi::CudnnConvGraph>(cudnn, shape.n, h, w, cin, cout, k, io_type, false, layout);
-            candidates = p.graph->candidates(cudnn, workspace_limit);
+            candidates = p.graph->candidates_matching(
+                cudnn, workspace_limit, 0, [](const umzi::CudnnDescriptor&, int64_t) { return true; },
+                /*stop_before_fallback=*/true);
             ++fp16_fallback_plans;
         }
-        auto time_candidate = [&](float best) {
-            return umzi::time_cudnn_backend_plan(cudnn, stream, timing, p, in_buf, weights, out_buf, scratch,
-                                                 scratch_bytes, best, &peak_workspace_bytes, &device_used[1]);
-        };
-        if (auto saved = plan_cache.convolutions.find(key); saved != plan_cache.convolutions.end()) {
-            const auto& choice = saved->second;
-            if (choice.math == saved_plan_marker && choice.algorithm < candidates.size()
-                && uint64_t(candidates[choice.algorithm].workspace) == choice.workspace) {
-                auto& candidate = candidates[choice.algorithm];
-                p.plan = std::move(candidate.plan);
-                p.workspace = size_t(candidate.workspace);
-                if (time_candidate(0.f) < std::numeric_limits<float>::infinity()) {
-                    workspace_bytes = std::max(workspace_bytes, p.workspace);
-                    plans.emplace(key, std::move(plan));
-                    return;
-                }
-                p.plan.reset();
-            }
-        }
         plan_cache.record_tuning();
-        float best = std::numeric_limits<float>::infinity();
-        size_t fastest = candidates.size();
-        for (size_t i = 0; i < candidates.size(); ++i) {
-            p.plan = std::move(candidates[i].plan);
-            p.workspace = size_t(candidates[i].workspace);
-            const float elapsed = time_candidate(best);
-            candidates[i].plan = std::move(p.plan);
-            if (elapsed < best) {
-                best = elapsed;
-                fastest = i;
-            }
-        }
-        if (fastest == candidates.size())
+        if (!umzi::select_fastest_cudnn_plan(cudnn, stream, timing, candidates, p, in_buf, weights, out_buf, scratch,
+                                             scratch_bytes, &peak_workspace_bytes, &device_used[1]))
             throw std::runtime_error("No cuDNN convolution for MoSR " + std::to_string(cin) + " to "
                                      + std::to_string(cout) + " (" + std::to_string(k) + "x" + std::to_string(k)
                                      + ") within the workspace limit");
-        p.plan = std::move(candidates[fastest].plan);
-        p.workspace = size_t(candidates[fastest].workspace);
         workspace_bytes = std::max(workspace_bytes, p.workspace);
         ++timed_plans;
-        plan_cache.convolutions.insert_or_assign(key,
-                                                 umzi::ConvChoice{uint32_t(fastest), saved_plan_marker, p.workspace});
+        if (auto json = umzi::CudnnConvGraph::plan_json(*p.plan); !json.empty()) {
+            const uint32_t marker = half_compute == fp16 ? saved_plan_marker : saved_fallback_marker;
+            plan_cache.json_plans.insert_or_assign(key, umzi::JsonPlanChoice{marker, p.workspace, std::move(json)});
+        }
         plans.emplace(key, std::move(plan));
     }
 

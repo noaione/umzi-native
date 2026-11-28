@@ -105,7 +105,7 @@ Pass a `umzi.SessionOptions(...)` instance to `InferenceSession` to configure pr
 | --- | --- | --- |
 | `precision` | `"mixed"` | `"mixed"` (FP32 NumPy I/O, half-precision weights/ops where supported), `"fp16"` (FP16 NumPy I/O), or `"fp32"` (GFISRv2, SMoSR, and FiGSR only). |
 | `device_id` | `0` | CUDA GPU index to use (respects `CUDA_VISIBLE_DEVICES`). |
-| `cache_dir` | `None` | Writable directory for saving tuned GPU algorithm choices (`.umplan` files) so subsequent runs skip tuning. Used by GateRV3, GateRV2, MoESR, MoSR, GFISRv2 (`mixed`/`fp16`), and SMoSR (`fuse_silu=1` or `tune_convolutions=1`). CUDA Graphs are still captured per process. |
+| `cache_dir` | `None` | Writable directory for saving tuned GPU algorithm choices (`.umplan` files) so subsequent runs skip tuning. Used by GateRV3, GateRV2, MoESR, MoSR, GFISRv2 (`mixed`/`fp16`), SMoSR (`fuse_silu=1` or `tune_convolutions=1`), and FiGSR (`tune_convolutions=1`). CUDA Graphs are still captured per process. |
 | `enable_cuda_graph` | `True` | Captures the forward pass into a CUDA Graph and replays it to reduce CPU launch overhead. Set `False` to submit kernels directly. |
 | `kernel_options` | `{}` | Dictionary of `name: int` switches specific to the model family (see below). Unknown names or invalid values raise `RuntimeError`. |
 | `dll_path` | `None` | Explicit path to `umzi_native.dll` / `libumzi_native.so`. By default the loader checks the installed package directory, then the `.ummodel` file's directory. |
@@ -294,7 +294,7 @@ More detail: [SMoSR measurements](handoff-smosr.md).
 
 | Option | Default | Values | Precision scope | What it does |
 | --- | ---: | --- | --- | --- |
-| `tune_convolutions` | `0` | `0` or `1` | All | `0` uses cuDNN heuristic plans; `1` times eligible plans during `prepare()`, adding setup time and potentially altering rounding. |
+| `tune_convolutions` | `0` | `0` or `1` | All | `0` uses cuDNN heuristic plans; `1` times eligible heuristic-A plans during `prepare()` and caches selections under `cache_dir` (`figsr_<key>.umplan`), adding cold setup time and potentially altering rounding. |
 | `fp32_nchw` | `0` | `0` or `1` | `"fp32"` only | Uses NCHW layout instead of NHWC for block expansion and projection. |
 | `fp16_expand_accumulation` | `0` | `0` or `1` | `"mixed"` only | Uses FP16 accumulation in block expansion (lower latency, lower PSNR vs. FP32). |
 | `fuse_row_gate` | `0` | `0` or `1` | `"mixed"` only | Fuses the 1×17 convolution and spatial gate with FP32 accumulation. |

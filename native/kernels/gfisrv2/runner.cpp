@@ -32,7 +32,7 @@ constexpr int rgb_lanes = 8, freq_lanes = 64;
 constexpr int expand_shared_bytes = (2 * 324 * 16 + 2 * 3 * 64 * 16) * 2; // 33,024 B
 constexpr int project_shared_bytes = (2 * 324 * 16 + 2 * 3 * 48 * 16) * 2; // 29,952 B
 constexpr uint64_t default_workspace_mib = 512, max_workspace_mib = 4096;
-constexpr uint32_t plan_schema = 5;
+constexpr uint32_t plan_schema = 6;
 constexpr uint32_t saved_plan_marker = 0x4742;
 constexpr std::array<uint32_t, 7> configuration{3, 3, scale, channels, blocks, hidden, fourier};
 constexpr int r2c = 0x2a, c2r = 0x2c;
@@ -492,7 +492,7 @@ class Session final : public umzi::KernelSession {
     std::map<LegacyKey, std::unique_ptr<LegacyConvolution>> legacy_plans;
     std::map<umzi::PlanShape, std::unique_ptr<umzi::CudnnBackendPlan>> backend_plans;
     std::map<std::array<CUdeviceptr, 4>, std::unique_ptr<umzi::CudnnDescriptor>> variants;
-    umzi::CudaPlanCache<umzi::gfisrv2_id, plan_schema> plan_cache;
+    umzi::CudaPlanCache<umzi::gfisrv2_id, plan_schema, true> plan_cache;
     std::filesystem::path cache_dir;
     umzi::Digest cache_environment{}, plan_key{};
     std::string cache_environment_error;
@@ -810,51 +810,35 @@ private:
                            CUdeviceptr in_buf, CUdeviceptr out_buf) {
         auto plan = std::make_unique<umzi::CudnnBackendPlan>();
         auto& p = *plan;
-        p.graph = std::make_unique<umzi::CudnnConvGraph>(cudnn, shape.n, h, w, cin, cout, k, io_type, fp16_compute);
-        auto candidates = p.graph->candidates(cudnn, workspace_limit);
         const umzi::PlanShape key{shape.n, h, w, cin, cout};
-        auto time_candidate = [&](float best) {
-            return umzi::time_cudnn_backend_plan(cudnn, stream, timing, p, in_buf, weights, out_buf, cudnn_scratch,
-                                                 scratch_bytes, best, &peak_workspace_bytes, &device_used[1]);
-        };
-        if (auto saved = plan_cache.convolutions.find(key); saved != plan_cache.convolutions.end()) {
+        if (auto saved = plan_cache.json_plans.find(key); saved != plan_cache.json_plans.end()) {
             const auto& choice = saved->second;
-            if (choice.math == saved_plan_marker && choice.algorithm < candidates.size()
-                && uint64_t(candidates[choice.algorithm].workspace) == choice.workspace) {
-                auto& candidate = candidates[choice.algorithm];
-                p.plan = std::move(candidate.plan);
-                p.workspace = size_t(candidate.workspace);
-                if (time_candidate(0.f) < std::numeric_limits<float>::infinity()) {
+            if (choice.math == saved_plan_marker) {
+                p.plan = umzi::restore_cudnn_plan_json(cudnn, stream, choice.json, choice.workspace, workspace_limit,
+                                                       in_buf, weights, out_buf, cudnn_scratch, scratch_bytes,
+                                                       &peak_workspace_bytes, &device_used[1]);
+                if (p.plan) {
+                    p.workspace = size_t(choice.workspace);
                     cudnn_workspace = std::max(cudnn_workspace, p.workspace);
                     backend_plans.emplace(key, std::move(plan));
                     return;
                 }
-                // Give the plan back so the tuning loop below still sees every candidate.
-                candidate.plan = std::move(p.plan);
             }
         }
+        p.graph = std::make_unique<umzi::CudnnConvGraph>(cudnn, shape.n, h, w, cin, cout, k, io_type, fp16_compute);
+        auto candidates = p.graph->candidates_matching(
+            cudnn, workspace_limit, 0, [](const umzi::CudnnDescriptor&, int64_t) { return true; },
+            /*stop_before_fallback=*/true);
         plan_cache.record_tuning();
-        float best = std::numeric_limits<float>::infinity();
-        size_t fastest = candidates.size();
-        for (size_t i = 0; i < candidates.size(); ++i) {
-            p.plan = std::move(candidates[i].plan);
-            p.workspace = size_t(candidates[i].workspace);
-            const float elapsed = time_candidate(best);
-            candidates[i].plan = std::move(p.plan);
-            if (elapsed < best) {
-                best = elapsed;
-                fastest = i;
-            }
-        }
-        if (fastest == candidates.size())
+        if (!umzi::select_fastest_cudnn_plan(cudnn, stream, timing, candidates, p, in_buf, weights, out_buf,
+                                             cudnn_scratch, scratch_bytes, &peak_workspace_bytes, &device_used[1]))
             throw std::runtime_error("No cuDNN convolution for GFISRv2 " + std::to_string(cin) + " to "
                                      + std::to_string(cout) + " channels within the workspace limit");
-        p.plan = std::move(candidates[fastest].plan);
-        p.workspace = size_t(candidates[fastest].workspace);
         cudnn_workspace = std::max(cudnn_workspace, p.workspace);
         ++timed_plans;
-        plan_cache.convolutions.insert_or_assign(key,
-                                                 umzi::ConvChoice{uint32_t(fastest), saved_plan_marker, p.workspace});
+        if (auto json = umzi::CudnnConvGraph::plan_json(*p.plan); !json.empty())
+            plan_cache.json_plans.insert_or_assign(
+                key, umzi::JsonPlanChoice{saved_plan_marker, p.workspace, std::move(json)});
         backend_plans.emplace(key, std::move(plan));
     }
 
