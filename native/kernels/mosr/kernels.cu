@@ -899,12 +899,22 @@ __device__ __forceinline__ uint4 quad_transpose4(unsigned v0, unsigned v1, unsig
     return make_uint4(v0, v1, v2, v3);
 }
 
-template<bool HalfAccumulate>
-__device__ void mosr_expand_gate_impl(half* plain_gated, half* dw_v, half* dw_g, const half* norm_out,
+template<bool HalfAccumulate, int Dim, int Hidden>
+__device__ void mosr_expand_gate_impl(half* gated_planar, half* dw_v, half* dw_g, const half* norm_out,
                                       const half* packed_weight, const float* packed_bias, int h, int w, int tiles_x,
                                       int tiles_y, int total_pixels) {
+    constexpr int Plain = Hidden - Dim;
+    constexpr int PlainSlices = Plain / 8;
+    constexpr int DwSlices = Dim / 8;
+    constexpr int Cout = 2 * Hidden;
+    constexpr int KsSlices = Dim / 16;
+    constexpr int TotalSteps = KsSlices * 3;
+    constexpr int WarpNChannels = Cout / 3;
+    constexpr int JCount = WarpNChannels / 16;
+    constexpr int WarpNTiles = WarpNChannels / 8;
+
     constexpr int halo_cols = 18, halo_count = 180, a_slice_halves = halo_count * 16;
-    constexpr int b_tap_halves = 192 * 16, b_3tap_halves = 3 * b_tap_halves;
+    constexpr int b_tap_halves = Cout * 16, b_3tap_halves = 3 * b_tap_halves;
 
     half* const a_bufs = reinterpret_cast<half*>(mosr_smem);
     half* const b_bufs = a_bufs + 2 * a_slice_halves;
@@ -920,7 +930,7 @@ __device__ void mosr_expand_gate_impl(half* plain_gated, half* dw_v, half* dw_g,
             const int p = thread >> 1, chunk = thread & 1;
             const int py = y0 - 1 + p / halo_cols, px = x0 - 1 + p % halo_cols;
             const bool valid = unsigned(py) < unsigned(h) && unsigned(px) < unsigned(w);
-            const half* src = valid ? norm_out + ((size_t(image) * h + py) * w + px) * 64 + k_base + chunk * 8 : norm_out;
+            const half* src = valid ? norm_out + ((size_t(image) * h + py) * w + px) * Dim + k_base + chunk * 8 : norm_out;
             copy_async(dst + swizzle16(p, chunk), src, valid);
         }
     };
@@ -938,21 +948,21 @@ __device__ void mosr_expand_gate_impl(half* plain_gated, half* dw_v, half* dw_g,
     const int q = lane & 3;
     int step = 0;
 
-    Accumulator<HalfAccumulate> acc[2][8];
-    for (int ks = 0; ks < 4; ++ks) {
+    Accumulator<HalfAccumulate> acc[2][WarpNTiles];
+    for (int ks = 0; ks < KsSlices; ++ks) {
         const half* a_slice = a_bufs + (ks & 1) * a_slice_halves;
         for (int dy = 0; dy < 3; ++dy) {
             asm volatile("cp.async.wait_group 0;\n");
             __syncthreads();
             const int cb = step & 1;
-            if (step + 1 < 12) load_b3(step + 1, b_bufs + (cb ^ 1) * b_3tap_halves);
-            if (dy == 0 && ks + 1 < 4) load_a(ks + 1, a_bufs + ((ks + 1) & 1) * a_slice_halves);
-            if (step + 1 < 12) asm volatile("cp.async.commit_group;\n");
+            if (step + 1 < TotalSteps) load_b3(step + 1, b_bufs + (cb ^ 1) * b_3tap_halves);
+            if (dy == 0 && ks + 1 < KsSlices) load_a(ks + 1, a_bufs + ((ks + 1) & 1) * a_slice_halves);
+            if (step + 1 < TotalSteps) asm volatile("cp.async.commit_group;\n");
             const half* b3 = b_bufs + cb * b_3tap_halves;
             ++step;
 
             if constexpr (HalfAccumulate) {
-                unsigned a_frag[2][2][4], b_frag[2][4][4];
+                unsigned a_frag[2][2][4], b_frag[2][JCount][4];
                 auto load_dx = [&](int dx, int buf) {
                     const half* b_tile = b3 + dx * b_tap_halves;
 #pragma unroll
@@ -961,8 +971,8 @@ __device__ void mosr_expand_gate_impl(half* plain_gated, half* dw_v, half* dw_g,
                         load_matrix_x4(a_frag[buf][mt], a_slice + swizzle16(p, lane >> 4));
                     }
 #pragma unroll
-                    for (int j = 0; j < 4; ++j) {
-                        const int row = 64 * warp_n + 16 * j + (lane >> 4) * 8 + (lane & 7);
+                    for (int j = 0; j < JCount; ++j) {
+                        const int row = WarpNChannels * warp_n + 16 * j + (lane >> 4) * 8 + (lane & 7);
                         load_matrix_x4(b_frag[buf][j], b_tile + swizzle16(row, (lane >> 3) & 1));
                     }
                 };
@@ -974,7 +984,7 @@ __device__ void mosr_expand_gate_impl(half* plain_gated, half* dw_v, half* dw_g,
 #pragma unroll
                     for (int mt = 0; mt < 2; ++mt)
 #pragma unroll
-                        for (int j = 0; j < 4; ++j) {
+                        for (int j = 0; j < JCount; ++j) {
                             acc[mt][2 * j].mma(a_frag[cur][mt], b_frag[cur][j][0], b_frag[cur][j][1]);
                             acc[mt][2 * j + 1].mma(a_frag[cur][mt], b_frag[cur][j][2], b_frag[cur][j][3]);
                         }
@@ -995,9 +1005,9 @@ __device__ void mosr_expand_gate_impl(half* plain_gated, half* dw_v, half* dw_g,
                     const int cur = dx & 1;
                     const half* b_tile = b3 + dx * b_tap_halves;
 #pragma unroll
-                    for (int j = 0; j < 4; ++j) {
+                    for (int j = 0; j < JCount; ++j) {
                         unsigned b_frag[4];
-                        const int row = 64 * warp_n + 16 * j + (lane >> 4) * 8 + (lane & 7);
+                        const int row = WarpNChannels * warp_n + 16 * j + (lane >> 4) * 8 + (lane & 7);
                         load_matrix_x4(b_frag, b_tile + swizzle16(row, (lane >> 3) & 1));
 #pragma unroll
                         for (int mt = 0; mt < 2; ++mt) {
@@ -1018,27 +1028,27 @@ __device__ void mosr_expand_gate_impl(half* plain_gated, half* dw_v, half* dw_g,
 #pragma unroll
             for (int half_row = 0; half_row < 2; ++half_row) {
                 const int x = x0 + (lane >> 2) + 8 * half_row;
-                unsigned r[4];
+                unsigned r[4] = {0u, 0u, 0u, 0u};
 #pragma unroll
-                for (int g = 0; g < 4; ++g) {
+                for (int g = 0; g < PlainSlices; ++g) {
                     const float2 gv = acc[mt][g].pair(half_row);
-                    const float2 vv = acc[mt][4 + g].pair(half_row);
+                    const float2 vv = acc[mt][PlainSlices + g].pair(half_row);
                     const int off = g * 8 + 2 * q;
                     const half2 h2 = __floats2half2_rn(
-                        fast_mish(gv.x + packed_bias[off]) * (vv.x + packed_bias[32 + off]),
-                        fast_mish(gv.y + packed_bias[off + 1]) * (vv.y + packed_bias[32 + off + 1]));
+                        fast_mish(gv.x + packed_bias[off]) * (vv.x + packed_bias[Plain + off]),
+                        fast_mish(gv.y + packed_bias[off + 1]) * (vv.y + packed_bias[Plain + off + 1]));
                     r[g] = *reinterpret_cast<const unsigned*>(&h2);
                 }
                 const uint4 u = quad_transpose4(r[0], r[1], r[2], r[3], q);
-                if (x < w) {
+                if (x < w && q < PlainSlices) {
                     const size_t pix = (size_t(image) * h + y) * w + x;
-                    *reinterpret_cast<uint4*>(plain_gated + pix * 32 + q * 8) = u;
+                    *reinterpret_cast<uint4*>(gated_planar + (size_t(q) * total_pixels + pix) * 8) = u;
                 }
             }
         }
     } else {
         half* const dst_planar = (warp_n == 1) ? dw_v : dw_g;
-        const float* const b_base = packed_bias + warp_n * 64;
+        const float* const b_base = packed_bias + warp_n * WarpNChannels;
 #pragma unroll
         for (int mt = 0; mt < 2; ++mt) {
             const int y = y0 + warp_m * 2 + mt;
@@ -1047,20 +1057,34 @@ __device__ void mosr_expand_gate_impl(half* plain_gated, half* dw_v, half* dw_g,
             for (int half_row = 0; half_row < 2; ++half_row) {
                 const int x = x0 + (lane >> 2) + 8 * half_row;
                 const size_t pix = (size_t(image) * h + y) * w + x;
-#pragma unroll
-                for (int hi = 0; hi < 2; ++hi) {
+                {
                     unsigned r[4];
 #pragma unroll
                     for (int s = 0; s < 4; ++s) {
-                        const int nt = hi * 4 + s;
+                        const float2 f = acc[mt][s].pair(half_row);
+                        const int off = s * 8 + 2 * q;
+                        const half2 h2 = __floats2half2_rn(f.x + b_base[off], f.y + b_base[off + 1]);
+                        r[s] = *reinterpret_cast<const unsigned*>(&h2);
+                    }
+                    const uint4 u = quad_transpose4(r[0], r[1], r[2], r[3], q);
+                    if (x < w) {
+                        *reinterpret_cast<uint4*>(dst_planar + (size_t(q) * total_pixels + pix) * 8) = u;
+                    }
+                }
+                {
+                    constexpr int rem = DwSlices - 4;
+                    unsigned r[4] = {0u, 0u, 0u, 0u};
+#pragma unroll
+                    for (int s = 0; s < rem; ++s) {
+                        const int nt = 4 + s;
                         const float2 f = acc[mt][nt].pair(half_row);
                         const int off = nt * 8 + 2 * q;
                         const half2 h2 = __floats2half2_rn(f.x + b_base[off], f.y + b_base[off + 1]);
                         r[s] = *reinterpret_cast<const unsigned*>(&h2);
                     }
                     const uint4 u = quad_transpose4(r[0], r[1], r[2], r[3], q);
-                    if (x < w) {
-                        const int slice_id = hi * 4 + q;
+                    if (x < w && q < rem) {
+                        const int slice_id = 4 + q;
                         *reinterpret_cast<uint4*>(dst_planar + (size_t(slice_id) * total_pixels + pix) * 8) = u;
                     }
                 }
@@ -1069,18 +1093,32 @@ __device__ void mosr_expand_gate_impl(half* plain_gated, half* dw_v, half* dw_g,
     }
 }
 
-extern "C" __global__ void mosr_expand_gate_fp16(half* plain_gated, half* dw_v, half* dw_g, const half* norm_out,
+extern "C" __global__ void mosr_expand_gate_fp16(half* gated_planar, half* dw_v, half* dw_g, const half* norm_out,
                                                  const half* packed_weight, const float* packed_bias, int h, int w,
                                                  int tiles_x, int tiles_y, int total_pixels) {
-    mosr_expand_gate_impl<true>(plain_gated, dw_v, dw_g, norm_out, packed_weight, packed_bias, h, w, tiles_x, tiles_y,
-                                total_pixels);
+    mosr_expand_gate_impl<true, 64, 96>(gated_planar, dw_v, dw_g, norm_out, packed_weight, packed_bias, h, w, tiles_x,
+                                        tiles_y, total_pixels);
 }
 
-extern "C" __global__ void mosr_expand_gate_mixed(half* plain_gated, half* dw_v, half* dw_g, const half* norm_out,
+extern "C" __global__ void mosr_expand_gate_mixed(half* gated_planar, half* dw_v, half* dw_g, const half* norm_out,
                                                   const half* packed_weight, const float* packed_bias, int h, int w,
                                                   int tiles_x, int tiles_y, int total_pixels) {
-    mosr_expand_gate_impl<false>(plain_gated, dw_v, dw_g, norm_out, packed_weight, packed_bias, h, w, tiles_x, tiles_y,
-                                 total_pixels);
+    mosr_expand_gate_impl<false, 64, 96>(gated_planar, dw_v, dw_g, norm_out, packed_weight, packed_bias, h, w, tiles_x,
+                                         tiles_y, total_pixels);
+}
+
+extern "C" __global__ void mosr_expand_gate_d48_fp16(half* gated_planar, half* dw_v, half* dw_g, const half* norm_out,
+                                                     const half* packed_weight, const float* packed_bias, int h, int w,
+                                                     int tiles_x, int tiles_y, int total_pixels) {
+    mosr_expand_gate_impl<true, 48, 72>(gated_planar, dw_v, dw_g, norm_out, packed_weight, packed_bias, h, w, tiles_x,
+                                        tiles_y, total_pixels);
+}
+
+extern "C" __global__ void mosr_expand_gate_d48_mixed(half* gated_planar, half* dw_v, half* dw_g, const half* norm_out,
+                                                      const half* packed_weight, const float* packed_bias, int h, int w,
+                                                      int tiles_x, int tiles_y, int total_pixels) {
+    mosr_expand_gate_impl<false, 48, 72>(gated_planar, dw_v, dw_g, norm_out, packed_weight, packed_bias, h, w, tiles_x,
+                                         tiles_y, total_pixels);
 }
 
 template<int FixedK, int TileW>
@@ -1252,13 +1290,18 @@ extern "C" __global__ void mosr_dw_gate_planar_k17(half* dw_gated, const half* d
     mosr_dw_gate_planar_impl<17, 16>(dw_gated, dw_v, dw_g, dw_weight, dw_bias, h, w, tiles_x, total_pixels);
 }
 
-template<bool HalfAccumulate, bool DoNorm>
-__device__ void mosr_project_res_norm_impl(half* state, half* norm_out, const half* plain_gated, const half* dw_gated,
+template<bool HalfAccumulate, bool DoNorm, int Dim, int Hidden>
+__device__ void mosr_project_res_norm_impl(half* state, half* norm_out, const half* gated_planar,
                                            const half* packed_weight, const float* fc2_bias, const float* norm_weight,
                                            const float* norm_bias, int h, int w, int tiles_x, int tiles_y,
                                            int total_pixels) {
+    constexpr int KsSlices = (Hidden + 15) / 16;
+    constexpr int TotalSteps = KsSlices * 3;
+    constexpr int GatedSlices = Hidden / 8;
+    constexpr int OutSlices = Dim / 8;
+    constexpr int JCount = Dim / 16;
     constexpr int halo_cols = 18, halo_count = 324, a_slice_halves = halo_count * 16;
-    constexpr int b_tap_halves = 64 * 16, b_3tap_halves = 3 * b_tap_halves;
+    constexpr int b_tap_halves = Dim * 16, b_3tap_halves = 3 * b_tap_halves;
 
     half* const a_bufs = reinterpret_cast<half*>(mosr_smem);
     half* const b_bufs = a_bufs + 2 * a_slice_halves;
@@ -1271,17 +1314,10 @@ __device__ void mosr_project_res_norm_impl(half* state, half* norm_out, const ha
         for (int idx = thread; idx < halo_count * 2; idx += 256) {
             const int p = idx >> 1, chunk = idx & 1;
             const int py = y0 - 1 + p / halo_cols, px = x0 - 1 + p % halo_cols;
-            const bool valid = unsigned(py) < unsigned(h) && unsigned(px) < unsigned(w);
+            const int slice_id = ks * 2 + chunk;
+            const bool valid = unsigned(py) < unsigned(h) && unsigned(px) < unsigned(w) && slice_id < GatedSlices;
             const size_t pix = (size_t(image) * h + py) * w + px;
-            const half* src;
-            if (!valid) {
-                src = plain_gated;
-            } else if (ks < 2) {
-                src = plain_gated + pix * 32 + ks * 16 + chunk * 8;
-            } else {
-                const int slice_id = (ks - 2) * 2 + chunk;
-                src = dw_gated + (size_t(slice_id) * total_pixels + pix) * 8;
-            }
+            const half* src = valid ? gated_planar + (size_t(slice_id) * total_pixels + pix) * 8 : gated_planar;
             copy_async(dst + swizzle16(p, chunk), src, valid);
         }
     };
@@ -1299,21 +1335,21 @@ __device__ void mosr_project_res_norm_impl(half* state, half* norm_out, const ha
     const int q = lane & 3;
     int step = 0;
 
-    Accumulator<HalfAccumulate> acc[2][8];
-    for (int ks = 0; ks < 6; ++ks) {
+    Accumulator<HalfAccumulate> acc[2][OutSlices];
+    for (int ks = 0; ks < KsSlices; ++ks) {
         const half* a_slice = a_bufs + (ks & 1) * a_slice_halves;
         for (int dy = 0; dy < 3; ++dy) {
             asm volatile("cp.async.wait_group 0;\n");
             __syncthreads();
             const int cb = step & 1;
-            if (step + 1 < 18) load_b3(step + 1, b_bufs + (cb ^ 1) * b_3tap_halves);
-            if (dy == 0 && ks + 1 < 6) load_a(ks + 1, a_bufs + ((ks + 1) & 1) * a_slice_halves);
-            if (step + 1 < 18) asm volatile("cp.async.commit_group;\n");
+            if (step + 1 < TotalSteps) load_b3(step + 1, b_bufs + (cb ^ 1) * b_3tap_halves);
+            if (dy == 0 && ks + 1 < KsSlices) load_a(ks + 1, a_bufs + ((ks + 1) & 1) * a_slice_halves);
+            if (step + 1 < TotalSteps) asm volatile("cp.async.commit_group;\n");
             const half* b3 = b_bufs + cb * b_3tap_halves;
             ++step;
 
             if constexpr (HalfAccumulate) {
-                unsigned a_frag[2][2][4], b_frag[2][4][4];
+                unsigned a_frag[2][2][4], b_frag[2][JCount][4];
                 auto load_dx = [&](int dx, int buf) {
                     const half* b_tile = b3 + dx * b_tap_halves;
 #pragma unroll
@@ -1322,7 +1358,7 @@ __device__ void mosr_project_res_norm_impl(half* state, half* norm_out, const ha
                         load_matrix_x4(a_frag[buf][mt], a_slice + swizzle16(p, lane >> 4));
                     }
 #pragma unroll
-                    for (int j = 0; j < 4; ++j) {
+                    for (int j = 0; j < JCount; ++j) {
                         const int row = 16 * j + (lane >> 4) * 8 + (lane & 7);
                         load_matrix_x4(b_frag[buf][j], b_tile + swizzle16(row, (lane >> 3) & 1));
                     }
@@ -1335,7 +1371,7 @@ __device__ void mosr_project_res_norm_impl(half* state, half* norm_out, const ha
 #pragma unroll
                     for (int mt = 0; mt < 2; ++mt)
 #pragma unroll
-                        for (int j = 0; j < 4; ++j) {
+                        for (int j = 0; j < JCount; ++j) {
                             acc[mt][2 * j].mma(a_frag[cur][mt], b_frag[cur][j][0], b_frag[cur][j][1]);
                             acc[mt][2 * j + 1].mma(a_frag[cur][mt], b_frag[cur][j][2], b_frag[cur][j][3]);
                         }
@@ -1356,7 +1392,7 @@ __device__ void mosr_project_res_norm_impl(half* state, half* norm_out, const ha
                     const int cur = dx & 1;
                     const half* b_tile = b3 + dx * b_tap_halves;
 #pragma unroll
-                    for (int j = 0; j < 4; ++j) {
+                    for (int j = 0; j < JCount; ++j) {
                         unsigned b_frag[4];
                         const int row = 16 * j + (lane >> 4) * 8 + (lane & 7);
                         load_matrix_x4(b_frag, b_tile + swizzle16(row, (lane >> 3) & 1));
@@ -1371,6 +1407,7 @@ __device__ void mosr_project_res_norm_impl(half* state, half* norm_out, const ha
         }
     }
 
+    constexpr int rem = OutSlices - 4;
 #pragma unroll
     for (int mt = 0; mt < 2; ++mt) {
         const int y = y0 + warp * 2 + mt;
@@ -1383,18 +1420,18 @@ __device__ void mosr_project_res_norm_impl(half* state, half* norm_out, const ha
             uint4 s_raw0 = make_uint4(0u, 0u, 0u, 0u);
             uint4 s_raw1 = make_uint4(0u, 0u, 0u, 0u);
             if (valid_x) {
-                s_raw0 = *reinterpret_cast<const uint4*>(state + pix * 64 + q * 8);
-                s_raw1 = *reinterpret_cast<const uint4*>(state + pix * 64 + 32 + q * 8);
+                s_raw0 = *reinterpret_cast<const uint4*>(state + pix * Dim + q * 8);
+                if (q < rem) s_raw1 = *reinterpret_cast<const uint4*>(state + pix * Dim + 32 + q * 8);
             }
             const uint4 s_tr0 = quad_transpose4(s_raw0.x, s_raw0.y, s_raw0.z, s_raw0.w, q);
             const uint4 s_tr1 = quad_transpose4(s_raw1.x, s_raw1.y, s_raw1.z, s_raw1.w, q);
             const unsigned s_arr[8] = {s_tr0.x, s_tr0.y, s_tr0.z, s_tr0.w, s_tr1.x, s_tr1.y, s_tr1.z, s_tr1.w};
 
-            unsigned st_u[8];
-            float2 st_f[8];
+            unsigned st_u[8] = {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
+            float2 st_f[OutSlices];
             float sum = 0.f;
 #pragma unroll
-            for (int nt = 0; nt < 8; ++nt) {
+            for (int nt = 0; nt < OutSlices; ++nt) {
                 const float2 f = acc[mt][nt].pair(half_row);
                 const unsigned su = s_arr[nt];
                 const float2 sv = __half22float2(*reinterpret_cast<const half2*>(&su));
@@ -1410,21 +1447,21 @@ __device__ void mosr_project_res_norm_impl(half* state, half* norm_out, const ha
             const uint4 st_out0 = quad_transpose4(st_u[0], st_u[1], st_u[2], st_u[3], q);
             const uint4 st_out1 = quad_transpose4(st_u[4], st_u[5], st_u[6], st_u[7], q);
             if (valid_x) {
-                *reinterpret_cast<uint4*>(state + pix * 64 + q * 8) = st_out0;
-                *reinterpret_cast<uint4*>(state + pix * 64 + 32 + q * 8) = st_out1;
+                *reinterpret_cast<uint4*>(state + pix * Dim + q * 8) = st_out0;
+                if (q < rem) *reinterpret_cast<uint4*>(state + pix * Dim + 32 + q * 8) = st_out1;
             }
             if (DoNorm) {
-                const float mean = quad_sum(sum) * (1.f / 64.f);
+                const float mean = quad_sum(sum) * (1.f / float(Dim));
                 float var = 0.f;
 #pragma unroll
-                for (int nt = 0; nt < 8; ++nt) {
+                for (int nt = 0; nt < OutSlices; ++nt) {
                     const float d0 = st_f[nt].x - mean, d1 = st_f[nt].y - mean;
                     var = fmaf(d0, d0, fmaf(d1, d1, var));
                 }
-                const float inv = rsqrtf(quad_sum(var) * (1.f / 64.f) + 1e-6f);
-                unsigned nm_u[8];
+                const float inv = rsqrtf(quad_sum(var) * (1.f / float(Dim)) + 1e-6f);
+                unsigned nm_u[8] = {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
 #pragma unroll
-                for (int nt = 0; nt < 8; ++nt) {
+                for (int nt = 0; nt < OutSlices; ++nt) {
                     const int c0 = nt * 8 + 2 * q;
                     const float n0 = (st_f[nt].x - mean) * inv;
                     const float n1 = (st_f[nt].y - mean) * inv;
@@ -1435,45 +1472,74 @@ __device__ void mosr_project_res_norm_impl(half* state, half* norm_out, const ha
                 const uint4 nm_out0 = quad_transpose4(nm_u[0], nm_u[1], nm_u[2], nm_u[3], q);
                 const uint4 nm_out1 = quad_transpose4(nm_u[4], nm_u[5], nm_u[6], nm_u[7], q);
                 if (valid_x) {
-                    *reinterpret_cast<uint4*>(norm_out + pix * 64 + q * 8) = nm_out0;
-                    *reinterpret_cast<uint4*>(norm_out + pix * 64 + 32 + q * 8) = nm_out1;
+                    *reinterpret_cast<uint4*>(norm_out + pix * Dim + q * 8) = nm_out0;
+                    if (q < rem) *reinterpret_cast<uint4*>(norm_out + pix * Dim + 32 + q * 8) = nm_out1;
                 }
             }
         }
     }
 }
 
-extern "C" __global__ void mosr_project_res_norm_fp16(half* state, half* norm_out, const half* plain_gated,
-                                                      const half* dw_gated, const half* packed_weight,
-                                                      const float* fc2_bias, const float* norm_weight,
-                                                      const float* norm_bias, int h, int w, int tiles_x, int tiles_y,
-                                                      int total_pixels) {
-    mosr_project_res_norm_impl<true, true>(state, norm_out, plain_gated, dw_gated, packed_weight, fc2_bias, norm_weight,
-                                           norm_bias, h, w, tiles_x, tiles_y, total_pixels);
+extern "C" __global__ void mosr_project_res_norm_fp16(half* state, half* norm_out, const half* gated_planar,
+                                                      const half* packed_weight, const float* fc2_bias,
+                                                      const float* norm_weight, const float* norm_bias, int h, int w,
+                                                      int tiles_x, int tiles_y, int total_pixels) {
+    mosr_project_res_norm_impl<true, true, 64, 96>(state, norm_out, gated_planar, packed_weight, fc2_bias, norm_weight,
+                                                   norm_bias, h, w, tiles_x, tiles_y, total_pixels);
 }
 
-extern "C" __global__ void mosr_project_res_fp16(half* state, half* norm_out, const half* plain_gated,
-                                                 const half* dw_gated, const half* packed_weight, const float* fc2_bias,
+extern "C" __global__ void mosr_project_res_fp16(half* state, half* norm_out, const half* gated_planar,
+                                                 const half* packed_weight, const float* fc2_bias,
                                                  const float* norm_weight, const float* norm_bias, int h, int w,
                                                  int tiles_x, int tiles_y, int total_pixels) {
-    mosr_project_res_norm_impl<true, false>(state, norm_out, plain_gated, dw_gated, packed_weight, fc2_bias,
-                                            norm_weight, norm_bias, h, w, tiles_x, tiles_y, total_pixels);
+    mosr_project_res_norm_impl<true, false, 64, 96>(state, norm_out, gated_planar, packed_weight, fc2_bias,
+                                                    norm_weight, norm_bias, h, w, tiles_x, tiles_y, total_pixels);
 }
 
-extern "C" __global__ void mosr_project_res_norm_mixed(half* state, half* norm_out, const half* plain_gated,
-                                                       const half* dw_gated, const half* packed_weight,
-                                                       const float* fc2_bias, const float* norm_weight,
-                                                       const float* norm_bias, int h, int w, int tiles_x, int tiles_y,
-                                                       int total_pixels) {
-    mosr_project_res_norm_impl<false, true>(state, norm_out, plain_gated, dw_gated, packed_weight, fc2_bias,
-                                            norm_weight, norm_bias, h, w, tiles_x, tiles_y, total_pixels);
+extern "C" __global__ void mosr_project_res_norm_mixed(half* state, half* norm_out, const half* gated_planar,
+                                                       const half* packed_weight, const float* fc2_bias,
+                                                       const float* norm_weight, const float* norm_bias, int h, int w,
+                                                       int tiles_x, int tiles_y, int total_pixels) {
+    mosr_project_res_norm_impl<false, true, 64, 96>(state, norm_out, gated_planar, packed_weight, fc2_bias,
+                                                    norm_weight, norm_bias, h, w, tiles_x, tiles_y, total_pixels);
 }
 
-extern "C" __global__ void mosr_project_res_mixed(half* state, half* norm_out, const half* plain_gated,
-                                                  const half* dw_gated, const half* packed_weight,
-                                                  const float* fc2_bias, const float* norm_weight,
-                                                  const float* norm_bias, int h, int w, int tiles_x, int tiles_y,
-                                                  int total_pixels) {
-    mosr_project_res_norm_impl<false, false>(state, norm_out, plain_gated, dw_gated, packed_weight, fc2_bias,
-                                             norm_weight, norm_bias, h, w, tiles_x, tiles_y, total_pixels);
+extern "C" __global__ void mosr_project_res_mixed(half* state, half* norm_out, const half* gated_planar,
+                                                  const half* packed_weight, const float* fc2_bias,
+                                                  const float* norm_weight, const float* norm_bias, int h, int w,
+                                                  int tiles_x, int tiles_y, int total_pixels) {
+    mosr_project_res_norm_impl<false, false, 64, 96>(state, norm_out, gated_planar, packed_weight, fc2_bias,
+                                                     norm_weight, norm_bias, h, w, tiles_x, tiles_y, total_pixels);
+}
+
+extern "C" __global__ void mosr_project_res_norm_d48_fp16(half* state, half* norm_out, const half* gated_planar,
+                                                          const half* packed_weight, const float* fc2_bias,
+                                                          const float* norm_weight, const float* norm_bias, int h,
+                                                          int w, int tiles_x, int tiles_y, int total_pixels) {
+    mosr_project_res_norm_impl<true, true, 48, 72>(state, norm_out, gated_planar, packed_weight, fc2_bias, norm_weight,
+                                                   norm_bias, h, w, tiles_x, tiles_y, total_pixels);
+}
+
+extern "C" __global__ void mosr_project_res_d48_fp16(half* state, half* norm_out, const half* gated_planar,
+                                                     const half* packed_weight, const float* fc2_bias,
+                                                     const float* norm_weight, const float* norm_bias, int h, int w,
+                                                     int tiles_x, int tiles_y, int total_pixels) {
+    mosr_project_res_norm_impl<true, false, 48, 72>(state, norm_out, gated_planar, packed_weight, fc2_bias,
+                                                    norm_weight, norm_bias, h, w, tiles_x, tiles_y, total_pixels);
+}
+
+extern "C" __global__ void mosr_project_res_norm_d48_mixed(half* state, half* norm_out, const half* gated_planar,
+                                                           const half* packed_weight, const float* fc2_bias,
+                                                           const float* norm_weight, const float* norm_bias, int h,
+                                                           int w, int tiles_x, int tiles_y, int total_pixels) {
+    mosr_project_res_norm_impl<false, true, 48, 72>(state, norm_out, gated_planar, packed_weight, fc2_bias,
+                                                    norm_weight, norm_bias, h, w, tiles_x, tiles_y, total_pixels);
+}
+
+extern "C" __global__ void mosr_project_res_d48_mixed(half* state, half* norm_out, const half* gated_planar,
+                                                      const half* packed_weight, const float* fc2_bias,
+                                                      const float* norm_weight, const float* norm_bias, int h, int w,
+                                                      int tiles_x, int tiles_y, int total_pixels) {
+    mosr_project_res_norm_impl<false, false, 48, 72>(state, norm_out, gated_planar, packed_weight, fc2_bias,
+                                                     norm_weight, norm_bias, h, w, tiles_x, tiles_y, total_pixels);
 }

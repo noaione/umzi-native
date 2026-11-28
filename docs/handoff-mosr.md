@@ -57,11 +57,11 @@ DySample (`offset`, `scope`, bilinear `grid_sample`, `end_conv`).
   and FP16 RGB I/O.
 - **Options and caching:** Supports `fused_gate` (0 or 1, default 1; enables
   Tensor Core fused `expand_gate` / `project_res_norm` and coalesced planar
-  depthwise gating for `dim=64`, `hidden=96`, `kernel_size=7` or `17` in mixed
-  and FP16), `workspace_mib` (0–4096, default 512), and disk plan caching
-  (`mosr_<key>.umplan` under `cache_dir`, `plan_schema=2`). Reports
-  diagnostics `timed_plans`, `plan_workspace_bytes`, `peak_plan_workspace_bytes`,
-  and `fp16_fallback_plans`.
+  depthwise gating for `(dim=64, hidden=96)` or `(dim=48, hidden=72)` with
+  `kernel_size=7` or `17` in mixed and FP16), `workspace_mib` (0–4096, default 512),
+  and disk plan caching (`mosr_<key>.umplan` under `cache_dir`, `plan_schema=3`).
+  Reports diagnostics `timed_plans`, `plan_workspace_bytes`,
+  `peak_plan_workspace_bytes`, and `fp16_fallback_plans`.
 
 ## Baseline measurements
 
@@ -163,20 +163,33 @@ baseline (`control = output/mosr-session/native-win/umzi_native.dll`):
 4. **Pass 4 (`p4-win` — precision-specific fragment prefetch):**
    Restored double-buffered `b_frag[2][4][4]` for FP16 (`HalfAccumulate=true`)
    while keeping single `b_frag[4]` for mixed (`HalfAccumulate=false`).
+5. **Pass 5 (`p5-win` — unified `gated_planar` + `mosr-t` `(dim=48, hidden=72)` tensor-core gating):**
+   Unified `plain_gated` and `dw_gated` into a single contiguous planar buffer
+   `gated_planar[Hidden/8, N*H*W, 8]` (removing the `ks` branch inside
+   `project_res_norm`) and parameterized `mosr_expand_gate` /
+   `mosr_project_res_norm` for both `(64, 96)` and `(48, 72)` (`mosr-t`). On
+   `dim=48, hidden=72`, the `72`-channel input spans 5 `swizzle16` slices (`9`
+   planar 8-channel chunks with the 10th chunk zero-filled by `copy_async`) and
+   removes all body cuDNN convolutions across `mosr-t` too.
 
 ### Alternating A/B progression (`mosr`, `1×3×512×512`, `scripts/ab_mosr_builds.py`)
 
-Measured in a single process alternating all 5 builds (`6 rounds × 3 calls`, median ms per batch-1 tile):
+Measured in a single process alternating `control` through `p4` (`6 rounds × 3 calls`) and `p4` vs `p5` (`6 rounds × 3 calls`, median ms per batch-1 tile):
 
-| Precision | `control` (ms) | `p1` (ms) | `p2` (ms) | `p3` (ms) | `p4` (ms) | Speedup (`control → p4`) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `fp16` | 307.90 | 267.35 | 183.51 | 168.95 | **167.21** | **1.84×** (−45.7%) |
-| `mixed` | 382.08 | 339.11 | 265.46 | **253.29** | 265.77 | **~1.44–1.51×** |
-| `fp32` | 697.10 | 675.26 | 640.35 | **629.95** | 630.91 | **1.11×** (−66.2 ms) |
+| Precision | `control` (ms) | `p1` (ms) | `p2` (ms) | `p3` (ms) | `p4` (ms) | `p5` vs `p4` (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `fp16` | 307.90 | 267.35 | 183.51 | 168.95 | 167.21 | **167.54** (`p4`: 171.96) |
+| `mixed` | 382.08 | 339.11 | 265.46 | 253.29 | 265.77 | **239.05** (`p4`: 259.31) |
+| `fp32` | 697.10 | 675.26 | 640.35 | **629.95** | 630.91 | — |
+
+On `mosr-t` (`1×3×512×512`, `8 rounds × 3 calls`):
+- **`fp16`:** `61.22 (control) → 57.54 (p4) → 31.73 ms (p5)` (**1.93×** speedup vs control)
+- **`mixed`:** `72.00 (control) → 63.24 (p4) → 44.85 ms (p5)` (**1.61×** speedup vs control)
+- **`fp32`:** `126.69 (control) → 114.70 (p4) → 113.56 ms (p5)` (**1.12×** speedup vs control)
 
 Option parity check (`mosr`, `1×3×64×64`, `p4-win`): `fused_gate=1` vs `fused_gate=0` gives `mse = 1.999e-06` (`max_abs = 8.301e-03`) in FP16 and `mse = 4.753e-07` (`max_abs = 4.700e-03`) in mixed.
 
-## Optimized measurements (`p4-win`)
+## Optimized measurements (`p5-win`)
 
 Reports and outputs are in `output/architecture-baselines/{mosr,mosr-l,mosr-t}/batch-1/native-*-optimized/`.
 
@@ -185,12 +198,12 @@ Reports and outputs are in `output/architecture-baselines/{mosr,mosr-l,mosr-t}/b
 | Backend | Total s | Median ms/image | Median page avg ms/tile | Input MPx/s | Pooled PSNR (dB) | Mean / Min SSIMULACRA2 | Device peak above bg (MiB) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | Native FP32 (`optimized`) | 15.037 | 3750.03 | 625.01 | 0.323 | 140.21 | 89.42 / 88.00 | 602.19 |
-| Native mixed (`optimized`) | 6.302 | 1572.89 | 262.15 | 0.771 | 69.85 | 87.41 / 86.23 | 370.00 |
-| Native FP16 (`optimized`) | **4.015** | **995.21** | **165.87** | **1.210** | 64.63 | 87.23 / 86.24 | 379.84 |
+| Native mixed (`optimized`) | 5.822 | 1452.23 | 242.04 | 0.835 | 69.85 | 87.41 / 86.23 | 377.82 |
+| Native FP16 (`optimized`) | **3.981** | **998.22** | **166.37** | **1.221** | 64.63 | 87.23 / 86.24 | **370.00** |
 
-Relative to the `control` baseline:
-- **Native FP16:** `298.36 → 165.87 ms/tile` (**1.80×** faster; **1.75×** faster per-image median than TensorRT-RTX FP16's `289.80 ms/tile` while delivering +1.35 dB higher PSNR and ~121 MiB lower peak VRAM).
-- **Native mixed:** `377.11 → 262.15 ms/tile` (**1.44×** faster; also faster than TensorRT-RTX FP16 at 69.85 dB PSNR).
+Relative to the `control` baseline and TensorRT-RTX FP16:
+- **Native FP16:** `298.36 → 166.37 ms/tile` (**1.79×** faster than baseline; **1.74×** faster per-image median than TensorRT-RTX FP16's `289.80 ms/tile` while delivering +1.35 dB higher PSNR and ~130 MiB lower peak VRAM).
+- **Native mixed:** `377.11 → 242.04 ms/tile` (**1.56×** faster than baseline; **1.20×** faster than TensorRT-RTX FP16 at 69.85 dB PSNR).
 - **Native FP32:** `668.17 → 625.01 ms/tile` (**1.07×** full-page, **1.11×** A/B).
 
 ### `mosr-l` optimized (`4x_umzi_digital_art_mosr_l.pth`, k=17)
@@ -198,42 +211,41 @@ Relative to the `control` baseline:
 | Backend | Total s | Median ms/image | Median page avg ms/tile | Input MPx/s | Pooled PSNR (dB) | Mean / Min SSIMULACRA2 | Device peak above bg (MiB) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | Native FP32 (`optimized`) | 21.062 | 5261.14 | 876.86 | 0.231 | 138.87 | 89.18 / 87.79 | 605.03 |
-| Native mixed (`optimized`) | 8.177 | 2039.55 | 339.93 | 0.594 | 67.91 | 87.01 / 85.94 | 372.75 |
-| Native FP16 (`optimized`) | **6.070** | **1521.57** | **253.60** | **0.801** | 62.20 | 86.85 / 85.88 | 372.00 |
+| Native mixed (`optimized`) | 7.837 | 1951.50 | 325.25 | 0.620 | 67.91 | 87.01 / 85.89 | 438.00 |
+| Native FP16 (`optimized`) | **6.009** | **1501.89** | **250.32** | **0.809** | 62.64 | 86.79 / 85.86 | **415.19** |
 
-- **Native FP16:** `616.81 → 253.60 ms/tile` (**2.43×** faster than baseline; **2.21×** faster per-image median than TensorRT-RTX FP16's `560.75 ms/tile`, with +0.16 dB PSNR, +0.08/+0.10 SSIMULACRA2, and 161 MiB lower peak VRAM).
-- **Native mixed:** `682.69 → 339.93 ms/tile` (**2.01×** faster than baseline; **1.65×** faster than TensorRT-RTX FP16 with +5.87 dB PSNR and 161 MiB lower peak VRAM).
+- **Native FP16:** `616.81 → 250.32 ms/tile` (**2.46×** faster than baseline; **2.24×** faster per-image median than TensorRT-RTX FP16's `560.75 ms/tile`, with +0.60 dB PSNR, slightly higher SSIMULACRA2, and 118 MiB lower peak VRAM).
+- **Native mixed:** `682.69 → 325.25 ms/tile` (**2.10×** faster than baseline; **1.72×** faster than TensorRT-RTX FP16 with +5.87 dB PSNR and 95 MiB lower peak VRAM).
 - **Native FP32:** `1150.43 → 876.86 ms/tile` (**1.31×** faster).
 
 ### `mosr-t` optimized (`2x_umzi_digital_art_mosr_t.pth`, dim=48, hidden=72, `dys`)
 
-Uses Pass 1 vectorized/8-ch NHWC kernels (`fused_gate` scopes to `dim=64, hidden=96`) plus Pass 2/3 NCHW FP32 improvements:
-
 | Backend | Total s | Median ms/image | Median page avg ms/tile | Input MPx/s | Pooled PSNR (dB) | Mean / Min SSIMULACRA2 | Device peak above bg (MiB) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | Native FP32 (`optimized`) | 2.731 | 684.50 | 114.08 | 1.780 | 128.22 | 91.45 / 90.35 | 372.00 |
-| Native mixed (`optimized`) | 1.576 | 391.95 | 65.33 | 3.084 | 70.35 | 89.78 / 89.08 | 212.00 |
-| Native FP16 (`optimized`) | **1.394** | **351.55** | **58.59** | **3.486** | 67.00 | 89.67 / 89.09 | 208.00 |
+| Native mixed (`optimized`) | 1.056 | 263.27 | 43.88 | 4.602 | 70.12 | 89.73 / 89.05 | 211.94 |
+| Native FP16 (`optimized`) | **0.787** | **196.91** | **32.82** | **6.175** | 66.31 | **89.82 / 89.15** | **208.00** |
 
-- **Vs TensorRT-RTX FP16 (`52.59 ms/tile`, `495.84 MiB`):** Native FP16 runs within 6 ms/tile (`58.59 ms/tile`) while preserving DySample fidelity (**+25.23 dB PSNR**, **89.67 vs 85.36** mean SSIMULACRA2) and using **288 MiB** less peak VRAM.
+- **Native FP16:** `58.80 → 32.82 ms/tile` (**1.79×** faster full-page, **1.93×** A/B vs baseline; **1.60×** faster than TensorRT-RTX FP16's `52.59 ms/tile` while preserving DySample fidelity at **+24.54 dB PSNR**, **89.82 vs 85.36** mean SSIMULACRA2, and **288 MiB** lower peak VRAM).
+- **Native mixed:** `74.90 → 43.88 ms/tile` (**1.71×** faster than baseline; **1.20×** faster than TensorRT-RTX FP16 at **70.12 dB** PSNR).
+- **Native FP32:** `126.58 → 114.08 ms/tile` (**1.11×** faster).
 
 ## Verification commands
 
 ```powershell
 $env:PYTHONPATH = 'src;scripts'
 $py = 'C:\Python314\python.exe'
-& $py scripts/build_native.py --arch sm_86 --nvrtc-root output/nvrtc-13.0/nvidia/cu13 --output output/mosr-session/p4-win
-& $py scripts/validate_mosr_session.py --library output/mosr-session/p4-win/umzi_native.dll --cli output/mosr-session/p4-win/umzi_native.exe --output output/mosr-session/val-p4
-& $py scripts/ab_mosr_builds.py --model output/mosr-session/validation/mosr.ummodel --cache-dir output/mosr-session/bench-cache control=output/mosr-session/native-win/umzi_native.dll p1=output/mosr-session/p1-win/umzi_native.dll p2=output/mosr-session/p2-win/umzi_native.dll p3=output/mosr-session/p3-win/umzi_native.dll p4=output/mosr-session/p4-win/umzi_native.dll
+& $py scripts/build_native.py --arch sm_86 --nvrtc-root output/nvrtc-13.0/nvidia/cu13 --output output/mosr-session/p5-win
+& $py scripts/validate_mosr_session.py --library output/mosr-session/p5-win/umzi_native.dll --cli output/mosr-session/p5-win/umzi_native.exe --output output/mosr-session/val-p5
+& $py scripts/ab_mosr_builds.py --model output/mosr-session/validation/mosr-t.ummodel --cache-dir output/mosr-session/bench-cache --rounds 8 control=output/mosr-session/native-win/umzi_native.dll p4=output/mosr-session/p4-win/umzi_native.dll p5=output/mosr-session/p5-win/umzi_native.dll
 foreach ($f in @('mosr', 'mosr-l', 'mosr-t')) {
     foreach ($b in @('native-fp32', 'native-mixed', 'native-fp16')) {
-        & $py scripts/benchmark_architectures.py $f $b --native-model "output/mosr-session/validation/$f.ummodel" --native-library output/mosr-session/p4-win/umzi_native.dll --native-cache-dir output/mosr-session/bench-cache --tag optimized
+        & $py scripts/benchmark_architectures.py $f $b --native-model "output/mosr-session/validation/$f.ummodel" --native-library output/mosr-session/p5-win/umzi_native.dll --native-cache-dir output/mosr-session/bench-cache --tag optimized
     }
 }
-& $py scripts/check_python_session.py --model output/mosr-session/validation/mosr.ummodel --cli output/mosr-session/p4-win/umzi_native.exe --library output/mosr-session/p4-win/umzi_native.dll --import-torch --output output/mosr-session/check-python
 ```
 
 ## Next
 
 1. Run TorchInductor FP16 (`benchmark_architectures.py mosr inductor`) outside the Windows sandbox so Triton's `tcc.exe` can compile `cuda_utils`.
-2. Extend `fused_gate` tensor-core support to `dim=48, hidden=72` (`mosr-t`) if small-variant speedup becomes a priority, or fold the 8× GPS tail ensemble weights in mixed/FP16 for minor tail memory/latency savings.
+2. Consider wider `16×32` tiling on `mosr_dw_gate_planar_k17` (`mosr-l`), packed `half2` DW arithmetic, or folding the `8×` GPS ensemble tail weights in mixed/FP16 for additional latency/VRAM margin.

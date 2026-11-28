@@ -27,7 +27,7 @@ namespace {
 constexpr int rgb_lanes = 8, threads = 256;
 constexpr int lanes(int count) { return (count + 7) & ~7; }
 constexpr uint64_t default_workspace_mib = 512, max_workspace_mib = 4096;
-constexpr uint32_t plan_schema = 2;
+constexpr uint32_t plan_schema = 3;
 using umzi::Clock;
 using umzi::ContextScope;
 #define CHECK(expr) umzi::check((expr), #expr)
@@ -115,11 +115,11 @@ struct Network {
     bool nhwc_half = false;
 
     Network() = default;
-    Network(const Architecture& a, bool device_nhwc_half) : nhwc_half(device_nhwc_half) {
+    Network(const Architecture& a, bool device_nhwc_half, bool fused_gate = false) : nhwc_half(device_nhwc_half) {
         const int d = a.d(), hd = a.hd(), k = a.k(), s = a.s();
         const int rgb_in = nhwc_half ? rgb_lanes : 3;
         const int fc1_out = nhwc_half ? lanes(2 * hd) : 2 * hd;
-        const int fc2_in = nhwc_half ? lanes(hd) : hd;
+        const int fc2_in = nhwc_half ? (fused_gate ? ((hd + 15) & ~15) : lanes(hd)) : hd;
         stem = conv(rgb_in, d, 3);
         blocks.resize(a.blocks);
         for (auto& b : blocks) {
@@ -220,8 +220,9 @@ void pack_fused_fc1(uint16_t* dst_w, float* dst_b, const float* src_w, const flo
 }
 
 void pack_fused_fc2(uint16_t* dst_w, const float* src_w, int dim, int hidden) {
+    const int ks_slices = (hidden + 15) / 16;
     size_t stage = 0;
-    for (int ks = 0; ks < hidden / 16; ++ks) {
+    for (int ks = 0; ks < ks_slices; ++ks) {
         for (int dy = 0; dy < 3; ++dy) {
             uint16_t* stage_dst = dst_w + stage * (3 * size_t(dim) * 16);
             for (int dx = 0; dx < 3; ++dx) {
@@ -233,7 +234,7 @@ void pack_fused_fc2(uint16_t* dst_w, const float* src_w, int dim, int hidden) {
                         const size_t d = (size_t(row) * 2 + (chunk ^ mask)) * 8;
                         for (int hi = 0; hi < 8; ++hi) {
                             const int ci = ks * 16 + chunk * 8 + hi;
-                            tap_dst[d + hi] = checked_half(src_w[(size_t(row) * hidden + ci) * 9 + tap]);
+                            tap_dst[d + hi] = (ci < hidden) ? checked_half(src_w[(size_t(row) * hidden + ci) * 9 + tap]) : 0;
                         }
                     }
                 }
@@ -334,12 +335,18 @@ constexpr const char* kernel_names[] = {
     "fill_noise_f32",
     "mosr_expand_gate_fp16",
     "mosr_expand_gate_mixed",
+    "mosr_expand_gate_d48_fp16",
+    "mosr_expand_gate_d48_mixed",
     "mosr_dw_gate_planar_k7",
     "mosr_dw_gate_planar_k17",
     "mosr_project_res_norm_fp16",
     "mosr_project_res_fp16",
     "mosr_project_res_norm_mixed",
     "mosr_project_res_mixed",
+    "mosr_project_res_norm_d48_fp16",
+    "mosr_project_res_d48_fp16",
+    "mosr_project_res_norm_d48_mixed",
+    "mosr_project_res_d48_mixed",
 };
 
 enum Kernel {
@@ -380,12 +387,18 @@ enum Kernel {
     FillNoiseF32,
     MosrExpandGateFp16,
     MosrExpandGateMixed,
+    MosrExpandGateD48Fp16,
+    MosrExpandGateD48Mixed,
     MosrDwGatePlanarK7,
     MosrDwGatePlanarK17,
     MosrProjectResNormFp16,
     MosrProjectResFp16,
     MosrProjectResNormMixed,
     MosrProjectResMixed,
+    MosrProjectResNormD48Fp16,
+    MosrProjectResD48Fp16,
+    MosrProjectResNormD48Mixed,
+    MosrProjectResD48Mixed,
     KernelCount,
 };
 static_assert(std::size(kernel_names) == KernelCount);
@@ -508,8 +521,10 @@ public:
         }
         fp32 = options.precision == UMZI_FP32;
         fp16 = options.precision == UMZI_FP16;
-        fused_gate = !fp32 && fused_gate_option && arch.d() == 64 && arch.hd() == 96 && (arch.k() == 7 || arch.k() == 17);
-        device_model = Network(arch, !fp32);
+        fused_gate = !fp32 && fused_gate_option &&
+                     ((arch.d() == 64 && arch.hd() == 96) || (arch.d() == 48 && arch.hd() == 72)) &&
+                     (arch.k() == 7 || arch.k() == 17);
+        device_model = Network(arch, !fp32, fused_gate);
         graph_enabled = (options.flags & UMZI_CUDA_GRAPH) != 0;
 
         CHECK(cuInit(0));
@@ -522,9 +537,11 @@ public:
             umzi::load_kernel_module(device, module, mosr_images::embedded_cubins, mosr_images::embedded_ptx);
         shared->module = module;
         for (int i = 0; i < KernelCount; ++i) CHECK(cuModuleGetFunction(&functions[i], module, kernel_names[i]));
-        for (Kernel k : {MosrExpandGateFp16, MosrExpandGateMixed, MosrProjectResNormFp16, MosrProjectResFp16,
-                         MosrProjectResNormMixed, MosrProjectResMixed, MosrDwGatePlanarK7, MosrDwGatePlanarK17,
-                         BiasNormNchwF32, MishResidualNormNchwF32}) {
+        for (Kernel k : {MosrExpandGateFp16, MosrExpandGateMixed, MosrExpandGateD48Fp16, MosrExpandGateD48Mixed,
+                         MosrProjectResNormFp16, MosrProjectResFp16, MosrProjectResNormMixed, MosrProjectResMixed,
+                         MosrProjectResNormD48Fp16, MosrProjectResD48Fp16, MosrProjectResNormD48Mixed,
+                         MosrProjectResD48Mixed, MosrDwGatePlanarK7, MosrDwGatePlanarK17, BiasNormNchwF32,
+                         MishResidualNormNchwF32}) {
             CHECK(cuFuncSetAttribute(functions[k], CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
                                      CU_SHAREDMEM_CARVEOUT_MAX_SHARED));
         }
@@ -941,27 +958,31 @@ private:
             const unsigned exp_grid = unsigned(exp_tx * exp_ty * shape.n);
             const unsigned dw_grid = unsigned(dw_tx * tiles_y);
             const unsigned proj_grid = unsigned(tiles_x * tiles_y * shape.n);
-            const unsigned exp_smem = 48384u;
+            const bool d64 = d == 64;
+            const unsigned exp_smem = d64 ? 48384u : 39168u;
             const unsigned dw_threads = (k == 7) ? 256u : 128u;
             const unsigned dw_smem = unsigned((16 + k - 1) * (dw_tile_w + k - 1) * 16 + k * k * 32);
-            const unsigned proj_smem = 33024u;
+            const unsigned proj_smem = d64 ? 33024u : 29952u;
             const size_t elem = 2;
-            CUdeviceptr plain_gated_buf = projected;
-            CUdeviceptr dw_v_buf = plain_gated_buf + size_t(pixels) * 32 * elem;
-            CUdeviceptr dw_g_buf = dw_v_buf + size_t(pixels) * 64 * elem;
-            CUdeviceptr dw_gated_buf = dw_g_buf + size_t(pixels) * 64 * elem;
-            const Kernel expand_k = fp16 ? MosrExpandGateFp16 : MosrExpandGateMixed;
+            CUdeviceptr gated_planar_buf = projected;
+            CUdeviceptr dw_gated_buf = gated_planar_buf + size_t(pixels) * size_t(hd - d) * elem;
+            CUdeviceptr dw_v_buf = gated_planar_buf + size_t(pixels) * size_t(hd) * elem;
+            CUdeviceptr dw_g_buf = dw_v_buf + size_t(pixels) * size_t(d) * elem;
+            const Kernel expand_k =
+                d64 ? (fp16 ? MosrExpandGateFp16 : MosrExpandGateMixed) : (fp16 ? MosrExpandGateD48Fp16 : MosrExpandGateD48Mixed);
             const Kernel dw_planar_k = k == 7 ? MosrDwGatePlanarK7 : MosrDwGatePlanarK17;
-            const Kernel proj_norm_k = fp16 ? MosrProjectResNormFp16 : MosrProjectResNormMixed;
-            const Kernel proj_last_k = fp16 ? MosrProjectResFp16 : MosrProjectResMixed;
+            const Kernel proj_norm_k = d64 ? (fp16 ? MosrProjectResNormFp16 : MosrProjectResNormMixed)
+                                           : (fp16 ? MosrProjectResNormD48Fp16 : MosrProjectResNormD48Mixed);
+            const Kernel proj_last_k =
+                d64 ? (fp16 ? MosrProjectResFp16 : MosrProjectResMixed) : (fp16 ? MosrProjectResD48Fp16 : MosrProjectResD48Mixed);
 
             for (size_t idx = 0; idx < net.blocks.size(); ++idx) {
                 const auto& blk = net.blocks[idx];
                 {
                     CUdeviceptr fc1_w = weights + blk.fc1.weight, fc1_b = weights + blk.fc1.bias;
                     int h_arg = h, w_arg = w, ex_arg = exp_tx, ey_arg = exp_ty, pix_arg = pixels;
-                    void* params[] = {&plain_gated_buf, &dw_v_buf, &dw_g_buf, &norm_out, &fc1_w, &fc1_b,
-                                      &h_arg,           &w_arg,    &ex_arg,   &ey_arg,   &pix_arg};
+                    void* params[] = {&gated_planar_buf, &dw_v_buf, &dw_g_buf, &norm_out, &fc1_w, &fc1_b,
+                                      &h_arg,            &w_arg,    &ex_arg,   &ey_arg,   &pix_arg};
                     CHECK(cuLaunchKernel(functions[expand_k], exp_grid, 1, 1, 384, 1, 1, exp_smem, target, params,
                                          nullptr));
                 }
@@ -970,8 +991,8 @@ private:
                     int h_arg = h, w_arg = w, tx_arg = dw_tx, pix_arg = pixels;
                     void* params[] = {&dw_gated_buf, &dw_v_buf, &dw_g_buf, &dw_w,   &dw_b,
                                       &h_arg,        &w_arg,    &tx_arg,   &pix_arg};
-                    CHECK(cuLaunchKernel(functions[dw_planar_k], dw_grid, 8, unsigned(shape.n), dw_threads, 1, 1,
-                                         dw_smem, target, params, nullptr));
+                    CHECK(cuLaunchKernel(functions[dw_planar_k], dw_grid, unsigned(d / 8), unsigned(shape.n),
+                                         dw_threads, 1, 1, dw_smem, target, params, nullptr));
                 }
                 {
                     const bool do_norm = idx + 1 < net.blocks.size();
@@ -980,8 +1001,8 @@ private:
                     CUdeviceptr nw = do_norm ? (weights + net.blocks[idx + 1].norm_weight) : weights;
                     CUdeviceptr nb = do_norm ? (weights + net.blocks[idx + 1].norm_bias) : weights;
                     int h_arg = h, w_arg = w, tx_arg = tiles_x, ty_arg = tiles_y, pix_arg = pixels;
-                    void* params[] = {&state,  &norm_out, &plain_gated_buf, &dw_gated_buf, &fc2_w, &fc2_b, &nw,
-                                      &nb,     &h_arg,    &w_arg,           &tx_arg,       &ty_arg, &pix_arg};
+                    void* params[] = {&state, &norm_out, &gated_planar_buf, &fc2_w,  &fc2_b,  &nw,
+                                      &nb,    &h_arg,    &w_arg,            &tx_arg, &ty_arg, &pix_arg};
                     CHECK(cuLaunchKernel(functions[pk], proj_grid, 1, 1, 256, 1, 1, proj_smem, target, params, nullptr));
                 }
             }
