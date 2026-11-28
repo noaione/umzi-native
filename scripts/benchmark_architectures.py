@@ -68,6 +68,9 @@ FAMILIES = {
     "gfisrv2": Family("4x_wtp_MangaScale_GfisrV2.pth", "GFISRV2", "mscale", 4, 256, 2, 32),
     "smosr": Family("2x_enhancr_da_smosr_v1.safetensors", "SMoSR", "2x-test", 2, 256, 1),
     "figsr": Family("2x_enhancr_da_figsr.safetensors", "FIGSR", "2x-test", 2, 256, 1),
+    "mosr": Family("4x_umzi_digital_art_mosr_v2.pth", "mosr", "4x-test", 4, 512, 1),
+    "mosr-l": Family("4x_umzi_digital_art_mosr_l.pth", "mosr", "4x-test", 4, 512, 1),
+    "mosr-t": Family("2x_umzi_digital_art_mosr_t.pth", "mosr", "4x-test", 2, 512, 1),
 }
 
 
@@ -709,14 +712,16 @@ def main() -> None:
     if args.native_cache_dir and not native:
         parser.error("--native-cache-dir requires a native backend")
     if native and (
-        args.family not in ("smosr", "figsr", "gfisrv2")
+        args.family not in ("smosr", "figsr", "gfisrv2", "mosr", "mosr-l", "mosr-t")
         or batch != 1
         or not args.native_model
         or not args.native_library
     ):
-        parser.error("Native baselines require SMoSR, FiGSR, or GFISRv2, batch 1, --native-model, and --native-library")
-    if args.family not in ("smosr", "gfisrv2") and args.native_cache_dir:
-        parser.error("--native-cache-dir requires SMoSR or GFISRv2")
+        parser.error(
+            "Native baselines require SMoSR, FiGSR, GFISRv2, or MoSR, batch 1, --native-model, and --native-library"
+        )
+    if args.family not in ("smosr", "gfisrv2", "mosr", "mosr-l", "mosr-t") and args.native_cache_dir:
+        parser.error("--native-cache-dir requires SMoSR, GFISRv2, or MoSR")
     if args.family != "smosr" and (args.mixed_fp16_accumulation or args.fuse_silu):
         parser.error("The FP16 accumulation and SiLU fusion options require SMoSR")
     if args.tag is not None:
@@ -834,7 +839,7 @@ def main() -> None:
             packaged = peek_model(args.native_model)
             if (
                 not packaged.supported
-                or packaged.family_name != args.family
+                or packaged.family_name != family.model_class.casefold()
                 or getattr(packaged.payload, "checkpoint", None) != signature["checkpoint_sha256"]
             ):
                 raise ValueError("The native package must match the benchmark checkpoint")

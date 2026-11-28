@@ -33,7 +33,7 @@ info = export_model("models/4x_dwtp_ds_moesr_v2.pth", "output/moesr.ummodel", ke
 
 ## Supported checkpoints and topologies
 
-`gaterv3` and `gaterv2` accept compatible architecture configurations (within their supported channel and depth limits). `moesr`, `gfisrv2`, `smosr`, and `figsr` currently target the specific checkpoint topologies below and reject checkpoints with different layer counts or channel sizes.
+`gaterv3`, `gaterv2`, and `mosr` accept compatible architecture configurations (within their supported channel and depth limits). `moesr`, `gfisrv2`, `smosr`, and `figsr` currently target the specific checkpoint topologies below and reject checkpoints with different layer counts or channel sizes.
 
 | Family (`--kernel`) | Reference checkpoint | Scale | Topology / constraints |
 | --- | --- | ---: | --- |
@@ -41,6 +41,7 @@ info = export_model("models/4x_dwtp_ds_moesr_v2.pth", "output/moesr.ummodel", ke
 | `gaterv3` | `1x_umzi_idc_gaterv3.safetensors` | 1× | IDC variant, 32 base channels, 8 px alignment (3 encoder/decoder levels) |
 | `gaterv2` | `1x_umzi_dehalftone_gater2_v1_smooth.safetensors` | 1× | RGB 1×, 16–64 base channels (divisible by 16), 1–4 encoder/decoder levels |
 | `moesr` | `4x_dwtp_ds_moesr_v2.pth` | 4× | DWTP DS direct-shuffle topology (64 channels, 9 groups) |
+| `mosr` | `4x_umzi_digital_art_mosr_v2.pth` | 4× | 64 channels, 24 blocks, 7×7 depthwise, `gps` 4× tail (also supports `mosr-l` 17×17 and `mosr-t` 2× `dys`) |
 | `gfisrv2` | `4x_wtp_MangaScale_GfisrV2.pth` | 4× | MangaScale topology (48 channels, 24 blocks, direct shuffle) |
 | `smosr` | `2x_enhancr_da_smosr_v1.safetensors` | 2× | 48 channels, 6 blocks (2+3+1), direct 2× shuffle |
 | `figsr` | `2x_enhancr_da_figsr.safetensors` | 2× | 32 channels, 24 blocks (2×12), direct 2× shuffle |
@@ -51,6 +52,7 @@ Examples:
 python -m umzi_native export models/1x_umzi_digital_decompress_gaterv3_1.pth -o output/native/gaterv3.ummodel
 python -m umzi_native export models/1x_umzi_dehalftone_gater2_v1_smooth.safetensors -o output/native/gaterv2.ummodel --kernel gaterv2
 python -m umzi_native export models/4x_dwtp_ds_moesr_v2.pth -o output/native/moesr.ummodel --kernel moesr
+python -m umzi_native export models/4x_umzi_digital_art_mosr_v2.pth -o output/native/mosr.ummodel --kernel mosr
 python -m umzi_native export models/4x_wtp_MangaScale_GfisrV2.pth -o output/native/gfisrv2.ummodel --kernel gfisrv2
 python -m umzi_native export models/2x_enhancr_da_smosr_v1.safetensors -o output/native/smosr.ummodel --kernel smosr
 python -m umzi_native export models/2x_enhancr_da_figsr.safetensors -o output/native/figsr.ummodel --kernel figsr

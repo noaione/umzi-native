@@ -17,6 +17,7 @@ __all__ = [
     "GateRV2Model",
     "GateRV3Model",
     "MoESRModel",
+    "MoSRModel",
     "ModelInfo",
     "ModelSection",
     "SMoSRModel",
@@ -44,6 +45,7 @@ GATERV2_FAMILY = 3
 MOESR_FAMILY = 4
 SMOSR_FAMILY = 5
 FIGSR_FAMILY = 6
+MOSR_FAMILY = 7
 FAMILIES = {
     GATERV3_FAMILY: "gaterv3",
     GFISRV2_FAMILY: "gfisrv2",
@@ -51,8 +53,9 @@ FAMILIES = {
     MOESR_FAMILY: "moesr",
     SMOSR_FAMILY: "smosr",
     FIGSR_FAMILY: "figsr",
+    MOSR_FAMILY: "mosr",
 }
-SCHEMAS = {"gaterv3": 1, "gfisrv2": 1, "gaterv2": 1, "moesr": 1, "smosr": 2, "figsr": 1}
+SCHEMAS = {"gaterv3": 1, "gfisrv2": 1, "gaterv2": 1, "moesr": 1, "smosr": 2, "figsr": 1, "mosr": 1}
 SECTION_NAMES = {1: "architecture", 2: "schedule", 3: "weights", 4: "checkpoint"}
 # GateRV2 schema 1 architecture: input, output, scale, alignment, base
 # channels, levels, latent blocks, the attention epsilon as float32, four
@@ -93,6 +96,8 @@ FIGSR_BLOCK_FILTERS = (
     (80, 32, 3, 3, 1),
 )
 FIGSR_TAIL = ((32, 32, 3, 3, 1), (96, 32, 1, 1, 1), (32, 16, 3, 3, 1))
+MOSR_ARCHITECTURE = struct.Struct("<10I")
+MOSR_UPSAMPLERS = {0: "ps", 1: "gps", 2: "dys"}
 
 
 class GateRV3Op(IntEnum):
@@ -231,6 +236,72 @@ class FiGSRModel:
     checkpoint: str
 
 
+@dataclass(frozen=True)
+class MoSRModel:
+    """Direct-shuffle or DySample MoSR payload (schema 1)."""
+
+    input_channels: int
+    output_channels: int
+    scale: int
+    blocks: int
+    dim: int
+    hidden: int
+    kernel_size: int
+    upsampler: str
+    dysample_groups: int
+    flags: int
+    weight_bytes: int
+    checkpoint: str
+
+
+def mosr_parameter_sizes(
+    input_channels: int,
+    output_channels: int,
+    scale: int,
+    blocks: int,
+    dim: int,
+    hidden: int,
+    kernel_size: int,
+    upsampler: int,
+    dysample_groups: int,
+) -> list[int]:
+    """FP32 tensor sizes in bytes in native execution order."""
+
+    def conv(inputs: int, outputs: int, kh: int = 3, kw: int = 3, groups: int = 1, *, bias: bool = True) -> list[int]:
+        sizes = [outputs * (inputs // groups) * kh * kw * 4]
+        if bias:
+            sizes.append(outputs * 4)
+        return sizes
+
+    block = [
+        dim * 4,
+        dim * 4,
+        *conv(dim, 2 * hidden),
+        *conv(dim, dim, kernel_size, kernel_size, groups=dim),
+        *conv(hidden, dim),
+    ]
+    sizes = conv(input_channels, dim)
+    sizes += block * blocks
+    sizes += conv(dim, 2 * dim)
+    sizes += conv(2 * dim, dim)
+    sizes += conv(dim, dim, 1, 1)
+    sizes += conv(input_channels, dim)
+    sizes += conv(dim, dim)
+    sizes += conv(input_channels, dim, 1, 1)
+    if upsampler == 0:
+        sizes += conv(dim, output_channels * scale * scale)
+    elif upsampler == 1:
+        sizes += conv(dim, output_channels * scale * scale * 8)
+    elif upsampler == 2:
+        offset_ch = 2 * dysample_groups * scale * scale
+        sizes += conv(dim, offset_ch, 1, 1)
+        sizes += conv(dim, offset_ch, 1, 1, bias=False)
+        sizes += conv(dim, output_channels, 1, 1)
+    else:
+        raise ValueError(f"Unsupported MoSR upsampler kind: {upsampler}")
+    return sizes
+
+
 def figsr_parameter_sizes() -> list[int]:
     """Unaligned byte sizes in the same order as FiGSR's native weight layout."""
 
@@ -349,7 +420,7 @@ class ModelInfo:
     schema: int
     digest: str
     sections: tuple[ModelSection, ...]
-    payload: GateRV3Model | GateRV2Model | MoESRModel | GFISRv2Model | SMoSRModel | FiGSRModel | None = None
+    payload: GateRV3Model | GateRV2Model | MoESRModel | GFISRv2Model | SMoSRModel | FiGSRModel | MoSRModel | None = None
     problems: tuple[str, ...] = ()
 
     @property
@@ -439,6 +510,8 @@ def peek_model(path: PathArg) -> ModelInfo:
         payload = _read_smosr(schema, contents.get(1), contents.get(2), weights, contents.get(4), problems)
     elif family_name == "figsr":
         payload = _read_figsr(schema, contents.get(1), contents.get(2), weights, contents.get(4), problems)
+    elif family_name == "mosr":
+        payload = _read_mosr(schema, contents.get(1), contents.get(2), weights, contents.get(4), problems)
     return ModelInfo(
         path=model,
         size=size,
@@ -710,3 +783,78 @@ def _read_gfisrv2(
             return GFISRv2Model(*GFISRV2_CONFIG, weight_bytes, checkpoint.hex())
         problems.append("Invalid GFISRv2 weight layout")
     return None
+
+
+def _read_mosr(
+    schema: int,
+    architecture: bytes | None,
+    table: bytes | None,
+    weight_bytes: int,
+    checkpoint: bytes | None,
+    problems: list[str],
+) -> MoSRModel | None:
+    if schema != SCHEMAS["mosr"]:
+        problems.append("Unsupported MoSR model payload version")
+        return None
+    if (
+        architecture is None
+        or len(architecture) != MOSR_ARCHITECTURE.size
+        or checkpoint is None
+        or len(checkpoint) != DIGEST_SIZE
+    ):
+        problems.append("Invalid MoSR model metadata size")
+        return None
+    (
+        input_channels,
+        output_channels,
+        scale,
+        blocks,
+        dim,
+        hidden,
+        kernel_size,
+        upsampler,
+        dysample_groups,
+        flags,
+    ) = MOSR_ARCHITECTURE.unpack(architecture)
+    upsampler_name = MOSR_UPSAMPLERS.get(upsampler)
+    valid = (
+        (input_channels, output_channels) == (3, 3)
+        and 1 <= scale <= 8
+        and 1 <= blocks <= 64
+        and 16 <= dim <= 256
+        and dim % 8 == 0
+        and dim <= hidden <= 4 * dim
+        and kernel_size % 2 == 1
+        and 1 <= kernel_size <= 31
+        and upsampler_name is not None
+        and flags == 0
+    )
+    if upsampler == 2:
+        valid = valid and scale >= 2 and dysample_groups > 0 and dim % dysample_groups == 0
+    else:
+        valid = valid and dysample_groups == 0
+    if not valid or upsampler_name is None:
+        problems.append("Unsupported MoSR model architecture")
+        return None
+    expected = 0
+    for size in mosr_parameter_sizes(
+        input_channels, output_channels, scale, blocks, dim, hidden, kernel_size, upsampler, dysample_groups
+    ):
+        expected = (expected + 255) // 256 * 256 + size
+    if table is not None or expected != weight_bytes:
+        problems.append("Invalid MoSR weight layout")
+        return None
+    return MoSRModel(
+        input_channels=input_channels,
+        output_channels=output_channels,
+        scale=scale,
+        blocks=blocks,
+        dim=dim,
+        hidden=hidden,
+        kernel_size=kernel_size,
+        upsampler=upsampler_name,
+        dysample_groups=dysample_groups,
+        flags=flags,
+        weight_bytes=weight_bytes,
+        checkpoint=checkpoint.hex(),
+    )

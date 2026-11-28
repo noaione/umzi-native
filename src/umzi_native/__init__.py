@@ -11,6 +11,7 @@ from ._model import (
     ModelInfo,
     ModelSection,
     MoESRModel,
+    MoSRModel,
     SMoSRModel,
     peek_model,
 )
@@ -23,6 +24,7 @@ __all__ = [
     "GateRV3Model",
     "InferenceSession",
     "MoESRModel",
+    "MoSRModel",
     "ModelInfo",
     "ModelSection",
     "SMoSRModel",

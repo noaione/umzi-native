@@ -19,6 +19,7 @@ _PACKERS = {
     "gfisrv2": "._gfisrv2",
     "gaterv2": "._gaterv2",
     "moesr": "._moesr",
+    "mosr": "._mosr",
     "smosr": "._smosr",
     "figsr": "._figsr",
 }

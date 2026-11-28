@@ -12,6 +12,7 @@ inline constexpr uint32_t gaterv2_id = 3;
 inline constexpr uint32_t moesr_id = 4;
 inline constexpr uint32_t smosr_id = 5;
 inline constexpr uint32_t figsr_id = 6;
+inline constexpr uint32_t mosr_id = 7;
 
 class ModelPackage {
     std::vector<char> bytes;

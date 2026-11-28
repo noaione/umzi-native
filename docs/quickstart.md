@@ -143,7 +143,7 @@ standalone = umzi.SessionOptions(
 
 ## 4. Model-specific `kernel_options`
 
-The `.ummodel` header selects the kernel family automatically (`gaterv3`, `gaterv2`, `moesr`, `gfisrv2`, `smosr`, or `figsr`). All `kernel_options` values are integers (`0` or `1` unless a range is noted).
+The `.ummodel` header selects the kernel family automatically (`gaterv3`, `gaterv2`, `moesr`, `gfisrv2`, `smosr`, `figsr`, or `mosr`). All `kernel_options` values are integers (`0` or `1` unless a range is noted).
 
 ### GateRV3
 
@@ -312,6 +312,21 @@ tuned_mixed = umzi.SessionOptions(
 
 More detail: [FiGSR measurements](handoff-figsr.md).
 
+### MoSR
+
+- **Scale & precisions:** 1×–8× (4× `gps` / 2× `dys` tested) · `"fp32"`, `"mixed"`, `"fp16"`
+- **Input constraints:** Any positive spatial dimensions (`H >= 1`, `W >= 1`)
+
+| Option | Default | Values | Precision scope | What it does |
+| --- | ---: | --- | --- | --- |
+| `workspace_mib` | `512` | `0` to `4096` | All | Max temporary cuDNN workspace (MiB) used during tuning. |
+
+`workspace_mib` is part of the `mosr_<key>.umplan` cache key.
+
+- **Diagnostics (`get_session_info()["diagnostics"]`):** `timed_plans`, `plan_workspace_bytes`, `peak_plan_workspace_bytes`, `fp16_fallback_plans`.
+
+More detail: [MoSR measurements](handoff-mosr.md).
+
 ## 5. Inspecting models and sessions
 
 ### Before opening a session (`peek_model`)
@@ -325,7 +340,7 @@ print(info.family_name, info.supported, info.problems)
 
 ### On an open session
 
-- **Properties:** `session.kernel` (`"gaterv3"`, `"gaterv2"`, `"moesr"`, `"gfisrv2"`, `"smosr"`, or `"figsr"`), `session.scale_factor`, `session.context`, `session.library_path`, `session.closed`.
+- **Properties:** `session.kernel` (`"gaterv3"`, `"gaterv2"`, `"moesr"`, `"gfisrv2"`, `"smosr"`, `"figsr"`, or `"mosr"`), `session.scale_factor`, `session.context`, `session.library_path`, `session.closed`.
 - **Runtime diagnostics (`session.get_session_info()`):** Call after `prepare()` or `run()` to inspect:
   - `padded_shape`: actual padded `(N, 3, H, W)` shape running on the GPU (`None` before first prepare).
   - `cache_status`:

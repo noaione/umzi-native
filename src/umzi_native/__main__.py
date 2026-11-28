@@ -8,7 +8,7 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
-from ._model import GateRV2Model, GateRV3Model, ModelInfo, MoESRModel, peek_model
+from ._model import GateRV2Model, GateRV3Model, ModelInfo, MoESRModel, MoSRModel, peek_model
 
 
 def _bytes(count: int) -> str:
@@ -69,6 +69,12 @@ def _summary(info: ModelInfo) -> str:
         lines.append(
             f"  RGB x{payload.scale}, {payload.base_channels} base channels, {payload.groups} groups of "
             f"{payload.full_blocks} full-resolution and {payload.reduced_blocks} reduced-resolution blocks"
+        )
+        lines.append(f"  checkpoint: {payload.checkpoint}")
+    elif isinstance(payload, MoSRModel):
+        lines.append(
+            f"  RGB x{payload.scale}, {payload.dim} dim, {payload.hidden} hidden, {payload.blocks} blocks, "
+            f"{payload.kernel_size}x{payload.kernel_size} depthwise, upsampler={payload.upsampler}"
         )
         lines.append(f"  checkpoint: {payload.checkpoint}")
     lines.extend(f"  problem: {problem}" for problem in info.problems)
