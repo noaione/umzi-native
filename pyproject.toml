@@ -15,7 +15,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "umzi-native"
-version = "0.0.7"
+version = "0.0.8"
 description = "Native CUDA inference runtime for Umzi image restoration and upscaling models"
 readme = "README.md"
 license = "MPL-2.0"

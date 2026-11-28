@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+Nothing yet!
+
+## [0.0.8] - 2026-11-27
+
 ### Added
 
 - Add GPU `tiling="even"` and `tiling="fewest-even"` for equal rectangular tiles under a size cap (ABI 3), plus GFISRv2 `fp32_project_accum`, `fp32_accum`, and `even` vs. `fewest-even` guidance in `docs/quickstart.md`.
