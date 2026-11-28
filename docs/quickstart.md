@@ -105,7 +105,7 @@ Pass a `umzi.SessionOptions(...)` instance to `InferenceSession` to configure pr
 | --- | --- | --- |
 | `precision` | `"mixed"` | `"mixed"` (FP32 NumPy I/O, half-precision weights/ops where supported), `"fp16"` (FP16 NumPy I/O), or `"fp32"` (GFISRv2, SMoSR, and FiGSR only). |
 | `device_id` | `0` | CUDA GPU index to use (respects `CUDA_VISIBLE_DEVICES`). |
-| `cache_dir` | `None` | Writable directory for saving tuned GPU algorithm choices (`.umplan` files) so subsequent runs skip tuning. Used by GateRV3, GateRV2, MoESR, GFISRv2 (`mixed`/`fp16`), and SMoSR (`fuse_silu=1`). CUDA Graphs are still captured per process. |
+| `cache_dir` | `None` | Writable directory for saving tuned GPU algorithm choices (`.umplan` files) so subsequent runs skip tuning. Used by GateRV3, GateRV2, MoESR, MoSR, GFISRv2 (`mixed`/`fp16`), and SMoSR (`fuse_silu=1` or `tune_convolutions=1`). CUDA Graphs are still captured per process. |
 | `enable_cuda_graph` | `True` | Captures the forward pass into a CUDA Graph and replays it to reduce CPU launch overhead. Set `False` to submit kernels directly. |
 | `kernel_options` | `{}` | Dictionary of `name: int` switches specific to the model family (see below). Unknown names or invalid values raise `RuntimeError`. |
 | `dll_path` | `None` | Explicit path to `umzi_native.dll` / `libumzi_native.so`. By default the loader checks the installed package directory, then the `.ummodel` file's directory. |
@@ -270,7 +270,7 @@ More detail: [GFISRv2 measurements](handoff-gfisrv2.md).
 
 | Option | Default | Values | Precision scope | What it does |
 | --- | ---: | --- | --- | --- |
-| `tune_convolutions` | `0` | `0` or `1` | `"mixed"`, `"fp16"` | `1` times zero-workspace cuDNN plans for body convolutions during `prepare()` instead of picking the first supported plan. Adds setup time and can slightly alter rounding. |
+| `tune_convolutions` | `0` | `0` or `1` | `"mixed"`, `"fp16"` | `1` times zero-workspace cuDNN plans from heuristic A for body convolutions during `prepare()` instead of picking the first supported plan, and caches selections under `cache_dir` (`smosr-conv_<key>.umplan`). Adds cold setup time and can slightly alter rounding. |
 | `fp16_accumulation` | `0` | `0` or `1` | `"mixed"` only | Allows FP16 accumulation in body convolutions instead of FP32 accumulation. |
 | `fuse_silu` | `0` | `0` or `1` | `"mixed"`, `"fp16"` | Fuses eligible block convolutions with SiLU via cuDNN graphs and caches choices under `cache_dir` (`smosr-silu_<key>.umplan`). |
 

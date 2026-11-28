@@ -201,8 +201,16 @@ class Session final : public umzi::KernelSession {
         cache_diagnostic = error.what();
     }
 
-    std::unique_ptr<umzi::CudnnDescriptor> load_fused_plan(const std::filesystem::path& path,
-        const umzi::Digest& digest, const Filter& f, CUdeviceptr bias) {
+    struct ScratchGuard {
+        CUdeviceptr& ptr;
+        ~ScratchGuard() {
+            if (ptr) cuMemFree(ptr);
+        }
+    };
+
+    std::unique_ptr<umzi::CudnnDescriptor> load_cached_plan(const std::filesystem::path& path,
+        const umzi::Digest& digest, const Filter& f, size_t workspace_limit, CUdeviceptr bias,
+        size_t& loaded_workspace) {
         try {
             if (!std::filesystem::exists(path)) {
                 if (cache_status == UMZI_CACHE_HIT) cache_status = UMZI_CACHE_MISS;
@@ -212,24 +220,25 @@ class Session final : public umzi::KernelSession {
             if (payload.empty() || std::find(payload.begin(), payload.end(), '\0') != payload.end())
                 throw std::runtime_error("Invalid cached SMoSR plan JSON");
             payload.push_back('\0');
-            umzi::CudnnBackendPlan restored;
-            restored.plan = std::make_unique<umzi::CudnnDescriptor>(CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR);
-            restored.plan->set(CUDNN_ATTR_EXECUTION_PLAN_HANDLE, CUDNN_TYPE_HANDLE, &cudnn);
-            restored.plan->set(CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION, CUDNN_TYPE_CHAR,
-                               payload.data(), int64_t(payload.size()));
-            restored.plan->finalize();
+            auto restored = std::make_unique<umzi::CudnnDescriptor>(CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR);
+            restored->set(CUDNN_ATTR_EXECUTION_PLAN_HANDLE, CUDNN_TYPE_HANDLE, &cudnn);
+            restored->set(CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION, CUDNN_TYPE_CHAR,
+                          payload.data(), int64_t(payload.size()));
+            restored->finalize();
             int64_t bytes = 0, count = 0;
-            CHECK(cudnnBackendGetAttribute(restored.plan->get(), CUDNN_ATTR_EXECUTION_PLAN_WORKSPACE_SIZE,
+            CHECK(cudnnBackendGetAttribute(restored->get(), CUDNN_ATTR_EXECUTION_PLAN_WORKSPACE_SIZE,
                                            CUDNN_TYPE_INT64, 1, &count, &bytes));
-            if (count != 1 || bytes != 0) throw std::runtime_error("Cached SMoSR plan requires workspace");
+            if (count != 1 || bytes < 0 || uint64_t(bytes) > workspace_limit)
+                throw std::runtime_error("Cached SMoSR plan exceeds workspace limit");
             CUdeviceptr scratch = 0;
             size_t scratch_bytes = 0;
-            const float elapsed = umzi::time_cudnn_backend_plan(cudnn, stream, timing, restored,
-                buffer[Activated], weights + f.weight, buffer[Projection], scratch, scratch_bytes, 0,
-                nullptr, nullptr, bias);
-            if (elapsed == std::numeric_limits<float>::infinity())
+            ScratchGuard scratch_guard{scratch};
+            if (!umzi::run_cudnn_backend_plan(cudnn, stream, *restored, size_t(bytes), buffer[Activated],
+                                              weights + f.weight, buffer[Projection], scratch, scratch_bytes,
+                                              nullptr, nullptr, bias))
                 throw std::runtime_error("Cached SMoSR plan did not execute");
-            return std::move(restored.plan);
+            loaded_workspace = size_t(bytes);
+            return restored;
         } catch (const std::filesystem::filesystem_error& error) {
             cache_issue(UMZI_CACHE_UNAVAILABLE, error);
         } catch (const std::exception& error) {
@@ -241,22 +250,25 @@ class Session final : public umzi::KernelSession {
     void prepare_plan(const Filter& f, Shape padded, size_t limit, CUdeviceptr bias = 0) {
         const std::array key{f.cin, f.cout, f.k, int(bias != 0)};
         if (plans.find(key) != plans.end()) return;
+        const bool tuned_unfused = !bias && tune_convolutions && f.cin == features && f.k == 3;
+        const size_t plan_limit = bias ? size_t(0) : limit;
         umzi::CudnnBackendPlan plan;
         std::filesystem::path cache_path;
         umzi::Digest cache_key{};
-        if (bias && !cache_dir.empty() && cache_status != UMZI_CACHE_UNAVAILABLE) {
+        if ((bias || tuned_unfused) && !cache_dir.empty() && cache_status != UMZI_CACHE_UNAVAILABLE) {
             try {
                 umzi::Sha256 hash;
                 hash.add(cache_environment);
                 hash.add(std::array{padded.n, padded.h, padded.w, f.cin, f.cout, f.k});
                 if (!fp16) hash.add(std::array{int(fp16_accumulation)});
                 cache_key = hash.finish();
-                cache_path = umzi::plan_path(cache_dir, "smosr-silu", cache_key);
-                plan.plan = load_fused_plan(cache_path, cache_key, f, bias);
+                cache_path = umzi::plan_path(cache_dir, bias ? "smosr-silu" : "smosr-conv", cache_key);
+                plan.plan = load_cached_plan(cache_path, cache_key, f, plan_limit, bias, plan.workspace);
             } catch (const std::exception& error) {
                 cache_issue(UMZI_CACHE_UNAVAILABLE, error);
             }
             if (plan.plan) {
+                workspace_bytes = std::max(workspace_bytes, plan.workspace);
                 plans.emplace(key, std::move(plan));
                 return;
             }
@@ -266,18 +278,27 @@ class Session final : public umzi::KernelSession {
             cudnn, padded.n, padded.h, padded.w, f.cin, f.cout, f.k, fp32 ? CUDNN_DATA_FLOAT : CUDNN_DATA_HALF,
             fp16 || body_accumulates_in_fp16,
             fp32 ? CUDNN_TENSOR_NCHW : CUDNN_TENSOR_NHWC, bias != 0, !fp16);
-        bool tune = bias || (tune_convolutions && f.cin == features && f.k == 3);
-        // Tuning deliberately times only zero-workspace engines; see docs/handoff-smosr.md.
-        auto candidates = plan.graph->candidates(cudnn, tune ? 0 : limit, !tune);
-        if (tune && candidates.empty() && !bias) {
-            // No zero-workspace engine exists: take the default planner's first plan instead of failing the shape.
-            tune = false;
+        bool tune = bias || tuned_unfused;
+        // Tuning deliberately times only zero-workspace engines from heuristic A; see docs/handoff-smosr.md.
+        CUdeviceptr scratch = 0;
+        size_t scratch_bytes = 0;
+        ScratchGuard scratch_guard{scratch};
+        std::vector<umzi::CudnnCandidate> candidates;
+        if (tune) {
+            const size_t max_candidates = (!bias && f.cout == 2 * features) ? size_t(4) : size_t(0);
+            candidates = plan.graph->candidates_matching(
+                cudnn, 0, max_candidates, [](const umzi::CudnnDescriptor&, int64_t) { return true; },
+                /*stop_before_fallback=*/true);
+            if (candidates.empty() && !bias) {
+                // No zero-workspace engine exists: take the default planner's first plan instead of failing the shape.
+                tune = false;
+                candidates = plan.graph->candidates(cudnn, limit, true);
+            }
+        } else {
             candidates = plan.graph->candidates(cudnn, limit, true);
         }
         size_t selected = 0;
         if (tune) {
-            CUdeviceptr scratch = 0;
-            size_t scratch_bytes = 0;
             float fastest = std::numeric_limits<float>::infinity();
             selected = candidates.size();
             for (size_t i = 0; i < candidates.size(); ++i) {
@@ -527,7 +548,7 @@ public:
         const auto& image = umzi::load_kernel_module(device, module, smosr_images::embedded_cubins,
                                                      smosr_images::embedded_ptx);
         shared->module = module;
-        if (fuse_silu && options.cache_dir && *options.cache_dir) {
+        if ((fuse_silu || tune_convolutions) && options.cache_dir && *options.cache_dir) {
             try {
                 cache_dir = std::filesystem::absolute(std::filesystem::u8path(options.cache_dir));
                 std::filesystem::create_directories(cache_dir);

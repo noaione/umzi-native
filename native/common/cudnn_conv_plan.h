@@ -193,11 +193,18 @@ public:
         : CudnnConvGraph(handle, n, h, w, cin, cout, 3, CUDNN_DATA_HALF, fp16_compute) {}
 
     // Every engine configuration from heuristics A and fallback that finalizes
-    // into a plan within the workspace limit, in heuristic order, deduplicated.
-    std::vector<CudnnCandidate> candidates(cudnnHandle_t handle, uint64_t limit, bool first_only = false) {
+    // into a plan within the workspace limit, in heuristic order, optionally
+    // filtered by `accept`, stopping after `max_results` matches (when non-zero)
+    // and skipping fallback heuristics when `stop_before_fallback` is true and
+    // heuristic A already yielded matches.
+    template<class Accept>
+    std::vector<CudnnCandidate> candidates_matching(cudnnHandle_t handle, uint64_t limit, size_t max_results,
+                                                    Accept&& accept, bool stop_before_fallback = false) {
         std::vector<CudnnCandidate> result;
         if (!graph) return result;
         for (auto mode : {CUDNN_HEUR_MODE_A, CUDNN_HEUR_MODE_FALLBACK}) {
+            if (mode == CUDNN_HEUR_MODE_FALLBACK && !result.empty() && (max_results > 0 || stop_before_fallback))
+                break;
             CudnnDescriptor heuristic(CUDNN_BACKEND_ENGINEHEUR_DESCRIPTOR);
             heuristic.set(CUDNN_ATTR_ENGINEHEUR_MODE, CUDNN_TYPE_HEUR_MODE, &mode);
             heuristic.ref(CUDNN_ATTR_ENGINEHEUR_OPERATION_GRAPH, *graph);
@@ -229,7 +236,8 @@ public:
                                              CUDNN_TYPE_INT64, 1, &count, &bytes) != CUDNN_STATUS_SUCCESS
                     || bytes < 0 || uint64_t(bytes) > limit)
                     continue;
-                if (first_only) {
+                if (max_results == 1) {
+                    if (!accept(*plan, bytes)) continue;
                     result.push_back({std::move(plan), bytes, {}});
                     return result;
                 }
@@ -238,10 +246,16 @@ public:
                 const bool duplicate = std::any_of(result.begin(), result.end(),
                                                    [&](const CudnnCandidate& seen) { return seen.name == name; });
                 if (duplicate) continue;
+                if (!accept(*plan, bytes)) continue;
                 result.push_back({std::move(plan), bytes, std::move(name)});
+                if (max_results > 0 && result.size() >= max_results) return result;
             }
         }
         return result;
+    }
+
+    std::vector<CudnnCandidate> candidates(cudnnHandle_t handle, uint64_t limit, bool first_only = false) {
+        return candidates_matching(handle, limit, first_only ? 1 : 0, [](CudnnDescriptor&, int64_t) { return true; });
     }
 
     static std::string plan_json(const CudnnDescriptor& plan) {
@@ -305,6 +319,23 @@ inline bool ensure_device_scratch(CUstream stream, CUdeviceptr& scratch, size_t&
     return true;
 }
 
+// Execute one finalized execution plan once on the active stream. Returns false on
+// scratch allocation failure or execution error without timing.
+inline bool run_cudnn_backend_plan(cudnnHandle_t cudnn, CUstream stream, const CudnnDescriptor& plan,
+                                   size_t workspace, CUdeviceptr in_buf, CUdeviceptr weight_buf, CUdeviceptr out_buf,
+                                   CUdeviceptr& scratch, size_t& scratch_bytes, size_t* peak_bytes = nullptr,
+                                   uint64_t* peak_device_used = nullptr, CUdeviceptr bias = 0) {
+    const size_t before = scratch_bytes;
+    if (!ensure_device_scratch(stream, scratch, scratch_bytes, workspace, peak_bytes)) return false;
+    if (peak_device_used && scratch_bytes > before) *peak_device_used = std::max(*peak_device_used, device_used_bytes());
+    const auto variant = bind_conv_variant(reinterpret_cast<void*>(in_buf), reinterpret_cast<void*>(weight_buf),
+                                           reinterpret_cast<void*>(out_buf), reinterpret_cast<void*>(scratch),
+                                           reinterpret_cast<void*>(bias));
+    if (cudnnBackendExecute(cudnn, plan.get(), variant->get()) == CUDNN_STATUS_SUCCESS) return true;
+    check(cuStreamSynchronize(stream), "cuStreamSynchronize");
+    return false;
+}
+
 // Time one candidate execution plan. Repeats 5 times only when the first run
 // is within 2x of the current best. Returns infinity on failure.
 inline float time_cudnn_backend_plan(cudnnHandle_t cudnn, CUstream stream, const std::array<CUevent, 2>& timing,
@@ -312,18 +343,16 @@ inline float time_cudnn_backend_plan(cudnnHandle_t cudnn, CUstream stream, const
                                      CUdeviceptr out_buf, CUdeviceptr& scratch, size_t& scratch_bytes, float best,
                                      size_t* peak_bytes = nullptr, uint64_t* peak_device_used = nullptr,
                                      CUdeviceptr bias = 0) {
-    const size_t before = scratch_bytes;
-    if (!ensure_device_scratch(stream, scratch, scratch_bytes, p.workspace, peak_bytes))
+    if (!run_cudnn_backend_plan(cudnn, stream, *p.plan, p.workspace, in_buf, weight_buf, out_buf, scratch,
+                                scratch_bytes, peak_bytes, peak_device_used, bias))
         return std::numeric_limits<float>::infinity();
-    if (peak_device_used && scratch_bytes > before) *peak_device_used = std::max(*peak_device_used, device_used_bytes());
     const auto variant = bind_conv_variant(reinterpret_cast<void*>(in_buf), reinterpret_cast<void*>(weight_buf),
                                            reinterpret_cast<void*>(out_buf), reinterpret_cast<void*>(scratch),
                                            reinterpret_cast<void*>(bias));
-    const auto run = [&] { return cudnnBackendExecute(cudnn, p.plan->get(), variant->get()) == CUDNN_STATUS_SUCCESS; };
     const auto measure = [&](int repeats) {
         check(cuEventRecord(timing[0], stream), "cuEventRecord");
         for (int i = 0; i < repeats; ++i)
-            if (!run()) {
+            if (cudnnBackendExecute(cudnn, p.plan->get(), variant->get()) != CUDNN_STATUS_SUCCESS) {
                 check(cuStreamSynchronize(stream), "cuStreamSynchronize");
                 return std::numeric_limits<float>::infinity();
             }
@@ -333,10 +362,6 @@ inline float time_cudnn_backend_plan(cudnnHandle_t cudnn, CUstream stream, const
         check(cuEventElapsedTime(&elapsed, timing[0], timing[1]), "cuEventElapsedTime");
         return elapsed / repeats;
     };
-    if (!run()) {
-        check(cuStreamSynchronize(stream), "cuStreamSynchronize");
-        return std::numeric_limits<float>::infinity();
-    }
     const float first = measure(1);
     if (!(first < 2.f * best)) return first;
     return measure(5);
