@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+Nothing yet!
+
+## [0.0.9] - 2026-11-28
+
 ### Added
 
 - **MoSR** native CUDA support (`fp32`, `mixed`, `fp16`) for `mosr`, `mosr-l`, and `mosr-t` (`gps` and `dys` DySample tails), including `MoSRModel` inspection, plan caching (`mosr_*.umplan`), and `fused_gate`, `dw_fp16`, `fold_gps`, and `workspace_mib` kernel options.
