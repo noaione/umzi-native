@@ -319,9 +319,10 @@ More detail: [FiGSR measurements](handoff-figsr.md).
 
 | Option | Default | Values | Precision scope | What it does |
 | --- | ---: | --- | --- | --- |
+| `fused_gate` | `1` | `0` or `1` | `"mixed"`, `"fp16"` | `1` (recommended) enables fused tensor-core `expand_gate` / `project_res_norm` kernels and coalesced planar depthwise gating (`dim=64`, `hidden=96`, `kernel_size=7` or `17`). Set `0` to fall back to separate cuDNN convolutions and NHWC 8-channel gating. Ignored in `"fp32"` or other block widths. |
 | `workspace_mib` | `512` | `0` to `4096` | All | Max temporary cuDNN workspace (MiB) used during tuning. |
 
-`workspace_mib` is part of the `mosr_<key>.umplan` cache key.
+Both `fused_gate` and `workspace_mib` are part of the `mosr_<key>.umplan` cache key.
 
 - **Diagnostics (`get_session_info()["diagnostics"]`):** `timed_plans`, `plan_workspace_bytes`, `peak_plan_workspace_bytes`, `fp16_fallback_plans`.
 

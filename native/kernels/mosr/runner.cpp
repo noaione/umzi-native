@@ -27,7 +27,7 @@ namespace {
 constexpr int rgb_lanes = 8, threads = 256;
 constexpr int lanes(int count) { return (count + 7) & ~7; }
 constexpr uint64_t default_workspace_mib = 512, max_workspace_mib = 4096;
-constexpr uint32_t plan_schema = 1;
+constexpr uint32_t plan_schema = 2;
 using umzi::Clock;
 using umzi::ContextScope;
 #define CHECK(expr) umzi::check((expr), #expr)
@@ -174,9 +174,107 @@ struct Network {
     }
 };
 
-std::vector<char> pack_half_weights(const Network& src, const Network& dst, const char* raw) {
+uint16_t checked_half(float val) {
+    const uint16_t h = umzi::float_to_half(val);
+    if ((h & 0x7fffu) >= 0x7c00u) throw std::runtime_error("MoSR weight exceeds the finite FP16 range");
+    return h;
+}
+
+void pack_fused_fc1(uint16_t* dst_w, float* dst_b, const float* src_w, const float* src_b, int dim, int hidden) {
+    const int plain = hidden - dim;
+    for (int i = 0; i < plain; ++i) dst_b[i] = src_b[i];
+    for (int i = 0; i < plain; ++i) dst_b[plain + i] = src_b[hidden + i];
+    for (int i = 0; i < dim; ++i) dst_b[2 * plain + i] = src_b[hidden + plain + i];
+    for (int i = 0; i < dim; ++i) dst_b[2 * plain + dim + i] = src_b[plain + i];
+
+    auto orig_out = [&](int row) {
+        if (row < plain) return row;
+        if (row < 2 * plain) return hidden + (row - plain);
+        if (row < 2 * plain + dim) return hidden + plain + (row - 2 * plain);
+        return plain + (row - 2 * plain - dim);
+    };
+
+    const int cout = 2 * hidden;
+    size_t stage = 0;
+    for (int ks = 0; ks < dim / 16; ++ks) {
+        for (int dy = 0; dy < 3; ++dy) {
+            uint16_t* stage_dst = dst_w + stage * (3 * size_t(cout) * 16);
+            for (int dx = 0; dx < 3; ++dx) {
+                const int tap = dy * 3 + dx;
+                uint16_t* tap_dst = stage_dst + dx * (size_t(cout) * 16);
+                for (int row = 0; row < cout; ++row) {
+                    const int co = orig_out(row);
+                    const int mask = (row >> 2) & 1;
+                    for (int chunk = 0; chunk < 2; ++chunk) {
+                        const size_t d = (size_t(row) * 2 + (chunk ^ mask)) * 8;
+                        for (int hi = 0; hi < 8; ++hi) {
+                            const int ci = ks * 16 + chunk * 8 + hi;
+                            tap_dst[d + hi] = checked_half(src_w[(size_t(co) * dim + ci) * 9 + tap]);
+                        }
+                    }
+                }
+            }
+            ++stage;
+        }
+    }
+}
+
+void pack_fused_fc2(uint16_t* dst_w, const float* src_w, int dim, int hidden) {
+    size_t stage = 0;
+    for (int ks = 0; ks < hidden / 16; ++ks) {
+        for (int dy = 0; dy < 3; ++dy) {
+            uint16_t* stage_dst = dst_w + stage * (3 * size_t(dim) * 16);
+            for (int dx = 0; dx < 3; ++dx) {
+                const int tap = dy * 3 + dx;
+                uint16_t* tap_dst = stage_dst + dx * (size_t(dim) * 16);
+                for (int row = 0; row < dim; ++row) {
+                    const int mask = (row >> 2) & 1;
+                    for (int chunk = 0; chunk < 2; ++chunk) {
+                        const size_t d = (size_t(row) * 2 + (chunk ^ mask)) * 8;
+                        for (int hi = 0; hi < 8; ++hi) {
+                            const int ci = ks * 16 + chunk * 8 + hi;
+                            tap_dst[d + hi] = checked_half(src_w[(size_t(row) * hidden + ci) * 9 + tap]);
+                        }
+                    }
+                }
+            }
+            ++stage;
+        }
+    }
+}
+
+std::vector<char> pack_half_weights(const Network& src, const Network& dst, const char* raw, bool fused_gate, int dim,
+                                    int hidden) {
     std::vector<char> out(dst.bytes, 0);
+    std::vector<bool> skip_entry(src.entries.size(), false);
+    std::vector<std::pair<size_t, size_t>> fc_blocks;
+    if (fused_gate) {
+        for (size_t b = 0; b < src.blocks.size(); ++b) {
+            const auto& sb = src.blocks[b];
+            const auto& db = dst.blocks[b];
+            pack_fused_fc1(reinterpret_cast<uint16_t*>(out.data() + db.fc1.weight),
+                           reinterpret_cast<float*>(out.data() + db.fc1.bias),
+                           reinterpret_cast<const float*>(raw + sb.fc1.weight),
+                           reinterpret_cast<const float*>(raw + sb.fc1.bias), dim, hidden);
+            pack_fused_fc2(reinterpret_cast<uint16_t*>(out.data() + db.fc2.weight),
+                           reinterpret_cast<const float*>(raw + sb.fc2.weight), dim, hidden);
+            std::memcpy(out.data() + db.fc2.bias, raw + sb.fc2.bias, size_t(dim) * sizeof(float));
+            fc_blocks.emplace_back(sb.fc1.weight, db.fc1.weight);
+            fc_blocks.emplace_back(sb.fc1.bias, db.fc1.bias);
+            fc_blocks.emplace_back(sb.fc2.weight, db.fc2.weight);
+            fc_blocks.emplace_back(sb.fc2.bias, db.fc2.bias);
+        }
+        for (size_t idx = 0; idx < src.entries.size(); ++idx) {
+            for (const auto& p : fc_blocks) {
+                if (src.entries[idx].offset == p.first) {
+                    skip_entry[idx] = true;
+                    break;
+                }
+            }
+        }
+    }
     for (size_t idx = 0; idx < src.entries.size(); ++idx) {
+        if (skip_entry[idx]) continue;
         const auto& s = src.entries[idx];
         const auto& d = dst.entries[idx];
         const float* in_f = reinterpret_cast<const float*>(raw + s.offset);
@@ -190,10 +288,7 @@ std::vector<char> pack_half_weights(const Network& src, const Network& dst, cons
             for (int tap = 0; tap < taps; ++tap) {
                 for (int i = 0; i < s.cin; ++i) {
                     const float val = in_f[((size_t(o) * s.cin + i) * taps) + tap];
-                    const uint16_t h = umzi::float_to_half(val);
-                    if ((h & 0x7fffu) >= 0x7c00u)
-                        throw std::runtime_error("MoSR weight exceeds the finite FP16 range");
-                    dst_h[(size_t(o) * taps + tap) * d.cin + i] = h;
+                    dst_h[(size_t(o) * taps + tap) * d.cin + i] = checked_half(val);
                 }
             }
         }
@@ -206,6 +301,10 @@ constexpr const char* kernel_names[] = {
     "layer_norm_nchw_f32",
     "plain_gate_nchw_f32",
     "dw_gate_nchw_f32",
+    "dw_gate_nchw_f32_k7",
+    "dw_gate_nchw_f32_k17",
+    "bias_norm_nchw_f32",
+    "mish_residual_norm_nchw_f32",
     "mish_bias_residual_nchw_f32",
     "mish_bias_inplace_nchw_f32",
     "combine_body_shortcut_nchw_f32",
@@ -216,7 +315,12 @@ constexpr const char* kernel_names[] = {
     "pack_rgb_nhwc_f16",
     "layer_norm_nhwc",
     "plain_gate_nhwc",
+    "plain_gate_nhwc_vec8",
     "dw_gate_nhwc",
+    "dw_gate_nhwc_8ch_k7",
+    "dw_gate_nhwc_8ch_k17",
+    "bias_norm_nhwc",
+    "mish_residual_norm_nhwc",
     "mish_bias_residual_nhwc",
     "mish_bias_inplace_nhwc",
     "add_bias_nhwc",
@@ -228,6 +332,14 @@ constexpr const char* kernel_names[] = {
     "unpack_rgb_nhwc_f16",
     "fill_noise_f16",
     "fill_noise_f32",
+    "mosr_expand_gate_fp16",
+    "mosr_expand_gate_mixed",
+    "mosr_dw_gate_planar_k7",
+    "mosr_dw_gate_planar_k17",
+    "mosr_project_res_norm_fp16",
+    "mosr_project_res_fp16",
+    "mosr_project_res_norm_mixed",
+    "mosr_project_res_mixed",
 };
 
 enum Kernel {
@@ -235,6 +347,10 @@ enum Kernel {
     LayerNormNchwF32,
     PlainGateNchwF32,
     DwGateNchwF32,
+    DwGateNchwF32K7,
+    DwGateNchwF32K17,
+    BiasNormNchwF32,
+    MishResidualNormNchwF32,
     MishBiasResidualNchwF32,
     MishBiasInplaceNchwF32,
     CombineBodyShortcutNchwF32,
@@ -245,7 +361,12 @@ enum Kernel {
     PackRgbNhwcF16,
     LayerNormNhwc,
     PlainGateNhwc,
+    PlainGateNhwcVec8,
     DwGateNhwc,
+    DwGateNhwc8chK7,
+    DwGateNhwc8chK17,
+    BiasNormNhwc,
+    MishResidualNormNhwc,
     MishBiasResidualNhwc,
     MishBiasInplaceNhwc,
     AddBiasNhwc,
@@ -257,6 +378,14 @@ enum Kernel {
     UnpackRgbNhwcF16,
     FillNoiseF16,
     FillNoiseF32,
+    MosrExpandGateFp16,
+    MosrExpandGateMixed,
+    MosrDwGatePlanarK7,
+    MosrDwGatePlanarK17,
+    MosrProjectResNormFp16,
+    MosrProjectResFp16,
+    MosrProjectResNormMixed,
+    MosrProjectResMixed,
     KernelCount,
 };
 static_assert(std::size(kernel_names) == KernelCount);
@@ -265,6 +394,7 @@ class Session final : public umzi::KernelSession {
     Architecture arch{};
     Network model, device_model;
     bool fp16 = false, fp32 = false, graph_enabled = false, pending = false;
+    bool fused_gate_option = true, fused_gate = false;
 
     struct Shared {
         CUdevice device = 0;
@@ -356,7 +486,7 @@ public:
         if (options.precision != UMZI_FP32 && options.precision != UMZI_MIXED && options.precision != UMZI_FP16)
             throw std::runtime_error("Unsupported MoSR session precision");
 
-        bool seen_workspace = false;
+        bool seen_workspace = false, seen_fused = false;
         for (uint32_t i = 0; i < options.kernel_option_count; ++i) {
             const auto& option = options.kernel_options[i];
             const std::string name = option.name ? option.name : "";
@@ -366,12 +496,19 @@ public:
                     throw std::runtime_error("MoSR option workspace_mib must be between 0 and 4096");
                 workspace_limit = uint64_t(option.value) << 20;
                 seen_workspace = true;
+            } else if (name == "fused_gate") {
+                if (seen_fused) throw std::runtime_error("Duplicate MoSR option: fused_gate");
+                if (option.value != 0 && option.value != 1)
+                    throw std::runtime_error("MoSR option fused_gate must be 0 or 1");
+                fused_gate_option = option.value != 0;
+                seen_fused = true;
             } else {
-                throw std::runtime_error("Unknown MoSR option: " + name + " (expected workspace_mib)");
+                throw std::runtime_error("Unknown MoSR option: " + name + " (expected workspace_mib or fused_gate)");
             }
         }
         fp32 = options.precision == UMZI_FP32;
         fp16 = options.precision == UMZI_FP16;
+        fused_gate = !fp32 && fused_gate_option && arch.d() == 64 && arch.hd() == 96 && (arch.k() == 7 || arch.k() == 17);
         device_model = Network(arch, !fp32);
         graph_enabled = (options.flags & UMZI_CUDA_GRAPH) != 0;
 
@@ -385,6 +522,12 @@ public:
             umzi::load_kernel_module(device, module, mosr_images::embedded_cubins, mosr_images::embedded_ptx);
         shared->module = module;
         for (int i = 0; i < KernelCount; ++i) CHECK(cuModuleGetFunction(&functions[i], module, kernel_names[i]));
+        for (Kernel k : {MosrExpandGateFp16, MosrExpandGateMixed, MosrProjectResNormFp16, MosrProjectResFp16,
+                         MosrProjectResNormMixed, MosrProjectResMixed, MosrDwGatePlanarK7, MosrDwGatePlanarK17,
+                         BiasNormNchwF32, MishResidualNormNchwF32}) {
+            CHECK(cuFuncSetAttribute(functions[k], CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+                                     CU_SHAREDMEM_CARVEOUT_MAX_SHARED));
+        }
         CHECK(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
         CHECK(cuEventCreate(&complete, CU_EVENT_DISABLE_TIMING));
         for (auto& event : timing) CHECK(cuEventCreate(&event, CU_EVENT_DEFAULT));
@@ -396,7 +539,7 @@ public:
             shared->weights = weights;
             CHECK(cuMemcpyHtoD(weights, data.data(), data.size()));
         } else {
-            const auto packed = pack_half_weights(model, device_model, data.data());
+            const auto packed = pack_half_weights(model, device_model, data.data(), fused_gate, arch.d(), arch.hd());
             CHECK(cuMemAlloc(&weights, packed.size()));
             shared->weights = weights;
             CHECK(cuMemcpyHtoD(weights, packed.data(), packed.size()));
@@ -411,6 +554,7 @@ public:
             umzi::Sha256 hash;
             umzi::hash_plan_environment(hash, umzi::mosr_id, plan_schema, model_digest, image, device);
             hash.add(static_cast<uint32_t>(fp32 ? 2 : (fp16 ? 1 : 0)));
+            hash.add(static_cast<uint32_t>(fused_gate ? 1 : 0));
             hash.add(workspace_limit);
             cache_environment = hash.finish();
         } catch (const std::exception& error) {
@@ -618,8 +762,10 @@ private:
             load_plan_cache();
             const int h = shape.h, w = shape.w;
             make_plan(h, w, rgb_ch, d, 3, rgb_buf, state);
-            make_plan(h, w, d, proj_ch, 3, norm_out, projected);
-            make_plan(h, w, gated_ch, d, 3, gated, norm_out);
+            if (!fused_gate) {
+                make_plan(h, w, d, proj_ch, 3, norm_out, projected);
+                make_plan(h, w, gated_ch, d, 3, gated, norm_out);
+            }
             make_plan(h, w, d, 2 * d, 3, state, projected);
             make_plan(h, w, 2 * d, d, 3, projected, gated);
             make_plan(h, w, d, d, 1, gated, state);
@@ -691,15 +837,28 @@ private:
         const auto& net = device_model;
         elementwise(target, CopyNchwF32, pixels * 3, rgb_buf, input);
         conv(state, rgb_buf, h, w, net.stem);
-        elementwise(target, AddBiasNchwF32, pixels * d, state, state, weights + net.stem.bias, d, hw);
+        const unsigned norm_f32_smem = (d <= 64) ? unsigned(128 * d) * sizeof(float) : 0u;
+        const unsigned norm_f32_threads = (d <= 64) ? 128u : 256u;
+        const unsigned norm_f32_grid = unsigned((pixels + int(norm_f32_threads) - 1) / int(norm_f32_threads));
+        if (net.blocks.empty()) {
+            elementwise(target, AddBiasNchwF32, pixels * d, state, state, weights + net.stem.bias, d, hw);
+        } else {
+            CUdeviceptr st_bias = weights + net.stem.bias, nw = weights + net.blocks[0].norm_weight,
+                        nb = weights + net.blocks[0].norm_bias;
+            int d_arg = d, hw_arg = hw, pix_arg = pixels;
+            void* params[] = {&state, &norm_out, &st_bias, &nw, &nb, &d_arg, &hw_arg, &pix_arg};
+            CHECK(cuLaunchKernel(functions[BiasNormNchwF32], norm_f32_grid, 1, 1, norm_f32_threads, 1, 1, norm_f32_smem,
+                                 target, params, nullptr));
+        }
 
         const int tiles_x = (w + 15) / 16, tiles_y = (h + 15) / 16;
         const int radius = k / 2;
         const unsigned smem_bytes = unsigned((16 + 2 * radius) * (16 + 2 * radius)) * sizeof(float);
         const int plain = hd - d;
-        for (const auto& blk : net.blocks) {
-            launch(target, LayerNormNchwF32, pixels, norm_out, state, weights + blk.norm_weight,
-                   weights + blk.norm_bias, d, hw, pixels);
+        const Kernel dw_f32_kernel = k == 7 ? DwGateNchwF32K7 : (k == 17 ? DwGateNchwF32K17 : DwGateNchwF32);
+        const unsigned dw_f32_threads = (k == 7 || k == 17) ? 128u : 256u;
+        for (size_t idx = 0; idx < net.blocks.size(); ++idx) {
+            const auto& blk = net.blocks[idx];
             conv(projected, norm_out, h, w, blk.fc1);
             if (plain > 0) {
                 elementwise(target, PlainGateNchwF32, pixels * plain, gated, projected, weights + blk.fc1.bias, d, hd,
@@ -710,11 +869,21 @@ private:
                 CUdeviceptr fc1_b = weights + blk.fc1.bias, dw_w = weights + blk.dw.weight, dw_b = weights + blk.dw.bias;
                 int h_arg = h, w_arg = w, d_arg = d, hd_arg = hd, k_arg = k, tx_arg = tiles_x;
                 void* params[] = {&g_out, &p_in, &fc1_b, &dw_w, &dw_b, &d_arg, &hd_arg, &k_arg, &h_arg, &w_arg, &tx_arg};
-                CHECK(cuLaunchKernel(functions[DwGateNchwF32], unsigned(tiles_x * tiles_y), unsigned(d), unsigned(shape.n),
-                                     256, 1, 1, smem_bytes, target, params, nullptr));
+                CHECK(cuLaunchKernel(functions[dw_f32_kernel], unsigned(tiles_x * tiles_y), unsigned(d), unsigned(shape.n),
+                                     dw_f32_threads, 1, 1, smem_bytes, target, params, nullptr));
             }
             conv(norm_out, gated, h, w, blk.fc2);
-            elementwise(target, MishBiasResidualNchwF32, pixels * d, state, norm_out, weights + blk.fc2.bias, d, hw);
+            if (idx + 1 < net.blocks.size()) {
+                const auto& next_blk = net.blocks[idx + 1];
+                CUdeviceptr fc2_b = weights + blk.fc2.bias, nw = weights + next_blk.norm_weight,
+                            nb = weights + next_blk.norm_bias;
+                int d_arg = d, hw_arg = hw, pix_arg = pixels;
+                void* params[] = {&state, &norm_out, &norm_out, &fc2_b, &nw, &nb, &d_arg, &hw_arg, &pix_arg};
+                CHECK(cuLaunchKernel(functions[MishResidualNormNchwF32], norm_f32_grid, 1, 1, norm_f32_threads, 1, 1,
+                                     norm_f32_smem, target, params, nullptr));
+            } else {
+                elementwise(target, MishBiasResidualNchwF32, pixels * d, state, norm_out, weights + blk.fc2.bias, d, hw);
+            }
         }
 
         conv(projected, state, h, w, net.tail0);
@@ -757,34 +926,114 @@ private:
         const auto& net = device_model;
         elementwise(target, fp16 ? PackRgbNhwcF16 : PackRgbNhwcF32, pixels * rgb_lanes, rgb_buf, input, h, w);
         conv(state, rgb_buf, h, w, net.stem);
-        launch(target, AddBiasNhwc, (pixels * d) / 2, state, weights + net.stem.bias, d, (pixels * d) / 2);
+        if (net.blocks.empty()) {
+            launch(target, AddBiasNhwc, (pixels * d) / 2, state, weights + net.stem.bias, d, (pixels * d) / 2);
+        } else {
+            launch(target, BiasNormNhwc, pixels * 32, state, norm_out, weights + net.stem.bias,
+                   weights + net.blocks[0].norm_weight, weights + net.blocks[0].norm_bias, d, pixels);
+        }
 
         const int tiles_x = (w + 15) / 16, tiles_y = (h + 15) / 16;
-        const int radius = k / 2;
-        const unsigned smem_bytes = unsigned((16 + 2 * radius) * (16 + 2 * radius) * 4) * sizeof(float);
-        const int plain = hd - d;
-        for (size_t idx = 0; idx < net.blocks.size(); ++idx) {
-            const auto& blk = net.blocks[idx];
-            launch(target, LayerNormNhwc, pixels * 32, norm_out, state, weights + blk.norm_weight,
-                   weights + blk.norm_bias, d, pixels);
-            conv(projected, norm_out, h, w, blk.fc1);
-            if (plain > 0) {
-                elementwise(target, PlainGateNhwc, pixels * plain, gated, projected, weights + blk.fc1.bias, d, hd,
-                            fc1_stride, gated_stride);
+        if (fused_gate) {
+            const int exp_tx = (w + 15) / 16, exp_ty = (h + 7) / 8;
+            const int dw_tile_w = (k == 7) ? 32 : 16;
+            const int dw_tx = (w + dw_tile_w - 1) / dw_tile_w;
+            const unsigned exp_grid = unsigned(exp_tx * exp_ty * shape.n);
+            const unsigned dw_grid = unsigned(dw_tx * tiles_y);
+            const unsigned proj_grid = unsigned(tiles_x * tiles_y * shape.n);
+            const unsigned exp_smem = 48384u;
+            const unsigned dw_threads = (k == 7) ? 256u : 128u;
+            const unsigned dw_smem = unsigned((16 + k - 1) * (dw_tile_w + k - 1) * 16 + k * k * 32);
+            const unsigned proj_smem = 33024u;
+            const size_t elem = 2;
+            CUdeviceptr plain_gated_buf = projected;
+            CUdeviceptr dw_v_buf = plain_gated_buf + size_t(pixels) * 32 * elem;
+            CUdeviceptr dw_g_buf = dw_v_buf + size_t(pixels) * 64 * elem;
+            CUdeviceptr dw_gated_buf = dw_g_buf + size_t(pixels) * 64 * elem;
+            const Kernel expand_k = fp16 ? MosrExpandGateFp16 : MosrExpandGateMixed;
+            const Kernel dw_planar_k = k == 7 ? MosrDwGatePlanarK7 : MosrDwGatePlanarK17;
+            const Kernel proj_norm_k = fp16 ? MosrProjectResNormFp16 : MosrProjectResNormMixed;
+            const Kernel proj_last_k = fp16 ? MosrProjectResFp16 : MosrProjectResMixed;
+
+            for (size_t idx = 0; idx < net.blocks.size(); ++idx) {
+                const auto& blk = net.blocks[idx];
+                {
+                    CUdeviceptr fc1_w = weights + blk.fc1.weight, fc1_b = weights + blk.fc1.bias;
+                    int h_arg = h, w_arg = w, ex_arg = exp_tx, ey_arg = exp_ty, pix_arg = pixels;
+                    void* params[] = {&plain_gated_buf, &dw_v_buf, &dw_g_buf, &norm_out, &fc1_w, &fc1_b,
+                                      &h_arg,           &w_arg,    &ex_arg,   &ey_arg,   &pix_arg};
+                    CHECK(cuLaunchKernel(functions[expand_k], exp_grid, 1, 1, 384, 1, 1, exp_smem, target, params,
+                                         nullptr));
+                }
+                {
+                    CUdeviceptr dw_w = weights + blk.dw.weight, dw_b = weights + blk.dw.bias;
+                    int h_arg = h, w_arg = w, tx_arg = dw_tx, pix_arg = pixels;
+                    void* params[] = {&dw_gated_buf, &dw_v_buf, &dw_g_buf, &dw_w,   &dw_b,
+                                      &h_arg,        &w_arg,    &tx_arg,   &pix_arg};
+                    CHECK(cuLaunchKernel(functions[dw_planar_k], dw_grid, 8, unsigned(shape.n), dw_threads, 1, 1,
+                                         dw_smem, target, params, nullptr));
+                }
+                {
+                    const bool do_norm = idx + 1 < net.blocks.size();
+                    const Kernel pk = do_norm ? proj_norm_k : proj_last_k;
+                    CUdeviceptr fc2_w = weights + blk.fc2.weight, fc2_b = weights + blk.fc2.bias;
+                    CUdeviceptr nw = do_norm ? (weights + net.blocks[idx + 1].norm_weight) : weights;
+                    CUdeviceptr nb = do_norm ? (weights + net.blocks[idx + 1].norm_bias) : weights;
+                    int h_arg = h, w_arg = w, tx_arg = tiles_x, ty_arg = tiles_y, pix_arg = pixels;
+                    void* params[] = {&state,  &norm_out, &plain_gated_buf, &dw_gated_buf, &fc2_w, &fc2_b, &nw,
+                                      &nb,     &h_arg,    &w_arg,           &tx_arg,       &ty_arg, &pix_arg};
+                    CHECK(cuLaunchKernel(functions[pk], proj_grid, 1, 1, 256, 1, 1, proj_smem, target, params, nullptr));
+                }
             }
-            {
-                CUdeviceptr g_out = gated, p_in = projected;
-                CUdeviceptr fc1_b = weights + blk.fc1.bias, dw_w = weights + blk.dw.weight, dw_b = weights + blk.dw.bias;
-                int d_arg = d, hd_arg = hd, fs_arg = fc1_stride, gs_arg = gated_stride, k_arg = k, h_arg = h, w_arg = w,
-                    tx_arg = tiles_x;
-                void* params[] = {&g_out,  &p_in,   &fc1_b,  &dw_w,  &dw_b,  &d_arg,  &hd_arg,
-                                  &fs_arg, &gs_arg, &k_arg,  &h_arg, &w_arg, &tx_arg};
-                CHECK(cuLaunchKernel(functions[DwGateNhwc], unsigned(tiles_x * tiles_y), unsigned(d / 4),
-                                     unsigned(shape.n), 256, 1, 1, smem_bytes, target, params, nullptr));
+        } else {
+            const int radius = k / 2;
+            const int plain = hd - d;
+            const bool use_plain_vec8 =
+                plain > 0 && (plain % 8 == 0) && (fc1_stride % 8 == 0) && (gated_stride % 8 == 0) && (gated_stride == hd);
+            const bool use_dw_8ch = (d % 8 == 0) && ((2 * hd - d) % 8 == 0) && ((hd - d) % 8 == 0) &&
+                                    (fc1_stride % 8 == 0) && (gated_stride % 8 == 0) && (k == 7 || k == 17);
+            const unsigned smem_bytes =
+                unsigned((16 + 2 * radius) * (16 + 2 * radius) * (use_dw_8ch ? 8 : 4)) * sizeof(float);
+            for (size_t idx = 0; idx < net.blocks.size(); ++idx) {
+                const auto& blk = net.blocks[idx];
+                conv(projected, norm_out, h, w, blk.fc1);
+                if (plain > 0) {
+                    if (use_plain_vec8) {
+                        elementwise(target, PlainGateNhwcVec8, pixels * (plain >> 3), gated, projected,
+                                    weights + blk.fc1.bias, d, hd, fc1_stride, gated_stride);
+                    } else {
+                        elementwise(target, PlainGateNhwc, pixels * plain, gated, projected, weights + blk.fc1.bias, d, hd,
+                                    fc1_stride, gated_stride);
+                    }
+                }
+                {
+                    CUdeviceptr g_out = gated, p_in = projected;
+                    CUdeviceptr fc1_b = weights + blk.fc1.bias, dw_w = weights + blk.dw.weight, dw_b = weights + blk.dw.bias;
+                    int d_arg = d, hd_arg = hd, fs_arg = fc1_stride, gs_arg = gated_stride, k_arg = k, h_arg = h, w_arg = w,
+                        tx_arg = tiles_x;
+                    if (use_dw_8ch) {
+                        void* params[] = {&g_out,  &p_in,   &fc1_b,  &dw_w,  &dw_b,  &d_arg,
+                                          &hd_arg, &fs_arg, &gs_arg, &h_arg, &w_arg, &tx_arg};
+                        const Kernel dw_8ch = k == 7 ? DwGateNhwc8chK7 : DwGateNhwc8chK17;
+                        CHECK(cuLaunchKernel(functions[dw_8ch], unsigned(tiles_x * tiles_y), unsigned(d / 8),
+                                             unsigned(shape.n), 256, 1, 1, smem_bytes, target, params, nullptr));
+                    } else {
+                        void* params[] = {&g_out,  &p_in,   &fc1_b,  &dw_w,  &dw_b,  &d_arg,  &hd_arg,
+                                          &fs_arg, &gs_arg, &k_arg,  &h_arg, &w_arg, &tx_arg};
+                        CHECK(cuLaunchKernel(functions[DwGateNhwc], unsigned(tiles_x * tiles_y), unsigned(d / 4),
+                                             unsigned(shape.n), 256, 1, 1, smem_bytes, target, params, nullptr));
+                    }
+                }
+                conv(norm_out, gated, h, w, blk.fc2);
+                if (idx + 1 < net.blocks.size()) {
+                    const auto& next_blk = net.blocks[idx + 1];
+                    launch(target, MishResidualNormNhwc, pixels * 32, state, norm_out, norm_out, weights + blk.fc2.bias,
+                           weights + next_blk.norm_weight, weights + next_blk.norm_bias, d, pixels);
+                } else {
+                    launch(target, MishBiasResidualNhwc, (pixels * d) / 2, state, norm_out, weights + blk.fc2.bias, d,
+                           (pixels * d) / 2);
+                }
             }
-            conv(norm_out, gated, h, w, blk.fc2);
-            launch(target, MishBiasResidualNhwc, (pixels * d) / 2, state, norm_out, weights + blk.fc2.bias, d,
-                   (pixels * d) / 2);
         }
 
         conv(projected, state, h, w, net.tail0);
@@ -918,8 +1167,8 @@ public:
     const char* cache_message() const override { return plan_cache.diagnostic.c_str(); }
     const char* kernel_message() const override {
         if (fp32) return "MoSR NCHW FP32";
-        if (fp16) return "MoSR NHWC FP16";
-        return "MoSR NHWC mixed precision";
+        if (fp16) return fused_gate ? "MoSR NHWC FP16 (fused tensor-core gate)" : "MoSR NHWC FP16";
+        return fused_gate ? "MoSR NHWC mixed precision (fused tensor-core gate)" : "MoSR NHWC mixed precision";
     }
 
     UmziSessionInfo session_info() const override {
