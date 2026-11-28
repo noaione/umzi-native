@@ -54,8 +54,8 @@ import umzi_native as umzi
 
 options = umzi.SessionOptions(
     dll_dirs=[
-        Path("path/to/nvidia/cu13/bin/x86_64"),   # Linux: .../cu13/lib
-        Path("path/to/nvidia/cudnn/bin"),         # Linux: .../cudnn/lib
+        Path("path/to/nvidia/cu13/bin/x86_64"),  # Linux: .../cu13/lib
+        Path("path/to/nvidia/cudnn/bin"),  # Linux: .../cudnn/lib
     ],
 )
 ```

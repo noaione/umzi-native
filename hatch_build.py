@@ -24,7 +24,8 @@ from typing import NamedTuple
 ROOT = Path(__file__).resolve().parent
 NATIVE = ROOT / "native"
 KERNEL_SOURCES = {
-    family: NATIVE / "kernels" / family for family in ("gaterv3", "gaterv2", "moesr", "gfisrv2", "smosr", "figsr", "mosr")
+    family: NATIVE / "kernels" / family
+    for family in ("gaterv3", "gaterv2", "moesr", "gfisrv2", "smosr", "figsr", "mosr")
 }
 EXACT_MATH_FAMILIES = frozenset({"gaterv2", "moesr", "gfisrv2", "smosr", "figsr", "mosr"})
 HOST_SOURCES = (
