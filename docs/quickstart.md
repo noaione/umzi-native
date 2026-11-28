@@ -320,9 +320,11 @@ More detail: [FiGSR measurements](handoff-figsr.md).
 | Option | Default | Values | Precision scope | What it does |
 | --- | ---: | --- | --- | --- |
 | `fused_gate` | `1` | `0` or `1` | `"mixed"`, `"fp16"` | `1` (recommended) enables fused tensor-core `expand_gate` / `project_res_norm` kernels and coalesced planar depthwise gating for `(dim=64, hidden=96)` or `(dim=48, hidden=72)` with `kernel_size=7` or `17`. Set `0` to fall back to separate cuDNN convolutions and NHWC 8-channel gating. Ignored in `"fp32"` or other block widths. |
+| `dw_fp16` | `1` | `0` or `1` | `"fp16"` | `1` (recommended) uses packed `half2` arithmetic in planar depthwise gating when `fused_gate=1`. Set `0` for FP32 depthwise accumulation in `"fp16"`. |
+| `fold_gps` | `0` | `0` or `1` | `"mixed"`, `"fp16"` | `1` pre-averages the `8×` GPS ensemble head on host and shrinks body scratch (saves ~44 MiB at `512×512` at a ~3 dB FP16 tail PSNR cost). Kept `0` by default to preserve full GPS ensemble precision. |
 | `workspace_mib` | `512` | `0` to `4096` | All | Max temporary cuDNN workspace (MiB) used during tuning. |
 
-Both `fused_gate` and `workspace_mib` are part of the `mosr_<key>.umplan` cache key.
+`fused_gate`, `dw_fp16`, `fold_gps`, and `workspace_mib` are part of the `mosr_<key>.umplan` cache key.
 
 - **Diagnostics (`get_session_info()["diagnostics"]`):** `timed_plans`, `plan_workspace_bytes`, `peak_plan_workspace_bytes`, `fp16_fallback_plans`.
 

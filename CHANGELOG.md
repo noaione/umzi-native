@@ -4,12 +4,14 @@
 
 ### Added
 
+- **MoSR** native CUDA support (`fp32`, `mixed`, `fp16`) for `mosr`, `mosr-l`, and `mosr-t` (`gps` and `dys` DySample tails), including `MoSRModel` inspection, plan caching (`mosr_*.umplan`), and `fused_gate`, `dw_fp16`, `fold_gps`, and `workspace_mib` kernel options.
 - Pre-allocation shape memory estimation (ABI 4): `umzi_session_estimate_memory()` / `UmziMemoryInfo` in the C ABI and `InferenceSession.estimate_memory()` in Python, reporting weights, activations, workspace upper bound, staging I/O, and available device VRAM without allocating GPU buffers or tuning plans (using `cufftEstimateMany` for cuFFT models).
 - VRAM-budgeted tiling helpers in Python: `whole_page_tile()`, `InferenceSession.estimate_tiled_memory()`, and `InferenceSession.fit_tile_size()`.
 
 ### Changed
 
-- Consistent pre-allocation free-VRAM checks (`require_device_memory` / `allocate_device_checked`) across all six kernel families (`gaterv3`, `gaterv2`, `moesr`, `gfisrv2`, `smosr`, `figsr`), `PageTiler` arena allocations, and `ensure_device_scratch()` during cuDNN plan tuning, raising `AllocationError` (`MemoryError`) cleanly instead of spilling into shared system RAM.
+- Optimized **MoSR** (`native/kernels/mosr/`): Tensor Core fused gating (`dim=64/hidden=96` and `dim=48/hidden=72`), `16×32` planar depthwise gating with packed `half2` math (`dw_fp16=1`), and shrunken activation scratch—running `1.8×–2.6×` faster than TensorRT-RTX FP16 across `mosr`, `mosr-l`, and `mosr-t` with higher PSNR and `137–296 MiB` lower peak VRAM (`docs/handoff-mosr.md`).
+- Consistent pre-allocation free-VRAM checks (`require_device_memory` / `allocate_device_checked`) across all kernel families, `PageTiler` arena allocations, and `ensure_device_scratch()` during cuDNN plan tuning, raising `AllocationError` (`MemoryError`) cleanly instead of spilling into shared system RAM.
 - NVML-aware device free-VRAM reporting (`device_vram_info` dynamically loading `nvml.dll` / `libnvidia-ml.so.1` and matching the CUDA device by UUID) so Windows WDDM cross-process VRAM usage is accounted for when available, falling back to `cuMemGetInfo` otherwise.
 
 ## [0.0.8] - 2026-11-27

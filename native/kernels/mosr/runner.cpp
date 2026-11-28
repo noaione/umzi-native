@@ -27,7 +27,7 @@ namespace {
 constexpr int rgb_lanes = 8, threads = 256;
 constexpr int lanes(int count) { return (count + 7) & ~7; }
 constexpr uint64_t default_workspace_mib = 512, max_workspace_mib = 4096;
-constexpr uint32_t plan_schema = 3;
+constexpr uint32_t plan_schema = 4;
 using umzi::Clock;
 using umzi::ContextScope;
 #define CHECK(expr) umzi::check((expr), #expr)
@@ -115,7 +115,8 @@ struct Network {
     bool nhwc_half = false;
 
     Network() = default;
-    Network(const Architecture& a, bool device_nhwc_half, bool fused_gate = false) : nhwc_half(device_nhwc_half) {
+    Network(const Architecture& a, bool device_nhwc_half, bool fused_gate = false, bool fold_gps = false)
+        : nhwc_half(device_nhwc_half) {
         const int d = a.d(), hd = a.hd(), k = a.k(), s = a.s();
         const int rgb_in = nhwc_half ? rgb_lanes : 3;
         const int fc1_out = nhwc_half ? lanes(2 * hd) : 2 * hd;
@@ -143,7 +144,7 @@ struct Network {
             dys_scope = conv(d, off_lanes, 1, false);
             dys_end = conv(d, end_out, 1);
         } else {
-            const int real_out = 3 * s * s * a.gps_ensemble();
+            const int real_out = 3 * s * s * (fold_gps ? 1 : a.gps_ensemble());
             const int up_lanes = nhwc_half ? lanes(real_out) : real_out;
             upsample_conv = conv(d, up_lanes, 3);
         }
@@ -244,11 +245,11 @@ void pack_fused_fc2(uint16_t* dst_w, const float* src_w, int dim, int hidden) {
     }
 }
 
-std::vector<char> pack_half_weights(const Network& src, const Network& dst, const char* raw, bool fused_gate, int dim,
-                                    int hidden) {
+std::vector<char> pack_half_weights(const Network& src, const Network& dst, const char* raw, bool fused_gate,
+                                    bool fold_gps, int dim, int hidden) {
     std::vector<char> out(dst.bytes, 0);
     std::vector<bool> skip_entry(src.entries.size(), false);
-    std::vector<std::pair<size_t, size_t>> fc_blocks;
+    std::vector<size_t> skip_offsets;
     if (fused_gate) {
         for (size_t b = 0; b < src.blocks.size(); ++b) {
             const auto& sb = src.blocks[b];
@@ -260,17 +261,45 @@ std::vector<char> pack_half_weights(const Network& src, const Network& dst, cons
             pack_fused_fc2(reinterpret_cast<uint16_t*>(out.data() + db.fc2.weight),
                            reinterpret_cast<const float*>(raw + sb.fc2.weight), dim, hidden);
             std::memcpy(out.data() + db.fc2.bias, raw + sb.fc2.bias, size_t(dim) * sizeof(float));
-            fc_blocks.emplace_back(sb.fc1.weight, db.fc1.weight);
-            fc_blocks.emplace_back(sb.fc1.bias, db.fc1.bias);
-            fc_blocks.emplace_back(sb.fc2.weight, db.fc2.weight);
-            fc_blocks.emplace_back(sb.fc2.bias, db.fc2.bias);
+            skip_offsets.push_back(sb.fc1.weight);
+            skip_offsets.push_back(sb.fc1.bias);
+            skip_offsets.push_back(sb.fc2.weight);
+            skip_offsets.push_back(sb.fc2.bias);
         }
-        for (size_t idx = 0; idx < src.entries.size(); ++idx) {
-            for (const auto& p : fc_blocks) {
-                if (src.entries[idx].offset == p.first) {
-                    skip_entry[idx] = true;
-                    break;
+    }
+    if (fold_gps) {
+        const auto& su = src.upsample_conv;
+        const auto& du = dst.upsample_conv;
+        const int ens = 8;
+        const int plane = su.cout / ens;
+        const float inv = 1.f / float(ens);
+        const float* src_w = reinterpret_cast<const float*>(raw + su.weight);
+        const float* src_b = reinterpret_cast<const float*>(raw + su.bias);
+        uint16_t* dst_w = reinterpret_cast<uint16_t*>(out.data() + du.weight);
+        float* dst_b = reinterpret_cast<float*>(out.data() + du.bias);
+        for (int c = 0; c < plane; ++c) {
+            double b_acc = 0.0;
+            for (int k = 0; k < ens; ++k) b_acc += double(src_b[size_t(k) * plane + c]);
+            dst_b[c] = float(b_acc * double(inv));
+            for (int tap = 0; tap < 9; ++tap) {
+                for (int i = 0; i < dim; ++i) {
+                    double w_acc = 0.0;
+                    for (int k = 0; k < ens; ++k) {
+                        const int o = k * plane + c;
+                        w_acc += double(src_w[(size_t(o) * dim + i) * 9 + tap]);
+                    }
+                    dst_w[(size_t(c) * 9 + tap) * du.cin + i] = checked_half(float(w_acc * double(inv)));
                 }
+            }
+        }
+        skip_offsets.push_back(su.weight);
+        skip_offsets.push_back(su.bias);
+    }
+    for (size_t idx = 0; idx < src.entries.size(); ++idx) {
+        for (const size_t off : skip_offsets) {
+            if (src.entries[idx].offset == off) {
+                skip_entry[idx] = true;
+                break;
             }
         }
     }
@@ -337,8 +366,10 @@ constexpr const char* kernel_names[] = {
     "mosr_expand_gate_mixed",
     "mosr_expand_gate_d48_fp16",
     "mosr_expand_gate_d48_mixed",
-    "mosr_dw_gate_planar_k7",
-    "mosr_dw_gate_planar_k17",
+    "mosr_dw_gate_planar_k7_f16",
+    "mosr_dw_gate_planar_k7_f32",
+    "mosr_dw_gate_planar_k17_f16",
+    "mosr_dw_gate_planar_k17_f32",
     "mosr_project_res_norm_fp16",
     "mosr_project_res_fp16",
     "mosr_project_res_norm_mixed",
@@ -389,8 +420,10 @@ enum Kernel {
     MosrExpandGateMixed,
     MosrExpandGateD48Fp16,
     MosrExpandGateD48Mixed,
-    MosrDwGatePlanarK7,
-    MosrDwGatePlanarK17,
+    MosrDwGatePlanarK7F16,
+    MosrDwGatePlanarK7F32,
+    MosrDwGatePlanarK17F16,
+    MosrDwGatePlanarK17F32,
     MosrProjectResNormFp16,
     MosrProjectResFp16,
     MosrProjectResNormMixed,
@@ -408,6 +441,8 @@ class Session final : public umzi::KernelSession {
     Network model, device_model;
     bool fp16 = false, fp32 = false, graph_enabled = false, pending = false;
     bool fused_gate_option = true, fused_gate = false;
+    bool dw_fp16_option = true, dw_fp16 = false;
+    bool fold_gps_option = false, fold_gps = false;
 
     struct Shared {
         CUdevice device = 0;
@@ -474,14 +509,16 @@ class Session final : public umzi::KernelSession {
         const int rgb_ch = fp32 ? 3 : rgb_lanes;
         const int proj_ch = fp32 ? 2 * hd : lanes(2 * hd);
         const int gated_ch = fp32 ? hd : lanes(hd);
-        const int body_ch = rgb_ch + d + d + proj_ch + gated_ch;
+        const int scratch_ch = fused_gate ? (hd + 2 * d) : (proj_ch + gated_ch);
+        const int body_ch = rgb_ch + d + d + scratch_ch;
         int up_ch = 0;
         if (arch.upsampler == UpsampleDYS) {
             const int off_ch = fp32 ? arch.offset_ch() : lanes(arch.offset_ch());
             const int end_ch = (fp32 ? 3 : rgb_lanes) * s * s;
             up_ch = d + std::max(2 * off_ch, end_ch) + d * s * s;
         } else {
-            const int raw_up = 3 * s * s * arch.gps_ensemble();
+            const int up_ens = fold_gps ? 1 : arch.gps_ensemble();
+            const int raw_up = 3 * s * s * up_ens;
             up_ch = d + (fp32 ? raw_up : lanes(raw_up));
         }
         return std::max(body_ch, up_ch);
@@ -499,7 +536,7 @@ public:
         if (options.precision != UMZI_FP32 && options.precision != UMZI_MIXED && options.precision != UMZI_FP16)
             throw std::runtime_error("Unsupported MoSR session precision");
 
-        bool seen_workspace = false, seen_fused = false;
+        bool seen_workspace = false, seen_fused = false, seen_dw_fp16 = false, seen_fold_gps = false;
         for (uint32_t i = 0; i < options.kernel_option_count; ++i) {
             const auto& option = options.kernel_options[i];
             const std::string name = option.name ? option.name : "";
@@ -515,8 +552,21 @@ public:
                     throw std::runtime_error("MoSR option fused_gate must be 0 or 1");
                 fused_gate_option = option.value != 0;
                 seen_fused = true;
+            } else if (name == "dw_fp16") {
+                if (seen_dw_fp16) throw std::runtime_error("Duplicate MoSR option: dw_fp16");
+                if (option.value != 0 && option.value != 1)
+                    throw std::runtime_error("MoSR option dw_fp16 must be 0 or 1");
+                dw_fp16_option = option.value != 0;
+                seen_dw_fp16 = true;
+            } else if (name == "fold_gps") {
+                if (seen_fold_gps) throw std::runtime_error("Duplicate MoSR option: fold_gps");
+                if (option.value != 0 && option.value != 1)
+                    throw std::runtime_error("MoSR option fold_gps must be 0 or 1");
+                fold_gps_option = option.value != 0;
+                seen_fold_gps = true;
             } else {
-                throw std::runtime_error("Unknown MoSR option: " + name + " (expected workspace_mib or fused_gate)");
+                throw std::runtime_error(
+                    "Unknown MoSR option: " + name + " (expected workspace_mib, fused_gate, dw_fp16, or fold_gps)");
             }
         }
         fp32 = options.precision == UMZI_FP32;
@@ -524,7 +574,9 @@ public:
         fused_gate = !fp32 && fused_gate_option &&
                      ((arch.d() == 64 && arch.hd() == 96) || (arch.d() == 48 && arch.hd() == 72)) &&
                      (arch.k() == 7 || arch.k() == 17);
-        device_model = Network(arch, !fp32, fused_gate);
+        dw_fp16 = fp16 && dw_fp16_option && fused_gate;
+        fold_gps = !fp32 && fold_gps_option && arch.upsampler == UpsampleGPS;
+        device_model = Network(arch, !fp32, fused_gate, fold_gps);
         graph_enabled = (options.flags & UMZI_CUDA_GRAPH) != 0;
 
         CHECK(cuInit(0));
@@ -540,8 +592,8 @@ public:
         for (Kernel k : {MosrExpandGateFp16, MosrExpandGateMixed, MosrExpandGateD48Fp16, MosrExpandGateD48Mixed,
                          MosrProjectResNormFp16, MosrProjectResFp16, MosrProjectResNormMixed, MosrProjectResMixed,
                          MosrProjectResNormD48Fp16, MosrProjectResD48Fp16, MosrProjectResNormD48Mixed,
-                         MosrProjectResD48Mixed, MosrDwGatePlanarK7, MosrDwGatePlanarK17, BiasNormNchwF32,
-                         MishResidualNormNchwF32}) {
+                         MosrProjectResD48Mixed, MosrDwGatePlanarK7F16, MosrDwGatePlanarK7F32,
+                         MosrDwGatePlanarK17F16, MosrDwGatePlanarK17F32, BiasNormNchwF32, MishResidualNormNchwF32}) {
             CHECK(cuFuncSetAttribute(functions[k], CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
                                      CU_SHAREDMEM_CARVEOUT_MAX_SHARED));
         }
@@ -556,7 +608,8 @@ public:
             shared->weights = weights;
             CHECK(cuMemcpyHtoD(weights, data.data(), data.size()));
         } else {
-            const auto packed = pack_half_weights(model, device_model, data.data(), fused_gate, arch.d(), arch.hd());
+            const auto packed =
+                pack_half_weights(model, device_model, data.data(), fused_gate, fold_gps, arch.d(), arch.hd());
             CHECK(cuMemAlloc(&weights, packed.size()));
             shared->weights = weights;
             CHECK(cuMemcpyHtoD(weights, packed.data(), packed.size()));
@@ -571,7 +624,7 @@ public:
             umzi::Sha256 hash;
             umzi::hash_plan_environment(hash, umzi::mosr_id, plan_schema, model_digest, image, device);
             hash.add(static_cast<uint32_t>(fp32 ? 2 : (fp16 ? 1 : 0)));
-            hash.add(static_cast<uint32_t>(fused_gate ? 1 : 0));
+            hash.add(static_cast<uint32_t>((fused_gate ? 1 : 0) | (fold_gps ? 2 : 0)));
             hash.add(workspace_limit);
             cache_environment = hash.finish();
         } catch (const std::exception& error) {
@@ -619,6 +672,12 @@ public:
         copy->fp16 = fp16;
         copy->fp32 = fp32;
         copy->graph_enabled = graph_enabled;
+        copy->fused_gate_option = fused_gate_option;
+        copy->fused_gate = fused_gate;
+        copy->dw_fp16_option = dw_fp16_option;
+        copy->dw_fp16 = dw_fp16;
+        copy->fold_gps_option = fold_gps_option;
+        copy->fold_gps = fold_gps;
         copy->device = device;
         copy->context = context;
         copy->module = module;
@@ -744,6 +803,8 @@ private:
             const int rgb_ch = fp32 ? 3 : rgb_lanes;
             const int proj_ch = fp32 ? 2 * hd : lanes(2 * hd);
             const int gated_ch = fp32 ? hd : lanes(hd);
+            const int scratch_ch = fused_gate ? (hd + 2 * d) : (proj_ch + gated_ch);
+            const int tail_proj_ch = fused_gate ? 2 * d : proj_ch;
             const int total_ch = arena_channels();
             activation_bytes = pixels * size_t(total_ch) * elem;
             const size_t stage_bytes = graph_enabled ? shape.rgb_bytes(fp16) * (1 + s * s) : 0;
@@ -753,8 +814,8 @@ private:
             state = arena;
             norm_out = state + pixels * size_t(d) * elem;
             projected = norm_out + pixels * size_t(d) * elem;
-            gated = projected + pixels * size_t(proj_ch) * elem;
-            rgb_buf = gated + pixels * size_t(gated_ch) * elem;
+            gated = projected + pixels * size_t(tail_proj_ch) * elem;
+            rgb_buf = projected + pixels * size_t(scratch_ch) * elem;
             upsample_buf = state + pixels * size_t(d) * elem;
 
             if (arch.upsampler == UpsampleDYS) {
@@ -794,7 +855,8 @@ private:
                 make_plan(h, w, d, off_ch, 1, state, dys_off_buf);
                 make_plan(s * h, s * w, d, end_out, 1, dys_smp_buf, dys_end_buf);
             } else {
-                const int up_raw = 3 * s * s * arch.gps_ensemble();
+                const int up_ens = fold_gps ? 1 : arch.gps_ensemble();
+                const int up_raw = 3 * s * s * up_ens;
                 const int up_ch = fp32 ? up_raw : lanes(up_raw);
                 make_plan(h, w, d, up_ch, 3, state, upsample_buf);
             }
@@ -953,15 +1015,15 @@ private:
         const int tiles_x = (w + 15) / 16, tiles_y = (h + 15) / 16;
         if (fused_gate) {
             const int exp_tx = (w + 15) / 16, exp_ty = (h + 7) / 8;
-            const int dw_tile_w = (k == 7) ? 32 : 16;
+            const int dw_tile_w = 32;
             const int dw_tx = (w + dw_tile_w - 1) / dw_tile_w;
             const unsigned exp_grid = unsigned(exp_tx * exp_ty * shape.n);
             const unsigned dw_grid = unsigned(dw_tx * tiles_y);
             const unsigned proj_grid = unsigned(tiles_x * tiles_y * shape.n);
             const bool d64 = d == 64;
             const unsigned exp_smem = d64 ? 48384u : 39168u;
-            const unsigned dw_threads = (k == 7) ? 256u : 128u;
-            const unsigned dw_smem = unsigned((16 + k - 1) * (dw_tile_w + k - 1) * 16 + k * k * 32);
+            const unsigned dw_threads = 256u;
+            const unsigned dw_smem = unsigned((16 + k - 1) * (dw_tile_w + k - 1) * 16 + k * k * (dw_fp16 ? 16 : 32));
             const unsigned proj_smem = d64 ? 33024u : 29952u;
             const size_t elem = 2;
             CUdeviceptr gated_planar_buf = projected;
@@ -970,7 +1032,8 @@ private:
             CUdeviceptr dw_g_buf = dw_v_buf + size_t(pixels) * size_t(d) * elem;
             const Kernel expand_k =
                 d64 ? (fp16 ? MosrExpandGateFp16 : MosrExpandGateMixed) : (fp16 ? MosrExpandGateD48Fp16 : MosrExpandGateD48Mixed);
-            const Kernel dw_planar_k = k == 7 ? MosrDwGatePlanarK7 : MosrDwGatePlanarK17;
+            const Kernel dw_planar_k = (k == 7) ? (dw_fp16 ? MosrDwGatePlanarK7F16 : MosrDwGatePlanarK7F32)
+                                                : (dw_fp16 ? MosrDwGatePlanarK17F16 : MosrDwGatePlanarK17F32);
             const Kernel proj_norm_k = d64 ? (fp16 ? MosrProjectResNormFp16 : MosrProjectResNormMixed)
                                            : (fp16 ? MosrProjectResNormD48Fp16 : MosrProjectResNormD48Mixed);
             const Kernel proj_last_k =
@@ -1081,10 +1144,11 @@ private:
             elementwise(target, fp16 ? UnpackRgbNhwcF16 : UnpackRgbNhwcF32, pixels * 3 * s * s, output, dys_end_buf,
                         weights + net.dys_end.bias, 3, rgb_lanes, s * h, s * w);
         } else {
-            const int up_stride = lanes(3 * s * s * arch.gps_ensemble());
+            const int up_ens = fold_gps ? 1 : arch.gps_ensemble();
+            const int up_stride = lanes(3 * s * s * up_ens);
             conv(upsample_buf, state, h, w, net.upsample_conv);
             elementwise(target, fp16 ? GpsShuffleNhwcF16 : GpsShuffleNhwcF32, pixels * 3 * s * s, output, upsample_buf,
-                        weights + net.upsample_conv.bias, 3, s, h, w, arch.gps_ensemble(), up_stride);
+                        weights + net.upsample_conv.bias, 3, s, h, w, up_ens, up_stride);
         }
     }
 

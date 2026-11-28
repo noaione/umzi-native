@@ -1121,7 +1121,7 @@ extern "C" __global__ void mosr_expand_gate_d48_mixed(half* gated_planar, half* 
                                          tiles_y, total_pixels);
 }
 
-template<int FixedK, int TileW>
+template<int FixedK, int TileW, bool HalfAccum>
 __device__ void mosr_dw_gate_planar_impl(half* dw_gated, const half* dw_v, const half* dw_g, const float* dw_weight,
                                          const float* dw_bias, int h, int w, int tiles_x, int total_pixels) {
     uint4* s_u4 = mosr_smem;
@@ -1132,7 +1132,7 @@ __device__ void mosr_dw_gate_planar_impl(half* dw_gated, const half* dw_v, const
     const int ch0 = slice << 3;
     const int image = blockIdx.z;
     const int tid = threadIdx.x;
-    constexpr int nthreads = (TileW == 32) ? 256 : 128;
+    constexpr int nthreads = 256;
     constexpr int radius = FixedK >> 1;
     constexpr int smem_w = TileW + 2 * radius;
     constexpr int smem_h = 16 + 2 * radius;
@@ -1152,11 +1152,19 @@ __device__ void mosr_dw_gate_planar_impl(half* dw_gated, const half* dw_v, const
         }
         s_u4[i] = v;
     }
-    float4* w_s4 = reinterpret_cast<float4*>(s_u4 + smem_count);
-    float* w_f = reinterpret_cast<float*>(w_s4);
-    for (int i = tid; i < 8 * taps; i += nthreads) {
-        const int lc = i / taps, tap = i % taps;
-        w_f[tap * 8 + lc] = dw_weight[size_t(ch0 + lc) * taps + tap];
+    uint4* w_u4 = s_u4 + smem_count;
+    if constexpr (HalfAccum) {
+        half* w_h = reinterpret_cast<half*>(w_u4);
+        for (int i = tid; i < 8 * taps; i += nthreads) {
+            const int lc = i / taps, tap = i % taps;
+            w_h[tap * 8 + lc] = __float2half_rn(dw_weight[size_t(ch0 + lc) * taps + tap]);
+        }
+    } else {
+        float* w_f = reinterpret_cast<float*>(w_u4);
+        for (int i = tid; i < 8 * taps; i += nthreads) {
+            const int lc = i / taps, tap = i % taps;
+            w_f[tap * 8 + lc] = dw_weight[size_t(ch0 + lc) * taps + tap];
+        }
     }
     __syncthreads();
 
@@ -1167,76 +1175,129 @@ __device__ void mosr_dw_gate_planar_impl(half* dw_gated, const half* dw_v, const
     float acc0[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
     float acc1[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 
-    auto decode = [](uint4 u, float* out) {
-        const half2* hp = reinterpret_cast<const half2*>(&u);
-        const float2 f0 = __half22float2(hp[0]), f1 = __half22float2(hp[1]);
-        const float2 f2 = __half22float2(hp[2]), f3 = __half22float2(hp[3]);
-        out[0] = f0.x;
-        out[1] = f0.y;
-        out[2] = f1.x;
-        out[3] = f1.y;
-        out[4] = f2.x;
-        out[5] = f2.y;
-        out[6] = f3.x;
-        out[7] = f3.y;
-    };
-
-    for (int kx = 0; kx < FixedK; ++kx) {
-        const uint4* col = s_u4 + (ly_pair * 2) * smem_w + (lx + kx);
-        float cur[8];
-        decode(col[0], cur);
-        if constexpr (FixedK <= 7) {
+    if constexpr (HalfAccum) {
+        half2 h_acc0[4], h_acc1[4];
 #pragma unroll
-            for (int ky = 0; ky < FixedK; ++ky) {
-                float nxt[8];
-                decode(col[(ky + 1) * smem_w], nxt);
-                const int tap = ky * FixedK + kx;
-                const float4 w0 = w_s4[2 * tap];
-                const float4 w1 = w_s4[2 * tap + 1];
-                acc0[0] = fmaf(w0.x, cur[0], acc0[0]);
-                acc0[1] = fmaf(w0.y, cur[1], acc0[1]);
-                acc0[2] = fmaf(w0.z, cur[2], acc0[2]);
-                acc0[3] = fmaf(w0.w, cur[3], acc0[3]);
-                acc0[4] = fmaf(w1.x, cur[4], acc0[4]);
-                acc0[5] = fmaf(w1.y, cur[5], acc0[5]);
-                acc0[6] = fmaf(w1.z, cur[6], acc0[6]);
-                acc0[7] = fmaf(w1.w, cur[7], acc0[7]);
-                acc1[0] = fmaf(w0.x, nxt[0], acc1[0]);
-                acc1[1] = fmaf(w0.y, nxt[1], acc1[1]);
-                acc1[2] = fmaf(w0.z, nxt[2], acc1[2]);
-                acc1[3] = fmaf(w0.w, nxt[3], acc1[3]);
-                acc1[4] = fmaf(w1.x, nxt[4], acc1[4]);
-                acc1[5] = fmaf(w1.y, nxt[5], acc1[5]);
-                acc1[6] = fmaf(w1.z, nxt[6], acc1[6]);
-                acc1[7] = fmaf(w1.w, nxt[7], acc1[7]);
+        for (int j = 0; j < 4; ++j) {
+            h_acc0[j] = __floats2half2_rn(0.f, 0.f);
+            h_acc1[j] = __floats2half2_rn(0.f, 0.f);
+        }
+        for (int kx = 0; kx < FixedK; ++kx) {
+            const uint4* col = s_u4 + (ly_pair * 2) * smem_w + (lx + kx);
+            uint4 cur = col[0];
+            if constexpr (FixedK <= 7) {
 #pragma unroll
-                for (int j = 0; j < 8; ++j) cur[j] = nxt[j];
+                for (int ky = 0; ky < FixedK; ++ky) {
+                    const uint4 nxt = col[(ky + 1) * smem_w];
+                    const uint4 wu = w_u4[ky * FixedK + kx];
+                    const half2* c_h = reinterpret_cast<const half2*>(&cur);
+                    const half2* n_h = reinterpret_cast<const half2*>(&nxt);
+                    const half2* w_h = reinterpret_cast<const half2*>(&wu);
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        h_acc0[j] = __hfma2(w_h[j], c_h[j], h_acc0[j]);
+                        h_acc1[j] = __hfma2(w_h[j], n_h[j], h_acc1[j]);
+                    }
+                    cur = nxt;
+                }
+            } else {
+                for (int ky = 0; ky < FixedK; ++ky) {
+                    const uint4 nxt = col[(ky + 1) * smem_w];
+                    const uint4 wu = w_u4[ky * FixedK + kx];
+                    const half2* c_h = reinterpret_cast<const half2*>(&cur);
+                    const half2* n_h = reinterpret_cast<const half2*>(&nxt);
+                    const half2* w_h = reinterpret_cast<const half2*>(&wu);
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        h_acc0[j] = __hfma2(w_h[j], c_h[j], h_acc0[j]);
+                        h_acc1[j] = __hfma2(w_h[j], n_h[j], h_acc1[j]);
+                    }
+                    cur = nxt;
+                }
             }
-        } else {
-            for (int ky = 0; ky < FixedK; ++ky) {
-                float nxt[8];
-                decode(col[(ky + 1) * smem_w], nxt);
-                const int tap = ky * FixedK + kx;
-                const float4 w0 = w_s4[2 * tap];
-                const float4 w1 = w_s4[2 * tap + 1];
-                acc0[0] = fmaf(w0.x, cur[0], acc0[0]);
-                acc0[1] = fmaf(w0.y, cur[1], acc0[1]);
-                acc0[2] = fmaf(w0.z, cur[2], acc0[2]);
-                acc0[3] = fmaf(w0.w, cur[3], acc0[3]);
-                acc0[4] = fmaf(w1.x, cur[4], acc0[4]);
-                acc0[5] = fmaf(w1.y, cur[5], acc0[5]);
-                acc0[6] = fmaf(w1.z, cur[6], acc0[6]);
-                acc0[7] = fmaf(w1.w, cur[7], acc0[7]);
-                acc1[0] = fmaf(w0.x, nxt[0], acc1[0]);
-                acc1[1] = fmaf(w0.y, nxt[1], acc1[1]);
-                acc1[2] = fmaf(w0.z, nxt[2], acc1[2]);
-                acc1[3] = fmaf(w0.w, nxt[3], acc1[3]);
-                acc1[4] = fmaf(w1.x, nxt[4], acc1[4]);
-                acc1[5] = fmaf(w1.y, nxt[5], acc1[5]);
-                acc1[6] = fmaf(w1.z, nxt[6], acc1[6]);
-                acc1[7] = fmaf(w1.w, nxt[7], acc1[7]);
+        }
 #pragma unroll
-                for (int j = 0; j < 8; ++j) cur[j] = nxt[j];
+        for (int j = 0; j < 4; ++j) {
+            const float2 f0 = __half22float2(h_acc0[j]);
+            const float2 f1 = __half22float2(h_acc1[j]);
+            acc0[2 * j] = f0.x;
+            acc0[2 * j + 1] = f0.y;
+            acc1[2 * j] = f1.x;
+            acc1[2 * j + 1] = f1.y;
+        }
+    } else {
+        const float4* w_s4 = reinterpret_cast<const float4*>(w_u4);
+        auto decode = [](uint4 u, float* out) {
+            const half2* hp = reinterpret_cast<const half2*>(&u);
+            const float2 f0 = __half22float2(hp[0]), f1 = __half22float2(hp[1]);
+            const float2 f2 = __half22float2(hp[2]), f3 = __half22float2(hp[3]);
+            out[0] = f0.x;
+            out[1] = f0.y;
+            out[2] = f1.x;
+            out[3] = f1.y;
+            out[4] = f2.x;
+            out[5] = f2.y;
+            out[6] = f3.x;
+            out[7] = f3.y;
+        };
+
+        for (int kx = 0; kx < FixedK; ++kx) {
+            const uint4* col = s_u4 + (ly_pair * 2) * smem_w + (lx + kx);
+            float cur[8];
+            decode(col[0], cur);
+            if constexpr (FixedK <= 7) {
+#pragma unroll
+                for (int ky = 0; ky < FixedK; ++ky) {
+                    float nxt[8];
+                    decode(col[(ky + 1) * smem_w], nxt);
+                    const int tap = ky * FixedK + kx;
+                    const float4 w0 = w_s4[2 * tap];
+                    const float4 w1 = w_s4[2 * tap + 1];
+                    acc0[0] = fmaf(w0.x, cur[0], acc0[0]);
+                    acc0[1] = fmaf(w0.y, cur[1], acc0[1]);
+                    acc0[2] = fmaf(w0.z, cur[2], acc0[2]);
+                    acc0[3] = fmaf(w0.w, cur[3], acc0[3]);
+                    acc0[4] = fmaf(w1.x, cur[4], acc0[4]);
+                    acc0[5] = fmaf(w1.y, cur[5], acc0[5]);
+                    acc0[6] = fmaf(w1.z, cur[6], acc0[6]);
+                    acc0[7] = fmaf(w1.w, cur[7], acc0[7]);
+                    acc1[0] = fmaf(w0.x, nxt[0], acc1[0]);
+                    acc1[1] = fmaf(w0.y, nxt[1], acc1[1]);
+                    acc1[2] = fmaf(w0.z, nxt[2], acc1[2]);
+                    acc1[3] = fmaf(w0.w, nxt[3], acc1[3]);
+                    acc1[4] = fmaf(w1.x, nxt[4], acc1[4]);
+                    acc1[5] = fmaf(w1.y, nxt[5], acc1[5]);
+                    acc1[6] = fmaf(w1.z, nxt[6], acc1[6]);
+                    acc1[7] = fmaf(w1.w, nxt[7], acc1[7]);
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) cur[j] = nxt[j];
+                }
+            } else {
+                for (int ky = 0; ky < FixedK; ++ky) {
+                    float nxt[8];
+                    decode(col[(ky + 1) * smem_w], nxt);
+                    const int tap = ky * FixedK + kx;
+                    const float4 w0 = w_s4[2 * tap];
+                    const float4 w1 = w_s4[2 * tap + 1];
+                    acc0[0] = fmaf(w0.x, cur[0], acc0[0]);
+                    acc0[1] = fmaf(w0.y, cur[1], acc0[1]);
+                    acc0[2] = fmaf(w0.z, cur[2], acc0[2]);
+                    acc0[3] = fmaf(w0.w, cur[3], acc0[3]);
+                    acc0[4] = fmaf(w1.x, cur[4], acc0[4]);
+                    acc0[5] = fmaf(w1.y, cur[5], acc0[5]);
+                    acc0[6] = fmaf(w1.z, cur[6], acc0[6]);
+                    acc0[7] = fmaf(w1.w, cur[7], acc0[7]);
+                    acc1[0] = fmaf(w0.x, nxt[0], acc1[0]);
+                    acc1[1] = fmaf(w0.y, nxt[1], acc1[1]);
+                    acc1[2] = fmaf(w0.z, nxt[2], acc1[2]);
+                    acc1[3] = fmaf(w0.w, nxt[3], acc1[3]);
+                    acc1[4] = fmaf(w1.x, nxt[4], acc1[4]);
+                    acc1[5] = fmaf(w1.y, nxt[5], acc1[5]);
+                    acc1[6] = fmaf(w1.z, nxt[6], acc1[6]);
+                    acc1[7] = fmaf(w1.w, nxt[7], acc1[7]);
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) cur[j] = nxt[j];
+                }
             }
         }
     }
@@ -1278,16 +1339,28 @@ __device__ void mosr_dw_gate_planar_impl(half* dw_gated, const half* dw_v, const
     }
 }
 
-extern "C" __global__ void mosr_dw_gate_planar_k7(half* dw_gated, const half* dw_v, const half* dw_g,
-                                                  const float* dw_weight, const float* dw_bias, int h, int w,
-                                                  int tiles_x, int total_pixels) {
-    mosr_dw_gate_planar_impl<7, 32>(dw_gated, dw_v, dw_g, dw_weight, dw_bias, h, w, tiles_x, total_pixels);
+extern "C" __global__ void mosr_dw_gate_planar_k7_f16(half* dw_gated, const half* dw_v, const half* dw_g,
+                                                      const float* dw_weight, const float* dw_bias, int h, int w,
+                                                      int tiles_x, int total_pixels) {
+    mosr_dw_gate_planar_impl<7, 32, true>(dw_gated, dw_v, dw_g, dw_weight, dw_bias, h, w, tiles_x, total_pixels);
 }
 
-extern "C" __global__ void mosr_dw_gate_planar_k17(half* dw_gated, const half* dw_v, const half* dw_g,
-                                                   const float* dw_weight, const float* dw_bias, int h, int w,
-                                                   int tiles_x, int total_pixels) {
-    mosr_dw_gate_planar_impl<17, 16>(dw_gated, dw_v, dw_g, dw_weight, dw_bias, h, w, tiles_x, total_pixels);
+extern "C" __global__ void mosr_dw_gate_planar_k7_f32(half* dw_gated, const half* dw_v, const half* dw_g,
+                                                      const float* dw_weight, const float* dw_bias, int h, int w,
+                                                      int tiles_x, int total_pixels) {
+    mosr_dw_gate_planar_impl<7, 32, false>(dw_gated, dw_v, dw_g, dw_weight, dw_bias, h, w, tiles_x, total_pixels);
+}
+
+extern "C" __global__ void mosr_dw_gate_planar_k17_f16(half* dw_gated, const half* dw_v, const half* dw_g,
+                                                       const float* dw_weight, const float* dw_bias, int h, int w,
+                                                       int tiles_x, int total_pixels) {
+    mosr_dw_gate_planar_impl<17, 32, true>(dw_gated, dw_v, dw_g, dw_weight, dw_bias, h, w, tiles_x, total_pixels);
+}
+
+extern "C" __global__ void mosr_dw_gate_planar_k17_f32(half* dw_gated, const half* dw_v, const half* dw_g,
+                                                       const float* dw_weight, const float* dw_bias, int h, int w,
+                                                       int tiles_x, int total_pixels) {
+    mosr_dw_gate_planar_impl<17, 32, false>(dw_gated, dw_v, dw_g, dw_weight, dw_bias, h, w, tiles_x, total_pixels);
 }
 
 template<bool HalfAccumulate, bool DoNorm, int Dim, int Hidden>
