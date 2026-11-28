@@ -60,6 +60,7 @@ enum GateStat {
 #define CHECK(expr) umzi::check((expr), #expr)
 
 void allocate(CUdeviceptr& pointer, size_t bytes, const char* name) {
+    umzi::require_device_memory(bytes, name);
     auto status = cuMemAlloc(&pointer, bytes);
     if (status == CUDA_ERROR_OUT_OF_MEMORY)
         throw AllocationError(std::string("Could not allocate ") + std::to_string(bytes)
@@ -521,13 +522,6 @@ private:
     }
 
     void allocate_shape() {
-        size_t free_bytes, capacity;
-        CHECK(cuMemGetInfo(&free_bytes, &capacity));
-        size_t required = arena_bytes;
-        if (required > free_bytes)
-            throw AllocationError("Shape buffers require " + std::to_string(required)
-                + " bytes with " + std::to_string(free_bytes)
-                + " bytes available; try a smaller tile or batch");
         allocate(arena, arena_bytes, "activation arena");
         addresses.resize(tensors.size());
         addresses.front() = input;
@@ -1377,6 +1371,27 @@ public:
         io.input.shape = io.output.shape = shape;
         io.input.bytes = io.output.bytes = bytes;
         return io;
+    }
+
+    UmziMemoryInfo estimate_memory(const UmziShape& shape) const override {
+        const auto concrete = checked(shape);
+        const auto padded = shared->model.padded(concrete);
+        if (!matches(padded)) shared->model.check_shape(padded);
+        ContextScope scope(shared->context);
+        const auto vram = umzi::device_vram_info(shared->device);
+        UmziMemoryInfo info{};
+        info.struct_size = sizeof(info);
+        if (matches(padded)) {
+            active->buffer_sizes(info.buffer_bytes);
+        } else {
+            info.buffer_bytes[0] = shared->model.weight_bytes;
+            info.buffer_bytes[1] = shared->model.resolve(padded).arena_bytes;
+            info.buffer_bytes[2] = shared->workspace_limit;
+            info.buffer_bytes[3] = (shared->flags & GT_CREATE_GRAPH) ? concrete.rgb_bytes(fp16()) * 2 : 0;
+        }
+        info.device_free = vram.free_bytes;
+        info.device_total = vram.total_bytes;
+        return info;
     }
 
     void prepare_shape(const UmziShape& shape) override { prepare(checked(shape)); }

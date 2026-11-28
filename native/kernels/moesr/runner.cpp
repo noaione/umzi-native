@@ -19,6 +19,7 @@
 #include <map>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <tuple>
 #include <vector>
 
@@ -542,8 +543,19 @@ private:
         pending = false;
     }
 
-    void activation(CUdeviceptr& buffer, size_t elements) {
-        const auto bytes = elements * 2;
+    std::array<size_t, 6> activation_sizes(Shape padded_shape) const {
+        const size_t pixels = padded_shape.pixels();
+        return {
+            pixels * channels * 2,
+            pixels * channels * 2,
+            pixels / 4 * channels * 2,
+            pixels * channels * 2,
+            pixels * (fused_gate ? channels : expand_width(full_hidden)) * 2,
+            pixels * lanes(full_hidden) * 2,
+        };
+    }
+
+    void activation(CUdeviceptr& buffer, size_t bytes) {
         CHECK(cuMemAlloc(&buffer, bytes));
         activation_bytes += bytes;
     }
@@ -613,16 +625,16 @@ private:
             device_used[0] = umzi::device_used_bytes();
             shape = requested;
             padded = shape.padded();
-            const size_t pixels = padded.pixels();
-            activation(initial, pixels * channels);
-            activation(state, pixels * channels);
-            activation(reduced, pixels / 4 * channels);
-            activation(normalized, pixels * channels);
-            // With fused_gate no convolution writes the 344-channel expansion: the
-            // widest remaining output is 64 channels per full-resolution pixel
-            // (first, projection and up convolutions), so projected shrinks 5.4x.
-            activation(projected, pixels * (fused_gate ? channels : expand_width(full_hidden)));
-            activation(gated, pixels * lanes(full_hidden));
+            const auto sizes = activation_sizes(padded);
+            const size_t total_act = std::accumulate(sizes.begin(), sizes.end(), size_t(0));
+            const size_t stage_bytes = graph_enabled ? shape.rgb_bytes(fp16) * (1 + scale * scale) : 0;
+            umzi::require_device_memory(total_act + stage_bytes, "MoESR shape buffers", device);
+            activation(initial, sizes[0]);
+            activation(state, sizes[1]);
+            activation(reduced, sizes[2]);
+            activation(normalized, sizes[3]);
+            activation(projected, sizes[4]);
+            activation(gated, sizes[5]);
             device_used[1] = umzi::device_used_bytes();
             setup_ms[0] = umzi::elapsed_ms(start);
 
@@ -630,7 +642,7 @@ private:
             CHECK(cudnnSetStream(cudnn, stream));
             // Time plans on random activations: zero inputs make some tensor-core
             // engines look faster than they run on real images.
-            elementwise(stream, FillNoise, int(pixels * lanes(full_hidden)), gated);
+            elementwise(stream, FillNoise, int(padded.pixels() * lanes(full_hidden)), gated);
             load_plan_cache();
             const int h = padded.h, w = padded.w;
             make_plan(h, w, rgb_lanes, channels);
@@ -880,6 +892,23 @@ public:
         return io;
     }
 
+    UmziMemoryInfo estimate_memory(const UmziShape& request) const override {
+        const auto concrete = checked(request);
+        const auto p = concrete.padded();
+        ContextScope scope(context);
+        const auto vram = umzi::device_vram_info(device);
+        const auto sizes = activation_sizes(p);
+        UmziMemoryInfo info{};
+        info.struct_size = sizeof(info);
+        info.buffer_bytes[0] = device_model.bytes;
+        info.buffer_bytes[1] = std::accumulate(sizes.begin(), sizes.end(), uint64_t(0));
+        info.buffer_bytes[2] = (shape == concrete) ? workspace_bytes : workspace_limit;
+        info.buffer_bytes[3] = graph_enabled ? concrete.rgb_bytes(fp16) * (1 + scale * scale) : 0;
+        info.device_free = vram.free_bytes;
+        info.device_total = vram.total_bytes;
+        return info;
+    }
+
     void prepare_shape(const UmziShape& request) override {
         ContextScope scope(context);
         prepare(checked(request));
@@ -888,6 +917,8 @@ public:
     void ensure_staging() {
         if (stage_in && stage_out) return;
         const auto input_bytes = shape.rgb_bytes(fp16);
+        const size_t needed = (stage_out ? 0 : size_t(input_bytes) * scale * scale) + (stage_in ? 0 : size_t(input_bytes));
+        umzi::require_device_memory(needed, "MoESR staging buffers", device);
         // Allocate only what is missing: a failed second allocation must not leave a half-built pair that passes the early return.
         if (!stage_out) CHECK(cuMemAlloc(&stage_out, input_bytes * scale * scale));
         if (!stage_in) CHECK(cuMemAlloc(&stage_in, input_bytes));

@@ -8,7 +8,9 @@
 #include "../runtime/kernel.h"
 #include "../runtime/plan_cache_file.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -110,6 +112,92 @@ inline uint64_t device_used_bytes() {
     size_t available = 0, total = 0;
     check(cuMemGetInfo(&available, &total), "cuMemGetInfo");
     return static_cast<uint64_t>(total - available);
+}
+
+struct VramInfo {
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+};
+
+namespace detail {
+struct NvmlMemory {
+    unsigned long long total;
+    unsigned long long free;
+    unsigned long long used;
+};
+
+class NvmlApi {
+    using InitFn = int (*)();
+    using HandleByUuidFn = int (*)(const char*, void**);
+    using MemoryInfoFn = int (*)(void*, NvmlMemory*);
+
+    InitFn init_ = nullptr;
+    HandleByUuidFn handle_by_uuid_ = nullptr;
+    MemoryInfoFn memory_info_ = nullptr;
+    bool ready_ = false;
+
+    NvmlApi() {
+#ifdef _WIN32
+        HMODULE lib = LoadLibraryW(L"nvml.dll");
+        auto sym = [lib](const char* name) { return lib ? reinterpret_cast<void*>(GetProcAddress(lib, name)) : nullptr; };
+#else
+        void* lib = dlopen("libnvidia-ml.so.1", RTLD_NOW | RTLD_LOCAL);
+        auto sym = [lib](const char* name) { return lib ? dlsym(lib, name) : nullptr; };
+#endif
+        init_ = reinterpret_cast<InitFn>(sym("nvmlInit_v2"));
+        handle_by_uuid_ = reinterpret_cast<HandleByUuidFn>(sym("nvmlDeviceGetHandleByUUID"));
+        memory_info_ = reinterpret_cast<MemoryInfoFn>(sym("nvmlDeviceGetMemoryInfo"));
+        if (init_ && handle_by_uuid_ && memory_info_ && init_() == 0) ready_ = true;
+    }
+
+public:
+    static const NvmlApi& instance() {
+        static const NvmlApi api;
+        return api;
+    }
+
+    bool query_free(CUdevice device, size_t& free_bytes) const {
+        if (!ready_) return false;
+        if (device < 0 && cuCtxGetDevice(&device) != CUDA_SUCCESS) return false;
+        CUuuid uuid{};
+        if (cuDeviceGetUuid(&uuid, device) != CUDA_SUCCESS) return false;
+        const auto* bytes = reinterpret_cast<const unsigned char*>(uuid.bytes);
+        char text[48]{};
+        std::snprintf(text, sizeof(text),
+            "GPU-%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]);
+        void* handle = nullptr;
+        if (handle_by_uuid_(text, &handle) != 0 || !handle) return false;
+        NvmlMemory mem{};
+        if (memory_info_(handle, &mem) != 0) return false;
+        free_bytes = static_cast<size_t>(mem.free);
+        return true;
+    }
+};
+} // namespace detail
+
+inline VramInfo device_vram_info(CUdevice device = -1) {
+    size_t free_bytes = 0, total_bytes = 0;
+    check(cuMemGetInfo(&free_bytes, &total_bytes), "cuMemGetInfo");
+    size_t nvml_free = 0;
+    if (detail::NvmlApi::instance().query_free(device, nvml_free))
+        free_bytes = std::min(free_bytes, nvml_free);
+    return {free_bytes, total_bytes};
+}
+
+inline void require_device_memory(size_t required, const char* what, CUdevice device = -1) {
+    if (!required) return;
+    const auto info = device_vram_info(device);
+    if (required > info.free_bytes) {
+        throw AllocationError(std::string(what) + " require " + std::to_string(required) + " bytes with "
+            + std::to_string(info.free_bytes) + " bytes available; try a smaller tile or batch");
+    }
+}
+
+inline void allocate_device_checked(CUdeviceptr& ptr, size_t bytes, const char* what, CUdevice device = -1) {
+    require_device_memory(bytes, what, device);
+    check(cuMemAlloc(&ptr, bytes), what);
 }
 
 // IEEE binary16 with round-to-nearest-even, matching __float2half_rn.

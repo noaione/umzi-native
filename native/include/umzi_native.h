@@ -80,6 +80,14 @@ typedef struct UmziSessionInfo {
     double shape_setup_ms[4];  // Allocation, plans, warmup, graph capture.
 } UmziSessionInfo;
 
+typedef struct UmziMemoryInfo {
+    uint32_t struct_size;
+    uint32_t reserved;
+    uint64_t buffer_bytes[4];  // Weights, activations, workspace (upper bound), staging I/O.
+    uint64_t device_free;      // Available device memory at query time.
+    uint64_t device_total;
+} UmziMemoryInfo;
+
 typedef struct UmziDiagnostic {
     uint32_t struct_size;
     const char* name;
@@ -109,6 +117,8 @@ UMZI_API void umzi_session_close(UmziSession* session);
 UMZI_API int umzi_session_model(const UmziSession* session, UmziModelInfo* info);
 UMZI_API int umzi_session_tensors(const UmziSession* session, UmziIo* io);
 UMZI_API int umzi_session_describe(const UmziSession* session, const UmziShape* shape, UmziIo* io);
+UMZI_API int umzi_session_estimate_memory(const UmziSession* session, const UmziShape* shape,
+                                          UmziMemoryInfo* memory);
 UMZI_API int umzi_session_prepare(UmziSession* session, const UmziShape* shape);
 UMZI_API int umzi_session_run(UmziSession* session, const UmziShape* shape,
                               const void* input, uint64_t input_bytes, void* output, uint64_t output_bytes);

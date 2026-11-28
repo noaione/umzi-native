@@ -14,7 +14,7 @@ from ._model import (
     SMoSRModel,
     peek_model,
 )
-from ._session import InferenceSession, SessionOptions, TensorInfo
+from ._session import InferenceSession, SessionOptions, TensorInfo, whole_page_tile
 
 __all__ = [
     "FiGSRModel",
@@ -30,4 +30,5 @@ __all__ = [
     "TensorInfo",
     "load_cuda_libraries",
     "peek_model",
+    "whole_page_tile",
 ]

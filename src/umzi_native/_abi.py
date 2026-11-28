@@ -75,6 +75,16 @@ class InfoABI(ctypes.Structure):
     ]
 
 
+class MemoryABI(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32),
+        ("buffer_bytes", ctypes.c_uint64 * 4),
+        ("device_free", ctypes.c_uint64),
+        ("device_total", ctypes.c_uint64),
+    ]
+
+
 class DiagnosticABI(ctypes.Structure):
     _fields_ = [("struct_size", ctypes.c_uint32), ("name", ctypes.c_char_p), ("value", ctypes.c_int64)]
 
@@ -121,8 +131,12 @@ def bind_session_api(dll: ctypes.CDLL) -> None:
         function = getattr(dll, name)
         function.argtypes = args
         function.restype = result
-    if dll.umzi_abi_version() not in (1, 2, 3):
+    if dll.umzi_abi_version() not in (1, 2, 3, 4):
         raise OSError("Unsupported Umzi native ABI version")
+    estimate = getattr(dll, "umzi_session_estimate_memory", None)
+    if estimate is not None:
+        estimate.argtypes = [pointer, shape, ctypes.POINTER(MemoryABI)]
+        estimate.restype = ctypes.c_int
     for name in ("umzi_session_run_tiled", "umzi_session_run_tiled_variable"):
         tiled = getattr(dll, name, None)
         if tiled is None:
@@ -180,6 +194,15 @@ def read_session_info(dll: ctypes.CDLL, handle: int | None) -> InfoABI:
     info = InfoABI(ctypes.sizeof(InfoABI))
     check_status(dll, dll.umzi_session_info(handle, ctypes.byref(info)))
     return info
+
+
+def read_memory_info(dll: ctypes.CDLL, handle: int | None, shape: ShapeABI) -> MemoryABI:
+    estimate = getattr(dll, "umzi_session_estimate_memory", None)
+    if estimate is None:
+        raise RuntimeError("This Umzi native library does not support memory estimation")
+    memory = MemoryABI(ctypes.sizeof(MemoryABI))
+    check_status(dll, estimate(handle, ctypes.byref(shape), ctypes.byref(memory)))
+    return memory
 
 
 def session_setup(dll: ctypes.CDLL, handle: int | None, info: InfoABI) -> dict:

@@ -393,6 +393,8 @@ class Session final : public umzi::KernelSession {
             device_used[0] = umzi::device_used_bytes();
             const auto lane_bytes = size_t(padded.pixels()) * (fp32 ? 4 : 2);
             activation_bytes = lane_bytes * arena_channels;
+            const size_t stage_bytes = graph ? rgb_bytes(requested) * (1 + scale * scale) : 0;
+            umzi::require_device_memory(activation_bytes + stage_bytes, "SMoSR shape buffers", device);
             CHECK(cuMemAlloc(&arena, activation_bytes));
             for (size_t i = 0; i < buffer.size(); ++i)
                 buffer[i] = arena + lane_bytes * buffer_offsets[i];
@@ -400,8 +402,7 @@ class Session final : public umzi::KernelSession {
             setup_ms[0] = umzi::elapsed_ms(start);
 
             start = umzi::Clock::now();
-            size_t available = 0, total = 0;
-            CHECK(cuMemGetInfo(&available, &total));
+            const size_t available = umzi::device_vram_info(device).free_bytes;
             const auto limit = std::min<size_t>(available / 2, 256u << 20);
             CHECK(cudnnSetStream(cudnn, stream));
             if (!cache_dir.empty() && cache_status != UMZI_CACHE_UNAVAILABLE) {
@@ -420,7 +421,7 @@ class Session final : public umzi::KernelSession {
             }
             prepare_plan(net.end, padded, limit);
             prepare_plan(net.tail, padded, limit);
-            if (workspace_bytes) CHECK(cuMemAlloc(&workspace, workspace_bytes));
+            if (workspace_bytes) umzi::allocate_device_checked(workspace, workspace_bytes, "SMoSR workspace", device);
             device_used[2] = umzi::device_used_bytes();
             setup_ms[1] = umzi::elapsed_ms(start);
 
@@ -637,6 +638,23 @@ public:
         return io;
     }
 
+    UmziMemoryInfo estimate_memory(const UmziShape& request) const override {
+        const auto input = checked(request);
+        const auto padded = input.padded();
+        ContextScope scope(context);
+        const auto vram = umzi::device_vram_info(device);
+        const auto lane_bytes = uint64_t(padded.pixels()) * (fp32 ? 4 : 2);
+        UmziMemoryInfo info{};
+        info.struct_size = sizeof(info);
+        info.buffer_bytes[0] = persistent_bytes();
+        info.buffer_bytes[1] = lane_bytes * arena_channels;
+        info.buffer_bytes[2] = (shape == input) ? workspace_bytes : std::min<uint64_t>(vram.free_bytes / 2, 256u << 20);
+        info.buffer_bytes[3] = graph ? rgb_bytes(input) * (1 + scale * scale) : 0;
+        info.device_free = vram.free_bytes;
+        info.device_total = vram.total_bytes;
+        return info;
+    }
+
     void prepare_shape(const UmziShape& request) override {
         ContextScope scope(context);
         prepare(checked(request));
@@ -645,6 +663,8 @@ public:
     void ensure_staging() {
         if (stage_in && stage_out) return;
         const auto bytes = rgb_bytes(shape);
+        const size_t needed = (stage_out ? 0 : bytes * scale * scale) + (stage_in ? 0 : bytes);
+        umzi::require_device_memory(needed, "SMoSR staging buffers", device);
         // Allocate only what is missing: a failed second allocation must not leave a half-built pair that passes the early return.
         if (!stage_out) CHECK(cuMemAlloc(&stage_out, bytes * scale * scale));
         if (!stage_in) CHECK(cuMemAlloc(&stage_in, bytes));

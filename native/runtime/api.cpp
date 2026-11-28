@@ -123,7 +123,7 @@ int run_tiled_page(UmziSession* session, uint32_t height, uint32_t width, const 
 }
 }
 
-uint32_t umzi_abi_version() { return 3; }
+uint32_t umzi_abi_version() { return 4; }
 const char* umzi_error() { return error_text.c_str(); }
 int umzi_error_code() { return error_code; }
 
@@ -172,6 +172,10 @@ int umzi_session_tensors(const UmziSession* session, UmziIo* io) {
 
 int umzi_session_describe(const UmziSession* session, const UmziShape* shape, UmziIo* io) {
     return report([&] { write(io, kernel(session).describe(checked_shape(shape))); });
+}
+
+int umzi_session_estimate_memory(const UmziSession* session, const UmziShape* shape, UmziMemoryInfo* memory) {
+    return report([&] { write(memory, kernel(session).estimate_memory(checked_shape(shape))); });
 }
 
 int umzi_session_prepare(UmziSession* session, const UmziShape* shape) {

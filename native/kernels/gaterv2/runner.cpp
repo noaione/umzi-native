@@ -725,6 +725,54 @@ public:
         matrix_part = c > 1 ? arena + matrix_part_offset : 0;
     }
 
+    uint64_t arena_bytes_for(Shape shape) const {
+        const uint64_t n = uint64_t(shape.n), pixels = uint64_t(shape.h) * shape.w;
+        const uint32_t levels = arch.levels;
+        const auto aligned = [](uint64_t bytes) { return (bytes + 255) & ~uint64_t(255); };
+        const auto features = [&](uint32_t level) {
+            return n * uint64_t(arch.dim(level)) * (pixels >> (2 * level)) * 2;
+        };
+        uint64_t prefix = 0;
+        const auto reserve = [&](uint64_t bytes) { prefix += aligned(bytes); };
+        std::array<uint64_t, max_levels + 1> skip_ends{};
+        for (uint32_t level = 0; level <= levels; ++level) {
+            reserve(features(level));
+            skip_ends[level] = prefix;
+        }
+        const uint64_t l = uint64_t(arch.latent_dim()), k = uint64_t(arch.keys());
+        const uint64_t t = pixels >> (2 * levels), c = (t + 63) / 64;
+        reserve(n * t * (2 * k + l) * 4);
+        reserve(n * k * 4);
+        reserve(n * l * 4);
+        reserve(n * k * l * 4);
+        reserve(c > 1 ? n * c * k * 4 : 0);
+        reserve(c > 1 ? n * c * l * 4 : 0);
+        reserve(c > 1 ? n * c * k * l * 4 : 0);
+        uint64_t projection_end = prefix + aligned(3 * features(levels));
+        for (uint32_t level = 0; level < levels; ++level) {
+            const uint64_t size = features(level);
+            const uint64_t proj = std::max(aligned(3 * size), aligned(size) + aligned(2 * size));
+            projection_end = std::max(projection_end, skip_ends[level] + proj);
+            projection_end = std::max(projection_end, skip_ends[level + 1] + aligned(size));
+        }
+        const bool share_norm = arch.base != 48;
+        const uint64_t gate_bytes = aligned(3 * features(0) / 2);
+        const uint64_t gate_offset = projection_end + (share_norm ? 0 : aligned(features(0)));
+        return gate_offset + gate_bytes;
+    }
+
+    uint64_t local_part_bytes_for(Shape shape) const {
+        uint64_t parts = 0;
+        for (uint32_t level = 0; level < arch.levels; ++level) {
+            const int dim = arch.dim(level);
+            const auto grid = gate_grid(dim, shape.h >> level, shape.w >> level, 1);
+            parts = std::max(parts, uint64_t(grid[0]) * grid[1] * uint64_t(dim));
+        }
+        return uint64_t(shape.n) * parts * 4;
+    }
+
+    uint64_t multiplier_bytes_for(Shape shape) const { return uint64_t(shape.n) * 256 * 4; }
+
     void resize_workspace(size_t bytes) {
         if (bytes == scratch_bytes) return;
         if (scratch) {
@@ -733,7 +781,7 @@ public:
             scratch = 0;
             scratch_bytes = 0;
         }
-        if (bytes) CHECK(cuMemAlloc(&scratch, bytes));
+        if (bytes) umzi::allocate_device_checked(scratch, bytes, "GateRV2 workspace", device);
         scratch_bytes = bytes;
         peak_workspace_bytes = std::max(peak_workspace_bytes, bytes);
         if (bytes) startup_used[1] = std::max(startup_used[1], umzi::device_used_bytes());
@@ -761,17 +809,17 @@ public:
             startup_used[0] = umzi::device_used_bytes();
             const uint64_t n = uint64_t(p.n), pixels = uint64_t(p.h) * uint64_t(p.w);
             total_elements(p);
+            const uint64_t local_bytes = local_part_bytes_for(p);
+            const uint64_t mult_bytes = multiplier_bytes_for(p);
+            const uint64_t stage_bytes = n * 3 * pixels * io_element();
+            const uint64_t total_shape = std::max<uint64_t>(arena_bytes_for(p), 256)
+                + std::max<uint64_t>(local_bytes, 256) + std::max<uint64_t>(mult_bytes, 256) + 2 * stage_bytes;
+            umzi::require_device_memory(size_t(total_shape), "GateRV2 shape buffers", device);
             allocate_activations(p);
             prepared = p;
-            uint64_t parts = 0;
-            for (uint32_t level = 0; level < arch.levels; ++level) {
-                const int dim = arch.dim(level);
-                const auto grid = gate_grid(dim, p.h >> level, p.w >> level, 1);
-                parts = std::max(parts, uint64_t(grid[0]) * grid[1] * uint64_t(dim));
-            }
-            allocate(local_part, n * parts * 4);
-            allocate(multiplier, n * 256 * 4);
-            io_bytes = n * 3 * pixels * io_element();
+            allocate(local_part, local_bytes);
+            allocate(multiplier, mult_bytes);
+            io_bytes = stage_bytes;
             CHECK(cuMemAlloc(&stage_in, io_bytes));
             CHECK(cuMemAlloc(&stage_out, io_bytes));
             CHECK(cuMemsetD8Async(stage_in, 0, io_bytes, stream));
@@ -1230,6 +1278,25 @@ public:
         return io;
     }
 
+    UmziMemoryInfo estimate_memory(const UmziShape& shape) const override {
+        const auto concrete = checked(shape);
+        const auto p = padded(concrete);
+        total_elements(p);
+        ContextScope scope(context);
+        const auto vram = umzi::device_vram_info(device);
+        UmziMemoryInfo info{};
+        info.struct_size = sizeof(info);
+        info.buffer_bytes[0] = weight32_bytes + weight16_bytes;
+        info.buffer_bytes[1] = std::max<uint64_t>(arena_bytes_for(p), 256)
+            + std::max<uint64_t>(local_part_bytes_for(p), 256)
+            + std::max<uint64_t>(multiplier_bytes_for(p), 256);
+        info.buffer_bytes[2] = (prepared == p) ? workspace_bytes : workspace_limit;
+        info.buffer_bytes[3] = io_bytes_for(concrete) * 2;
+        info.device_free = vram.free_bytes;
+        info.device_total = vram.total_bytes;
+        return info;
+    }
+
     // Graphs are captured for the shape a session was prepared with; prepare
     // the exact unpadded shape so the captured crop matches it.
     void prepare_exact(Shape shape) {
@@ -1254,6 +1321,8 @@ public:
 
     void ensure_staging() {
         if (stage_in && stage_out) return;
+        const size_t needed = (size_t(!stage_out) + size_t(!stage_in)) * size_t(io_bytes);
+        umzi::require_device_memory(needed, "GateRV2 staging buffers", device);
         // Allocate only what is missing: a failed second allocation must not leave a half-built pair that passes the early return.
         if (!stage_out) CHECK(cuMemAlloc(&stage_out, io_bytes));
         if (!stage_in) CHECK(cuMemAlloc(&stage_in, io_bytes));

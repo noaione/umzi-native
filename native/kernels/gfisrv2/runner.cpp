@@ -372,7 +372,7 @@ struct FftPlan {
         int sizes[] = {shape.h, shape.w};
         FFT_CHECK(api.make_plan(handle, 2, sizes, nullptr, 1, 0, nullptr, 1, 0, transform, shape.n * fourier, &bytes));
         if (bytes) {
-            CHECK(cuMemAlloc(&workspace, bytes));
+            umzi::allocate_device_checked(workspace, bytes, "GFISRv2 cuFFT workspace");
             FFT_CHECK(api.work_area(handle, reinterpret_cast<void*>(workspace)));
         }
     }
@@ -733,6 +733,46 @@ private:
         pending = false;
     }
 
+    struct ActivationLayout {
+        size_t initial = 0, state = 0, norm = 0, projected = 0, gated = 0;
+        size_t spectrum = 0, freq_a = 0, freq_b = 0, fft_buf = 0, freq_stride = 0;
+        size_t total() const {
+            return initial + state + norm + projected + gated + spectrum + freq_a + freq_b + fft_buf;
+        }
+    };
+
+    ActivationLayout activation_layout(Shape s) const {
+        const size_t pixels = size_t(s.n) * s.pixels();
+        const int b = s.h * (s.w / 2 + 1);
+        ActivationLayout layout;
+        if (!reduced()) {
+            const size_t frequency_bytes = size_t(s.n) * b * 2 * fourier * sizeof(float);
+            layout.initial = pixels * channels * sizeof(float);
+            layout.state = pixels * channels * sizeof(float);
+            layout.norm = pixels * channels * sizeof(float);
+            layout.projected = pixels * 2 * hidden * sizeof(float);
+            layout.gated = pixels * hidden * sizeof(float);
+            layout.spectrum = frequency_bytes;
+            layout.freq_a = frequency_bytes;
+            layout.freq_b = frequency_bytes;
+        } else {
+            const size_t state_elem = element(half_io());
+            const size_t proj_ch = fused_conv ? size_t(2 * channels) : size_t(2 * hidden);
+            const size_t fft_bytes = pixels * fourier * sizeof(float);
+            const size_t freq_elem = element(half_io());
+            const size_t freq_bytes = size_t(s.n) * b * freq_lanes * freq_elem;
+            layout.freq_stride = (freq_bytes + 255) & ~size_t(255);
+            layout.initial = pixels * channels * state_elem;
+            layout.state = pixels * channels * state_elem;
+            layout.norm = pixels * channels * sizeof(uint16_t);
+            layout.projected = pixels * proj_ch * sizeof(uint16_t);
+            layout.gated = pixels * hidden * sizeof(uint16_t);
+            layout.spectrum = size_t(s.n) * b * 2 * fourier * sizeof(float);
+            layout.fft_buf = std::max(fft_bytes, layout.freq_stride + freq_bytes);
+        }
+        return layout;
+    }
+
     void activation(CUdeviceptr& buffer, size_t bytes) {
         CHECK(cuMemAlloc(&buffer, bytes));
         activation_bytes += bytes;
@@ -835,35 +875,23 @@ private:
             const size_t pixels = size_t(shape.n) * shape.pixels();
             bins = shape.h * (shape.w / 2 + 1);
             fft_scale = float(1.0 / std::sqrt(double(shape.pixels())));
+            const auto layout = activation_layout(shape);
+            const size_t stage_bytes = graph_enabled ? shape.rgb_bytes(element(half_io())) * (1 + scale * scale) : 0;
+            umzi::require_device_memory(layout.total() + stage_bytes, "GFISRv2 shape buffers", device);
 
+            activation(initial, layout.initial);
+            activation(state, layout.state);
+            activation(norm, layout.norm);
+            activation(projected, layout.projected);
+            activation(gated, layout.gated);
+            activation(spectrum, layout.spectrum);
             if (!reduced()) {
-                activation(initial, pixels * channels * sizeof(float));
-                activation(state, pixels * channels * sizeof(float));
-                activation(norm, pixels * channels * sizeof(float));
-                activation(projected, pixels * 2 * hidden * sizeof(float));
-                activation(gated, pixels * hidden * sizeof(float));
-                const size_t frequency_bytes = size_t(shape.n) * bins * 2 * fourier * sizeof(float);
-                activation(spectrum, frequency_bytes);
-                activation(freq_a, frequency_bytes);
-                activation(freq_b, frequency_bytes);
+                activation(freq_a, layout.freq_a);
+                activation(freq_b, layout.freq_b);
             } else {
-                const size_t state_elem = element(half_io());
-                activation(initial, pixels * channels * state_elem);
-                activation(state, pixels * channels * state_elem);
-                activation(norm, pixels * channels * sizeof(uint16_t));
-                // With fused_conv, projected holds compact Fourier/branch buffers (80 ch)
-                // during body blocks and tail_expand output (96 ch) during tail.
-                const size_t proj_ch = fused_conv ? size_t(2 * channels) : size_t(2 * hidden);
-                activation(projected, pixels * proj_ch * sizeof(uint16_t));
-                activation(gated, pixels * hidden * sizeof(uint16_t));
-                const size_t fft_bytes = pixels * fourier * sizeof(float);
-                activation(spectrum, size_t(shape.n) * bins * 2 * fourier * sizeof(float));
-                const size_t freq_elem = element(half_io());
-                const size_t freq_bytes = size_t(shape.n) * bins * freq_lanes * freq_elem;
-                const size_t freq_stride = (freq_bytes + 255) & ~size_t(255);
-                activation(fft_buf, std::max(fft_bytes, freq_stride + freq_bytes));
+                activation(fft_buf, layout.fft_buf);
                 freq_a = fft_buf;
-                freq_b = fft_buf + freq_stride;
+                freq_b = fft_buf + layout.freq_stride;
             }
             device_used[1] = umzi::device_used_bytes();
             setup_ms[0] = umzi::elapsed_ms(start);
@@ -1224,6 +1252,31 @@ public:
         return io;
     }
 
+    UmziMemoryInfo estimate_memory(const UmziShape& request) const override {
+        const auto concrete = checked(request);
+        ContextScope scope(context);
+        const auto vram = umzi::device_vram_info(device);
+        UmziMemoryInfo info{};
+        info.struct_size = sizeof(info);
+        info.buffer_bytes[0] = weight_bytes;
+        info.buffer_bytes[1] = activation_layout(concrete).total();
+        if (shape == concrete) {
+            info.buffer_bytes[2] = cudnn_workspace + forward_fft.bytes + inverse_fft.bytes;
+        } else {
+            int dims[] = {concrete.h, concrete.w};
+            size_t r2c_bytes = 0, c2r_bytes = 0;
+            FFT_CHECK(shared->fft->estimate_many(2, dims, nullptr, 1, 0, nullptr, 1, 0, r2c, concrete.n * fourier,
+                                                 &r2c_bytes));
+            FFT_CHECK(shared->fft->estimate_many(2, dims, nullptr, 1, 0, nullptr, 1, 0, c2r, concrete.n * fourier,
+                                                 &c2r_bytes));
+            info.buffer_bytes[2] = (reduced() ? workspace_limit : 0) + r2c_bytes + c2r_bytes;
+        }
+        info.buffer_bytes[3] = graph_enabled ? concrete.rgb_bytes(element(half_io())) * (1 + scale * scale) : 0;
+        info.device_free = vram.free_bytes;
+        info.device_total = vram.total_bytes;
+        return info;
+    }
+
     void prepare_shape(const UmziShape& request) override {
         ContextScope scope(context);
         prepare(checked(request));
@@ -1232,6 +1285,8 @@ public:
     void ensure_staging() {
         if (stage_in && stage_out) return;
         const auto bytes = shape.rgb_bytes(element(half_io()));
+        const size_t needed = (stage_out ? 0 : size_t(bytes) * scale * scale) + (stage_in ? 0 : size_t(bytes));
+        umzi::require_device_memory(needed, "GFISRv2 staging buffers", device);
         // Allocate only what is missing: a failed second allocation must not leave a half-built pair that passes the early return.
         if (!stage_out) CHECK(cuMemAlloc(&stage_out, bytes * scale * scale));
         if (!stage_in) CHECK(cuMemAlloc(&stage_in, bytes));

@@ -21,6 +21,7 @@ struct CufftApi {
     using Create = int (UMZI_FFT_CALL*)(int*);
     using Flag = int (UMZI_FFT_CALL*)(int, int);
     using Plan = int (UMZI_FFT_CALL*)(int, int, int*, int*, int, int, int*, int, int, int, int, size_t*);
+    using Estimate = int (UMZI_FFT_CALL*)(int, int*, int*, int, int, int*, int, int, int, int, size_t*);
     using Pointer = int (UMZI_FFT_CALL*)(int, void*);
     using Exec = int (UMZI_FFT_CALL*)(int, void*, void*);
 
@@ -28,6 +29,7 @@ struct CufftApi {
     Simple destroy = nullptr;
     Flag auto_allocation = nullptr;
     Plan make_plan = nullptr;
+    Estimate estimate_many = nullptr;
     Pointer work_area = nullptr, set_stream = nullptr;
     Exec r2c = nullptr, c2r = nullptr;
 
@@ -45,6 +47,7 @@ struct CufftApi {
             destroy = symbol<Simple>("cufftDestroy");
             auto_allocation = symbol<Flag>("cufftSetAutoAllocation");
             make_plan = symbol<Plan>("cufftMakePlanMany");
+            estimate_many = symbol<Estimate>("cufftEstimateMany");
             work_area = symbol<Pointer>("cufftSetWorkArea");
             set_stream = symbol<Pointer>("cufftSetStream");
             r2c = symbol<Exec>("cufftExecR2C");

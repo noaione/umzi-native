@@ -23,6 +23,7 @@ public:
     virtual TilingConstraints tiling_constraints() const { return {}; }
     virtual UmziIo tensors() const = 0;
     virtual UmziIo describe(const UmziShape& shape) const = 0;
+    virtual UmziMemoryInfo estimate_memory(const UmziShape& shape) const = 0;
     virtual void prepare_shape(const UmziShape& shape) = 0;
     virtual void run_host(const UmziShape& shape, const void* input, void* output) = 0;
     virtual void enqueue_device(const UmziShape& shape, uint64_t input, uint64_t output, UmziStream stream) = 0;

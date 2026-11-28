@@ -7,6 +7,7 @@
 #include <climits>
 #include <cmath>
 #include <map>
+#include <numeric>
 
 namespace {
 using umzi::ContextScope;
@@ -197,9 +198,25 @@ class Session final : public umzi::KernelSession {
     size_t rgb_bytes(Shape input) const { return size_t(input.pixels()) * 3 * (fp16 ? 2 : 4); }
     size_t element_bytes() const { return fp32 ? sizeof(float) : sizeof(uint16_t); }
 
+    std::array<size_t, BufferCount> activation_sizes(Shape padded) const {
+        const Shape frequency{padded.n, padded.h, padded.w / 2 + 1};
+        const size_t image = size_t(padded.pixels()) * element_bytes();
+        const size_t spectrum = size_t(frequency.pixels()) * element_bytes();
+        const size_t fft_input = size_t(padded.pixels()) * fourier * sizeof(float);
+        const size_t fft_output = size_t(frequency.pixels()) * fourier * 2 * sizeof(float);
+        return {
+            features * image, features * image, features * image, features * image,
+            fuse_expand_gate ? (compact_expansion + hidden) * image : 2 * hidden * image,
+            fuse_expand_gate ? size_t(0) : hidden * image,
+            fft_input, fft_output, 2 * fourier * spectrum, 2 * fourier * spectrum,
+        };
+    }
+
     void ensure_staging() {
         if (stage_in && stage_out) return;
         const size_t input_bytes = rgb_bytes(shape);
+        const size_t needed = (stage_out ? 0 : input_bytes * scale * scale) + (stage_in ? 0 : input_bytes);
+        umzi::require_device_memory(needed, "FiGSR staging buffers", device);
         // Allocate only what is missing: a failed second allocation must not leave a half-built pair that passes the early return.
         if (!stage_out) CHECK(cuMemAlloc(&stage_out, input_bytes * scale * scale));
         if (!stage_in) CHECK(cuMemAlloc(&stage_in, input_bytes));
@@ -253,7 +270,7 @@ class Session final : public umzi::KernelSession {
             fft_bytes = std::max(fft_bytes, bytes);
         }
         if (fft_bytes) {
-            CHECK(cuMemAlloc(&fft_workspace, fft_bytes));
+            umzi::allocate_device_checked(fft_workspace, fft_bytes, "FiGSR cuFFT workspace", device);
             for (const auto handle : fft_plans)
                 FFT_CHECK(fft->work_area(handle, reinterpret_cast<void*>(fft_workspace)));
         }
@@ -475,16 +492,13 @@ class Session final : public umzi::KernelSession {
             const auto padded = requested.padded();
             const Shape frequency{padded.n, padded.h, padded.w / 2 + 1};
             const size_t image = size_t(padded.pixels()) * element_bytes();
-            const size_t spectrum = size_t(frequency.pixels()) * element_bytes();
-            const size_t fft_input = size_t(padded.pixels()) * fourier * sizeof(float);
-            const size_t fft_output = size_t(frequency.pixels()) * fourier * 2 * sizeof(float);
-            const std::array<size_t, BufferCount> bytes{
-                features * image, features * image, features * image, features * image,
-                fuse_expand_gate ? (compact_expansion + hidden) * image : 2 * hidden * image,
-                fuse_expand_gate ? size_t(0) : hidden * image,
-                fft_input, fft_output, 2 * fourier * spectrum, 2 * fourier * spectrum};
+            const auto bytes = activation_sizes(padded);
+            size_t total_act = 0;
+            for (size_t value : bytes) total_act += value;
+            const size_t stage_bytes = graph ? rgb_bytes(requested) * (1 + scale * scale) : 0;
             auto start = umzi::Clock::now();
             device_used[0] = umzi::device_used_bytes();
+            umzi::require_device_memory(total_act + stage_bytes, "FiGSR shape buffers", device);
             for (size_t i = 0; i < bytes.size(); ++i) {
                 if (!bytes[i]) continue;
                 CHECK(cuMemAlloc(&buffers[i], bytes[i]));
@@ -497,8 +511,7 @@ class Session final : public umzi::KernelSession {
             start = umzi::Clock::now();
             prepare_fft(padded);
             bind_stream(stream);
-            size_t available = 0, total = 0;
-            CHECK(cuMemGetInfo(&available, &total));
+            const size_t available = umzi::device_vram_info(device).free_bytes;
             const auto cap = std::min<size_t>(available / 2, 256u << 20);
             for (const auto* filter : {&net.head, &net.end, &net.combine, &net.tail}) prepare_conv(padded, *filter, cap);
             const auto& block = net.blocks.front();
@@ -507,7 +520,7 @@ class Session final : public umzi::KernelSession {
                     prepare_conv(padded, *filter, cap);
             prepare_conv(frequency, block.fpe, cap);
             prepare_conv(frequency, block.fdc, cap);
-            if (conv_bytes) CHECK(cuMemAlloc(&conv_workspace, conv_bytes));
+            if (conv_bytes) umzi::allocate_device_checked(conv_workspace, conv_bytes, "FiGSR cuDNN workspace", device);
             if (tune_convolutions) {
                 if (!fuse_expand_gate) tune_conv(padded, block.expand, Normalized, Expanded);
                 tune_conv(padded, block.project, Values, Normalized);
@@ -707,6 +720,31 @@ public:
         io.output.shape = Shape{input.n, input.h * scale, input.w * scale}.nchw();
         io.output.bytes = io.input.bytes * scale * scale;
         return io;
+    }
+
+    UmziMemoryInfo estimate_memory(const UmziShape& request) const override {
+        const auto input = checked(request);
+        const auto padded = input.padded();
+        ContextScope scope(context);
+        const auto vram = umzi::device_vram_info(device);
+        const auto sizes = activation_sizes(padded);
+        UmziMemoryInfo info{};
+        info.struct_size = sizeof(info);
+        info.buffer_bytes[0] = net.bytes;
+        info.buffer_bytes[1] = std::accumulate(sizes.begin(), sizes.end(), uint64_t(0));
+        if (shape == input) {
+            info.buffer_bytes[2] = conv_bytes + fft_bytes;
+        } else {
+            int dims[] = {padded.h, padded.w};
+            size_t r2c_bytes = 0, c2r_bytes = 0;
+            FFT_CHECK(fft->estimate_many(2, dims, nullptr, 1, 0, nullptr, 1, 0, r2c, padded.n * fourier, &r2c_bytes));
+            FFT_CHECK(fft->estimate_many(2, dims, nullptr, 1, 0, nullptr, 1, 0, c2r, padded.n * fourier, &c2r_bytes));
+            info.buffer_bytes[2] = std::min<uint64_t>(vram.free_bytes / 2, 256u << 20) + std::max(r2c_bytes, c2r_bytes);
+        }
+        info.buffer_bytes[3] = graph ? rgb_bytes(input) * (1 + scale * scale) : 0;
+        info.device_free = vram.free_bytes;
+        info.device_total = vram.total_bytes;
+        return info;
     }
 
     void prepare_shape(const UmziShape& request) override {

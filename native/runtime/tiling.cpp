@@ -14,7 +14,9 @@ namespace {
 struct DeviceBuffer {
     CUdeviceptr ptr = 0;
     DeviceBuffer() = default;
-    void allocate(size_t bytes) { check(cuMemAlloc(&ptr, bytes), "Allocate GPU tiling buffer"); }
+    void allocate(size_t bytes, CUdevice device = -1) {
+        allocate_device_checked(ptr, bytes, "GPU tiling arena", device);
+    }
     DeviceBuffer(const DeviceBuffer&) = delete;
     DeviceBuffer& operator=(const DeviceBuffer&) = delete;
     ~DeviceBuffer() { if (ptr) cuMemFree(ptr); }
@@ -344,11 +346,11 @@ void run_tiled(KernelSession& kernel, std::unique_ptr<PageTiler>& tiler, int32_t
     const auto result_offset = reuse_sums ? sums_offset : reserve(result_size);
     DeviceBuffer arena;
     try {
-        arena.allocate(arena_bytes);
+        arena.allocate(arena_bytes, tiler->device);
     } catch (const AllocationError&) {
         if (tiler->edges.empty()) throw;
         tiler->edges.clear();
-        arena.allocate(arena_bytes);
+        arena.allocate(arena_bytes, tiler->device);
     }
     auto page = arena.ptr + page_offset, tile_input = arena.ptr + input_offset, tile_output = arena.ptr + output_offset;
     auto sums = arena.ptr + sums_offset, weights = arena.ptr + weights_offset, destination = arena.ptr + result_offset;

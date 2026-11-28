@@ -21,15 +21,31 @@ from ._abi import (
     TilingABI,
     check_status,
     open_session,
+    read_memory_info,
     read_session_info,
     session_setup,
 )
 from ._loader import PathArg, find_session_library, load_cuda_libraries, load_session_library
 from ._model import FIGSR_FAMILY, GFISRV2_FAMILY, MAGIC, PREFIX
 
-__all__ = ["InferenceSession", "SessionOptions", "TensorInfo"]
+__all__ = ["InferenceSession", "SessionOptions", "TensorInfo", "whole_page_tile"]
 
 _DTYPE = {1: ("tensor(float)", np.dtype("float32")), 2: ("tensor(float16)", np.dtype("float16"))}
+
+
+def _align_up(value: int, alignment: int) -> int:
+    return ((value + alignment - 1) // alignment) * alignment
+
+
+def whole_page_tile(
+    side: int,
+    *,
+    min_tile: int = 1024,
+    max_tile: int = 2048,
+    alignment: int = 16,
+) -> int | None:
+    """Return the smallest aligned tile cap covering `side`, or None outside `(min_tile, max_tile]`."""
+    return _align_up(side, alignment) if min_tile < side <= max_tile else None
 
 
 @dataclass
@@ -174,6 +190,23 @@ class InferenceSession:
         with self._lock:
             self._ensure_open()
             check_status(self._dll, self._dll.umzi_session_prepare(self._handle, ctypes.byref(dims)))
+
+    def estimate_memory(self, shape: Sequence[int]) -> dict:
+        """Estimate shape device buffers and available VRAM without allocating or tuning."""
+        dims = ShapeABI.from_dimensions(shape)
+        with self._lock:
+            self._ensure_open()
+            memory = read_memory_info(self._dll, self._handle, dims)
+        buffers = dict(zip(("weights", "activations", "workspace", "rgb_io"), memory.buffer_bytes, strict=True))
+        shape_bytes = buffers["activations"] + buffers["workspace"] + buffers["rgb_io"]
+        return {
+            "shape": tuple(dims.dimensions_tuple()),
+            "buffer_bytes": buffers,
+            "shape_bytes": shape_bytes,
+            "total_bytes": buffers["weights"] + shape_bytes,
+            "device_free_bytes": int(memory.device_free),
+            "device_total_bytes": int(memory.device_total),
+        }
 
     def get_session_info(self) -> dict:
         """Return cache, timings, device-buffer information, and kernel diagnostics."""
@@ -327,3 +360,172 @@ class InferenceSession:
                 ),
             )
         return restored
+
+    def estimate_tiled_memory(
+        self,
+        height: int,
+        width: int,
+        *,
+        tile_size: int,
+        batch_size: int,
+        overlap: int = 0,
+        tiling: Literal["fixed", "variable", "even", "fewest-even"] = "fixed",
+        overlap_method: Literal["centered", "linear"] = "centered",
+        output_dtype: type[np.uint8] | type[np.float32] = np.uint8,
+    ) -> dict:
+        """Estimate device memory needed by `run_tiled` without allocating GPU buffers."""
+        if tiling not in ("fixed", "variable", "even", "fewest-even"):
+            raise ValueError("tiling must be 'fixed', 'variable', 'even', or 'fewest-even'")
+        if overlap_method not in ("centered", "linear"):
+            raise ValueError("overlap_method must be 'centered' or 'linear'")
+        dtype = np.dtype(output_dtype)
+        if dtype not in (np.dtype(np.uint8), np.dtype(np.float32)):
+            raise ValueError("output_dtype must be uint8 or float32")
+        height, width, tile_size, batch_size, overlap = map(
+            operator.index, (height, width, tile_size, batch_size, overlap)
+        )
+        scale = self.scale_factor
+        context = self.context
+        if (
+            min(height, width, tile_size, batch_size, scale) < 1
+            or max(height, width, tile_size) * scale >= 2**31
+            or batch_size >= 2**31
+            or not 0 <= overlap < (2**32 if overlap_method == "centered" else tile_size - 2 * context)
+        ):
+            raise ValueError("Invalid GPU tiling dimensions or overlap")
+
+        in_channels = self._input.shape[1]
+        out_channels = self._output.shape[1]
+        if not isinstance(in_channels, int) or not isinstance(out_channels, int):
+            raise ValueError("Memory estimation requires known input and output channel counts")
+
+        core = tile_size - 2 * context
+        eff_overlap = min(overlap, core // 2) if overlap_method == "centered" else overlap
+        step = max(1, core - eff_overlap)
+        cols = 1 if width <= eff_overlap else 1 + (width - eff_overlap - 1) // step
+        rows = 1 if height <= eff_overlap else 1 + (height - eff_overlap - 1) // step
+
+        if tiling in ("even", "fewest-even"):
+            minimum = min(tile_size, 128) if self._kernel == "gaterv3" else 1
+
+            def even_edge(length: int, count: int) -> int:
+                needed = max(minimum, (length + (count - 1) * eff_overlap + count - 1) // count + 2 * context)
+                if tiling == "even":
+                    aligned = _align_up(needed, 16)
+                    return aligned if aligned <= tile_size else needed
+                return needed
+
+            tile_h = even_edge(height, rows)
+            tile_w = even_edge(width, cols)
+            actual_batch = min(batch_size, rows * cols)
+        else:
+            tile_h = tile_w = tile_size
+            actual_batch = batch_size
+
+        model_estimate = self.estimate_memory((actual_batch, in_channels, tile_h, tile_w))
+        elem_bytes = self._dtype.itemsize
+        core_h = tile_h - 2 * context
+        core_w = tile_w - 2 * context
+        out_tile_h = core_h * scale
+        out_tile_w = core_w * scale
+        source_size = width * height * in_channels
+        max_input = actual_batch * in_channels * tile_h * tile_w * elem_bytes
+        max_output = actual_batch * out_channels * out_tile_h * out_tile_w * elem_bytes
+
+        out_width = width * scale
+        out_height = height * scale
+        num_pixels = out_width * out_height
+        raw = dtype == np.dtype(np.float32)
+        result_size = num_pixels * out_channels * (4 if raw else 1)
+
+        if eff_overlap > 0:
+            if not raw:
+                out_step_y = max(1, core_h - eff_overlap) * scale
+                max_batch_rows = 1 + (actual_batch - 2) // cols if actual_batch > 1 else 0
+                strip_h = min(out_height, max_batch_rows * out_step_y + out_tile_h)
+                accum_pixels = out_width * strip_h
+            else:
+                accum_pixels = num_pixels
+            sum_size = accum_pixels * out_channels * 4
+            weight_size = accum_pixels * 4
+        else:
+            sum_size = 0
+            weight_size = 0
+
+        arena_bytes = sum(
+            _align_up(size, 256)
+            for size in (
+                source_size,
+                max_input,
+                max_output,
+                sum_size,
+                weight_size,
+                0 if (raw and eff_overlap > 0) else result_size,
+            )
+            if size > 0
+        )
+        needed_bytes = model_estimate["shape_bytes"] + arena_bytes
+        return {
+            **model_estimate,
+            "tile_shape": (actual_batch, in_channels, tile_h, tile_w),
+            "tiling_arena_bytes": arena_bytes,
+            "needed_bytes": needed_bytes,
+        }
+
+    def fit_tile_size(
+        self,
+        height: int,
+        width: int,
+        *,
+        default_tile: int,
+        batch_size: int = 1,
+        overlap: int = 0,
+        candidates: Sequence[int] = (1024, 768),
+        whole_page: bool = False,
+        max_whole_tile: int = 2048,
+        tiling: Literal["fixed", "variable", "even", "fewest-even"] = "even",
+        overlap_method: Literal["centered", "linear"] = "centered",
+        output_dtype: type[np.uint8] | type[np.float32] = np.uint8,
+        headroom_fraction: float = 1 / 8,
+    ) -> int:
+        """Pick the largest candidate tile cap whose estimated VRAM fits within free device memory."""
+        if not 0.0 <= headroom_fraction < 1.0:
+            raise ValueError("headroom_fraction must be in [0, 1)")
+        if whole_page:
+            min_whole = max(candidates) if candidates else default_tile
+            whole = whole_page_tile(max(height, width), min_tile=min_whole, max_tile=max_whole_tile)
+            if whole is not None:
+                try:
+                    est = self.estimate_tiled_memory(
+                        height,
+                        width,
+                        tile_size=whole,
+                        batch_size=batch_size,
+                        overlap=overlap,
+                        tiling=tiling,
+                        overlap_method=overlap_method,
+                        output_dtype=output_dtype,
+                    )
+                    if est["needed_bytes"] <= est["device_free_bytes"]:
+                        return whole
+                except (MemoryError, RuntimeError, ValueError):
+                    pass
+
+        for candidate in sorted((t for t in candidates if t > default_tile), reverse=True):
+            try:
+                est = self.estimate_tiled_memory(
+                    height,
+                    width,
+                    tile_size=candidate,
+                    batch_size=batch_size,
+                    overlap=overlap,
+                    tiling=tiling,
+                    overlap_method=overlap_method,
+                    output_dtype=output_dtype,
+                )
+            except (MemoryError, RuntimeError, ValueError):
+                continue
+            room = est["device_free_bytes"] - int(est["device_total_bytes"] * headroom_fraction)
+            if est["needed_bytes"] <= room:
+                return candidate
+        return default_tile

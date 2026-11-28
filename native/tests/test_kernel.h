@@ -25,6 +25,14 @@ public:
         return io;
     }
 
+    UmziMemoryInfo estimate_memory(const UmziShape& shape) const override {
+        const auto io = describe(shape);
+        UmziMemoryInfo info{};
+        info.struct_size = sizeof(info);
+        info.buffer_bytes[3] = io.input.bytes + io.output.bytes;
+        return info;
+    }
+
     void prepare_shape(const UmziShape& shape) override { prepared = describe(shape).input.shape; }
 
     void run_host(const UmziShape& shape, const void* input, void* output) override {

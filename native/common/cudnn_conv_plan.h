@@ -293,6 +293,7 @@ inline bool ensure_device_scratch(CUstream stream, CUdeviceptr& scratch, size_t&
     if (scratch) check(cuMemFree(scratch), "cuMemFree");
     scratch = 0;
     scratch_bytes = 0;
+    if (required > device_vram_info().free_bytes) return false;
     const auto status = cuMemAlloc(&scratch, required);
     if (status == CUDA_ERROR_OUT_OF_MEMORY) {
         scratch = 0;

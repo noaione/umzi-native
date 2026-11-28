@@ -164,6 +164,7 @@ jobs:
               "umzi_session_model",
               "umzi_session_tensors",
               "umzi_session_describe",
+              "umzi_session_estimate_memory",
               "umzi_session_prepare",
               "umzi_session_run",
               "umzi_session_run_tiled",
